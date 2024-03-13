@@ -1,0 +1,5 @@
+bsp_msp_out/msp
+weights
+.vscode
+build*
+tools/test.cpp
