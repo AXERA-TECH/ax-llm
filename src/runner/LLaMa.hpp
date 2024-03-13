@@ -25,7 +25,8 @@ struct LLaMaAttrType
 
     int max_token_len = 127;
 
-    int kv_cache_num = 127, kv_cache_size = 256;
+    int kv_cache_num = 1024; // auto calc
+    int kv_cache_size = 256;
 };
 
 class LLaMa
@@ -105,8 +106,21 @@ public:
         }
         ALOGI("init post axmodel(%s) ok", attr.filename_post_axmodel.c_str());
 
+        auto &input_k_cache = llama_layers[0].get_input("K_cache");
+        _attr.kv_cache_num = input_k_cache.vShape[0] / _attr.kv_cache_size / sizeof(unsigned short);
+        ALOGI("kv_cache_num: %d", _attr.kv_cache_num);
+
         Reset();
         return true;
+    }
+
+    void Deinit()
+    {
+        for (int i = 0; i < _attr.axmodel_num; i++)
+        {
+            llama_layers[i].deinit();
+        }
+        llama_post.deinit();
     }
 
     void Reset()
@@ -126,8 +140,8 @@ public:
         std::string final_out;
 
         bfloat16 bf16 = -65536.f;
-        std::vector<unsigned short> mask(128, bf16.data);
-        mask[127] = 0;
+        std::vector<unsigned short> mask(_attr.kv_cache_num, bf16.data);
+        mask[_attr.kv_cache_num - 1] = 0;
 
         std::vector<int> token_ids = tokenizer.Encode(input_str);
         // print token_ids
@@ -148,7 +162,7 @@ public:
                 break;
             }
 
-            embed = embed_selector.getByIndex(next_token);
+            embed_selector.getByIndex(next_token, embed);
 
             // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
 

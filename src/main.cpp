@@ -10,6 +10,7 @@ int main(int argc, char *argv[])
 {
     LLaMaAttrType attr;
     std::string prompt = "Hi";
+    bool b_continue = false;
 
     cmdline::parser cmd;
     cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
@@ -24,8 +25,9 @@ int main(int argc, char *argv[])
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
     cmd.add<int>("max_token_len", 0, "max token len", false, attr.max_token_len);
-    cmd.add<int>("kv_cache_num", 0, "count of kv cache(axmodel kv_cache input dim-0)", false, attr.kv_cache_num);
     cmd.add<int>("kv_cache_size", 0, "len of kv cache(axmodel kv_cache input dim-1)", false, attr.kv_cache_size);
+
+    cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
 
     cmd.parse_check(argc, argv);
 
@@ -40,13 +42,36 @@ int main(int argc, char *argv[])
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
     attr.max_token_len = cmd.get<int>("max_token_len");
-    attr.kv_cache_num = cmd.get<int>("kv_cache_num");
     attr.kv_cache_size = cmd.get<int>("kv_cache_size");
+
+    b_continue = cmd.get<bool>("continue");
 
     LLaMa lLaMa;
     lLaMa.Init(attr);
 
     auto output = lLaMa.Run(prompt);
     printf("%s\n", output.c_str());
+    if (b_continue)
+    {
+        printf("input \"q\" to exit\n");
+        lLaMa.Reset();
+    }
+
+    while (b_continue)
+    {
+        printf(">> ");
+        fflush(stdout);
+        std::string input;
+        std::getline(std::cin, input);
+        if (input == "q")
+        {
+            break;
+        }
+        auto output = lLaMa.Run(input);
+        printf("%s\n", output.c_str());
+    }
+
+    lLaMa.Deinit();
+
     return 0;
 }

@@ -42,7 +42,7 @@ void update_cqdm(t_cqdm *cqdm, int x)
         fprintf(stdout, "█");
     for (int i = 0; i < (cqdm->size - temp * cqdm->size); i++)
         fprintf(stdout, " ");
-    fprintf(stdout, " | %d / %d [%.2fs<%.2fs, %.2fit/s]", x + 1, cqdm->total, cqdm->total_time,
+    fprintf(stdout, " | %d / %d [%.2fs<%.2fs, %.2f token/s]", x + 1, cqdm->total, cqdm->total_time,
             cqdm->average_time * cqdm->total, 1 / cqdm->average_time);
     fflush(stdout);
 }
