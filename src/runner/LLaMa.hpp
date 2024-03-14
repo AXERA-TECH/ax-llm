@@ -27,6 +27,10 @@ struct LLaMaAttrType
 
     int kv_cache_num = 1024; // auto calc
     int kv_cache_size = 256;
+
+    bool b_use_mmap_load_embed = false;
+    bool b_dynamic_load_axmodel_layer = false;
+    int count_dynamic_load_axmodel_layer_for_one_time = 10;
 };
 
 class LLaMa
@@ -37,7 +41,14 @@ private:
 
     LLaMaAttrType _attr;
 
-    std::vector<ax_runner_ax650> llama_layers;
+    struct LLaMaLayer
+    {
+        ax_runner_ax650 layer;
+        std::string filename;
+        MMap layer_buffer;
+    };
+
+    std::vector<LLaMaLayer> llama_layers;
     ax_runner_ax650 llama_post;
 
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
@@ -66,7 +77,7 @@ public:
         //     printf("\n");
         // }
 
-        if (!embed_selector.Init(attr.filename_tokens_embed, attr.tokens_embed_num, attr.tokens_embed_size))
+        if (!embed_selector.Init(attr.filename_tokens_embed, attr.tokens_embed_num, attr.tokens_embed_size, attr.b_use_mmap_load_embed))
         {
             ALOGE("embed_selector.Init(%s, %d, %d) failed", attr.filename_tokens_embed.c_str(), attr.tokens_embed_num, attr.tokens_embed_size);
             return false;
@@ -85,17 +96,33 @@ public:
         // }
 
         llama_layers.resize(attr.axmodel_num);
+
         char axmodel_path[1024];
         for (int i = 0; i < attr.axmodel_num; i++)
         {
             sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
-            int ret = llama_layers[i].init(axmodel_path);
-            if (ret != 0)
+            llama_layers[i].filename = axmodel_path;
+
+            if (!attr.b_dynamic_load_axmodel_layer)
             {
-                ALOGE("init axmodel(%s) failed", axmodel_path);
-                return false;
+                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str());
+                if (ret != 0)
+                {
+                    ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
+                    return false;
+                }
+                ALOGI("init axmodel(%s) ok", llama_layers[i].filename.c_str());
             }
-            ALOGI("init axmodel(%s) ok", axmodel_path);
+            else
+            {
+                // if (!read_file(llama_layers[i].filename, llama_layers[i].layer_buffer))
+                // {
+                //     ALOGE("read_file(%s) failed", llama_layers[i].filename.c_str());
+                //     return false;
+                // }
+                llama_layers[i].layer_buffer.open_file(llama_layers[i].filename.c_str());
+                ALOGI("read_file(%s) ok", llama_layers[i].filename.c_str());
+            }
         }
 
         int ret = llama_post.init(attr.filename_post_axmodel.c_str());
@@ -106,9 +133,17 @@ public:
         }
         ALOGI("init post axmodel(%s) ok", attr.filename_post_axmodel.c_str());
 
-        auto &input_k_cache = llama_layers[0].get_input("K_cache");
-        _attr.kv_cache_num = input_k_cache.vShape[0] / _attr.kv_cache_size / sizeof(unsigned short);
-        ALOGI("kv_cache_num: %d", _attr.kv_cache_num);
+        if (!attr.b_dynamic_load_axmodel_layer)
+        {
+            auto &input_k_cache = llama_layers[0].layer.get_input("K_cache");
+            _attr.kv_cache_num = input_k_cache.vShape[0] / _attr.kv_cache_size / sizeof(unsigned short);
+            ALOGI("kv_cache_num: %d", _attr.kv_cache_num);
+            if (_attr.max_token_len > _attr.kv_cache_num)
+            {
+                ALOGE("max_token_len(%d) > kv_cache_num(%d)", _attr.max_token_len, _attr.kv_cache_num);
+                return false;
+            }
+        }
 
         Reset();
         return true;
@@ -118,9 +153,10 @@ public:
     {
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
-            llama_layers[i].deinit();
+            llama_layers[i].layer.deinit();
         }
         llama_post.deinit();
+        embed_selector.Deinit();
     }
 
     void Reset()
@@ -175,30 +211,59 @@ public:
 
                 auto &layer = llama_layers[m];
 
-                auto &input_k_cache = layer.get_input("K_cache");
+                if (_attr.b_dynamic_load_axmodel_layer)
+                {
+                    int ret = layer.layer.init(layer.layer_buffer);
+                    if (ret != 0)
+                    {
+                        ALOGE("init axmodel(%s) failed", layer.filename.c_str());
+                    }
+                    // ALOGI("init axmodel(%s) ok", layer.filename.c_str());
+
+                    static bool b_first = true;
+                    if (m == 0 && indices == 0 && b_first)
+                    {
+                        b_first = false;
+                        auto &input_k_cache = layer.layer.get_input("K_cache");
+                        _attr.kv_cache_num = input_k_cache.vShape[0] / _attr.kv_cache_size / sizeof(unsigned short);
+                        ALOGI("kv_cache_num: %d", _attr.kv_cache_num);
+                        if (_attr.max_token_len > _attr.kv_cache_num)
+                        {
+                            ALOGE("max_token_len(%d) > kv_cache_num(%d)", _attr.max_token_len, _attr.kv_cache_num);
+                            return "";
+                        }
+                        /* code */
+                    }
+                }
+
+                auto &input_k_cache = layer.layer.get_input("K_cache");
                 memcpy(input_k_cache.pVirAddr, k_caches[m].data(), sizeof(unsigned short) * k_caches[m].size());
-                auto &input_v_cache = layer.get_input("V_cache");
+                auto &input_v_cache = layer.layer.get_input("V_cache");
                 memcpy(input_v_cache.pVirAddr, v_caches[m].data(), sizeof(unsigned short) * v_caches[m].size());
 
-                auto &input_indices = layer.get_input("indices");
+                auto &input_indices = layer.layer.get_input("indices");
                 memcpy(input_indices.pVirAddr, &indices, sizeof(indices));
 
-                auto &input_mask = layer.get_input("mask");
+                auto &input_mask = layer.layer.get_input("mask");
                 memcpy(input_mask.pVirAddr, mask.data(), mask.size() * sizeof(unsigned short));
 
-                auto &input_input = layer.get_input("input");
+                auto &input_input = layer.layer.get_input("input");
                 memcpy(input_input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
 
-                layer.inference();
+                layer.layer.inference();
 
-                auto &output_k_cache = layer.get_output("K_cache_out");
+                auto &output_k_cache = layer.layer.get_output("K_cache_out");
                 memcpy(k_caches[m].data() + indices * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
 
-                auto &output_v_cache = layer.get_output("V_cache_out");
+                auto &output_v_cache = layer.layer.get_output("V_cache_out");
                 memcpy(v_caches[m].data() + indices * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
 
-                auto &output = layer.get_output("output");
+                auto &output = layer.layer.get_output("output");
                 memcpy(embed.data(), output.pVirAddr, embed.size() * sizeof(unsigned short));
+                if (_attr.b_dynamic_load_axmodel_layer)
+                {
+                    layer.layer.deinit();
+                }
                 // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
             }
             // ALOGI("");

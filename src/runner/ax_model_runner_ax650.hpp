@@ -8,6 +8,8 @@ protected:
 
 public:
     int init(const char *model_file) override;
+    int init(std::vector<char> &model_buffer) override;
+    int init(MMap &model_buffer) override;
 
     void deinit() override;
 

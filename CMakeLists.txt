@@ -41,7 +41,7 @@ include_directories(third_party/sentencepiece/third_party/protobuf-lite)
 #     src/runner/ax_model_runner_ax650.cpp
 # )
 
-add_executable(main src/main.cpp src/runner/ax_model_runner_ax650.cpp src/runner/cqdm.cpp)
+add_executable(main src/main.cpp src/runner/ax_model_runner_ax650.cpp src/runner/memory_utils.cpp src/runner/cqdm.cpp)
 
 target_link_libraries(main ax_engine ax_interpreter ax_sys)
 

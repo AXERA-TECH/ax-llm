@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include "memory_utils.hpp"
 
 typedef enum _color_space_e
 {
@@ -47,6 +48,8 @@ protected:
 
 public:
     virtual int init(const char *model_file) = 0;
+    virtual int init(std::vector<char> &model_buffer) = 0;
+    virtual int init(MMap &model_buffer) = 0;
 
     virtual void deinit() = 0;
 

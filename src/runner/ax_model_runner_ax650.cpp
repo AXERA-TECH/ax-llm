@@ -6,7 +6,7 @@
 #include <ax_sys_api.h>
 #include <ax_engine_api.h>
 #include <fcntl.h>
-#include <sys/mman.h>
+#include "memory_utils.hpp"
 #include "sample_log.h"
 
 #define AX_CMM_ALIGN_SIZE 128
@@ -20,61 +20,6 @@ typedef enum
 } AX_ENGINE_ALLOC_BUFFER_STRATEGY_T;
 
 typedef std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRATEGY_T> INPUT_OUTPUT_ALLOC_STRATEGY;
-
-bool file_exist(const std::string &path)
-{
-    auto flag = false;
-
-    std::fstream fs(path, std::ios::in | std::ios::binary);
-    flag = fs.is_open();
-    fs.close();
-
-    return flag;
-}
-
-class MMap
-{
-private:
-    void *_add;
-    int _size;
-
-public:
-    MMap() {}
-    MMap(const char *file)
-    {
-        _add = _mmap(file, &_size);
-    }
-    ~MMap()
-    {
-        munmap(_add, _size);
-    }
-
-    size_t size()
-    {
-        return _size;
-    }
-
-    void *data()
-    {
-        return _add;
-    }
-
-    static void *_mmap(const char *model_file, int *model_size)
-    {
-        auto *file_fp = fopen(model_file, "r");
-        if (!file_fp)
-        {
-            ALOGE("Read Run-Joint model(%s) file failed.\n", model_file);
-            return nullptr;
-        }
-        fseek(file_fp, 0, SEEK_END);
-        *model_size = ftell(file_fp);
-        fclose(file_fp);
-        int fd = open(model_file, O_RDWR, 0644);
-        void *mmap_add = mmap(NULL, *model_size, PROT_WRITE, MAP_SHARED, fd, 0);
-        return mmap_add;
-    }
-};
 
 static void print_io_info(AX_ENGINE_IO_INFO_T *io_info)
 {
@@ -166,31 +111,6 @@ static void print_io_info(AX_ENGINE_IO_INFO_T *io_info)
         }
         printf("\e[0m\n\n");
     }
-}
-
-bool read_file(const std::string &path, std::vector<char> &data)
-{
-    std::fstream fs(path, std::ios::in | std::ios::binary);
-
-    if (!fs.is_open())
-    {
-        return false;
-    }
-
-    fs.seekg(std::ios::end);
-    auto fs_end = fs.tellg();
-    fs.seekg(std::ios::beg);
-    auto fs_beg = fs.tellg();
-
-    auto file_size = static_cast<size_t>(fs_end - fs_beg);
-    auto vector_size = data.size();
-
-    data.reserve(vector_size + file_size);
-    data.insert(data.end(), std::istreambuf_iterator<char>(fs), std::istreambuf_iterator<char>());
-
-    fs.close();
-
-    return true;
 }
 
 void free_io_index(AX_ENGINE_IO_BUFFER_T *io_buf, int index)
@@ -289,6 +209,26 @@ struct ax_joint_runner_ax650_handle_t
 
 int ax_runner_ax650::init(const char *model_file)
 {
+    // 2. load model
+    std::shared_ptr<MMap> model_buffer(new MMap(model_file));
+    if (!model_buffer->data())
+    {
+        ALOGE("mmap");
+        return -1;
+    }
+    return init(*model_buffer.get());
+    // std::shared_ptr<std::vector<char>> model_buffer((new std::vector<char>()));
+    // if (!read_file(model_file, *model_buffer.get()))
+    // {
+    //     ALOGE("read_file");
+    //     return -1;
+    // }
+
+    // 3. create handle
+}
+
+int ax_runner_ax650::init(MMap &model_buffer)
+{
     if (m_handle)
     {
         return -1;
@@ -306,17 +246,9 @@ int ax_runner_ax650::init(const char *model_file)
         return ret;
     }
 
-    // 2. load model
-    std::shared_ptr<MMap> model_buffer(new MMap(model_file));
-    if (!model_buffer->data())
-    {
-        ALOGE("mmap");
-        return -1;
-    }
-
     // 3. create handle
 
-    ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer->data(), model_buffer->size());
+    ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer.data(), model_buffer.size());
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateHandle");
@@ -351,34 +283,96 @@ int ax_runner_ax650::init(const char *model_file)
         ALOGE("prepare_io");
         return ret;
     }
-    // fprintf(stdout, "Engine alloc io is done. \n");
 
-    // m_handle->algo_width = m_handle->io_info->pInputs[0].pShape[2];
+    for (size_t i = 0; i < m_handle->io_info->nOutputSize; i++)
+    {
+        ax_runner_tensor_t tensor;
+        tensor.nIdx = i;
+        tensor.sName = std::string(m_handle->io_info->pOutputs[i].pName);
+        tensor.nSize = m_handle->io_info->pOutputs[i].nSize;
+        for (size_t j = 0; j < m_handle->io_info->pOutputs[i].nShapeSize; j++)
+        {
+            tensor.vShape.push_back(m_handle->io_info->pOutputs[i].pShape[j]);
+        }
+        tensor.phyAddr = m_handle->io_data.pOutputs[i].phyAddr;
+        tensor.pVirAddr = m_handle->io_data.pOutputs[i].pVirAddr;
+        mtensors.push_back(tensor);
+    }
 
-    // switch (m_handle->io_info->pInputs[0].pExtraMeta->eColorSpace)
-    // {
-    // case AX_ENGINE_CS_NV12:
-    //     m_handle->algo_colorformat = (int)AX_FORMAT_YUV420_SEMIPLANAR;
-    //     m_handle->algo_height = m_handle->io_info->pInputs[0].pShape[1] / 1.5;
-    //     ALOGI("NV12 MODEL");
-    //     break;
-    // case AX_ENGINE_CS_RGB:
-    //     m_handle->algo_colorformat = (int)AX_FORMAT_RGB888;
-    //     m_handle->algo_height = m_handle->io_info->pInputs[0].pShape[1];
-    //     ALOGI("RGB MODEL");
-    //     break;
-    // case AX_ENGINE_CS_BGR:
-    //     m_handle->algo_colorformat = (int)AX_FORMAT_BGR888;
-    //     m_handle->algo_height = m_handle->io_info->pInputs[0].pShape[1];
-    //     ALOGI("BGR MODEL");
-    //     break;
-    // default:
-    //     ALOGE("now ax-pipeline just only support NV12/RGB/BGR input format,you can modify by yourself");
-    //     // return deinit_joint();
-    //     return -1;
-    // }
+    for (size_t i = 0; i < m_handle->io_info->nInputSize; i++)
+    {
+        ax_runner_tensor_t tensor;
+        tensor.nIdx = i;
+        tensor.sName = std::string(m_handle->io_info->pInputs[i].pName);
+        tensor.nSize = m_handle->io_info->pInputs[i].nSize;
+        for (size_t j = 0; j < m_handle->io_info->pInputs[i].nShapeSize; j++)
+        {
+            tensor.vShape.push_back(m_handle->io_info->pInputs[i].pShape[j]);
+        }
+        tensor.phyAddr = m_handle->io_data.pInputs[i].phyAddr;
+        tensor.pVirAddr = m_handle->io_data.pInputs[i].pVirAddr;
+        minput_tensors.push_back(tensor);
+    }
 
-    // print_io_info(m_handle->io_info);
+    return ret;
+}
+
+int ax_runner_ax650::init(std::vector<char> &model_buffer)
+{
+    if (m_handle)
+    {
+        return -1;
+    }
+    m_handle = new ax_joint_runner_ax650_handle_t;
+
+    // 1. init engine
+    AX_ENGINE_NPU_ATTR_T npu_attr;
+    memset(&npu_attr, 0, sizeof(npu_attr));
+    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    AX_SYS_Init();
+    auto ret = AX_ENGINE_Init(&npu_attr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+
+    // 3. create handle
+
+    ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer.data(), model_buffer.size());
+    if (0 != ret)
+    {
+        ALOGE("AX_ENGINE_CreateHandle");
+        return ret;
+    }
+    // fprintf(stdout, "Engine creating handle is done.\n");
+
+    // 4. create context
+    ret = AX_ENGINE_CreateContext(m_handle->handle);
+    if (0 != ret)
+    {
+        ALOGE("AX_ENGINE_CreateContext");
+        return ret;
+    }
+    // fprintf(stdout, "Engine creating context is done.\n");
+
+    // 5. set io
+
+    ret = AX_ENGINE_GetIOInfo(m_handle->handle, &m_handle->io_info);
+    if (0 != ret)
+    {
+        ALOGE("AX_ENGINE_GetIOInfo");
+        return ret;
+    }
+    // fprintf(stdout, "Engine get io info is done. \n");
+
+    // 6. alloc io
+
+    ret = prepare_io(m_handle->io_info, &m_handle->io_data, std::make_pair(AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_DEFAULT));
+    if (0 != ret)
+    {
+        ALOGE("prepare_io");
+        return ret;
+    }
 
     for (size_t i = 0; i < m_handle->io_info->nOutputSize; i++)
     {
@@ -423,6 +417,10 @@ void ax_runner_ax650::deinit()
     delete m_handle;
     m_handle = nullptr;
     AX_ENGINE_Deinit();
+    mtensors.clear();
+    minput_tensors.clear();
+    map_input_tensors.clear();
+    map_tensors.clear();
 }
 
 int ax_runner_ax650::get_algo_width() { return -1; }

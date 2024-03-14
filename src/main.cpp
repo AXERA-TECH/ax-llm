@@ -27,6 +27,9 @@ int main(int argc, char *argv[])
     cmd.add<int>("max_token_len", 0, "max token len", false, attr.max_token_len);
     cmd.add<int>("kv_cache_size", 0, "len of kv cache(axmodel kv_cache input dim-1)", false, attr.kv_cache_size);
 
+    cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
+    cmd.add<bool>("dynamic_load_axmodel_layer", 0, "it can save cmm memory", false, attr.b_dynamic_load_axmodel_layer);
+
     cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
 
     cmd.parse_check(argc, argv);
@@ -43,6 +46,9 @@ int main(int argc, char *argv[])
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
     attr.max_token_len = cmd.get<int>("max_token_len");
     attr.kv_cache_size = cmd.get<int>("kv_cache_size");
+
+    attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
+    attr.b_dynamic_load_axmodel_layer = cmd.get<bool>("dynamic_load_axmodel_layer");
 
     b_continue = cmd.get<bool>("continue");
 
