@@ -6,11 +6,16 @@ class ax_runner_ax650 : public ax_runner_base
 protected:
     struct ax_joint_runner_ax650_handle_t *m_handle = nullptr;
 
+    bool _parepare_io = false;
+
+    int sub_init();
+
 public:
     int init(const char *model_file) override;
     int init(std::vector<char> &model_buffer) override;
     int init(MMap &model_buffer) override;
 
+    void release();
     void deinit() override;
 
     int get_algo_width() override;

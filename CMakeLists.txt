@@ -21,6 +21,8 @@ message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
 cmake_minimum_required(VERSION 3.0)
 project(LLAMA-AX650-CPP)
 
+include(overlook.cmake)
+
 set(SPM_ENABLE_SHARED OFF)
 add_subdirectory(third_party/sentencepiece)
 

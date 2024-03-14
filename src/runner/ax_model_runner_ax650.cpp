@@ -207,6 +207,75 @@ struct ax_joint_runner_ax650_handle_t
     // int algo_colorformat;
 };
 
+int ax_runner_ax650::sub_init()
+{
+    // 4. create context
+    int ret = AX_ENGINE_CreateContext(m_handle->handle);
+    if (0 != ret)
+    {
+        ALOGE("AX_ENGINE_CreateContext");
+        return ret;
+    }
+    // fprintf(stdout, "Engine creating context is done.\n");
+
+    // 5. set io
+
+    ret = AX_ENGINE_GetIOInfo(m_handle->handle, &m_handle->io_info);
+    if (0 != ret)
+    {
+        ALOGE("AX_ENGINE_GetIOInfo");
+        return ret;
+    }
+    // fprintf(stdout, "Engine get io info is done. \n");
+
+    // 6. alloc io
+    if (!_parepare_io)
+    {
+        ret = prepare_io(m_handle->io_info, &m_handle->io_data, std::make_pair(AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_DEFAULT));
+        if (0 != ret)
+        {
+            ALOGE("prepare_io");
+            return ret;
+        }
+
+        for (size_t i = 0; i < m_handle->io_info->nOutputSize; i++)
+        {
+            ax_runner_tensor_t tensor;
+            tensor.nIdx = i;
+            tensor.sName = std::string(m_handle->io_info->pOutputs[i].pName);
+            tensor.nSize = m_handle->io_info->pOutputs[i].nSize;
+            for (size_t j = 0; j < m_handle->io_info->pOutputs[i].nShapeSize; j++)
+            {
+                tensor.vShape.push_back(m_handle->io_info->pOutputs[i].pShape[j]);
+            }
+            tensor.phyAddr = m_handle->io_data.pOutputs[i].phyAddr;
+            tensor.pVirAddr = m_handle->io_data.pOutputs[i].pVirAddr;
+            mtensors.push_back(tensor);
+        }
+
+        for (size_t i = 0; i < m_handle->io_info->nInputSize; i++)
+        {
+            ax_runner_tensor_t tensor;
+            tensor.nIdx = i;
+            tensor.sName = std::string(m_handle->io_info->pInputs[i].pName);
+            tensor.nSize = m_handle->io_info->pInputs[i].nSize;
+            for (size_t j = 0; j < m_handle->io_info->pInputs[i].nShapeSize; j++)
+            {
+                tensor.vShape.push_back(m_handle->io_info->pInputs[i].pShape[j]);
+            }
+            tensor.phyAddr = m_handle->io_data.pInputs[i].phyAddr;
+            tensor.pVirAddr = m_handle->io_data.pInputs[i].pVirAddr;
+            minput_tensors.push_back(tensor);
+        }
+        _parepare_io = true;
+    }
+    else
+    {
+    }
+
+    return ret;
+}
+
 int ax_runner_ax650::init(const char *model_file)
 {
     // 2. load model
@@ -229,26 +298,30 @@ int ax_runner_ax650::init(const char *model_file)
 
 int ax_runner_ax650::init(MMap &model_buffer)
 {
-    if (m_handle)
+    if (!m_handle)
     {
-        return -1;
+        m_handle = new ax_joint_runner_ax650_handle_t;
     }
-    m_handle = new ax_joint_runner_ax650_handle_t;
 
-    // 1. init engine
-    AX_ENGINE_NPU_ATTR_T npu_attr;
-    memset(&npu_attr, 0, sizeof(npu_attr));
-    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
-    AX_SYS_Init();
-    auto ret = AX_ENGINE_Init(&npu_attr);
-    if (0 != ret)
+    static bool b_init = false;
+    if (!b_init)
     {
-        return ret;
+        // 1. init engine
+        AX_ENGINE_NPU_ATTR_T npu_attr;
+        memset(&npu_attr, 0, sizeof(npu_attr));
+        npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+        AX_SYS_Init();
+        auto ret = AX_ENGINE_Init(&npu_attr);
+        if (0 != ret)
+        {
+            return ret;
+        }
+        b_init = true;
     }
 
     // 3. create handle
 
-    ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer.data(), model_buffer.size());
+    int ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer.data(), model_buffer.size());
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateHandle");
@@ -256,89 +329,35 @@ int ax_runner_ax650::init(MMap &model_buffer)
     }
     // fprintf(stdout, "Engine creating handle is done.\n");
 
-    // 4. create context
-    ret = AX_ENGINE_CreateContext(m_handle->handle);
-    if (0 != ret)
-    {
-        ALOGE("AX_ENGINE_CreateContext");
-        return ret;
-    }
-    // fprintf(stdout, "Engine creating context is done.\n");
-
-    // 5. set io
-
-    ret = AX_ENGINE_GetIOInfo(m_handle->handle, &m_handle->io_info);
-    if (0 != ret)
-    {
-        ALOGE("AX_ENGINE_GetIOInfo");
-        return ret;
-    }
-    // fprintf(stdout, "Engine get io info is done. \n");
-
-    // 6. alloc io
-
-    ret = prepare_io(m_handle->io_info, &m_handle->io_data, std::make_pair(AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_DEFAULT));
-    if (0 != ret)
-    {
-        ALOGE("prepare_io");
-        return ret;
-    }
-
-    for (size_t i = 0; i < m_handle->io_info->nOutputSize; i++)
-    {
-        ax_runner_tensor_t tensor;
-        tensor.nIdx = i;
-        tensor.sName = std::string(m_handle->io_info->pOutputs[i].pName);
-        tensor.nSize = m_handle->io_info->pOutputs[i].nSize;
-        for (size_t j = 0; j < m_handle->io_info->pOutputs[i].nShapeSize; j++)
-        {
-            tensor.vShape.push_back(m_handle->io_info->pOutputs[i].pShape[j]);
-        }
-        tensor.phyAddr = m_handle->io_data.pOutputs[i].phyAddr;
-        tensor.pVirAddr = m_handle->io_data.pOutputs[i].pVirAddr;
-        mtensors.push_back(tensor);
-    }
-
-    for (size_t i = 0; i < m_handle->io_info->nInputSize; i++)
-    {
-        ax_runner_tensor_t tensor;
-        tensor.nIdx = i;
-        tensor.sName = std::string(m_handle->io_info->pInputs[i].pName);
-        tensor.nSize = m_handle->io_info->pInputs[i].nSize;
-        for (size_t j = 0; j < m_handle->io_info->pInputs[i].nShapeSize; j++)
-        {
-            tensor.vShape.push_back(m_handle->io_info->pInputs[i].pShape[j]);
-        }
-        tensor.phyAddr = m_handle->io_data.pInputs[i].phyAddr;
-        tensor.pVirAddr = m_handle->io_data.pInputs[i].pVirAddr;
-        minput_tensors.push_back(tensor);
-    }
-
-    return ret;
+    return sub_init();
 }
 
 int ax_runner_ax650::init(std::vector<char> &model_buffer)
 {
-    if (m_handle)
+    if (!m_handle)
     {
-        return -1;
+        m_handle = new ax_joint_runner_ax650_handle_t;
     }
-    m_handle = new ax_joint_runner_ax650_handle_t;
 
-    // 1. init engine
-    AX_ENGINE_NPU_ATTR_T npu_attr;
-    memset(&npu_attr, 0, sizeof(npu_attr));
-    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
-    AX_SYS_Init();
-    auto ret = AX_ENGINE_Init(&npu_attr);
-    if (0 != ret)
+    static bool b_init = false;
+    if (!b_init)
     {
-        return ret;
+        // 1. init engine
+        AX_ENGINE_NPU_ATTR_T npu_attr;
+        memset(&npu_attr, 0, sizeof(npu_attr));
+        npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+        AX_SYS_Init();
+        auto ret = AX_ENGINE_Init(&npu_attr);
+        if (0 != ret)
+        {
+            return ret;
+        }
+        b_init = true;
     }
 
     // 3. create handle
 
-    ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer.data(), model_buffer.size());
+    int ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer.data(), model_buffer.size());
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateHandle");
@@ -346,81 +365,48 @@ int ax_runner_ax650::init(std::vector<char> &model_buffer)
     }
     // fprintf(stdout, "Engine creating handle is done.\n");
 
-    // 4. create context
-    ret = AX_ENGINE_CreateContext(m_handle->handle);
-    if (0 != ret)
+    return sub_init();
+}
+
+void ax_runner_ax650::release()
+{
+    if (m_handle && m_handle->handle)
     {
-        ALOGE("AX_ENGINE_CreateContext");
-        return ret;
-    }
-    // fprintf(stdout, "Engine creating context is done.\n");
-
-    // 5. set io
-
-    ret = AX_ENGINE_GetIOInfo(m_handle->handle, &m_handle->io_info);
-    if (0 != ret)
-    {
-        ALOGE("AX_ENGINE_GetIOInfo");
-        return ret;
-    }
-    // fprintf(stdout, "Engine get io info is done. \n");
-
-    // 6. alloc io
-
-    ret = prepare_io(m_handle->io_info, &m_handle->io_data, std::make_pair(AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_DEFAULT));
-    if (0 != ret)
-    {
-        ALOGE("prepare_io");
-        return ret;
+        free_io(&m_handle->io_data);
+        AX_ENGINE_DestroyHandle(m_handle->handle);
+        m_handle->handle = nullptr;
     }
 
-    for (size_t i = 0; i < m_handle->io_info->nOutputSize; i++)
+    if (m_handle)
     {
-        ax_runner_tensor_t tensor;
-        tensor.nIdx = i;
-        tensor.sName = std::string(m_handle->io_info->pOutputs[i].pName);
-        tensor.nSize = m_handle->io_info->pOutputs[i].nSize;
-        for (size_t j = 0; j < m_handle->io_info->pOutputs[i].nShapeSize; j++)
-        {
-            tensor.vShape.push_back(m_handle->io_info->pOutputs[i].pShape[j]);
-        }
-        tensor.phyAddr = m_handle->io_data.pOutputs[i].phyAddr;
-        tensor.pVirAddr = m_handle->io_data.pOutputs[i].pVirAddr;
-        mtensors.push_back(tensor);
+        delete m_handle;
+        m_handle = nullptr;
     }
 
-    for (size_t i = 0; i < m_handle->io_info->nInputSize; i++)
-    {
-        ax_runner_tensor_t tensor;
-        tensor.nIdx = i;
-        tensor.sName = std::string(m_handle->io_info->pInputs[i].pName);
-        tensor.nSize = m_handle->io_info->pInputs[i].nSize;
-        for (size_t j = 0; j < m_handle->io_info->pInputs[i].nShapeSize; j++)
-        {
-            tensor.vShape.push_back(m_handle->io_info->pInputs[i].pShape[j]);
-        }
-        tensor.phyAddr = m_handle->io_data.pInputs[i].phyAddr;
-        tensor.pVirAddr = m_handle->io_data.pInputs[i].pVirAddr;
-        minput_tensors.push_back(tensor);
-    }
+    mtensors.clear();
+    minput_tensors.clear();
+    map_input_tensors.clear();
+    map_tensors.clear();
 
-    return ret;
+    // AX_ENGINE_Deinit();
 }
 
 void ax_runner_ax650::deinit()
 {
     if (m_handle && m_handle->handle)
     {
-        free_io(&m_handle->io_data);
+        // free_io(&m_handle->io_data);
+        // mtensors.clear();
+        // minput_tensors.clear();
+        // map_input_tensors.clear();
+        // map_tensors.clear();
         AX_ENGINE_DestroyHandle(m_handle->handle);
+        m_handle->handle = nullptr;
+        // delete m_handle;
+        // m_handle = nullptr;
     }
-    delete m_handle;
-    m_handle = nullptr;
-    AX_ENGINE_Deinit();
-    mtensors.clear();
-    minput_tensors.clear();
-    map_input_tensors.clear();
-    map_tensors.clear();
+
+    // AX_ENGINE_Deinit();
 }
 
 int ax_runner_ax650::get_algo_width() { return -1; }

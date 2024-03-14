@@ -30,7 +30,8 @@ struct LLaMaAttrType
 
     bool b_use_mmap_load_embed = false;
     bool b_dynamic_load_axmodel_layer = false;
-    int count_dynamic_load_axmodel_layer_for_one_time = 10;
+
+    bool b_use_mmap_load_layer = true;
 };
 
 class LLaMa
@@ -46,6 +47,7 @@ private:
         ax_runner_ax650 layer;
         std::string filename;
         MMap layer_buffer;
+        std::vector<char> layer_buffer_vec;
     };
 
     std::vector<LLaMaLayer> llama_layers;
@@ -115,12 +117,19 @@ public:
             }
             else
             {
-                // if (!read_file(llama_layers[i].filename, llama_layers[i].layer_buffer))
-                // {
-                //     ALOGE("read_file(%s) failed", llama_layers[i].filename.c_str());
-                //     return false;
-                // }
-                llama_layers[i].layer_buffer.open_file(llama_layers[i].filename.c_str());
+                if (!attr.b_use_mmap_load_layer)
+                {
+                    if (!read_file(llama_layers[i].filename, llama_layers[i].layer_buffer_vec))
+                    {
+                        ALOGE("read_file(%s) failed", llama_layers[i].filename.c_str());
+                        return false;
+                    }
+                }
+                else
+                {
+                    llama_layers[i].layer_buffer.open_file(llama_layers[i].filename.c_str());
+                }
+
                 ALOGI("read_file(%s) ok", llama_layers[i].filename.c_str());
             }
         }
@@ -153,9 +162,9 @@ public:
     {
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
-            llama_layers[i].layer.deinit();
+            llama_layers[i].layer.release();
         }
-        llama_post.deinit();
+        llama_post.release();
         embed_selector.Deinit();
     }
 
@@ -213,7 +222,15 @@ public:
 
                 if (_attr.b_dynamic_load_axmodel_layer)
                 {
-                    int ret = layer.layer.init(layer.layer_buffer);
+                    int ret;
+                    if (_attr.b_use_mmap_load_layer)
+                    {
+                        ret = layer.layer.init(layer.layer_buffer);
+                    }
+                    else
+                    {
+                        ret = layer.layer.init(layer.layer_buffer_vec);
+                    }
                     if (ret != 0)
                     {
                         ALOGE("init axmodel(%s) failed", layer.filename.c_str());
