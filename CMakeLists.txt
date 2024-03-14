@@ -50,5 +50,7 @@ target_link_libraries(main ax_engine ax_interpreter ax_sys)
 target_link_libraries(main sentencepiece)
 
 install(TARGETS main DESTINATION bin)
+file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*")
+install(FILES ${RUN_SCRIPT} DESTINATION bin/)
 
 add_executable(fp32_to_bf16 tools/fp32_to_bf16.cpp)
