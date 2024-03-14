@@ -32,6 +32,8 @@ struct LLaMaAttrType
     bool b_dynamic_load_axmodel_layer = false;
 
     bool b_use_mmap_load_layer = true;
+
+    bool b_live_print = true;
 };
 
 class LLaMa
@@ -311,6 +313,19 @@ public:
                 }
                 next_token = max_index;
                 token_ids.push_back(max_index);
+                if (_attr.b_live_print)
+                {
+                    static std::vector<int> cached_token;
+                    cached_token.push_back(max_index);
+                    if (cached_token.size() >= 3)
+                    {
+                        auto tmp_out = tokenizer.Decode({cached_token});
+                        fprintf(stdout, "%s", tmp_out.c_str());
+                        fflush(stdout);
+                        cached_token.clear();
+                    }
+                }
+
                 if (max_index == tokenizer.GetEosID())
                 {
                     printf("\n");
@@ -319,7 +334,8 @@ public:
                     break;
                 }
             }
-            update_cqdm(&cqdm, indices);
+            if (!_attr.b_live_print)
+                update_cqdm(&cqdm, indices);
             if (b_hit_eos)
             {
                 break;
