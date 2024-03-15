@@ -10,7 +10,7 @@
 
 #include "cqdm.h"
 
-struct LLaMaAttrType
+struct LLMAttrType
 {
     std::string template_filename_axmodel = "tinyllama-int8/tinyllama_l%d.axmodel";
     int axmodel_num = 22;
@@ -37,15 +37,15 @@ struct LLaMaAttrType
     bool b_live_print = true;
 };
 
-class LLaMa
+class LLM
 {
 private:
     std::shared_ptr<BaseTokenizer> tokenizer;
     LLaMaEmbedSelector embed_selector;
 
-    LLaMaAttrType _attr;
+    LLMAttrType _attr;
 
-    struct LLaMaLayer
+    struct LLMLayer
     {
         ax_runner_ax650 layer;
         std::string filename;
@@ -53,7 +53,7 @@ private:
         std::vector<char> layer_buffer_vec;
     };
 
-    std::vector<LLaMaLayer> llama_layers;
+    std::vector<LLMLayer> llama_layers;
     ax_runner_ax650 llama_post;
 
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
@@ -61,7 +61,7 @@ private:
     bool b_stop = false;
 
 public:
-    bool Init(LLaMaAttrType attr)
+    bool Init(LLMAttrType attr)
     {
         this->_attr = attr;
         tokenizer = CreateTokenizer(attr.tokenizer_type);
