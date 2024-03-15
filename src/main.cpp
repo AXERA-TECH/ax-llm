@@ -1,14 +1,10 @@
-#include "runner/LLaMaEmbedSelector.hpp"
-#include "runner/bfloat16.hpp"
+#include "runner/LLM.hpp"
 
-#include "runner/Tokenizer.hpp"
-
-#include "runner/LLaMa.hpp"
 #include "cmdline.hpp"
 
 int main(int argc, char *argv[])
 {
-    LLaMaAttrType attr;
+    LLMAttrType attr;
     std::string prompt = "Hi";
     bool b_continue = false;
 
@@ -16,6 +12,7 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
+    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen", false, attr.tokenizer_type);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
@@ -32,12 +29,12 @@ int main(int argc, char *argv[])
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false, attr.b_live_print);
 
-
     cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
 
     cmd.parse_check(argc, argv);
 
     prompt = cmd.get<std::string>("prompt");
+    attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
     attr.filename_tokenizer_model = cmd.get<std::string>("filename_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
@@ -57,7 +54,7 @@ int main(int argc, char *argv[])
 
     b_continue = cmd.get<bool>("continue");
 
-    LLaMa lLaMa;
+    LLM lLaMa;
     lLaMa.Init(attr);
 
     auto output = lLaMa.Run(prompt);

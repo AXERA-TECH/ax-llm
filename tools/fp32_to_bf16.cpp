@@ -1,7 +1,7 @@
 #include <fstream>
 #include <iostream>
 #include "vector"
-#include "../src/runner/bfloat16.hpp"
+#include "../src/runner/utils/bfloat16.hpp"
 
 int main(int argc, char *argv[])
 {

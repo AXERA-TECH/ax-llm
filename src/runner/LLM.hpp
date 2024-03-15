@@ -4,19 +4,20 @@
 #include <cmath>
 #include <numeric>
 #include "bfloat16.hpp"
-#include "Tokenizer.hpp"
-#include "LLaMaEmbedSelector.hpp"
-#include "ax_model_runner_ax650.hpp"
+#include "Tokenizer/Tokenizer.hpp"
+#include "LLMEmbedSelector.hpp"
+#include "ax_model_runner/ax_model_runner_ax650.hpp"
 
 #include "cqdm.h"
 
-struct LLaMaAttrType
+struct LLMAttrType
 {
     std::string template_filename_axmodel = "tinyllama-int8/tinyllama_l%d.axmodel";
     int axmodel_num = 22;
 
     std::string filename_post_axmodel = "tinyllama-int8/tinyllama_post.axmodel";
 
+    TokenizerType tokenizer_type = TKT_LLaMa;
     std::string filename_tokenizer_model = "tokenizer.model";
     bool b_bos = true, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
@@ -36,15 +37,15 @@ struct LLaMaAttrType
     bool b_live_print = true;
 };
 
-class LLaMa
+class LLM
 {
 private:
-    Tokenizer tokenizer;
+    std::shared_ptr<BaseTokenizer> tokenizer;
     LLaMaEmbedSelector embed_selector;
 
-    LLaMaAttrType _attr;
+    LLMAttrType _attr;
 
-    struct LLaMaLayer
+    struct LLMLayer
     {
         ax_runner_ax650 layer;
         std::string filename;
@@ -52,7 +53,7 @@ private:
         std::vector<char> layer_buffer_vec;
     };
 
-    std::vector<LLaMaLayer> llama_layers;
+    std::vector<LLMLayer> llama_layers;
     ax_runner_ax650 llama_post;
 
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
@@ -60,10 +61,11 @@ private:
     bool b_stop = false;
 
 public:
-    bool Init(LLaMaAttrType attr)
+    bool Init(LLMAttrType attr)
     {
         this->_attr = attr;
-        if (!tokenizer.Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
+        tokenizer = CreateTokenizer(attr.tokenizer_type);
+        if (!tokenizer->Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
         {
             ALOGE("tokenizer.Init(%s, %d, %d) failed", attr.filename_tokenizer_model.c_str(), attr.b_bos, attr.b_eos);
             return false;
@@ -187,10 +189,10 @@ public:
         std::string final_out;
 
         bfloat16 bf16 = -65536.f;
-        std::vector<unsigned short> mask(_attr.kv_cache_num, bf16.data);
-        mask[_attr.kv_cache_num - 1] = 0;
+        std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
+        mask[_attr.kv_cache_num] = 0;
 
-        std::vector<int> token_ids = tokenizer.Encode(input_str);
+        std::vector<int> token_ids = tokenizer->Encode(input_str);
         // print token_ids
         // for (size_t i = 0; i < token_ids.size(); i++)
         // {
@@ -319,14 +321,14 @@ public:
                     cached_token.push_back(max_index);
                     if (cached_token.size() >= 3)
                     {
-                        auto tmp_out = tokenizer.Decode({cached_token});
+                        auto tmp_out = tokenizer->Decode({cached_token});
                         fprintf(stdout, "%s", tmp_out.c_str());
                         fflush(stdout);
                         cached_token.clear();
                     }
                 }
 
-                if (max_index == tokenizer.GetEosID())
+                if (max_index == tokenizer->GetEosID())
                 {
                     printf("\n");
                     ALOGN("hit eos\n");
@@ -341,7 +343,7 @@ public:
                 break;
             }
         }
-        final_out = tokenizer.Decode(token_ids);
+        final_out = tokenizer->Decode(token_ids);
         printf("\n");
         return final_out;
     }
