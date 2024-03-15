@@ -1,4 +1,4 @@
-#include "runner/LLaMa.hpp"
+#include "runner/LLM.hpp"
 
 #include "cmdline.hpp"
 

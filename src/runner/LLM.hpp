@@ -5,7 +5,7 @@
 #include <numeric>
 #include "bfloat16.hpp"
 #include "Tokenizer/Tokenizer.hpp"
-#include "LLaMaEmbedSelector.hpp"
+#include "LLMEmbedSelector.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
 
 #include "cqdm.h"
