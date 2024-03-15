@@ -1,22 +1,15 @@
-#pragma once
+#include "Tokenizer.hpp"
+
 #include "sentencepiece_processor.h"
 #include "builtin_pb/sentencepiece.pb.h"
 
+#include "Tokenizer/QwenTokenizer.hpp"
+
 #include "sample_log.h"
 #include "string_utility.hpp"
+#include "memory_utils.hpp"
 
-class BaseTokenizer
-{
-public:
-    virtual bool Init(std::string model_path, bool b_bos = true, bool b_eos = false) = 0;
-    virtual bool Encode(std::string input, std::vector<int> &output) = 0;
-    virtual std::vector<int> Encode(std::string input) = 0;
-    virtual std::string Decode(const std::vector<int> input) = 0;
-    virtual int GetBosID() = 0;
-    virtual int GetEosID() = 0;
-};
-
-class Tokenizer : public BaseTokenizer
+class TokenizerLLaMa : public BaseTokenizer
 {
     sentencepiece::SentencePieceProcessor sp;
     bool _b_bos, _b_eos;
@@ -89,3 +82,76 @@ public:
         return sp.eos_id();
     }
 };
+
+class TokenizerQwen : public BaseTokenizer
+{
+    std::shared_ptr<QwenTokenizer> sp;
+    bool _b_bos, _b_eos;
+
+private:
+    /* data */
+public:
+    bool Init(std::string model_path, bool b_bos = true, bool b_eos = false) override
+    {
+        if (!file_exist(model_path))
+        {
+            return false;
+        }
+
+        sp.reset(new QwenTokenizer(model_path, QwenConfig()));
+
+        this->_b_bos = b_bos;
+        this->_b_eos = b_eos;
+        return true;
+    }
+
+    bool Encode(std::string input, std::vector<int> &output) override
+    {
+        if (_b_bos)
+        {
+            // input += "<|im_start|>";
+        }
+        if (_b_eos)
+        {
+            input += "<|endoftext|>";
+        }
+        output = sp->encode(input, 1024);
+
+        return true;
+    }
+
+    std::vector<int> Encode(std::string input) override
+    {
+        std::vector<int> output;
+        Encode(input, output);
+        return output;
+    }
+
+    std::string Decode(const std::vector<int> input) override
+    {
+        return sp->decode(input);
+    }
+
+    int GetBosID() override
+    {
+        return -1;
+    }
+
+    int GetEosID() override
+    {
+        return sp->eos_token_id;
+    }
+};
+
+std::shared_ptr<BaseTokenizer> CreateTokenizer(TokenizerType type)
+{
+    switch (type)
+    {
+    case TKT_LLaMa:
+        return std::make_shared<TokenizerLLaMa>();
+    case TKT_Qwen:
+        return std::make_shared<TokenizerQwen>();
+    default:
+        return nullptr;
+    }
+}

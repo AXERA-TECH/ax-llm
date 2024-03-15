@@ -1,3 +1,9 @@
 [submodule "third_party/sentencepiece"]
 	path = third_party/sentencepiece
 	url = https://github.com/google/sentencepiece.git
+[submodule "third_party/abseil-cpp"]
+	path = third_party/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git
+[submodule "third_party/re2"]
+	path = third_party/re2
+	url = https://github.com/google/re2.git
