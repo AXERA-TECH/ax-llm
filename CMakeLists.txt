@@ -48,17 +48,22 @@ include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
 
-add_executable(main src/main.cpp 
-                src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
-                src/runner/utils/memory_utils.cpp 
-                src/runner/utils/cqdm.cpp
-                src/runner/Tokenizer/Tokenizer.cpp
-                src/runner/Tokenizer/QwenTokenizer.cpp)
+function(build_exec name main_source)
+    add_executable(${name} ${main_source}
+                    src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
+                    src/runner/utils/memory_utils.cpp 
+                    src/runner/utils/cqdm.cpp
+                    src/runner/Tokenizer/Tokenizer.cpp
+                    src/runner/Tokenizer/QwenTokenizer.cpp)
 
-target_link_libraries(main ax_engine ax_interpreter ax_sys)
-target_link_libraries(main sentencepiece re2::re2)
+    target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
+    target_link_libraries(${name} sentencepiece re2::re2)
+    install(TARGETS ${name} DESTINATION bin)
+endfunction()
 
-install(TARGETS main DESTINATION bin)
+build_exec(main_llama src/main.cpp)
+build_exec(main_qwen src/main_qwen.cpp)
+
 file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*")
 install(FILES ${RUN_SCRIPT} DESTINATION bin/)
 

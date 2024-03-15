@@ -189,8 +189,8 @@ public:
         std::string final_out;
 
         bfloat16 bf16 = -65536.f;
-        std::vector<unsigned short> mask(_attr.kv_cache_num, bf16.data);
-        mask[_attr.kv_cache_num - 1] = 0;
+        std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
+        mask[_attr.kv_cache_num] = 0;
 
         std::vector<int> token_ids = tokenizer->Encode(input_str);
         // print token_ids

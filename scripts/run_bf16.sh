@@ -1,4 +1,4 @@
-./main \
+./main_llama \
 --template_filename_axmodel tinyllama-bf16/tinyllama_l%d.axmodel \
 --axmodel_num 22 \
 --filename_post_axmodel tinyllama-bf16/tinyllama_post.axmodel \
