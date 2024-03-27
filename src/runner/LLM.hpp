@@ -7,7 +7,7 @@
 #include "Tokenizer/Tokenizer.hpp"
 #include "LLMEmbedSelector.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
-
+#include "ax_cmm_utils.hpp"
 #include "cqdm.h"
 
 struct LLMAttrType
@@ -24,10 +24,10 @@ struct LLMAttrType
     int tokens_embed_num = 32000;
     int tokens_embed_size = 2048;
 
-    int max_token_len = 127;
+    int max_token_len = 127; // auto calc
 
     int kv_cache_num = 1024; // auto calc
-    int kv_cache_size = 256;
+    int kv_cache_size = 256; // auto calc
 
     bool b_use_mmap_load_embed = false;
     bool b_dynamic_load_axmodel_layer = false;
@@ -117,7 +117,8 @@ public:
                     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
                     return false;
                 }
-                ALOGI("init axmodel(%s) ok", llama_layers[i].filename.c_str());
+                int remain_cmm = get_remaining_cmm_size();
+                ALOGI("init axmodel(%s) ok remain_cmm(%d MB)", llama_layers[i].filename.c_str(), remain_cmm);
             }
             else
             {
@@ -148,9 +149,13 @@ public:
 
         if (!attr.b_dynamic_load_axmodel_layer)
         {
-            auto &input_k_cache = llama_layers[0].layer.get_input("K_cache");
-            _attr.kv_cache_num = input_k_cache.vShape[0] / _attr.kv_cache_size / sizeof(unsigned short);
-            ALOGI("kv_cache_num: %d", _attr.kv_cache_num);
+            _attr.max_token_len = llama_layers[0].layer.get_input("mask").vShape[0] / sizeof(unsigned short) - 1;
+            ALOGI("max_token_len : %d", _attr.max_token_len);
+            // auto &input_k_cache = llama_layers[0].layer.get_input("K_cache");
+            // auto &output_k_cache_out = llama_layers[0].layer.get_output("K_cache_out");
+            _attr.kv_cache_size = llama_layers[0].layer.get_output("K_cache_out").vShape[0] / sizeof(unsigned short);
+            _attr.kv_cache_num = llama_layers[0].layer.get_input("K_cache").vShape[0] / _attr.kv_cache_size / sizeof(unsigned short);
+            ALOGI("kv_cache_size : %d, kv_cache_num: %d", _attr.kv_cache_size, _attr.kv_cache_num);
             if (_attr.max_token_len > _attr.kv_cache_num)
             {
                 ALOGE("max_token_len(%d) > kv_cache_num(%d)", _attr.max_token_len, _attr.kv_cache_num);
