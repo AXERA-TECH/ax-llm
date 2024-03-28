@@ -4,7 +4,6 @@
 
 #include "cmdline.hpp"
 
-
 static LLM lLaMa;
 
 void __sigExit(int iSigNo)
@@ -63,7 +62,7 @@ int main(int argc, char *argv[])
 
     b_continue = cmd.get<bool>("continue");
 
-        lLaMa.Init(attr);
+    lLaMa.Init(attr);
     if (prompt != "")
     {
         auto output = lLaMa.Run(prompt);

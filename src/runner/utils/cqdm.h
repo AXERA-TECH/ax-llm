@@ -20,7 +20,7 @@ extern "C"
 {
 #endif
     t_cqdm create_cqdm(int total, int size);
-    void update_cqdm(t_cqdm *progress, int x);
+    void update_cqdm(t_cqdm *cqdm, int x, const char *unit, const char *log_str);
 #ifdef __cplusplus
 }
 #endif

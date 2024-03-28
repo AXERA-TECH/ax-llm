@@ -23,7 +23,7 @@ t_cqdm create_cqdm(int total, int size)
     return (cqdm);
 }
 
-void update_cqdm(t_cqdm *cqdm, int x)
+void update_cqdm(t_cqdm *cqdm, int x, const char *unit, const char *log_str)
 {
     long long now;
     double temp;
@@ -37,12 +37,12 @@ void update_cqdm(t_cqdm *cqdm, int x)
 
     temp = ((double)(x + 1) / (double)cqdm->total);
 
-    fprintf(stdout, "\r%d%% | ", (int)(temp * 100));
+    fprintf(stdout, "\033[1;30;33m\r%3d%% | ", (int)(temp * 100));
     for (int i = 0; i < (temp * cqdm->size); i++)
         fprintf(stdout, "█");
     for (int i = 0; i < (cqdm->size - temp * cqdm->size); i++)
         fprintf(stdout, " ");
-    fprintf(stdout, " | %d / %d [%.2fs<%.2fs, %.2f token/s]", x + 1, cqdm->total, cqdm->total_time,
-            cqdm->average_time * cqdm->total, 1 / cqdm->average_time);
+    fprintf(stdout, " | %3d / %3d [%2.2fs<%2.2fs, %2.2f %s/s] \033[1;30;32m%s\033[0m", x + 1, cqdm->total, cqdm->total_time,
+            cqdm->average_time * cqdm->total, 1 / cqdm->average_time, unit, log_str);
     fflush(stdout);
 }

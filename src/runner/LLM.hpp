@@ -9,6 +9,7 @@
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
 #include "ax_cmm_utils.hpp"
 #include "cqdm.h"
+#include "timer.hpp"
 
 struct LLMAttrType
 {
@@ -63,6 +64,8 @@ private:
 public:
     bool Init(LLMAttrType attr)
     {
+        ALOGI("LLM init start");
+        t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
         tokenizer = CreateTokenizer(attr.tokenizer_type);
         if (!tokenizer->Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
@@ -70,7 +73,7 @@ public:
             ALOGE("tokenizer.Init(%s, %d, %d) failed", attr.filename_tokenizer_model.c_str(), attr.b_bos, attr.b_eos);
             return false;
         }
-        ALOGI("tokenizer init ok");
+        update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
         // test code
         // {
         //     std::vector<int> output;
@@ -88,7 +91,7 @@ public:
             ALOGE("embed_selector.Init(%s, %d, %d) failed", attr.filename_tokens_embed.c_str(), attr.tokens_embed_num, attr.tokens_embed_size);
             return false;
         }
-        ALOGI("embed_selector init ok");
+        update_cqdm(&cqdm, 1, "count", "embed_selector init ok");
         // test code
         // {
         //     std::vector<unsigned short> embed = embed_selector.getByIndex(123);
@@ -118,7 +121,8 @@ public:
                     return false;
                 }
                 int remain_cmm = get_remaining_cmm_size();
-                ALOGI("init axmodel(%s) ok remain_cmm(%d MB)", llama_layers[i].filename.c_str(), remain_cmm);
+                sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
+                update_cqdm(&cqdm, i + 2, "count", axmodel_path);
             }
             else
             {
@@ -135,7 +139,8 @@ public:
                     llama_layers[i].layer_buffer.open_file(llama_layers[i].filename.c_str());
                 }
 
-                ALOGI("read_file(%s) ok", llama_layers[i].filename.c_str());
+                sprintf(axmodel_path, "read_file %s ok", llama_layers[i].filename.c_str());
+                update_cqdm(&cqdm, i + 2, "count", axmodel_path);
             }
         }
 
@@ -145,7 +150,7 @@ public:
             ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str());
             return false;
         }
-        ALOGI("init post axmodel(%s) ok", attr.filename_post_axmodel.c_str());
+        update_cqdm(&cqdm, attr.axmodel_num + 2, "count", "init post axmodel ok\n");
 
         if (!attr.b_dynamic_load_axmodel_layer)
         {
@@ -164,6 +169,7 @@ public:
         }
 
         Reset();
+        ALOGI("LLM init ok");
         return true;
     }
 
@@ -198,6 +204,7 @@ public:
         mask[_attr.kv_cache_num] = 0;
 
         std::vector<int> token_ids = tokenizer->Encode(input_str);
+        timer t_cost;
         // print token_ids
         // for (size_t i = 0; i < token_ids.size(); i++)
         // {
@@ -336,13 +343,14 @@ public:
                 if (max_index == tokenizer->GetEosID())
                 {
                     printf("\n");
-                    ALOGN("hit eos\n");
+                    float t_cost_ms = t_cost.cost();
+                    ALOGN("hit eos,avg %.2f token/s\n", token_ids.size() / (t_cost_ms / 1000));
                     b_hit_eos = true;
                     break;
                 }
             }
             if (!_attr.b_live_print)
-                update_cqdm(&cqdm, indices);
+                update_cqdm(&cqdm, indices, "token", "");
             if (b_hit_eos)
             {
                 break;
