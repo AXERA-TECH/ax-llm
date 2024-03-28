@@ -1,9 +1,22 @@
+#include "signal.h"
+
 #include "runner/LLM.hpp"
 
 #include "cmdline.hpp"
 
+
+static LLM lLaMa;
+
+void __sigExit(int iSigNo)
+{
+    lLaMa.Stop();
+    return;
+}
+
 int main(int argc, char *argv[])
 {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, __sigExit);
     LLMAttrType attr;
     std::string prompt = "Hi";
     bool b_continue = false;
@@ -21,8 +34,6 @@ int main(int argc, char *argv[])
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
-    // cmd.add<int>("max_token_len", 0, "max token len", false, attr.max_token_len);
-    // cmd.add<int>("kv_cache_size", 0, "len of kv cache(axmodel kv_cache input dim-1)", false, attr.kv_cache_size);
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
     cmd.add<bool>("dynamic_load_axmodel_layer", 0, "it can save cmm memory", false, attr.b_dynamic_load_axmodel_layer);
@@ -44,8 +55,6 @@ int main(int argc, char *argv[])
     attr.axmodel_num = cmd.get<int>("axmodel_num");
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
-    // attr.max_token_len = cmd.get<int>("max_token_len");
-    // attr.kv_cache_size = cmd.get<int>("kv_cache_size");
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
     attr.b_dynamic_load_axmodel_layer = cmd.get<bool>("dynamic_load_axmodel_layer");
@@ -54,17 +63,18 @@ int main(int argc, char *argv[])
 
     b_continue = cmd.get<bool>("continue");
 
-    LLM lLaMa;
-    lLaMa.Init(attr);
-
-    auto output = lLaMa.Run(prompt);
-    if (!attr.b_live_print)
-        printf("%s\n", output.c_str());
+        lLaMa.Init(attr);
+    if (prompt != "")
+    {
+        auto output = lLaMa.Run(prompt);
+        if (!attr.b_live_print)
+            printf("%s\n", output.c_str());
+    }
 
     //
     if (b_continue)
     {
-        printf("input \"q\" to exit\n");
+        printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
         lLaMa.Reset();
     }
 
@@ -77,6 +87,10 @@ int main(int argc, char *argv[])
         if (input == "q")
         {
             break;
+        }
+        if (input == "")
+        {
+            continue;
         }
         auto output = lLaMa.Run(input);
         if (!attr.b_live_print)
