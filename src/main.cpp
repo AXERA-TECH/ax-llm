@@ -65,8 +65,24 @@ int main(int argc, char *argv[])
     lLaMa.Init(attr);
     if (prompt != "")
     {
-        std::string tmp = "<|user|>\n" + prompt + "</s><|assistant|>\n";
-        auto output = lLaMa.Run(tmp);
+        std::ostringstream oss_prompt;
+        if (attr.tokenizer_type = TKT_LLaMa)
+        {
+            oss_prompt << "<|user|>\n"
+                       << prompt << "</s><|assistant|>\n";
+        }
+        else if (attr.tokenizer_type = TKT_Qwen)
+        {
+            oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
+            oss_prompt << "\n<|im_start|>user\n"
+                       << prompt << "<|im_end|>\n<|im_start|>assistant\n";
+        }
+        else
+        {
+            oss_prompt << prompt;
+        }
+
+        auto output = lLaMa.Run(oss_prompt.str());
         if (!attr.b_live_print)
             printf("%s\n", output.c_str());
     }
@@ -92,9 +108,25 @@ int main(int argc, char *argv[])
         {
             continue;
         }
-        std::string tmp = "<|user|>\n" + input + "</s><|assistant|>\n";
+        std::ostringstream oss_prompt;
+        if (attr.tokenizer_type = TKT_LLaMa)
+        {
+            oss_prompt << "<|user|>\n"
+                       << input << "</s><|assistant|>\n";
+        }
+        else if (attr.tokenizer_type = TKT_Qwen)
+        {
+            oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
+            oss_prompt << "\n<|im_start|>user\n"
+                       << input << "<|im_end|>\n<|im_start|>assistant\n";
+        }
+        else
+        {
+            oss_prompt << input;
+        }
+        // std::string tmp = "<|user|>\n" + input + "</s><|assistant|>\n";
         // printf("%s\n", tmp.c_str());
-        auto output = lLaMa.Run(tmp);
+        auto output = lLaMa.Run(oss_prompt.str());
         if (!attr.b_live_print)
             printf("%s\n", output.c_str());
     }

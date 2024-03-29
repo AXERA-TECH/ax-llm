@@ -6,5 +6,6 @@
 --eos 0 \
 --tokens_embed_num 32000 \
 --tokens_embed_size 4096 \
---live_print 0 \
+--live_print 1 \
+--continue 1 \
 --prompt "$1"

@@ -8,4 +8,5 @@
 --tokens_embed_num 151936 \
 --tokens_embed_size 1024 \
 --live_print 1 \
+--continue 1 \
 --prompt "$1"

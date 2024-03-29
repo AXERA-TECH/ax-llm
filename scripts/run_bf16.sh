@@ -5,4 +5,5 @@
 --eos 0 \
 --dynamic_load_axmodel_layer 0 \
 --live_print 1 \
+--continue 1 \
 --prompt "$1"
