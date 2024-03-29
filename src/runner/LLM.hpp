@@ -57,7 +57,7 @@ private:
     std::vector<LLMLayer> llama_layers;
     ax_runner_ax650 llama_post;
 
-    std::vector<std::vector<unsigned short>> k_caches, v_caches;
+    // std::vector<std::vector<unsigned short>> k_caches, v_caches;
 
     bool b_stop = false;
 
@@ -168,7 +168,7 @@ public:
             }
         }
 
-        Reset();
+        // Reset();
         ALOGI("LLM init ok");
         return true;
     }
@@ -183,11 +183,11 @@ public:
         embed_selector.Deinit();
     }
 
-    void Reset()
-    {
-        k_caches.resize(_attr.axmodel_num, std::vector<unsigned short>(_attr.kv_cache_num * _attr.kv_cache_size, 0));
-        v_caches.resize(_attr.axmodel_num, std::vector<unsigned short>(_attr.kv_cache_num * _attr.kv_cache_size, 0));
-    }
+    // void Reset()
+    // {
+    //     k_caches.resize(_attr.axmodel_num, std::vector<unsigned short>(_attr.kv_cache_num * _attr.kv_cache_size, 0));
+    //     v_caches.resize(_attr.axmodel_num, std::vector<unsigned short>(_attr.kv_cache_num * _attr.kv_cache_size, 0));
+    // }
 
     void Stop()
     {
@@ -202,7 +202,7 @@ public:
         bfloat16 bf16 = -65536.f;
         std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
         mask[_attr.kv_cache_num] = 0;
-
+        std::vector<int> cached_token;
         std::vector<int> token_ids = tokenizer->Encode(input_str);
         timer t_cost;
         // print token_ids
@@ -270,9 +270,11 @@ public:
                 }
 
                 auto &input_k_cache = layer.layer.get_input("K_cache");
-                memcpy(input_k_cache.pVirAddr, k_caches[m].data(), sizeof(unsigned short) * k_caches[m].size());
+                unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
+                // memcpy(input_k_cache.pVirAddr, k_caches[m].data(), sizeof(unsigned short) * k_caches[m].size());
                 auto &input_v_cache = layer.layer.get_input("V_cache");
-                memcpy(input_v_cache.pVirAddr, v_caches[m].data(), sizeof(unsigned short) * v_caches[m].size());
+                unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
+                // memcpy(input_v_cache.pVirAddr, v_caches[m].data(), sizeof(unsigned short) * v_caches[m].size());
 
                 auto &input_indices = layer.layer.get_input("indices");
                 memcpy(input_indices.pVirAddr, &indices, sizeof(indices));
@@ -286,10 +288,10 @@ public:
                 layer.layer.inference();
 
                 auto &output_k_cache = layer.layer.get_output("K_cache_out");
-                memcpy(k_caches[m].data() + indices * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
+                memcpy(input_k_cache_ptr + indices * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
 
                 auto &output_v_cache = layer.layer.get_output("V_cache_out");
-                memcpy(v_caches[m].data() + indices * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
+                memcpy(input_v_cache_ptr + indices * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
 
                 auto &output = layer.layer.get_output("output");
                 memcpy(embed.data(), output.pVirAddr, embed.size() * sizeof(unsigned short));
@@ -329,7 +331,6 @@ public:
                 token_ids.push_back(max_index);
                 if (_attr.b_live_print)
                 {
-                    static std::vector<int> cached_token;
                     cached_token.push_back(max_index);
                     if (cached_token.size() >= 3)
                     {

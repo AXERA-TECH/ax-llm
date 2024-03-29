@@ -74,7 +74,7 @@ int main(int argc, char *argv[])
     if (b_continue)
     {
         printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
-        lLaMa.Reset();
+        // lLaMa.Reset();
     }
 
     while (b_continue)

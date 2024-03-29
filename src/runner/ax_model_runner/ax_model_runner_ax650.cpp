@@ -4,6 +4,7 @@
 #include "memory"
 // #include "utilities/file.hpp"
 #include <ax_sys_api.h>
+#include <ax_ivps_api.h>
 #include <ax_engine_api.h>
 #include <fcntl.h>
 #include "memory_utils.hpp"
@@ -458,4 +459,9 @@ int ax_runner_ax650::inference(ax_image_t *pstFrame)
 int ax_runner_ax650::inference()
 {
     return AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data);
+}
+
+int ax_cmmcpy(unsigned long long int dst, unsigned long long int src, int size)
+{
+    return AX_IVPS_CmmCopyTdp(dst, src, size);
 }

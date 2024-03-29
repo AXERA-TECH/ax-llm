@@ -105,3 +105,5 @@ public:
         return inference(pstFrame);
     }
 };
+
+int ax_cmmcpy(unsigned long long int dst, unsigned long long int src, int size);
