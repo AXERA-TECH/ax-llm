@@ -65,7 +65,8 @@ int main(int argc, char *argv[])
     lLaMa.Init(attr);
     if (prompt != "")
     {
-        auto output = lLaMa.Run(prompt);
+        std::string tmp = "<|user|>\n" + prompt + "</s><|assistant|>\n";
+        auto output = lLaMa.Run(tmp);
         if (!attr.b_live_print)
             printf("%s\n", output.c_str());
     }
@@ -91,7 +92,9 @@ int main(int argc, char *argv[])
         {
             continue;
         }
-        auto output = lLaMa.Run(input);
+        std::string tmp = "<|user|>\n" + input + "</s><|assistant|>\n";
+        // printf("%s\n", tmp.c_str());
+        auto output = lLaMa.Run(tmp);
         if (!attr.b_live_print)
             printf("%s\n", output.c_str());
     }
