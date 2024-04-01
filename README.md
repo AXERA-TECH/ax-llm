@@ -1,7 +1,27 @@
-# LLM-AX650
+# AX-LLM
 
-- TinyLLaMa-1.1B-bf16
-- Qwen1.5-1.8B-int8
+# 简介
+
+**AX-LLM** 由 **[爱芯元智](https://www.axera-tech.com/)** 主导开发。该项目用于探索业界常用 **LLM(Large Language Model)** 在已有芯片平台上落地的可行性和相关能力边界，**方便**社区开发者进行**快速评估**和**二次开发**自己的 **LLM 应用**。
+
+## 已支持芯片
+
+- AX650A/AX650N
+
+## 已支持模型
+
+- TinyLLaMa-1.1B
+- Qwen1.5-1.8B
+
+## 获取地址
+
+- [百度网盘](https://pan.baidu.com/s/1_LG-sPKnLS_LTWF3Cmcr7A?pwd=ph0e)
+
+# 源码编译
+
+## *TODO*
+
+# 运行示例
 
 ## TinyLLaMa-1.1B-BF16
 ```shell
@@ -84,3 +104,10 @@ int main() {
 
 [N][                             Run][ 366]: hit eos,avg 8.44 token/s
 ```
+
+
+
+# Reference
+
+- [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+- [Qwen1.5-1.8B](https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat)
