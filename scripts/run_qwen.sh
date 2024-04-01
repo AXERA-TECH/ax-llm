@@ -4,7 +4,7 @@
 --tokenizer_type 1 \
 --filename_tokenizer_model qwen.tiktoken \
 --filename_post_axmodel qwen1.5-0.5-bf16/qwen_post.axmodel \
---filename_tokens_embed qwen.model.embed_tokens.weight.bfloat16.bin \
+--filename_tokens_embed qwen1.5-0.5-bf16/qwen.model.embed_tokens.weight.bfloat16.bin \
 --tokens_embed_num 151936 \
 --tokens_embed_size 1024 \
 --live_print 1 \

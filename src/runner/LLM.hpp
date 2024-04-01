@@ -11,6 +11,8 @@
 #include "cqdm.h"
 #include "timer.hpp"
 
+typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
+
 struct LLMAttrType
 {
     std::string template_filename_axmodel = "tinyllama-int8/tinyllama_l%d.axmodel";
@@ -35,7 +37,9 @@ struct LLMAttrType
 
     bool b_use_mmap_load_layer = true;
 
-    bool b_live_print = true;
+    // bool b_live_print = true;
+    LLMRuningCallback runing_callback = nullptr;
+    void *reserve = nullptr;
 };
 
 class LLM
@@ -204,6 +208,7 @@ public:
         mask[_attr.kv_cache_num] = 0;
         std::vector<int> cached_token;
         std::vector<int> token_ids = tokenizer->Encode(input_str);
+        int len_of_input = token_ids.size();
         timer t_cost;
         // print token_ids
         // for (size_t i = 0; i < token_ids.size(); i++)
@@ -329,36 +334,42 @@ public:
                 }
                 next_token = max_index;
                 token_ids.push_back(max_index);
-                if (_attr.b_live_print)
+                if (_attr.runing_callback)
                 {
                     cached_token.push_back(max_index);
                     if (cached_token.size() >= 3)
                     {
-                        auto tmp_out = tokenizer->Decode({cached_token});
-                        fprintf(stdout, "%s", tmp_out.c_str());
-                        fflush(stdout);
+                        float t_cost_ms = t_cost.cost();
+                        float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
+                        auto tmp_out = tokenizer->Decode(cached_token);
+                        _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
                 }
 
                 if (max_index == tokenizer->GetEosID())
                 {
-                    printf("\n");
-                    float t_cost_ms = t_cost.cost();
-                    ALOGN("hit eos,avg %.2f token/s\n", token_ids.size() / (t_cost_ms / 1000));
                     b_hit_eos = true;
                     break;
                 }
             }
-            if (!_attr.b_live_print)
+            if (_attr.runing_callback == nullptr)
                 update_cqdm(&cqdm, indices, "token", "");
             if (b_hit_eos)
             {
                 break;
             }
         }
+        printf("\n\n");
+        fflush(stdout);
+        float t_cost_ms = t_cost.cost();
+        ALOGN("hit eos,avg %.2f token/s\n", token_ids.size() / (t_cost_ms / 1000));
+
+        // 去掉 len_of_input 那部分
+        token_ids.erase(token_ids.begin(), token_ids.begin() + len_of_input);
+
         final_out = tokenizer->Decode(token_ids);
-        printf("\n");
+
         return final_out;
     }
 };

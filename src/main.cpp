@@ -12,6 +12,33 @@ void __sigExit(int iSigNo)
     return;
 }
 
+void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
+{
+    fprintf(stdout, "%s", p_str);
+    fflush(stdout);
+}
+
+std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
+{
+    std::ostringstream oss_prompt;
+    switch (tokenizer_type)
+    {
+    case TKT_LLaMa:
+        oss_prompt << "<|user|>\n"
+                   << prompt << "</s><|assistant|>\n";
+        break;
+    case TKT_Qwen:
+        oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
+        oss_prompt << "\n<|im_start|>user\n"
+                   << prompt << "<|im_end|>\n<|im_start|>assistant\n";
+        break;
+    default:
+        oss_prompt << prompt;
+        break;
+    }
+
+    return oss_prompt.str();
+}
 int main(int argc, char *argv[])
 {
     signal(SIGPIPE, SIG_IGN);
@@ -37,7 +64,7 @@ int main(int argc, char *argv[])
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
     cmd.add<bool>("dynamic_load_axmodel_layer", 0, "it can save cmm memory", false, attr.b_dynamic_load_axmodel_layer);
 
-    cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false, attr.b_live_print);
+    cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
 
     cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
 
@@ -58,32 +85,23 @@ int main(int argc, char *argv[])
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
     attr.b_dynamic_load_axmodel_layer = cmd.get<bool>("dynamic_load_axmodel_layer");
 
-    attr.b_live_print = cmd.get<bool>("live_print");
+    bool b_live_print = cmd.get<bool>("live_print");
+    if (b_live_print)
+    {
+        attr.runing_callback = llm_running_callback;
+        attr.reserve = 0;
+    }
 
     b_continue = cmd.get<bool>("continue");
 
-    lLaMa.Init(attr);
+    if (!lLaMa.Init(attr))
+    {
+        return -1;
+    }
     if (prompt != "")
     {
-        std::ostringstream oss_prompt;
-        if (attr.tokenizer_type = TKT_LLaMa)
-        {
-            oss_prompt << "<|user|>\n"
-                       << prompt << "</s><|assistant|>\n";
-        }
-        else if (attr.tokenizer_type = TKT_Qwen)
-        {
-            oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
-            oss_prompt << "\n<|im_start|>user\n"
-                       << prompt << "<|im_end|>\n<|im_start|>assistant\n";
-        }
-        else
-        {
-            oss_prompt << prompt;
-        }
-
-        auto output = lLaMa.Run(oss_prompt.str());
-        if (!attr.b_live_print)
+        auto output = lLaMa.Run(prompt_complete(prompt, attr.tokenizer_type));
+        if (!b_live_print)
             printf("%s\n", output.c_str());
     }
 
@@ -108,26 +126,9 @@ int main(int argc, char *argv[])
         {
             continue;
         }
-        std::ostringstream oss_prompt;
-        if (attr.tokenizer_type = TKT_LLaMa)
-        {
-            oss_prompt << "<|user|>\n"
-                       << input << "</s><|assistant|>\n";
-        }
-        else if (attr.tokenizer_type = TKT_Qwen)
-        {
-            oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
-            oss_prompt << "\n<|im_start|>user\n"
-                       << input << "<|im_end|>\n<|im_start|>assistant\n";
-        }
-        else
-        {
-            oss_prompt << input;
-        }
-        // std::string tmp = "<|user|>\n" + input + "</s><|assistant|>\n";
-        // printf("%s\n", tmp.c_str());
-        auto output = lLaMa.Run(oss_prompt.str());
-        if (!attr.b_live_print)
+
+        auto output = lLaMa.Run(prompt_complete(input, attr.tokenizer_type));
+        if (!b_live_print)
             printf("%s\n", output.c_str());
     }
 
