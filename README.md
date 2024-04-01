@@ -1,96 +1,86 @@
 # LLM-AX650
 
-## TinyLLaMa-INT8
+- TinyLLaMa-1.1B-bf16
+- Qwen1.5-1.8B-int8
 
+## TinyLLaMa-1.1B-BF16
 ```shell
-# ./run_int8.sh "help me calculate sum 1-9 use c language:"
-[I][                            Init][  71]: tokenizer init ok
-[I][                            Init][  89]: embed_selector init ok
-[I][                            Init][ 118]: init axmodel(tinyllama-int8-01/tinyllama_l0.axmodel) ok
-...
-[I][                            Init][ 118]: init axmodel(tinyllama-int8-01/tinyllama_l21.axmodel) ok
-[I][                            Init][ 145]: init post axmodel(tinyllama-int8-01/tinyllama_post.axmodel) ok
-[I][                            Init][ 151]: kv_cache_num: 1023
+# ./run_bf16.sh
+[I][                            Init][  71]: LLM init start
+100% | ████████████████████████████████ |  25 /  25 [21.82s<21.82s, 1.15 count/s] init post axmodel okremain_cmm(3760 MB)
+[I][                            Init][ 162]: max_token_len : 1023
+[I][                            Init][ 167]: kv_cache_size : 256, kv_cache_num: 1023
+[I][                            Init][ 176]: LLM init ok
+Type "q" to exit, Ctrl+c to stop current running
+>> write a c++ program to calculate 1-9 sum
 
- advantage of using c language for this task is that we can use functions to calculate the sum of the first 10 natural numbers.
+`c++
+#include <iostream>
 
-#include <stdio.h>
-
-int main()
-{
-    int sum = 0;
-
-    for (int I = 1; I <= 10; i++)
-    {
-        sum += i;
-    }
-
-    printf("sum of first 10 natural numbers is: %d\n", sum);
-
-    return 0;
-}
-
-
-in this program, we first include the necessary header files for the program.
-
-then, we declare a variable called `sum` to store the sum of the first 10 natural numbers.
-
-next, we use a for loop to iterate through each natural number from 1 to 10.
-
-in each iteration, we add the current number to the `sum` variable.
-
-finally, we print the `sum` variable to the console.
-
-this program uses the `for` loop to iterate through each natural number from 1 to 10.
-
-for each number, we add it to the `sum` variable.
-
-finally, we print the `sum` variable to the console.
-
-this program uses the `printf` function to print a message to the console.
-
-the `printf` function takes a format string and a variable number of arguments.
-
-in this case, we are printing a message that includes the value of the `sum` variable.
-
-in summary, this program uses the `for` loop to iterate through each natural number from 1 to 10.
-
-for each number, we add it to the `sum` variable.
-
-finally, we print the `sum` variable to the console
-[N][                             Run][ 332]: hit eos
-```
-
-## TinyLLaMa-BF16
-```shell
-# ./run_bf16.sh "help me calculate sum 1-9 use c language:"
-[I][                            Init][  71]: tokenizer init ok
-[I][                            Init][  89]: embed_selector init ok
-[I][                            Init][ 135]: read_file(tinyllama-bf16/tinyllama_l0.axmodel) ok
-...
-[I][                            Init][ 135]: read_file(tinyllama-bf16/tinyllama_l21.axmodel) ok
-[I][                            Init][ 145]: init post axmodel(tinyllama-bf16/tinyllama_post.axmodel) ok
-[I][                             Run][ 248]: kv_cache_num: 1023
-
-
-#include <stdio.h>
+using namespace std;
 
 int main() {
     int sum = 0;
     int num;
 
-    printf("Enter a number: ");
-    scanf("%d", &num);
+    cout << "Enter a number: ";
+    cin >> num;
 
     for (int I = 1; I <= num; i++) {
         sum += i;
     }
 
-    printf("The sum of numbers from 1 to %d is: %d\n", num, sum);
+    cout << "The sum of 1 to " << num << " is: " << sum << endl;
 
     return 0;
 }
+`
 
-this program prompts the user to enter a number and calculates the sum of numbers from 1 to the entered number using a for loop. The sum is then printed to the console.
-[N][                             Run][ 332]: hit eos
+
+this program prompts the user to enter a number, then calculates the sum of 1 to `num` using a loop. The loop iterates from 1 to `num`, adding each number to the sum variable `sum`. Finally, the program prints the sum of 1 to `num`.
+
+[N][                             Run][ 366]: hit eos,avg 10.14 token/s
+
+>> where is shenzhen
+Shenzhen is a city located in southern China, on the southern coast of the Pearl River Delta. It is the capital of Guangdong province and one of the most important economic and cultural centers in China. Shenzhen is known for its innovation, technology, and entrepreneurship, and it is home to many of China's largest companies, including Huawei, Lenovo, and Xiaomi. The city is also a hub for international trade and investment, with many multinational corporations and financial institutions setting up offices and operations in Shenzhen
+
+[N][                             Run][ 366]: hit eos,avg 10.16 token/s
+
+```
+
+## Qwen1.5-1.8B-int8
+```shell
+# ./run_qwen_1.8B.sh
+[I][                            Init][  71]: LLM init start
+100% | ████████████████████████████████ |  27 /  27 [23.68s<23.68s, 1.14 count/s] init post axmodel okremain_cmm(4140 MB)
+[I][                            Init][ 162]: max_token_len : 1023
+[I][                            Init][ 167]: kv_cache_size : 2048, kv_cache_num: 1023
+[I][                            Init][ 176]: LLM init ok
+Type "q" to exit, Ctrl+c to stop current running
+>> 给我写个C++代码计算1-9的和
+以下是一个简单的C++代码，用于计算1-9的和：
+
+`cpp
+#include <iostream>
+
+int main() {
+    int sum = 1;
+    for (int i = 1; i <= 9; i++) {
+        sum += i;
+    }
+    std::cout << "The sum of 1-9 is: " << sum << std::endl;
+    return 0;
+}
+`
+
+在这个代码中，我们首先定义了一个变量`sum`，并将其初始化为1。然后，我们使用一个`for`循环，从1开始，每次增加1，直到10。在每次循环中，我们都会将当前的数`i`加到`sum`中。最后，我们在主函数中打印出`sum`的值，即1-9的和。
+
+
+[N][                             Run][ 366]: hit eos,avg 8.00 token/s
+
+>> 深圳在哪
+深圳位于中国广东省南部，珠江口东侧，东临大亚湾，西濒珠江口，南界深圳湾，北界香港特别行政区，是中国四大一线城市之一，也是中国经济最发达的城市之一。
+
+
+[N][                             Run][ 366]: hit eos,avg 8.44 token/s
 ```
