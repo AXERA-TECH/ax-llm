@@ -40,6 +40,11 @@
 ## 运行示例
 
 ### TinyLLaMa-1.1B-BF16
+
+
+https://github.com/AXERA-TECH/ax-llm/assets/46700201/e592f78a-03ca-4824-b2d3-46d48740dbef
+
+
 ```shell
 # ./run_bf16.sh
 [I][                            Init][  71]: LLM init start
@@ -85,6 +90,11 @@ Shenzhen is a city located in southern China, on the southern coast of the Pearl
 ```
 
 ### Qwen1.5-1.8B-int8
+
+
+https://github.com/AXERA-TECH/ax-llm/assets/46700201/6788565f-19a5-45cb-9d17-41e2260886a2
+
+
 ```shell
 # ./run_qwen_1.8B.sh
 [I][                            Init][  71]: LLM init start
