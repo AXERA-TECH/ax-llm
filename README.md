@@ -19,8 +19,24 @@
 
 ## 源码编译
 
-### *TODO*
-
+- 递归 clone 本项目，确保所有 `submodule` 正确 clone
+    ```shell
+    git clone --recursive https://github.com/AXERA-TECH/ax-llm.git
+    cd ax-llm
+    ```
+- 仔细阅读 `build.sh` ，并在 `build.sh` 正确修改 `BSP_MSP_DIR` 变量后，运行编译脚本
+    ```shell
+    ./build.sh
+    ```
+- 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
+  ```
+  $ tree install/bin/
+    install/bin/
+    ├── main
+    ├── run_bf16.sh
+    └── run_qwen_1.8B.sh
+  ```
+  
 ## 运行示例
 
 ### TinyLLaMa-1.1B-BF16

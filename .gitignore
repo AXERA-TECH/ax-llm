@@ -3,3 +3,4 @@ weights
 .vscode
 build*
 tools/test.cpp
+!build.sh
