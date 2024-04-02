@@ -127,3 +127,9 @@ int main() {
 
 - [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
 - [Qwen1.5-1.8B](https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat)
+
+## 技术讨论
+
+- Github issues
+- QQ 群: 139953715
+
