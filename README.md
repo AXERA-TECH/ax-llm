@@ -1,5 +1,11 @@
 # AX-LLM
 
+![GitHub License](https://img.shields.io/github/license/AXERA-TECH/ax-llm)
+
+| Platform | Build Status |
+| -------- | ------------ |
+| AX650    | ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/AXERA-TECH/ax-llm/build_650.yml)|
+
 ## 简介
 
 **AX-LLM** 由 **[爱芯元智](https://www.axera-tech.com/)** 主导开发。该项目用于探索业界常用 **LLM(Large Language Model)** 在已有芯片平台上落地的可行性和相关能力边界，**方便**社区开发者进行**快速评估**和**二次开发**自己的 **LLM 应用**。
