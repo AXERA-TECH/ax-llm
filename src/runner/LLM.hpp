@@ -156,7 +156,25 @@ public:
         }
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", "init post axmodel ok\n");
 
-        if (!attr.b_dynamic_load_axmodel_layer)
+        if (attr.b_dynamic_load_axmodel_layer)
+        {
+            // 加载第一层获取shape信息
+            auto &layer = llama_layers[0];
+            int ret;
+            if (_attr.b_use_mmap_load_layer)
+            {
+                ret = layer.layer.init(layer.layer_buffer);
+            }
+            else
+            {
+                ret = layer.layer.init(layer.layer_buffer_vec);
+            }
+            if (ret != 0)
+            {
+                ALOGE("init axmodel(%s) failed", layer.filename.c_str());
+            }
+        }
+
         {
             _attr.max_token_len = llama_layers[0].layer.get_input("mask").vShape[0] / sizeof(unsigned short) - 1;
             ALOGI("max_token_len : %d", _attr.max_token_len);
@@ -170,6 +188,11 @@ public:
                 ALOGE("max_token_len(%d) > kv_cache_num(%d)", _attr.max_token_len, _attr.kv_cache_num);
                 return false;
             }
+        }
+        if (attr.b_dynamic_load_axmodel_layer)
+        {
+            auto &layer = llama_layers[0];
+            layer.layer.deinit();
         }
 
         // Reset();
@@ -255,22 +278,6 @@ public:
                     if (ret != 0)
                     {
                         ALOGE("init axmodel(%s) failed", layer.filename.c_str());
-                    }
-                    // ALOGI("init axmodel(%s) ok", layer.filename.c_str());
-
-                    static bool b_first = true;
-                    if (m == 0 && indices == 0 && b_first)
-                    {
-                        b_first = false;
-                        auto &input_k_cache = layer.layer.get_input("K_cache");
-                        _attr.kv_cache_num = input_k_cache.vShape[0] / _attr.kv_cache_size / sizeof(unsigned short);
-                        ALOGI("kv_cache_num: %d", _attr.kv_cache_num);
-                        if (_attr.max_token_len > _attr.kv_cache_num)
-                        {
-                            ALOGE("max_token_len(%d) > kv_cache_num(%d)", _attr.max_token_len, _attr.kv_cache_num);
-                            return "";
-                        }
-                        /* code */
                     }
                 }
 

@@ -4,3 +4,4 @@ weights
 build*
 tools/test.cpp
 !build.sh
+qtproj/LLM-Chat/CMakeLists.txt.user
