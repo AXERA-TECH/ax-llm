@@ -21,7 +21,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # bsp
 if(NOT BSP_MSP_DIR)
-    set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
+    # 判断 /soc/lib/libax_engine.so 是否存在，以确定是否为板端编译
+    if(EXISTS /soc/lib/libax_engine.so)
+        message(STATUS "Detected board,BSP_MSP_DIR = /soc")
+        set(BSP_MSP_DIR /soc)
+    else()
+        set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
+    endif()
 endif()
 message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
 include_directories(${BSP_MSP_DIR}/include)
