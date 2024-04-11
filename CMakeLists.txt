@@ -14,10 +14,6 @@ endif()
 cmake_minimum_required(VERSION 3.0)
 project(LLAMA-AX650-CPP)
 
-# 添加 FLAGS 检查代码是否有明显 bug
-# include(cmake/overlook.cmake)
-include(overlook.cmake)
-
 add_compile_options(-std=c++17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,6 +39,9 @@ add_subdirectory(third_party/re2)
 include_directories(third_party/abseil-cpp)
 include_directories(third_party/re2)
 link_directories(${CMAKE_BINARY_DIR}/lib)
+
+# 添加 FLAGS 检查代码是否有明显 bug
+include(overlook.cmake)
 
 include_directories(src)
 include_directories(src/runner)

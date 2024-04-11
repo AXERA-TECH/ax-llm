@@ -8,40 +8,9 @@ set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-set(CMAKE_CXX_STANDARD 11)
+add_compile_options(-std=c++17)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-
-find_package(Qt6 COMPONENTS Widgets)
-if(Qt6_FOUND)
-  set(QTWidget Qt6::Widgets)
-else()
-  find_package(Qt5 COMPONENTS Widgets REQUIRED)
-  set(QTWidget Qt5::Widgets)
-endif()
-
-add_executable(LLM-Chat
-  main.cpp
-  mainwindow.cpp
-  mainwindow.h
-  mainwindow.ui
-  style/DarkStyle.cpp
-  src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
-  src/runner/utils/memory_utils.cpp 
-  src/runner/utils/cqdm.cpp
-  src/runner/Tokenizer/Tokenizer.cpp
-  src/runner/Tokenizer/QwenTokenizer.cpp
-)
-
-target_link_libraries(LLM-Chat PRIVATE ${QTWidget})
-
-# bsp
-if(NOT BSP_MSP_DIR)
-    set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
-endif()
-message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
-include_directories(${BSP_MSP_DIR}/include)
-link_directories(${BSP_MSP_DIR}/lib)
 
 set(SPM_ENABLE_SHARED OFF)
 add_subdirectory(third_party/sentencepiece)
@@ -60,5 +29,41 @@ include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
 
+# bsp
+if(NOT BSP_MSP_DIR)
+    set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
+endif()
+message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
+include_directories(${BSP_MSP_DIR}/include)
+link_directories(${BSP_MSP_DIR}/lib)
+
+add_library(axllm STATIC 
+    src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
+    src/runner/utils/memory_utils.cpp 
+    src/runner/utils/cqdm.cpp
+    src/runner/Tokenizer/Tokenizer.cpp
+    src/runner/Tokenizer/QwenTokenizer.cpp
+)
+
+
+find_package(Qt6 COMPONENTS Widgets)
+if(Qt6_FOUND)
+  message(STATUS "Found Qt6")
+  set(QTWidget Qt6::Widgets)
+else()
+  find_package(Qt5 COMPONENTS Widgets REQUIRED)
+  set(QTWidget Qt5::Widgets)
+endif()
+
+add_executable(LLM-Chat
+  main.cpp
+  mainwindow.cpp
+  mainwindow.h
+  mainwindow.ui
+  style/DarkStyle.cpp
+)
+
+target_link_libraries(LLM-Chat PRIVATE ${QTWidget})
+target_link_libraries(LLM-Chat PRIVATE axllm)
 target_link_libraries(LLM-Chat PRIVATE ax_engine ax_interpreter ax_sys ax_ivps)
 target_link_libraries(LLM-Chat PRIVATE sentencepiece re2::re2)

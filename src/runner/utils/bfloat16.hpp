@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 
 struct bfloat16
 {
@@ -27,8 +28,11 @@ public:
     // cast to float
     operator float()
     {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
         unsigned int proc = data << 16;
         return *reinterpret_cast<float *>(&proc);
+#pragma GCC diagnostic pop
     }
     // cast to bfloat16
     bfloat16 &operator=(float float_val)
