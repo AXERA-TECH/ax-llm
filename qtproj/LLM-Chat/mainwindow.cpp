@@ -82,7 +82,7 @@ QTextEdit *create_textedit(QString rgb_color = "220,127,125")
 void MainWindow::on_btn_ask_clicked()
 {
     auto txtedit_input = create_textedit();
-    txtedit_input->setText(ui->txt_msg->text());
+
     QHBoxLayout *hboxlayout = new QHBoxLayout();
     hboxlayout->addWidget(txtedit_input);
     hboxlayout->addSpacing(200);
@@ -100,6 +100,8 @@ void MainWindow::on_btn_ask_clicked()
     m_textedit_output_vec.push_back(txtedit_output);
     // resize_textedit(txtedit);
     // resize_textedit(txtedit1);
+
+    txtedit_input->setText(ui->txt_msg->text());
 
     // 开线程run
     QString *str_msg = new QString(ui->txt_msg->text());

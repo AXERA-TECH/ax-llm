@@ -59,7 +59,8 @@ function(build_exec name main_source)
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
-                    src/runner/Tokenizer/QwenTokenizer.cpp)
+                    src/runner/Tokenizer/QwenTokenizer.cpp
+                    src/runner/Tokenizer/chatglm.cpp)
 
     target_link_libraries(${name} ax_engine ax_interpreter ax_sys ax_ivps)
     target_link_libraries(${name} sentencepiece re2::re2)
