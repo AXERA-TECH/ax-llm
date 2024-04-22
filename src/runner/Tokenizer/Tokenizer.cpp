@@ -231,40 +231,39 @@ public:
         try
         {
             cli = std::make_shared<httplib::Client>(base_url);
+            cli->set_connection_timeout(1);
+            cli->set_read_timeout(1);
+            cli->set_write_timeout(1);
+            {
+                auto ret = cli->Get("/bos_id");
+                auto rep = ret.value();
+                if (rep.status != 200)
+                {
+                    ALOGE("get bos_id failed, status: %d", rep.status);
+                    return false;
+                }
+                nlohmann::json j = nlohmann::json::parse(rep.body);
+                bos_id = j["bos_id"];
+            }
+
+            {
+                auto ret = cli->Get("/eos_id");
+                auto rep = ret.value();
+                if (rep.status != 200)
+                {
+                    ALOGE("get eos_id failed, status: %d", rep.status);
+                    return false;
+                }
+                nlohmann::json j = nlohmann::json::parse(rep.body);
+                eos_id = j["eos_id"];
+            }
+            printf("bos_id: %d, eos_id: %d\n", bos_id, eos_id);
         }
         catch (const std::exception &e)
         {
             std::cerr << e.what() << '\n';
             return false;
         }
-
-        cli->set_connection_timeout(1);
-        cli->set_read_timeout(1);
-        cli->set_write_timeout(1);
-        {
-            auto ret = cli->Get("/bos_id");
-            auto rep = ret.value();
-            if (rep.status != 200)
-            {
-                ALOGE("get bos_id failed, status: %d", rep.status);
-                return false;
-            }
-            nlohmann::json j = nlohmann::json::parse(rep.body);
-            bos_id = j["bos_id"];
-        }
-
-        {
-            auto ret = cli->Get("/eos_id");
-            auto rep = ret.value();
-            if (rep.status != 200)
-            {
-                ALOGE("get eos_id failed, status: %d", rep.status);
-                return false;
-            }
-            nlohmann::json j = nlohmann::json::parse(rep.body);
-            eos_id = j["eos_id"];
-        }
-        printf("bos_id: %d, eos_id: %d\n", bos_id, eos_id);
 
         this->_b_bos = b_bos;
         this->_b_eos = b_eos;
@@ -318,27 +317,36 @@ public:
 
     std::string Decode(const std::vector<int> input) override
     {
-        nlohmann::json j;
-        j["token_ids"] = input;
-        auto ret = cli->Post("/decode", j.dump(), "application/json");
-        auto rep = ret.value();
-        if (rep.status != 200)
+        int cnt = 2;
+        std::string out_str = "";
+        while (cnt--)
         {
-            ALOGE("decode failed, status: %d", rep.status);
-            ALOGE("%s", rep.body.c_str());
-            return "";
+            nlohmann::json j;
+            j["token_ids"] = input;
+            auto ret = cli->Post("/decode", j.dump(), "application/json");
+            auto rep = ret.value();
+            if (rep.status != 200)
+            {
+                ALOGE("decode failed, status: %d, try again", rep.status);
+                ALOGE("%s", rep.body.c_str());
+                usleep(1000 * 1000);
+                continue;
+            }
+            try
+            {
+                nlohmann::json j2 = nlohmann::json::parse(rep.body);
+                out_str = j2["text"];
+                break;
+            }
+            catch (const std::exception &e)
+            {
+                ALOGE("json parse failed: %s, try again", e.what());
+                ALOGE("%s", rep.body.c_str());
+                usleep(1000 * 1000);
+                continue;
+            }
         }
-        try
-        {
-            nlohmann::json j2 = nlohmann::json::parse(rep.body);
-            return j2["text"];
-        }
-        catch (const std::exception &e)
-        {
-            ALOGE("json parse failed: %s", e.what());
-            ALOGE("%s", rep.body.c_str());
-            return "";
-        }
+        return out_str;
     }
 
     int GetBosID() override
@@ -358,7 +366,7 @@ std::shared_ptr<BaseTokenizer> CreateTokenizer(TokenizerType type)
     {
     case TKT_LLaMa:
         return std::make_shared<TokenizerLLaMa>();
-    case TKT_GLM3:
+    case TKT_HTTP:
         return std::make_shared<Tokenizer_Http>();
     case TKT_Qwen:
         return std::make_shared<TokenizerQwen>();
