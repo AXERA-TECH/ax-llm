@@ -32,6 +32,7 @@ std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
         oss_prompt << "\n<|im_start|>user\n"
                    << prompt << "<|im_end|>\n<|im_start|>assistant\n";
         break;
+    case TKT_HTTP:
     default:
         oss_prompt << prompt;
         break;
@@ -51,7 +52,7 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
-    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen", false, attr.tokenizer_type);
+    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP", false, attr.tokenizer_type);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 

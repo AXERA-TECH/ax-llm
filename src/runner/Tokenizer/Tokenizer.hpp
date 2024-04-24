@@ -7,7 +7,7 @@ enum TokenizerType
 {
     TKT_LLaMa,
     TKT_Qwen,
-
+    TKT_HTTP,
     TKT_END
 };
 
