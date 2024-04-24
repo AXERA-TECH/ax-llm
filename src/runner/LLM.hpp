@@ -200,6 +200,11 @@ public:
         return true;
     }
 
+    LLMAttrType* getAttr()
+    {
+        return &_attr;
+    }
+
     void Deinit()
     {
         for (int i = 0; i < _attr.axmodel_num; i++)

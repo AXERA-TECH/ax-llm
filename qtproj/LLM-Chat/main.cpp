@@ -14,6 +14,12 @@ int main(int argc, char *argv[])
 
     {
         LLMAttrType attr;
+        attr.template_filename_axmodel = "tinyllama-bf16/tinyllama_l%d.axmodel";
+        attr.filename_post_axmodel = "tinyllama-bf16/tinyllama_post.axmodel";
+        attr.filename_tokenizer_model = "tokenizer.model";
+        attr.filename_tokens_embed = "tinyllama-bf16/tinyllama.model.embed_tokens.weight.bfloat16.bin";
+
+
         cmdline::parser cmd;
         cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
         cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);

@@ -21,6 +21,29 @@ void thread_llm_runing(LLM *p_llm, QString *p_str, MainWindow *p_win)
     ALOGI("thread_llm_runing end");
 }
 
+std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
+{
+    std::ostringstream oss_prompt;
+    switch (tokenizer_type)
+    {
+    case TKT_LLaMa:
+        oss_prompt << "<|user|>\n"
+                   << prompt << "</s><|assistant|>\n";
+        break;
+    case TKT_Qwen:
+        oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
+        oss_prompt << "\n<|im_start|>user\n"
+                   << prompt << "<|im_end|>\n<|im_start|>assistant\n";
+        break;
+    case TKT_HTTP:
+    default:
+        oss_prompt << prompt;
+        break;
+    }
+
+    return oss_prompt.str();
+}
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), ui(new Ui::MainWindow)
 {
@@ -28,6 +51,9 @@ MainWindow::MainWindow(QWidget *parent)
     m_vBoxLayout = new QVBoxLayout();
     ui->widget->setLayout(m_vBoxLayout);
     m_vBoxLayout->addSpacing(1080);
+
+    connect(this,&MainWindow::sig_llm_output,this,&MainWindow::on_llm_output);
+    connect(this,&MainWindow::sig_enable_controls,this,&MainWindow::on_enable_controls);
 }
 
 MainWindow::~MainWindow()
@@ -43,12 +69,25 @@ bool MainWindow::InitLLM(LLMAttrType attr)
 
 void MainWindow::append_textedit(const char *p_str)
 {
-    m_textedit_output_vec.back()->append(p_str);
-    printf("%s", p_str);
+    emit sig_llm_output(QString(p_str));
+}
+
+void MainWindow::on_llm_output(QString str)
+{
+    auto src =  m_textedit_output_vec.back()->toPlainText();//str);
+    src.append(str);
+    m_textedit_output_vec.back()->setText(src);
+    printf("%s", str.toStdString().c_str());
     fflush(stdout);
 }
 
+
 void MainWindow::enable_controls(bool b_enable)
+{
+    emit sig_enable_controls(b_enable);
+}
+
+void MainWindow::on_enable_controls(bool b_enable)
 {
     ui->btn_ask->setEnabled(b_enable);
     ui->txt_msg->setEnabled(b_enable);
@@ -81,6 +120,10 @@ QTextEdit *create_textedit(QString rgb_color = "220,127,125")
 
 void MainWindow::on_btn_ask_clicked()
 {
+    if(ui->txt_msg->text().trimmed().isEmpty())
+    {
+        return;
+    }
     auto txtedit_input = create_textedit();
 
     QHBoxLayout *hboxlayout = new QHBoxLayout();
@@ -103,8 +146,12 @@ void MainWindow::on_btn_ask_clicked()
 
     txtedit_input->setText(ui->txt_msg->text());
 
+    auto prompt = prompt_complete(ui->txt_msg->text().toStdString(),m_llm.getAttr()->tokenizer_type);
+    printf("%s\n",prompt.c_str());
+    fflush(stdout);
+
     // 开线程run
-    QString *str_msg = new QString(ui->txt_msg->text());
+    QString *str_msg = new QString(prompt.c_str());
     std::thread t(thread_llm_runing, &m_llm, str_msg, this);
     t.detach();
     ui->txt_msg->clear();
@@ -128,3 +175,9 @@ void MainWindow::on_txt_msg_returnPressed()
 {
     on_btn_ask_clicked();
 }
+
+void MainWindow::on_btn_stop_clicked()
+{
+    m_llm.Stop();
+}
+

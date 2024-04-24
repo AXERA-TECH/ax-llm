@@ -17,6 +17,9 @@ class MainWindow : public QMainWindow
 {
     Q_OBJECT
 
+signals:
+    void sig_llm_output(QString str);
+    void sig_enable_controls(bool enable);
 public:
     MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
@@ -28,10 +31,16 @@ public:
     void enable_controls(bool b_enable);
 
 private slots:
+    void on_btn_stop_clicked();
+
+private slots:
     void on_btn_ask_clicked();
     void resizeEvent(QResizeEvent *event) override;
 
     void on_txt_msg_returnPressed();
+
+    void on_llm_output(QString str);
+    void on_enable_controls(bool b_enable);
 
 private:
     Ui::MainWindow *ui;

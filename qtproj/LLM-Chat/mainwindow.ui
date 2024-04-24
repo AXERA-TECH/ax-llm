@@ -40,7 +40,7 @@
        </widget>
       </item>
       <item>
-       <layout class="QHBoxLayout" name="horizontalLayout" stretch="0,1">
+       <layout class="QHBoxLayout" name="horizontalLayout" stretch="0,1,0">
         <item>
          <widget class="QLineEdit" name="txt_msg">
           <property name="minimumSize">
@@ -87,6 +87,7 @@ background-color: rgb(99, 122, 125);</string>
     border: 1px solid #dcdfe6;
     padding: 10px;
     border-radius: 20px;
+	background-color: rgb(87, 227, 137);
 }
 
 QPushButton:hover {
@@ -101,6 +102,48 @@ QPushButton:pressed, QPushButton:checked {
           </property>
           <property name="text">
            <string>Ask</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="btn_stop">
+          <property name="minimumSize">
+           <size>
+            <width>100</width>
+            <height>60</height>
+           </size>
+          </property>
+          <property name="maximumSize">
+           <size>
+            <width>150</width>
+            <height>16777215</height>
+           </size>
+          </property>
+          <property name="font">
+           <font>
+            <family>DejaVu Sans</family>
+            <pointsize>14</pointsize>
+           </font>
+          </property>
+          <property name="styleSheet">
+           <string notr="true">QPushButton {
+    border: 1px solid #dcdfe6;
+    padding: 10px;
+    border-radius: 20px;
+	background-color: rgb(246, 97, 81);
+}
+
+QPushButton:hover {
+    background-color: rgb(224, 27, 36);
+}
+
+QPushButton:pressed, QPushButton:checked {
+    border: 1px solid #3a8ee6;
+	background-color: rgb(192, 28, 40);
+}</string>
+          </property>
+          <property name="text">
+           <string>Stop</string>
           </property>
          </widget>
         </item>
