@@ -1,0 +1,13 @@
+./main \
+--template_filename_axmodel "phi3-int8/llama_l%d.axmodel" \
+--axmodel_num 32 \
+--tokenizer_type 3 \
+--bos 1 --eos 0 \
+--filename_tokenizer_model tokenizer.model \
+--filename_post_axmodel phi3-int8/llama_post.axmodel \
+--filename_tokens_embed phi3-int8/model.embed_tokens.weight.bfloat16.bin \
+--tokens_embed_num 32064 \
+--tokens_embed_size 3072 \
+--live_print 1 \
+--continue 1 \
+--prompt "$1"

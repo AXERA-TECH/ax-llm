@@ -200,7 +200,7 @@ public:
         return true;
     }
 
-    LLMAttrType* getAttr()
+    LLMAttrType *getAttr()
     {
         return &_attr;
     }
@@ -239,6 +239,7 @@ public:
         int len_of_input = token_ids.size();
         timer t_cost;
         // print token_ids
+        // printf("%s\n", input_str.c_str());
         // for (size_t i = 0; i < token_ids.size(); i++)
         // {
         //     printf("%d ", token_ids[i]);
@@ -345,7 +346,22 @@ public:
                     }
                 }
                 next_token = max_index;
+
+                if (tokenizer->isEnd(max_index))
+                {
+                    if (cached_token.size())
+                    {
+                        float t_cost_ms = t_cost.cost();
+                        float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
+                        auto tmp_out = tokenizer->Decode(cached_token);
+                        _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
+                        cached_token.clear();
+                    }
+                    b_hit_eos = true;
+                    break;
+                }
                 token_ids.push_back(max_index);
+
                 if (_attr.runing_callback)
                 {
                     cached_token.push_back(max_index);
@@ -357,12 +373,6 @@ public:
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
-                }
-
-                if (max_index == tokenizer->GetEosID())
-                {
-                    b_hit_eos = true;
-                    break;
                 }
             }
             if (_attr.runing_callback == nullptr)

@@ -70,7 +70,10 @@ endfunction()
 build_exec(main src/main.cpp)
 # build_exec(main_qwen src/main_qwen.cpp)
 
-file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*")
+file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*.py" "${CMAKE_SOURCE_DIR}/scripts/*.sh")
 install(FILES ${RUN_SCRIPT} DESTINATION bin/)
+
+file(GLOB LLAMA3_TOKENIZER "${CMAKE_SOURCE_DIR}/scripts/llama3_tokenizer/*")
+install(FILES ${LLAMA3_TOKENIZER} DESTINATION bin/llama3_tokenizer/)
 
 # add_executable(fp32_to_bf16 tools/fp32_to_bf16.cpp)

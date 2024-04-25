@@ -8,6 +8,7 @@ enum TokenizerType
     TKT_LLaMa,
     TKT_Qwen,
     TKT_HTTP,
+    TKT_Phi3,
     TKT_END
 };
 
@@ -20,6 +21,8 @@ public:
     virtual std::string Decode(const std::vector<int> input) = 0;
     virtual int GetBosID() = 0;
     virtual int GetEosID() = 0;
+
+    virtual bool isEnd(int id) { return id == GetEosID(); }
 };
 
 std::shared_ptr<BaseTokenizer> CreateTokenizer(TokenizerType type);
