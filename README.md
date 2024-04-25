@@ -46,6 +46,51 @@
   
 ## 运行示例
 
+### Phi-3-mini-int8
+
+```shell
+./run_phi3_mini.sh
+[I][                            Init][  71]: LLM init start
+100% | ████████████████████████████████ |  35 /  35 [28.39s<28.39s, 1.23 count/s] init post axmodel okremain_cmm(9045 MB))
+[I][                            Init][ 180]: max_token_len : 1023
+[I][                            Init][ 185]: kv_cache_size : 3072, kv_cache_num: 1023
+[I][                            Init][ 199]: LLM init ok
+Type "q" to exit, Ctrl+c to stop current running
+>>
+>> who are you?
+ I am Phi, an AI developed by Microsoft, designed to assist and provide information to users across a wide range of topics. How can I assist you today?
+
+[N][                             Run][ 388]: hit eos,avg 4.40 token/s
+
+>>
+>> use c program language implement calculate sum 1-9
+ Certainly! To calculate the sum of numbers from 1 to 9 in C, you can use a simple loop. Here's a small program that does exactly that:
+
+`c
+#include <stdio.h>
+
+int main() {
+    int sum = 0; // Initialize sum to 0
+
+    // Loop from 1 to 9 and add each number to sum
+    for(int i = 1; i <= 9; i++) {
+        sum += i;
+    }
+
+    printf("The sum of numbers from 1 to 9 is: %d\n", sum);
+
+    return 0;
+}
+`
+
+This program initializes a variable `sum` to 0. It then iterates from 1 to 9, adding each number to `sum`. Finally, it prints the result.
+
+The sum of numbers from 1 to 9 is 45, as calculated by the loop in the program.
+
+[N][                             Run][ 388]: hit eos,avg 4.37 token/s
+
+```
+
 ### TinyLLaMa-1.1B-BF16
 
 
@@ -142,6 +187,7 @@ int main() {
 
 ## Reference
 
+- [Phi-3-mini](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
 - [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
 - [Qwen1.5-1.8B](https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat)
 
