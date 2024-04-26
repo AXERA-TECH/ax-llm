@@ -5,7 +5,7 @@
 
 #include "QwenTokenizer.hpp"
 
-#include "chatglm.h"
+// #include "chatglm.h"
 
 #include "httplib.h"
 #include "json.hpp"
@@ -231,69 +231,69 @@ public:
     }
 };
 
-class TokenizerGLM3 : public BaseTokenizer
-{
-    std::shared_ptr<chatglm::ChatGLM3Tokenizer> sp;
-    bool _b_bos, _b_eos;
+// class TokenizerGLM3 : public BaseTokenizer
+// {
+//     std::shared_ptr<chatglm::ChatGLM3Tokenizer> sp;
+//     bool _b_bos, _b_eos;
 
-private:
-    /* data */
-public:
-    bool Init(std::string model_path, bool b_bos = true, bool b_eos = false) override
-    {
-        if (!file_exist(model_path))
-        {
-            ALOGE("tokenizer model file(%s) not exist", model_path.c_str());
-            return false;
-        }
-        // std::vector<char> sp_model_data;
-        // read_file(model_path, sp_model_data);
-        // std::string_view serialized_model_proto(sp_model_data.data(), sp_model_data.size());
+// private:
+//     /* data */
+// public:
+//     bool Init(std::string model_path, bool b_bos = true, bool b_eos = false) override
+//     {
+//         if (!file_exist(model_path))
+//         {
+//             ALOGE("tokenizer model file(%s) not exist", model_path.c_str());
+//             return false;
+//         }
+//         // std::vector<char> sp_model_data;
+//         // read_file(model_path, sp_model_data);
+//         // std::string_view serialized_model_proto(sp_model_data.data(), sp_model_data.size());
 
-        sp.reset(new chatglm::ChatGLM3Tokenizer(model_path));
+//         sp.reset(new chatglm::ChatGLM3Tokenizer(model_path));
 
-        this->_b_bos = b_bos;
-        this->_b_eos = b_eos;
-        return true;
-    }
+//         this->_b_bos = b_bos;
+//         this->_b_eos = b_eos;
+//         return true;
+//     }
 
-    bool Encode(std::string input, std::vector<int> &output) override
-    {
-        if (_b_bos)
-        {
-            // input += "<|im_start|>";
-        }
-        if (_b_eos)
-        {
-            // input += "<|endoftext|>";
-        }
-        output = sp->encode(input, 1024);
+//     bool Encode(std::string input, std::vector<int> &output) override
+//     {
+//         if (_b_bos)
+//         {
+//             // input += "<|im_start|>";
+//         }
+//         if (_b_eos)
+//         {
+//             // input += "<|endoftext|>";
+//         }
+//         output = sp->encode(input, 1024);
 
-        return true;
-    }
+//         return true;
+//     }
 
-    std::vector<int> Encode(std::string input) override
-    {
-        std::vector<int> output;
-        Encode(input, output);
-        return output;
-    }
+//     std::vector<int> Encode(std::string input) override
+//     {
+//         std::vector<int> output;
+//         Encode(input, output);
+//         return output;
+//     }
 
-    std::string Decode(const std::vector<int> input) override
-    {
-        return sp->decode(input);
-    }
+//     std::string Decode(const std::vector<int> input) override
+//     {
+//         return sp->decode(input);
+//     }
 
-    int GetBosID() override
-    {
-        return sp->sp.bos_id();
-    }
+//     int GetBosID() override
+//     {
+//         return sp->sp.bos_id();
+//     }
 
-    int GetEosID() override
-    {
-        return sp->sp.eos_id();
-    }
-};
+//     int GetEosID() override
+//     {
+//         return sp->sp.eos_id();
+//     }
+// };
 
 class Tokenizer_Http : public BaseTokenizer
 {
