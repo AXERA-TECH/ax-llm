@@ -8,7 +8,7 @@
 bool file_exist(const std::string &path);
 
 bool read_file(const std::string &path, std::vector<char> &data);
-
+bool read_file(const std::string &path, char **data, size_t *len);
 class MMap
 {
 private:
@@ -36,6 +36,8 @@ public:
         if (_add)
         {
             munmap(_add, _size);
+            _add = nullptr;
+            _size = 0;
         }
     }
 

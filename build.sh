@@ -2,7 +2,7 @@
 
 # BSP_MSP_DIR 这个变量使用*绝对路径*指定到 SDK 的msp/out目录，如下所示（根据自己的目录修改）
 # 绝对路径 绝对路径 绝对路径 
-BSP_MSP_DIR=$PWD/AX650_SDK_V1.63.2_20240125165719_NO3387/msp/out/
+BSP_MSP_DIR=$PWD/bsp_msp_out/msp/out/
 echo "bsp dir: ${BSP_MSP_DIR}"
 # 下面会简单判断 BSP 路径是否正确
 if [ ! -d "${BSP_MSP_DIR}" ]; then
@@ -25,25 +25,28 @@ cd ${build_dir}
 URL="https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz"
 FOLDER="gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu"
 
-# Check if the file exists
-if [ ! -f "$FOLDER.tar.xz" ]; then
-    # Download the file
-    echo "Downloading $URL"
-    wget "$URL" -O "$FOLDER.tar.xz"
-fi
-
-# Check if the folder exists
-if [ ! -d "$FOLDER" ]; then
-    # Extract the file
-    echo "Extracting $FOLDER.tar.xz"
-    tar -xf "$FOLDER.tar.xz"
-fi
-
-export PATH=$PATH:$PWD/$FOLDER/bin/
 aarch64-none-linux-gnu-gcc -v
 if [ $? -ne 0 ]; then
-    echo "Error: aarch64-none-linux-gnu-gcc not found"
-    exit 1
+    # Check if the file exists
+    if [ ! -f "$FOLDER.tar.xz" ]; then
+        # Download the file
+        echo "Downloading $URL"
+        wget "$URL" -O "$FOLDER.tar.xz"
+    fi
+
+    # Check if the folder exists
+    if [ ! -d "$FOLDER" ]; then
+        # Extract the file
+        echo "Extracting $FOLDER.tar.xz"
+        tar -xf "$FOLDER.tar.xz"
+    fi
+
+    export PATH=$PATH:$PWD/$FOLDER/bin/
+    aarch64-none-linux-gnu-gcc -v
+    if [ $? -ne 0 ]; then
+        echo "Error: aarch64-none-linux-gnu-gcc not found"
+        exit 1
+    fi
 fi
 
 # 开始编译

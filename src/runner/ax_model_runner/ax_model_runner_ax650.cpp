@@ -277,63 +277,36 @@ int ax_runner_ax650::sub_init()
     return ret;
 }
 
-int ax_runner_ax650::init(const char *model_file)
+int ax_runner_ax650::init(const char *model_file, bool use_mmap)
 {
-    // 2. load model
-    std::shared_ptr<MMap> model_buffer(new MMap(model_file));
-    if (!model_buffer->data())
+    if (use_mmap)
     {
-        ALOGE("mmap");
-        return -1;
-    }
-    return init(*model_buffer.get());
-    // std::shared_ptr<std::vector<char>> model_buffer((new std::vector<char>()));
-    // if (!read_file(model_file, *model_buffer.get()))
-    // {
-    //     ALOGE("read_file");
-    //     return -1;
-    // }
-
-    // 3. create handle
-}
-
-int ax_runner_ax650::init(MMap &model_buffer)
-{
-    if (!m_handle)
-    {
-        m_handle = new ax_joint_runner_ax650_handle_t;
-    }
-
-    static bool b_init = false;
-    if (!b_init)
-    {
-        // 1. init engine
-        AX_ENGINE_NPU_ATTR_T npu_attr;
-        memset(&npu_attr, 0, sizeof(npu_attr));
-        npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
-        AX_SYS_Init();
-        auto ret = AX_ENGINE_Init(&npu_attr);
-        if (0 != ret)
+        MMap model_buffer(model_file);
+        if (!model_buffer.data())
         {
-            return ret;
+            ALOGE("mmap");
+            return -1;
         }
-        b_init = true;
-    }
-
-    // 3. create handle
-
-    int ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer.data(), model_buffer.size());
-    if (0 != ret)
-    {
-        ALOGE("AX_ENGINE_CreateHandle");
+        auto ret = init((char *)model_buffer.data(), model_buffer.size());
+        model_buffer.close_file();
         return ret;
     }
-    // fprintf(stdout, "Engine creating handle is done.\n");
-
-    return sub_init();
+    else
+    {
+        char *model_buffer;
+        size_t len;
+        if (!read_file(model_file, &model_buffer, &len))
+        {
+            ALOGE("read_file");
+            return -1;
+        }
+        auto ret = init(model_buffer, len);
+        delete[] model_buffer;
+        return ret;
+    }
 }
 
-int ax_runner_ax650::init(std::vector<char> &model_buffer)
+int ax_runner_ax650::init(char *model_buffer, size_t model_size)
 {
     if (!m_handle)
     {
@@ -358,7 +331,7 @@ int ax_runner_ax650::init(std::vector<char> &model_buffer)
 
     // 3. create handle
 
-    int ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer.data(), model_buffer.size());
+    int ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer, model_size);
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateHandle");
@@ -461,7 +434,7 @@ int ax_runner_ax650::inference()
     return AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data);
 }
 
-int ax_cmmcpy(unsigned long long int dst, unsigned long long int src, int size)
-{
-    return AX_IVPS_CmmCopyTdp(dst, src, size);
-}
+// int ax_cmmcpy(unsigned long long int dst, unsigned long long int src, int size)
+// {
+//     return AX_IVPS_CmmCopyTdp(dst, src, size);
+// }

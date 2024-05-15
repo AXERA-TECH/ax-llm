@@ -11,9 +11,8 @@ protected:
     int sub_init();
 
 public:
-    int init(const char *model_file) override;
-    int init(std::vector<char> &model_buffer) override;
-    int init(MMap &model_buffer) override;
+    int init(const char *model_file, bool use_mmap = false) override;
+    int init(char *model_buffer, size_t model_size) override;
 
     void release();
     void deinit() override;

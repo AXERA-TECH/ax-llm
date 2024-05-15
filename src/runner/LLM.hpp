@@ -118,7 +118,7 @@ public:
 
             if (!attr.b_dynamic_load_axmodel_layer)
             {
-                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str());
+                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), false);
                 if (ret != 0)
                 {
                     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
@@ -148,7 +148,7 @@ public:
             }
         }
 
-        int ret = llama_post.init(attr.filename_post_axmodel.c_str());
+        int ret = llama_post.init(attr.filename_post_axmodel.c_str(), false);
         if (ret != 0)
         {
             ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str());
@@ -163,11 +163,11 @@ public:
             int ret;
             if (_attr.b_use_mmap_load_layer)
             {
-                ret = layer.layer.init(layer.layer_buffer);
+                ret = layer.layer.init((char *)layer.layer_buffer.data(), layer.layer_buffer.size());
             }
             else
             {
-                ret = layer.layer.init(layer.layer_buffer_vec);
+                ret = layer.layer.init(layer.layer_buffer_vec.data(), layer.layer_buffer_vec.size());
             }
             if (ret != 0)
             {
@@ -176,12 +176,12 @@ public:
         }
 
         {
-            _attr.max_token_len = llama_layers[0].layer.get_input("mask").vShape[0] / sizeof(unsigned short) - 1;
+            _attr.max_token_len = llama_layers[0].layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
             ALOGI("max_token_len : %d", _attr.max_token_len);
             // auto &input_k_cache = llama_layers[0].layer.get_input("K_cache");
             // auto &output_k_cache_out = llama_layers[0].layer.get_output("K_cache_out");
-            _attr.kv_cache_size = llama_layers[0].layer.get_output("K_cache_out").vShape[0] / sizeof(unsigned short);
-            _attr.kv_cache_num = llama_layers[0].layer.get_input("K_cache").vShape[0] / _attr.kv_cache_size / sizeof(unsigned short);
+            _attr.kv_cache_size = llama_layers[0].layer.get_output("K_cache_out").nSize / sizeof(unsigned short);
+            _attr.kv_cache_num = llama_layers[0].layer.get_input("K_cache").nSize / _attr.kv_cache_size / sizeof(unsigned short);
             ALOGI("kv_cache_size : %d, kv_cache_num: %d", _attr.kv_cache_size, _attr.kv_cache_num);
             if (_attr.max_token_len > _attr.kv_cache_num)
             {
@@ -275,11 +275,11 @@ public:
                     int ret;
                     if (_attr.b_use_mmap_load_layer)
                     {
-                        ret = layer.layer.init(layer.layer_buffer);
+                        ret = layer.layer.init((char *)layer.layer_buffer.data(), layer.layer_buffer.size());
                     }
                     else
                     {
-                        ret = layer.layer.init(layer.layer_buffer_vec);
+                        ret = layer.layer.init(layer.layer_buffer_vec.data(), layer.layer_buffer_vec.size());
                     }
                     if (ret != 0)
                     {

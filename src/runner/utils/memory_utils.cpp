@@ -13,6 +13,7 @@ bool file_exist(const std::string &path)
 
 bool read_file(const std::string &path, std::vector<char> &data)
 {
+
     std::fstream fs(path, std::ios::in | std::ios::binary);
 
     if (!fs.is_open())
@@ -20,18 +21,45 @@ bool read_file(const std::string &path, std::vector<char> &data)
         return false;
     }
 
-    fs.seekg(std::ios::end);
-    auto fs_end = fs.tellg();
-    fs.seekg(std::ios::beg);
-    auto fs_beg = fs.tellg();
+    // get file size
+    fs.seekg(0, std::ios::end);
+    size_t file_size = fs.tellg();
+    fs.seekg(0, std::ios::beg);
 
-    auto file_size = static_cast<size_t>(fs_end - fs_beg);
-    auto vector_size = data.size();
+    if (file_size == 0)
+    {
+        return false;
+    }
 
-    data.reserve(vector_size + file_size);
-    data.insert(data.end(), std::istreambuf_iterator<char>(fs), std::istreambuf_iterator<char>());
+    data.resize(file_size);
+    fs.read(data.data(), file_size);
+    // data.insert(data.end(), std::istreambuf_iterator<char>(fs), std::istreambuf_iterator<char>());
 
     fs.close();
+
+    return true;
+}
+
+bool read_file(const std::string &path, char **data, size_t *len)
+{
+    FILE *fp = fopen(path.c_str(), "rb");
+
+    if (!fp)
+    {
+        return false;
+    }
+
+    fseek(fp, 0, SEEK_END);
+
+    *len = ftell(fp);
+
+    fseek(fp, 0, SEEK_SET);
+
+    *data = new char[*len];
+
+    fread(*data, *len, 1, fp);
+
+    fclose(fp);
 
     return true;
 }

@@ -2,7 +2,6 @@
 #include <vector>
 #include <string>
 #include <map>
-#include "memory_utils.hpp"
 
 typedef enum _color_space_e
 {
@@ -47,9 +46,8 @@ protected:
     std::map<std::string, ax_runner_tensor_t> map_input_tensors;
 
 public:
-    virtual int init(const char *model_file) = 0;
-    virtual int init(std::vector<char> &model_buffer) = 0;
-    virtual int init(MMap &model_buffer) = 0;
+    virtual int init(const char *model_file, bool use_mmap = false) = 0;
+    virtual int init(char *model_buffer, size_t model_size) = 0;
 
     virtual void deinit() = 0;
 
@@ -106,4 +104,4 @@ public:
     }
 };
 
-int ax_cmmcpy(unsigned long long int dst, unsigned long long int src, int size);
+// int ax_cmmcpy(unsigned long long int dst, unsigned long long int src, int size);

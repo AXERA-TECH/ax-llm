@@ -48,6 +48,7 @@ static std::vector<std::pair<int, float>> topk_bfloat16(unsigned short *arr, int
 
     // Create a vector of pairs with index and value
     std::vector<std::pair<int, float>> indexedValues;
+    indexedValues.reserve(size);
     for (int i = 0; i < size; ++i)
     {
         indexedValues.push_back(std::make_pair(i, bfloat16(arr[i])));
