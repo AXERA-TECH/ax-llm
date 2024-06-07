@@ -26,9 +26,14 @@ public:
         close_file();
     }
 
-    void open_file(const char *file)
+    bool open_file(const char *file)
     {
         _add = _mmap(file, &_size);
+        if (!_add)
+        {
+            return false;
+        }
+        return true;
     }
 
     void close_file()

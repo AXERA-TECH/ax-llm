@@ -24,7 +24,11 @@ public:
         if (use_mmap)
         {
             ALOGI("LLaMaEmbedSelector use mmap");
-            _embed_map.open_file(embed_path.c_str());
+            if (!_embed_map.open_file(embed_path.c_str()))
+            {
+                ALOGE("embed file(%s) open failed", embed_path.c_str());
+                return false;
+            }
         }
         else
         {

@@ -1,0 +1,13 @@
+./main \
+--template_filename_axmodel "minicpm/llama_l%d.axmodel" \
+--axmodel_num 40 \
+--tokenizer_type 2 \
+--bos 0 --eos 0 \
+--filename_tokenizer_model http://10.126.33.167:12345 \
+--filename_post_axmodel minicpm/llama_post.axmodel \
+--filename_tokens_embed minicpm/model.embed_tokens.weight.bfloat16.bin \
+--tokens_embed_num 122753 \
+--tokens_embed_size 2304 \
+--live_print 1 \
+--continue 1 \
+--prompt "$1"
