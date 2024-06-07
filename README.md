@@ -13,11 +13,21 @@
 ### 已支持芯片
 
 - AX650A/AX650N
+  - SDK ≥ v1.45.0_P31
+- AX630C
+  - SDK ≥ v2.0.0_P7
 
 ### 已支持模型
 
+- Qwen1.5-0.5B/1.8B/4B
+- Qwen2-0.5B/1.5B
+- ChatGLM3-6B
+- MiniCPM-2B
 - TinyLLaMa-1.1B
-- Qwen1.5-1.8B
+- Llama2-7B
+- Llama3-8B
+- Phi-2
+- Phi-3-mini
 
 ### 获取地址
 
@@ -190,6 +200,7 @@ int main() {
 - [Phi-3-mini](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
 - [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
 - [Qwen1.5-1.8B](https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat)
+- [Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B)
 
 ## 技术讨论
 
