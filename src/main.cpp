@@ -54,6 +54,7 @@ int main(int argc, char *argv[])
     cmdline::parser cmd;
     cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
+    cmd.add<std::string>("template_prefill_filename_axmodel", 0, "axmodel path template", true, attr.template_prefill_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3", false, attr.tokenizer_type);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
@@ -62,6 +63,7 @@ int main(int argc, char *argv[])
     cmd.add<bool>("bos", 0, "", false, attr.b_bos);
     cmd.add<bool>("eos", 0, "", false, attr.b_eos);
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
+    cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
 
@@ -102,9 +104,15 @@ int main(int argc, char *argv[])
     {
         return -1;
     }
+    std::vector<char> tmp_data;
+    read_file(prompt, tmp_data);
+    std::vector<unsigned short> prompt_data(tmp_data.size() / 2);
+    memcpy(prompt_data.data(), tmp_data.data(), tmp_data.size());
+    printf("%d \n", prompt_data.size());
+
     if (prompt != "")
     {
-        auto output = lLaMa.Run(prompt_complete(prompt, attr.tokenizer_type));
+        auto output = lLaMa.Run(prompt_data);
         if (!b_live_print)
             printf("%s\n", output.c_str());
     }
@@ -116,25 +124,25 @@ int main(int argc, char *argv[])
         // lLaMa.Reset();
     }
 
-    while (b_continue)
-    {
-        printf(">> ");
-        fflush(stdout);
-        std::string input;
-        std::getline(std::cin, input);
-        if (input == "q")
-        {
-            break;
-        }
-        if (input == "")
-        {
-            continue;
-        }
+    // while (b_continue)
+    // {
+    //     printf(">> ");
+    //     fflush(stdout);
+    //     std::string input;
+    //     std::getline(std::cin, input);
+    //     if (input == "q")
+    //     {
+    //         break;
+    //     }
+    //     if (input == "")
+    //     {
+    //         continue;
+    //     }
 
-        auto output = lLaMa.Run(prompt_complete(input, attr.tokenizer_type));
-        if (!b_live_print)
-            printf("%s\n", output.c_str());
-    }
+    //     auto output = lLaMa.Run(prompt_complete(input, attr.tokenizer_type));
+    //     if (!b_live_print)
+    //         printf("%s\n", output.c_str());
+    // }
 
     lLaMa.Deinit();
 
