@@ -1,0 +1,16 @@
+./main_test \
+--template_filename_axmodel "minicpmv/axmodel/minicpm_l%d.axmodel" \
+--axmodel_num 40 \
+--template_prefill_filename_axmodel "minicpmv/prefill_axmodel/minicpm_p96_l%d.axmodel" \
+--filename_vpm_resampler_axmodedl "minicpmv/vpm_resampler_version0_bf16.axmodel" \
+--prefill_axmodel_num 40 \
+--tokenizer_type 2 \
+--bos 0 --eos 0 \
+--filename_tokenizer_model http://10.126.33.167:12345 \
+--filename_post_axmodel minicpmv/axmodel/minicpm_post.axmodel \
+--filename_tokens_embed minicpmv/axmodel/model.embed_tokens.weight.bf16.bin \
+--tokens_embed_num 122753 \
+--tokens_embed_size 2304 \
+--live_print 1 \
+--continue 1 \
+--prompt "$1" --image "$2"

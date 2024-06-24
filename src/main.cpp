@@ -4,6 +4,8 @@
 
 #include "cmdline.hpp"
 
+#include <opencv2/opencv.hpp>
+
 static LLM lLaMa;
 
 void __sigExit(int iSigNo)
@@ -14,7 +16,7 @@ void __sigExit(int iSigNo)
 
 void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
 {
-    fprintf(stdout, "%s", p_str);
+    fprintf(stdout, "%s ", p_str);
     fflush(stdout);
 }
 
@@ -53,12 +55,17 @@ int main(int argc, char *argv[])
 
     cmdline::parser cmd;
     cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
+    cmd.add<std::string>("image", 'i', "image", true);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
-    cmd.add<std::string>("template_prefill_filename_axmodel", 0, "axmodel path template", true, attr.template_prefill_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3", false, attr.tokenizer_type);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
+
+    cmd.add<std::string>("template_prefill_filename_axmodel", 0, "axmodel path template", true, attr.template_prefill_filename_axmodel);
+    cmd.add<std::string>("filename_vpm_resampler_axmodedl", 0, "vpm resampler axmodel path", false, attr.filename_vpm_resampler_axmodedl);
+    cmd.add<int>("vpm_width", 0, "vpm width", false, attr.vpm_width);
+    cmd.add<int>("vpm_height", 0, "vpm height", false, attr.vpm_height);
 
     cmd.add<bool>("bos", 0, "", false, attr.b_bos);
     cmd.add<bool>("eos", 0, "", false, attr.b_eos);
@@ -77,11 +84,16 @@ int main(int argc, char *argv[])
     cmd.parse_check(argc, argv);
 
     prompt = cmd.get<std::string>("prompt");
+    auto image_prompt = cmd.get<std::string>("image");
     attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
     attr.filename_tokenizer_model = cmd.get<std::string>("filename_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
+    attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
+    attr.filename_vpm_resampler_axmodedl = cmd.get<std::string>("filename_vpm_resampler_axmodedl");
+    attr.vpm_width = cmd.get<int>("vpm_width");
+    attr.vpm_height = cmd.get<int>("vpm_height");
     attr.b_bos = cmd.get<bool>("bos");
     attr.b_eos = cmd.get<bool>("eos");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
@@ -108,7 +120,21 @@ int main(int argc, char *argv[])
     read_file(prompt, tmp_data);
     std::vector<unsigned short> prompt_data(tmp_data.size() / 2);
     memcpy(prompt_data.data(), tmp_data.data(), tmp_data.size());
-    printf("%d \n", prompt_data.size());
+    // printf("%d \n", prompt_data.size());
+
+    if (image_prompt != "")
+    {
+        cv::Mat src = cv::imread(image_prompt, cv::IMREAD_COLOR);
+        if (src.empty())
+        {
+            printf("Can not load image %s \n", image_prompt.c_str());
+            return -1;
+        }
+        std::vector<unsigned short> _tmp_data;
+        lLaMa.RunVpm(src, _tmp_data);
+        // printf("%d \n", _tmp_data.size());
+        memcpy(prompt_data.data() + 5 * attr.tokens_embed_size, _tmp_data.data(), _tmp_data.size() * sizeof(unsigned short));
+    }
 
     if (prompt != "")
     {

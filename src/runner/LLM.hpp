@@ -10,6 +10,7 @@
 #include "ax_cmm_utils.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
+#include "opencv2/opencv.hpp"
 
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 
@@ -23,6 +24,10 @@ struct LLMAttrType
     int prefill_feat_pad_num = 96;
 
     std::string filename_post_axmodel = "tinyllama-int8/tinyllama_post.axmodel";
+
+    std::string filename_vpm_resampler_axmodedl = "minicpmv/vpm_resampler_version0_fp16.axmodel";
+    int vpm_width = 280;
+    int vpm_height = 280;
 
     TokenizerType tokenizer_type = TKT_LLaMa;
     std::string filename_tokenizer_model = "tokenizer.model";
@@ -65,6 +70,8 @@ private:
     std::vector<LLMLayer> llama_layers, prefill_layers;
     ax_runner_ax650 llama_post;
 
+    ax_runner_ax650 vpm_resampler;
+
     // std::vector<std::vector<unsigned short>> k_caches, v_caches;
 
     bool b_stop = false;
@@ -73,7 +80,7 @@ public:
     bool Init(LLMAttrType attr)
     {
         ALOGI("LLM init start");
-        t_cqdm cqdm = create_cqdm(attr.axmodel_num + attr.prefill_axmodel_num + 3, 32);
+        t_cqdm cqdm = create_cqdm(attr.axmodel_num + attr.prefill_axmodel_num + 4, 32);
         this->_attr = attr;
         tokenizer = CreateTokenizer(attr.tokenizer_type);
         if (!tokenizer->Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
@@ -196,7 +203,19 @@ public:
             ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str());
             return false;
         }
-        update_cqdm(&cqdm, attr.axmodel_num + attr.prefill_axmodel_num + 2, "count", "init post axmodel ok\n");
+        int remain_cmm = get_remaining_cmm_size();
+        sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
+        update_cqdm(&cqdm, attr.axmodel_num + attr.prefill_axmodel_num + 2, "count", axmodel_path);
+
+        ret = vpm_resampler.init(attr.filename_vpm_resampler_axmodedl.c_str(), false);
+        if (ret != 0)
+        {
+            ALOGE("init vpm axmodel(%s) failed", attr.filename_vpm_resampler_axmodedl.c_str());
+            return false;
+        }
+        remain_cmm = get_remaining_cmm_size();
+        sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
+        update_cqdm(&cqdm, attr.axmodel_num + attr.prefill_axmodel_num + 3, "count", axmodel_path);
 
         if (attr.b_dynamic_load_axmodel_layer)
         {
@@ -266,6 +285,45 @@ public:
     void Stop()
     {
         b_stop = true;
+    }
+
+    int RunVpm(cv::Mat src, std::vector<unsigned short> &out_embed)
+    {
+        if (src.empty())
+        {
+            return -1;
+        }
+
+        cv::Mat dst;
+        cv::resize(src, dst, cv::Size(_attr.vpm_width, _attr.vpm_height), 0, 0, cv::INTER_LINEAR);
+        cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
+
+        void *data = vpm_resampler.get_input("input").pVirAddr;
+        memcpy(data, dst.data, dst.rows * dst.cols * 3);
+
+        static bool isfirst = true;
+        if (isfirst)
+        {
+            std::vector<int> pos_embed_ids(400, 0);
+            int pos = 0;
+            for (int i = 0; i < 20; i++)
+            {
+                for (int j = 0; j < 20; j++)
+                {
+                    pos_embed_ids[pos++] = i * 70 + j;
+                }
+            }
+            memcpy(vpm_resampler.get_input("pos_embed_ids").pVirAddr, pos_embed_ids.data(), 400 * sizeof(int));
+
+            isfirst = false;
+        }
+
+        vpm_resampler.inference();
+
+        out_embed.resize(vpm_resampler.get_output("output").nSize / sizeof(unsigned short));
+        memcpy(out_embed.data(), vpm_resampler.get_output("output").pVirAddr, vpm_resampler.get_output("output").nSize);
+
+        return 0;
     }
 
     std::string Run(std::vector<unsigned short> &test_embed)

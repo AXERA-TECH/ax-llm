@@ -53,6 +53,14 @@ include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
 
+if(NOT OpenCV_DIR)
+    set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/third_party/libopencv-4.6-aarch64-none/lib/cmake/opencv4)
+endif()
+
+message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
+find_package(OpenCV REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
+
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
                     src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
@@ -63,6 +71,7 @@ function(build_exec name main_source)
 
     target_link_libraries(${name} ax_engine ax_interpreter ax_sys ax_ivps)
     target_link_libraries(${name} sentencepiece re2::re2)
+    target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 
