@@ -16,7 +16,7 @@ void __sigExit(int iSigNo)
 
 void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
 {
-    fprintf(stdout, "%s ", p_str);
+    fprintf(stdout, "%s", p_str);
     fflush(stdout);
 }
 
@@ -91,6 +91,7 @@ int main(int argc, char *argv[])
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
     attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
+    attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
     attr.filename_vpm_resampler_axmodedl = cmd.get<std::string>("filename_vpm_resampler_axmodedl");
     attr.vpm_width = cmd.get<int>("vpm_width");
     attr.vpm_height = cmd.get<int>("vpm_height");

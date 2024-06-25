@@ -20,6 +20,7 @@ class MainWindow : public QMainWindow
 signals:
     void sig_llm_output(QString str);
     void sig_enable_controls(bool enable);
+
 public:
     MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
@@ -35,17 +36,15 @@ private slots:
 
 private slots:
     void on_btn_ask_clicked();
-    void resizeEvent(QResizeEvent *event) override;
-
-    void on_txt_msg_returnPressed();
 
     void on_llm_output(QString str);
     void on_enable_controls(bool b_enable);
 
 private:
     Ui::MainWindow *ui;
-    QVBoxLayout *m_vBoxLayout;
-    QVector<QTextEdit *> m_textedit_input_vec, m_textedit_output_vec;
     LLM m_llm;
+
+public:
+    std::vector<unsigned short> m_data_en, m_data_zh;
 };
 #endif // MAINWINDOW_H

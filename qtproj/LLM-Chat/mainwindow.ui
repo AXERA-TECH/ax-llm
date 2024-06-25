@@ -33,36 +33,35 @@
          </property>
          <layout class="QGridLayout" name="gridLayout_3">
           <item row="0" column="0">
-           <widget class="QWidget" name="widget" native="true"/>
+           <widget class="QWidget" name="widget" native="true">
+            <layout class="QGridLayout" name="gridLayout_2">
+             <item row="0" column="0">
+              <layout class="QHBoxLayout" name="horizontalLayout_2">
+               <item>
+                <widget class="myQLabel" name="lab_img">
+                 <property name="text">
+                  <string>TextLabel</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="txt_out">
+                 <property name="text">
+                  <string>TextLabel</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+            </layout>
+           </widget>
           </item>
          </layout>
         </widget>
        </widget>
       </item>
       <item>
-       <layout class="QHBoxLayout" name="horizontalLayout" stretch="0,1,0">
-        <item>
-         <widget class="QLineEdit" name="txt_msg">
-          <property name="minimumSize">
-           <size>
-            <width>0</width>
-            <height>60</height>
-           </size>
-          </property>
-          <property name="font">
-           <font>
-            <pointsize>18</pointsize>
-           </font>
-          </property>
-          <property name="styleSheet">
-           <string notr="true">border-radius: 20px;
-background-color: rgb(99, 122, 125);</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-        </item>
+       <layout class="QHBoxLayout" name="horizontalLayout" stretch="0,0,0,0">
         <item>
          <widget class="QPushButton" name="btn_ask">
           <property name="minimumSize">
@@ -101,7 +100,7 @@ QPushButton:pressed, QPushButton:checked {
 }</string>
           </property>
           <property name="text">
-           <string>Ask</string>
+           <string>Select Image</string>
           </property>
          </widget>
         </item>
@@ -147,6 +146,31 @@ QPushButton:pressed, QPushButton:checked {
           </property>
          </widget>
         </item>
+        <item>
+         <widget class="QCheckBox" name="ckbox_chinese">
+          <property name="font">
+           <font>
+            <pointsize>14</pointsize>
+           </font>
+          </property>
+          <property name="text">
+           <string>中文输出</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <spacer name="horizontalSpacer">
+          <property name="orientation">
+           <enum>Qt::Horizontal</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>40</width>
+            <height>20</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
        </layout>
       </item>
      </layout>
@@ -154,6 +178,13 @@ QPushButton:pressed, QPushButton:checked {
    </layout>
   </widget>
  </widget>
+ <customwidgets>
+  <customwidget>
+   <class>myQLabel</class>
+   <extends>QLabel</extends>
+   <header location="global">myqlabel.h</header>
+  </customwidget>
+ </customwidgets>
  <resources/>
  <connections/>
 </ui>

@@ -38,6 +38,14 @@ message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
 include_directories(${BSP_MSP_DIR}/include)
 link_directories(${BSP_MSP_DIR}/lib)
 
+if(NOT OpenCV_DIR)
+    set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/third_party/libopencv-4.6-aarch64-none/lib/cmake/opencv4)
+endif()
+
+message(STATUS "OpenCV_DIR Path: ${OpenCV_DIR}")
+find_package(OpenCV REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
+
 add_library(axllm STATIC 
     src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
     src/runner/utils/memory_utils.cpp 
@@ -65,6 +73,7 @@ add_executable(LLM-Chat
   main.cpp
   mainwindow.cpp
   mainwindow.h
+  myqlabel.h
   mainwindow.ui
   style/DarkStyle.cpp
 )
@@ -73,3 +82,4 @@ target_link_libraries(LLM-Chat PRIVATE ${QTWidget})
 target_link_libraries(LLM-Chat PRIVATE axllm)
 target_link_libraries(LLM-Chat PRIVATE ax_engine ax_interpreter ax_sys ax_ivps)
 target_link_libraries(LLM-Chat PRIVATE sentencepiece re2::re2)
+target_link_libraries(LLM-Chat PRIVATE ${OpenCV_LIBS})
