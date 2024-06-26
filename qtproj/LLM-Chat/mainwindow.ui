@@ -11,7 +11,10 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>MainWindow</string>
+   <string>MiniCPM-V</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">background-color: rgb(53,53,53);</string>
   </property>
   <widget class="QWidget" name="centralwidget">
    <layout class="QGridLayout" name="gridLayout">
@@ -36,18 +39,27 @@
            <widget class="QWidget" name="widget" native="true">
             <layout class="QGridLayout" name="gridLayout_2">
              <item row="0" column="0">
-              <layout class="QHBoxLayout" name="horizontalLayout_2">
+              <layout class="QHBoxLayout" name="horizontalLayout_2" stretch="1,1">
                <item>
                 <widget class="myQLabel" name="lab_img">
                  <property name="text">
-                  <string>TextLabel</string>
+                  <string/>
                  </property>
                 </widget>
                </item>
                <item>
                 <widget class="QLabel" name="txt_out">
+                 <property name="font">
+                  <font>
+                   <family>DejaVu Sans</family>
+                   <pointsize>14</pointsize>
+                  </font>
+                 </property>
                  <property name="text">
-                  <string>TextLabel</string>
+                  <string/>
+                 </property>
+                 <property name="wordWrap">
+                  <bool>true</bool>
                  </property>
                 </widget>
                </item>

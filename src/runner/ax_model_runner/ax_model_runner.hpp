@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <stdexcept>
 
 typedef enum _color_space_e
 {
@@ -51,6 +52,7 @@ public:
 
     virtual void deinit() = 0;
 
+    int get_num_inputs() { return minput_tensors.size(); };
     int get_num_outputs() { return mtensors.size(); };
 
     const ax_runner_tensor_t &get_input(int idx) { return minput_tensors[idx]; }

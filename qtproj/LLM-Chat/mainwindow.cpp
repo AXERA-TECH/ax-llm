@@ -49,19 +49,21 @@ void MainWindow::append_textedit(const char *p_str)
 
 void MainWindow::on_llm_output(QString str)
 {
-    if (ui->ckbox_chinese.isChecked())
+    if (ui->ckbox_chinese->isChecked())
     {
         if (str.endsWith("奖品"))
         {
             m_llm.Stop();
             str = str.replace("奖品", "");
+            str+=".";
         }
     }
     else
     {
         str += " ";
     }
-    ui->txt_out->append(str);
+    auto ss = ui->txt_out->text().append(str);
+    ui->txt_out->setText(ss);
     printf("%s", str.toStdString().c_str());
     fflush(stdout);
 }
@@ -84,13 +86,14 @@ void MainWindow::on_btn_ask_clicked()
     {
         return;
     }
+    ui->txt_out->clear();
     QImage img(filename);
     ui->lab_img->SetImage(img);
     cv::Mat src = cv::imread(filename.toStdString());
     std::vector<unsigned short> out_embed;
     m_llm.RunVpm(src, out_embed);
 
-    if (ui->ckbox_chinese.isChecked())
+    if (ui->ckbox_chinese->isChecked())
     {
         memcpy(m_data_zh.data() + 5 * m_llm.getAttr()->tokens_embed_size, out_embed.data(), out_embed.size() * sizeof(unsigned short));
 

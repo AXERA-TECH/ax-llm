@@ -326,7 +326,7 @@ public:
         return 0;
     }
 
-    std::string Run(std::vector<unsigned short> &test_embed)
+    std::string Run(std::vector<unsigned short> test_embed)
     {
         b_stop = false;
         std::string final_out;
@@ -364,6 +364,15 @@ public:
 
             auto &layer = prefill_layers[m];
             auto &layer_llama = llama_layers[m];
+//            for(unsigned int j=0;j<layer.layer.get_num_inputs();j++)
+//            {
+//                memset(layer.layer.get_input(j).pVirAddr,0,layer.layer.get_input(j).nSize);
+//            }
+
+//            for(unsigned int j=0;j<layer_llama.layer.get_num_inputs();j++)
+//            {
+//                memset(layer_llama.layer.get_input(j).pVirAddr,0,layer_llama.layer.get_input(j).nSize);
+//            }
 
             if (_attr.b_dynamic_load_axmodel_layer)
             {

@@ -22,7 +22,7 @@ int main(int argc, char *argv[])
         cmdline::parser cmd;
 
         cmd.add<std::string>("data_en", 0, "", false);
-        cmd.add<std::string>("data_zn", 0, "", false);
+        cmd.add<std::string>("data_zh", 0, "", false);
 
         cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
         cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
@@ -80,7 +80,7 @@ int main(int argc, char *argv[])
         std::vector<unsigned short> en_data(tmp_data.size() / 2);
         memcpy(en_data.data(), tmp_data.data(), tmp_data.size());
 
-        read_file(cmd.get<std::string>("data_zn"), tmp_data);
+        read_file(cmd.get<std::string>("data_zh"), tmp_data);
         std::vector<unsigned short> zn_data(tmp_data.size() / 2);
         memcpy(zn_data.data(), tmp_data.data(), tmp_data.size());
 
