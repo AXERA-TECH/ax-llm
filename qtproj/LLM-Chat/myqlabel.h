@@ -60,7 +60,7 @@ public:
 
     void SetImage(QImage img)
     {
-        cur_image = img;
+        cur_image = img.copy();
         repaint();
     }
 };

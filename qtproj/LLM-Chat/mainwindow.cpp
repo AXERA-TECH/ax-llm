@@ -49,13 +49,13 @@ void MainWindow::append_textedit(const char *p_str)
 
 void MainWindow::on_llm_output(QString str)
 {
-    if (ui->ckbox_chinese->isChecked())
+    if (ui->ck_ch->isChecked())
     {
         if (str.endsWith("奖品"))
         {
             m_llm.Stop();
             str = str.replace("奖品", "");
-            str+=".";
+            str += "。";
         }
     }
     else
@@ -76,7 +76,8 @@ void MainWindow::enable_controls(bool b_enable)
 void MainWindow::on_enable_controls(bool b_enable)
 {
     ui->btn_ask->setEnabled(b_enable);
-    ui->ckbox_chinese->setEnabled(b_enable);
+    ui->ck_ch->setEnabled(b_enable);
+    ui->ck_en->setEnabled(b_enable);
 }
 
 void MainWindow::on_btn_ask_clicked()
@@ -87,13 +88,13 @@ void MainWindow::on_btn_ask_clicked()
         return;
     }
     ui->txt_out->clear();
-    QImage img(filename);
-    ui->lab_img->SetImage(img);
     cv::Mat src = cv::imread(filename.toStdString());
+    QImage img(src.data, src.cols, src.rows, src.step1(), QImage::Format::Format_BGR888);
+    ui->lab_img->SetImage(img);
     std::vector<unsigned short> out_embed;
     m_llm.RunVpm(src, out_embed);
 
-    if (ui->ckbox_chinese->isChecked())
+    if (ui->ck_ch->isChecked())
     {
         memcpy(m_data_zh.data() + 5 * m_llm.getAttr()->tokens_embed_size, out_embed.data(), out_embed.size() * sizeof(unsigned short));
 
@@ -114,3 +115,11 @@ void MainWindow::on_btn_stop_clicked()
 {
     m_llm.Stop();
 }
+
+void MainWindow::on_horizontalSlider_valueChanged(int value)
+{
+    auto font = ui->txt_out->font();
+    font.setPointSize(value);
+    ui->txt_out->setFont(font);
+}
+

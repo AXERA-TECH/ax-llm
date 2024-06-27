@@ -40,6 +40,8 @@ private slots:
     void on_llm_output(QString str);
     void on_enable_controls(bool b_enable);
 
+    void on_horizontalSlider_valueChanged(int value);
+
 private:
     Ui::MainWindow *ui;
     LLM m_llm;
