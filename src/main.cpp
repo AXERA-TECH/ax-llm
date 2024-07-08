@@ -14,9 +14,17 @@ void __sigExit(int iSigNo)
     return;
 }
 
+timer ttft;
+bool is_ttft = true;
+
 void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
 {
-    fprintf(stdout, "%s", p_str);
+    if (is_ttft)
+    {
+        is_ttft = false;
+        // ALOGI("ttft: %.2f s", ttft.cost() / 1000);
+    }
+    fprintf(stdout, "%s ", p_str);
     fflush(stdout);
 }
 
@@ -117,29 +125,31 @@ int main(int argc, char *argv[])
     {
         return -1;
     }
-    std::vector<char> tmp_data;
-    read_file(prompt, tmp_data);
-    std::vector<unsigned short> prompt_data(tmp_data.size() / 2);
-    memcpy(prompt_data.data(), tmp_data.data(), tmp_data.size());
-    // printf("%d \n", prompt_data.size());
 
-    if (image_prompt != "")
-    {
-        cv::Mat src = cv::imread(image_prompt, cv::IMREAD_COLOR);
-        if (src.empty())
-        {
-            printf("Can not load image %s \n", image_prompt.c_str());
-            return -1;
-        }
-        std::vector<unsigned short> _tmp_data;
-        lLaMa.RunVpm(src, _tmp_data);
-        // printf("%d \n", _tmp_data.size());
-        memcpy(prompt_data.data() + 5 * attr.tokens_embed_size, _tmp_data.data(), _tmp_data.size() * sizeof(unsigned short));
-    }
+    std::vector<unsigned short> prompt_data;
+
+    //     std::vector<unsigned short> _tmp_data;
+    //     lLaMa.RunVpm(src, _tmp_data);
+    //     // printf("%d \n", _tmp_data.size());
+    //     memcpy(prompt_data.data() + 5 * attr.tokens_embed_size, _tmp_data.data(), _tmp_data.size() * sizeof(unsigned short));
+    // }
 
     if (prompt != "")
     {
-        auto output = lLaMa.Run(prompt_data);
+        std::string output;
+        cv::Mat src = cv::imread(image_prompt, cv::IMREAD_COLOR);
+        ttft.start();
+        is_ttft = true;
+        if (src.empty())
+        {
+            output = lLaMa.Run(prompt);
+        }
+        else
+        {
+            lLaMa.Encode(src, prompt_data, prompt);
+            output = lLaMa.Run(prompt_data);
+        }
+
         if (!b_live_print)
             printf("%s\n", output.c_str());
     }
@@ -151,25 +161,49 @@ int main(int argc, char *argv[])
         // lLaMa.Reset();
     }
 
-    // while (b_continue)
-    // {
-    //     printf(">> ");
-    //     fflush(stdout);
-    //     std::string input;
-    //     std::getline(std::cin, input);
-    //     if (input == "q")
-    //     {
-    //         break;
-    //     }
-    //     if (input == "")
-    //     {
-    //         continue;
-    //     }
+    while (b_continue)
+    {
+        printf("prompt >> ");
+        fflush(stdout);
+        std::getline(std::cin, prompt);
+        if (prompt == "q")
+        {
+            break;
+        }
+        if (prompt == "")
+        {
+            continue;
+        }
 
-    //     auto output = lLaMa.Run(prompt_complete(input, attr.tokenizer_type));
-    //     if (!b_live_print)
-    //         printf("%s\n", output.c_str());
-    // }
+        printf("image >> ");
+        fflush(stdout);
+        std::getline(std::cin, image_prompt);
+        std::string output;
+        if (image_prompt == "")
+        {
+            ttft.start();
+            is_ttft = true;
+            output = lLaMa.Run(prompt);
+        }
+        else
+        {
+            cv::Mat src = cv::imread(image_prompt, cv::IMREAD_COLOR);
+            ttft.start();
+            is_ttft = true;
+            if (src.empty())
+            {
+                output = lLaMa.Run(prompt);
+            }
+            else
+            {
+                lLaMa.Encode(src, prompt_data, prompt);
+                output = lLaMa.Run(prompt_data);
+            }
+        }
+
+        if (!b_live_print)
+            printf("%s\n", output.c_str());
+    }
 
     lLaMa.Deinit();
 

@@ -82,6 +82,25 @@ public:
         }
     }
 
+    void getByIndex(unsigned int index, unsigned short *embed)
+    {
+        if (index >= _token_num)
+        {
+            ALOGE("index(%d) > token_num(%d)", index, _token_num);
+            return;
+        }
+        
+        if (_use_mmap)
+        {
+            unsigned short *ptr = (unsigned short *)_embed_map.data();
+            memcpy(embed, ptr + index * _embed_size, _embed_size * sizeof(unsigned short));
+        }
+        else
+        {
+            memcpy(embed, _embeds.data() + index * _embed_size, _embed_size * sizeof(unsigned short));
+        }
+    }
+
     std::vector<unsigned short> getByIndex(unsigned int index)
     {
         std::vector<unsigned short> embed;

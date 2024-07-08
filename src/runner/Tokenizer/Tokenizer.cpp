@@ -36,7 +36,7 @@ public:
         return ret.ok();
     }
 
-    bool Encode(std::string input, std::vector<int> &output) override
+    bool Encode(std::string input, std::vector<int> &output, bool b_img_prompt = false) override
     {
         auto ret = sp.Encode(input, &output);
         if (!ret.ok())
@@ -55,10 +55,10 @@ public:
         return true;
     }
 
-    std::vector<int> Encode(std::string input) override
+    std::vector<int> Encode(std::string input, bool b_img_prompt = false) override
     {
         std::vector<int> output;
-        Encode(input, output);
+        Encode(input, output, b_img_prompt);
         return output;
     }
 
@@ -110,7 +110,7 @@ public:
         return ret.ok();
     }
 
-    bool Encode(std::string input, std::vector<int> &output) override
+    bool Encode(std::string input, std::vector<int> &output, bool b_img_prompt = false) override
     {
         auto ret = sp.Encode(input, &output);
         if (!ret.ok())
@@ -119,8 +119,8 @@ public:
             return false;
         }
         output.insert(output.begin(), 32010); //"<|user|>"
-        output.push_back(32007); //"<|end|>"
-        output.push_back(32001); //"<|assistant|>"
+        output.push_back(32007);              //"<|end|>"
+        output.push_back(32001);              //"<|assistant|>"
         if (_b_bos)
         {
             output.insert(output.begin(), sp.bos_id());
@@ -132,10 +132,10 @@ public:
         return true;
     }
 
-    std::vector<int> Encode(std::string input) override
+    std::vector<int> Encode(std::string input, bool b_img_prompt = false) override
     {
         std::vector<int> output;
-        Encode(input, output);
+        Encode(input, output, b_img_prompt);
         return output;
     }
 
@@ -193,7 +193,7 @@ public:
         return true;
     }
 
-    bool Encode(std::string input, std::vector<int> &output) override
+    bool Encode(std::string input, std::vector<int> &output, bool b_img_prompt = false) override
     {
         if (_b_bos)
         {
@@ -208,10 +208,10 @@ public:
         return true;
     }
 
-    std::vector<int> Encode(std::string input) override
+    std::vector<int> Encode(std::string input, bool b_img_prompt = false) override
     {
         std::vector<int> output;
-        Encode(input, output);
+        Encode(input, output, b_img_prompt);
         return output;
     }
 
@@ -352,10 +352,11 @@ public:
         return true;
     }
 
-    bool Encode(std::string input, std::vector<int> &output) override
+    bool Encode(std::string input, std::vector<int> &output, bool b_img_prompt = false) override
     {
         nlohmann::json j;
         j["text"] = input;
+        j["img_prompt"] = b_img_prompt;
         auto ret = cli->Post("/encode", j.dump(), "application/json");
         auto rep = ret.value();
         if (rep.status != 200)
@@ -390,10 +391,10 @@ public:
         return true;
     }
 
-    std::vector<int> Encode(std::string input) override
+    std::vector<int> Encode(std::string input, bool b_img_prompt = false) override
     {
         std::vector<int> output;
-        Encode(input, output);
+        Encode(input, output, b_img_prompt);
         return output;
     }
 
