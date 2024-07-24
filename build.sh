@@ -50,6 +50,6 @@ if [ $? -ne 0 ]; then
 fi
 
 # 开始编译
-cmake -DBSP_MSP_DIR=${BSP_MSP_DIR} -DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-none-linux-gnu.toolchain.cmake ..
+cmake -DBSP_MSP_DIR=${BSP_MSP_DIR} -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-none-linux-gnu.toolchain.cmake ..
 make -j16
 make install
