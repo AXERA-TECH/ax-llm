@@ -45,6 +45,8 @@ std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
 }
 int main(int argc, char *argv[])
 {
+    // print build time
+    printf("build time: %s %s\n", __DATE__, __TIME__);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, __sigExit);
     LLMAttrType attr;

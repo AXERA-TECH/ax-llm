@@ -53,15 +53,22 @@ include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
 
+include_directories(axcl/include)
+link_directories(axcl/lib)
+
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
                     src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
+                    src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
                     src/runner/Tokenizer/QwenTokenizer.cpp)
 
     target_link_libraries(${name} ax_engine ax_interpreter ax_sys ax_ivps)
+    
+    target_link_libraries(${name} ax_message ax_pcie_dma ax_pcie_msg axcl_runtime)
+
     target_link_libraries(${name} sentencepiece re2::re2)
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
@@ -76,3 +83,12 @@ file(GLOB LLAMA3_TOKENIZER "${CMAKE_SOURCE_DIR}/scripts/llama3_tokenizer/*")
 install(FILES ${LLAMA3_TOKENIZER} DESTINATION bin/llama3_tokenizer/)
 
 # add_executable(fp32_to_bf16 tools/fp32_to_bf16.cpp)
+
+set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/../3rdparty/libopencv-4.5.5-aarch64/lib/cmake/opencv4)
+find_package(OpenCV REQUIRED)
+
+add_executable(main_yolov5 src/main_yolov5.cpp src/runner/ax_model_runner/ax_model_runner_ax650.cpp src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp src/runner/utils/memory_utils.cpp)
+target_include_directories(main_yolov5 PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(main_yolov5 PRIVATE ${OpenCV_LIBS})
+target_link_libraries(main_yolov5 PRIVATE ax_message ax_pcie_dma ax_pcie_msg axcl_runtime)
+target_link_libraries(main_yolov5 PRIVATE ax_engine ax_interpreter ax_sys ax_ivps)

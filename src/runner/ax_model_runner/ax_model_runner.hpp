@@ -32,7 +32,7 @@ typedef struct
     unsigned int nIdx;
     std::vector<unsigned int> vShape;
     int nSize;
-    unsigned long phyAddr;
+    unsigned long long phyAddr;
     void *pVirAddr;
 } ax_runner_tensor_t;
 
