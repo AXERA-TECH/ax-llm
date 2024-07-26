@@ -7,7 +7,7 @@
 #include "Tokenizer/Tokenizer.hpp"
 #include "LLMEmbedSelector.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
-#include "ax_model_runner/ax_model_runner_ax650_host.hpp"
+
 #include "ax_cmm_utils.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
@@ -15,6 +15,10 @@
 #include "axcl/rt/axcl_rt_memory.h"
 
 #define HOST_DEBUG 0
+
+#if HOST_DEBUG
+#include "ax_model_runner/ax_model_runner_ax650_host.hpp"
+#endif
 
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 

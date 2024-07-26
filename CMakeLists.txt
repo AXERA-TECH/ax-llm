@@ -20,18 +20,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 
 # bsp
-if(NOT BSP_MSP_DIR)
-    # 判断 /soc/lib/libax_engine.so 是否存在，以确定是否为板端编译
-    if(EXISTS /soc/lib/libax_engine.so)
-        message(STATUS "Detected board,BSP_MSP_DIR = /soc")
-        set(BSP_MSP_DIR /soc)
-    else()
-        set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
-    endif()
-endif()
-message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
-include_directories(${BSP_MSP_DIR}/include)
-link_directories(${BSP_MSP_DIR}/lib)
+# if(NOT BSP_MSP_DIR)
+#     # 判断 /soc/lib/libax_engine.so 是否存在，以确定是否为板端编译
+#     if(EXISTS /soc/lib/libax_engine.so)
+#         message(STATUS "Detected board,BSP_MSP_DIR = /soc")
+#         set(BSP_MSP_DIR /soc)
+#     else()
+#         set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
+#     endif()
+# endif()
+# message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
+# include_directories(${BSP_MSP_DIR}/include)
+# link_directories(${BSP_MSP_DIR}/lib)
 
 set(SPM_ENABLE_SHARED OFF)
 add_subdirectory(third_party/sentencepiece)
@@ -59,13 +59,13 @@ link_directories(axcl/lib)
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
                     src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
-                    src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
+                    # src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
                     src/runner/Tokenizer/QwenTokenizer.cpp)
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys ax_ivps)
+    # target_link_libraries(${name} ax_engine ax_interpreter ax_sys ax_ivps)
     
     target_link_libraries(${name} ax_message ax_pcie_dma ax_pcie_msg axcl_runtime)
 
@@ -84,11 +84,11 @@ install(FILES ${LLAMA3_TOKENIZER} DESTINATION bin/llama3_tokenizer/)
 
 # add_executable(fp32_to_bf16 tools/fp32_to_bf16.cpp)
 
-set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/../3rdparty/libopencv-4.5.5-aarch64/lib/cmake/opencv4)
-find_package(OpenCV REQUIRED)
+# set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/../3rdparty/libopencv-4.5.5-aarch64/lib/cmake/opencv4)
+# find_package(OpenCV REQUIRED)
 
-add_executable(main_yolov5 src/main_yolov5.cpp src/runner/ax_model_runner/ax_model_runner_ax650.cpp src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp src/runner/utils/memory_utils.cpp)
-target_include_directories(main_yolov5 PRIVATE ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(main_yolov5 PRIVATE ${OpenCV_LIBS})
-target_link_libraries(main_yolov5 PRIVATE ax_message ax_pcie_dma ax_pcie_msg axcl_runtime)
-target_link_libraries(main_yolov5 PRIVATE ax_engine ax_interpreter ax_sys ax_ivps)
+# add_executable(main_yolov5 src/main_yolov5.cpp src/runner/ax_model_runner/ax_model_runner_ax650.cpp src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp src/runner/utils/memory_utils.cpp)
+# target_include_directories(main_yolov5 PRIVATE ${OpenCV_INCLUDE_DIRS})
+# target_link_libraries(main_yolov5 PRIVATE ${OpenCV_LIBS})
+# target_link_libraries(main_yolov5 PRIVATE ax_message ax_pcie_dma ax_pcie_msg axcl_runtime)
+# target_link_libraries(main_yolov5 PRIVATE ax_engine ax_interpreter ax_sys ax_ivps)
