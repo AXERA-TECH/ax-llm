@@ -21,6 +21,9 @@ public:
     int get_algo_height() override;
     ax_color_space_e get_color_space() override;
 
+    int set_input(int idx, unsigned long long int phy_addr, unsigned long size);
+    int set_output(int idx, unsigned long long int phy_addr, unsigned long size);
+
     int inference(ax_image_t *pstFrame) override;
     int inference() override;
 };

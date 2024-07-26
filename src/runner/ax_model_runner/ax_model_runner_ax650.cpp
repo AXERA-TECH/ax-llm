@@ -433,6 +433,16 @@ void ax_runner_ax650::deinit()
 
 int ax_runner_ax650::get_algo_width() { return -1; }
 int ax_runner_ax650::get_algo_height() { return -1; }
+
+int ax_runner_ax650::set_input(int idx, unsigned long long int phy_addr, unsigned long size)
+{
+    return axclrtEngineSetInputBufferByIndex(m_handle->handle, m_handle->context, idx, (void *)phy_addr, size);
+}
+int ax_runner_ax650::set_output(int idx, unsigned long long int phy_addr, unsigned long size)
+{
+    return axclrtEngineSetOutputBufferByIndex(m_handle->handle, m_handle->context, idx, (void *)phy_addr, size);
+}
+
 ax_color_space_e ax_runner_ax650::get_color_space()
 {
     // switch (m_handle->algo_colorformat)

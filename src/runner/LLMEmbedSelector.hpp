@@ -82,6 +82,24 @@ public:
         }
     }
 
+    unsigned short *getPtrByIndex(unsigned int index)
+    {
+        if (index >= _token_num)
+        {
+            ALOGE("index(%d) > token_num(%d)", index, _token_num);
+            return nullptr;
+        }
+        if (_use_mmap)
+        {
+            unsigned short *ptr = (unsigned short *)_embed_map.data();
+            return ptr + index * _embed_size;
+        }
+        else
+        {
+            return _embeds.data() + index * _embed_size;
+        }
+    }
+
     std::vector<unsigned short> getByIndex(unsigned int index)
     {
         std::vector<unsigned short> embed;
