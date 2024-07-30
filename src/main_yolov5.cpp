@@ -2,6 +2,7 @@
 #include "runner/ax_model_runner/ax_model_runner_ax650_host.hpp"
 #include "cmdline.hpp"
 #include "opencv2/opencv.hpp"
+#include <axcl/rt/axcl_rt_memory.h>
 
 typedef struct Object
 {
@@ -325,11 +326,25 @@ int main(int argc, char **argv)
     memcpy(runner.get_input(0).pVirAddr, image.data(), image.size());
 
     // dump input data
-    FILE *fp = fopen("input.bin", "wb");
+    FILE *fp = fopen("tmp/input.bin", "wb");
     fwrite(image.data(), image.size(), 1, fp);
     fclose(fp);
 
+    for (size_t i = 0; i < runner.get_num_inputs(); i++)
+    {
+        axclrtMemcpy(
+            (void *)runner.get_input(i).phyAddr, runner.get_input(i).nSize,
+            (void *)runner.get_input(i).pVirAddr, runner.get_input(i).nSize, AXCL_MEMCPY_HOST_TO_DEVICE);
+    }
+
     runner.inference();
+
+    for (size_t i = 0; i < runner.get_num_outputs(); i++)
+    {
+        axclrtMemcpy(
+            runner.get_output(i).pVirAddr, runner.get_output(i).nSize,
+            (void *)runner.get_output(i).phyAddr, runner.get_output(i).nSize, AXCL_MEMCPY_DEVICE_TO_HOST);
+    }
 
     ax_runner_ax650_host runner_host;
     if (runner_host.init(model_file.c_str()) != 0)
@@ -350,13 +365,13 @@ int main(int argc, char **argv)
         auto ptr_host = (float *)runner_host.get_output(i).pVirAddr;
 
         char str[256] = {0};
-        
-        sprintf(str, "output_slave_%d.bin", i);
+
+        sprintf(str, "tmp/output_slave_%d.bin", i);
         FILE *fp = fopen(str, "wb");
         fwrite(ptr, runner.get_output(i).nSize, 1, fp);
         fclose(fp);
 
-        sprintf(str, "output_host_%d.bin", i);
+        sprintf(str, "tmp/output_host_%d.bin", i);
         FILE *fp_host = fopen(str, "wb");
         fwrite(ptr_host, runner_host.get_output(i).nSize, 1, fp_host);
         fclose(fp_host);

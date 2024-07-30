@@ -129,7 +129,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
     // 1. alloc inputs
     for (int32_t i = 0; i < inputNum; i++)
     {
-        auto bufSize = axclrtEngineGetInputSizeByIndex(io_info, i);
+        auto bufSize = axclrtEngineGetInputSizeByIndex(io_info, 0, i);
         void *devPtr = nullptr;
         axclError ret = 0;
         if (AX_ENGINE_ABST_DEFAULT == strategy.first)
@@ -150,7 +150,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         axclrtMemset(devPtr, bufSize, 0, bufSize);
 
         axclrtEngineIODims dims;
-        ret = axclrtEngineGetInputDims(io_info, i, &dims);
+        ret = axclrtEngineGetInputDims(io_info, 0, i, &dims);
         if (ret != 0)
         {
             free_io_index(io_data->pInputs, i);
@@ -163,7 +163,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         io_data->pInputs[i].pBuf = devPtr;
         io_data->pInputs[i].dims = dims;
         io_data->pInputs[i].Name = axclrtEngineGetInputNameByIndex(io_info, i);
-        ret = axclrtEngineSetInputBufferByIndex(handle, context, i, devPtr, bufSize);
+        ret = axclrtEngineSetInputBufferByIndex(io, i, devPtr, bufSize);
         if (ret != 0)
         {
             free_io_index(io_data->pInputs, i);
@@ -175,7 +175,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
     // 2. alloc outputs
     for (int32_t i = 0; i < outputNum; i++)
     {
-        auto bufSize = axclrtEngineGetOutputSizeByIndex(io_info, i);
+        auto bufSize = axclrtEngineGetOutputSizeByIndex(io_info, 0, i);
         void *devPtr = NULL;
         axclError ret = 0;
         if (AX_ENGINE_ABST_DEFAULT == strategy.first)
@@ -195,7 +195,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         }
         axclrtMemset(devPtr, bufSize, 0, bufSize);
         axclrtEngineIODims dims;
-        ret = axclrtEngineGetOutputDims(io_info, i, &dims);
+        ret = axclrtEngineGetOutputDims(io_info, 0, i, &dims);
         if (ret != 0)
         {
             free_io_index(io_data->pOutputs, i);
@@ -208,7 +208,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         io_data->pOutputs[i].pBuf = devPtr;
         io_data->pOutputs[i].dims = dims;
         io_data->pOutputs[i].Name = axclrtEngineGetOutputNameByIndex(io_info, i);
-        ret = axclrtEngineSetOutputBufferByIndex(handle, context, i, devPtr, bufSize);
+        ret = axclrtEngineSetOutputBufferByIndex(io, i, devPtr, bufSize);
         if (ret != 0)
         {
             free_io_index(io_data->pOutputs, i);
@@ -436,11 +436,11 @@ int ax_runner_ax650::get_algo_height() { return -1; }
 
 int ax_runner_ax650::set_input(int idx, unsigned long long int phy_addr, unsigned long size)
 {
-    return axclrtEngineSetInputBufferByIndex(m_handle->handle, m_handle->context, idx, (void *)phy_addr, size);
+    return axclrtEngineSetInputBufferByIndex(m_handle->io, idx, (void *)phy_addr, size);
 }
 int ax_runner_ax650::set_output(int idx, unsigned long long int phy_addr, unsigned long size)
 {
-    return axclrtEngineSetOutputBufferByIndex(m_handle->handle, m_handle->context, idx, (void *)phy_addr, size);
+    return axclrtEngineSetOutputBufferByIndex(m_handle->io, idx, (void *)phy_addr, size);
 }
 
 ax_color_space_e ax_runner_ax650::get_color_space()
@@ -495,7 +495,7 @@ int ax_runner_ax650::inference()
     //         (void *)minput_tensors[i].phyAddr, minput_tensors[i].nSize,
     //         minput_tensors[i].pVirAddr, minput_tensors[i].nSize, AXCL_MEMCPY_HOST_TO_DEVICE);
     // }
-    auto ret = axclrtEngineExecute(m_handle->handle, m_handle->context);
+    auto ret = axclrtEngineExecute(m_handle->handle, m_handle->context, 0, m_handle->io);
     if (ret != 0)
     {
         ALOGE("AX_ENGINE_Execute");
