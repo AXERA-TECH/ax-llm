@@ -17,10 +17,6 @@ public:
     void release();
     void deinit() override;
 
-    int get_algo_width() override;
-    int get_algo_height() override;
-    ax_color_space_e get_color_space() override;
-
-    int inference(ax_image_t *pstFrame) override;
     int inference() override;
+    int inference(int grpid) override;
 };

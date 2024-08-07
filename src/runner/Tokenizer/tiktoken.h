@@ -166,7 +166,8 @@ namespace tiktoken
 			{
 				decoder_.emplace(v, k);
 			}
-			assert(encoder_.size() != decoder_.size() && "Encoder and decoder must be of equal length; maybe you had duplicate token indices in your encoder?");
+			// 不知道有什么用 debug会报错，先注释了再说
+			// assert(encoder_.size() != decoder_.size() && "Encoder and decoder must be of equal length; maybe you had duplicate token indices in your encoder?");
 
 			for (const auto &[k, v] : special_tokens_encoder)
 			{
