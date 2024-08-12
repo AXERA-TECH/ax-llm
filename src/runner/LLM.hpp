@@ -12,6 +12,8 @@
 #include "timer.hpp"
 #include "opencv2/opencv.hpp"
 
+#include <arm_neon.h>
+
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 
 struct LLMAttrType
@@ -21,7 +23,7 @@ struct LLMAttrType
 
     // std::string template_prefill_filename_axmodel = "minicpmv/prefill_axmodel/minicpm_p96_l%d.axmodel";
     // int prefill_axmodel_num = 40;
-    int prefill_token_num = 96; //auto calc
+    int prefill_token_num = 96; // auto calc
 
     std::string filename_post_axmodel = "tinyllama-int8/tinyllama_post.axmodel";
 
@@ -78,6 +80,43 @@ private:
     // std::vector<std::vector<unsigned short>> k_caches, v_caches;
 
     bool b_stop = false;
+
+    static int FindMax(unsigned short *p, int n, float *val = 0)
+    {
+        float max_val = -MAXFLOAT;
+        int max_index = 0;
+        // for (int i = 0; i < n; i++)
+        // {
+        //     unsigned int proc = p[i] << 16;
+        //     float tmp = *reinterpret_cast<float *>(&proc);
+        //     if (tmp > max_val)
+        //     {
+        //         max_val = tmp;
+        //         max_index = i;
+        //     }
+        // }
+
+        for (int i = 0; i < n; i += 4)
+        {
+            uint16x4_t bf16_data = vld1_u16(&p[i]);
+            uint32x4_t float_data = vmovl_u16(bf16_data);
+            float32x4_t tmp_floats = vreinterpretq_f32_u32(vshlq_n_u32(float_data, 16));
+
+            for (int j = 0; j < 4; j++)
+            {
+                float tmp = vgetq_lane_f32(tmp_floats, j);
+                if (tmp > max_val)
+                {
+                    max_val = tmp;
+                    max_index = i + j;
+                }
+            }
+        }
+
+        if (val)
+            *val = max_val;
+        return max_index;
+    }
 
 public:
     bool Init(LLMAttrType attr)
@@ -163,43 +202,6 @@ public:
             }
         }
 
-        // for (int i = 0; i < attr.prefill_axmodel_num; i++)
-        // {
-        //     sprintf(axmodel_path, attr.template_prefill_filename_axmodel.c_str(), i);
-        //     prefill_layers[i].filename = axmodel_path;
-
-        //     if (!attr.b_dynamic_load_axmodel_layer)
-        //     {
-        //         int ret = prefill_layers[i].layer.init(prefill_layers[i].filename.c_str(), false);
-        //         if (ret != 0)
-        //         {
-        //             ALOGE("init prefill axmodel(%s) failed", prefill_layers[i].filename.c_str());
-        //             return false;
-        //         }
-        //         int remain_cmm = get_remaining_cmm_size();
-        //         sprintf(axmodel_path, "init prefill %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
-        //         update_cqdm(&cqdm, i + attr.axmodel_num + 2, "count", axmodel_path);
-        //     }
-        //     else
-        //     {
-        //         if (!attr.b_use_mmap_load_layer)
-        //         {
-        //             if (!read_file(prefill_layers[i].filename, prefill_layers[i].layer_buffer_vec))
-        //             {
-        //                 ALOGE("read_file(%s) failed", prefill_layers[i].filename.c_str());
-        //                 return false;
-        //             }
-        //         }
-        //         else
-        //         {
-        //             prefill_layers[i].layer_buffer.open_file(prefill_layers[i].filename.c_str());
-        //         }
-
-        //         sprintf(axmodel_path, "read_file %s ok", prefill_layers[i].filename.c_str());
-        //         update_cqdm(&cqdm, i + attr.axmodel_num + 2, "count", axmodel_path);
-        //     }
-        // }
-
         int ret = llama_post.init(attr.filename_post_axmodel.c_str(), false);
         if (ret != 0)
         {
@@ -210,12 +212,6 @@ public:
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
 
-        // ret = vpm_resampler.init(attr.filename_vpm_resampler_axmodedl.c_str(), false);
-        // if (ret != 0)
-        // {
-        //     ALOGE("init vpm axmodel(%s) failed", attr.filename_vpm_resampler_axmodedl.c_str());
-        //     return false;
-        // }
         remain_cmm = get_remaining_cmm_size();
         sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 3, "count", axmodel_path);
@@ -361,15 +357,6 @@ public:
 
             auto &layer = llama_layers[m];
             auto &layer_llama = llama_layers[m];
-            //            for(unsigned int j=0;j<layer.layer.get_num_inputs();j++)
-            //            {
-            //                memset(layer.layer.get_input(j).pVirAddr,0,layer.layer.get_input(j).nSize);
-            //            }
-
-            //            for(unsigned int j=0;j<layer_llama.layer.get_num_inputs();j++)
-            //            {
-            //                memset(layer_llama.layer.get_input(j).pVirAddr,0,layer_llama.layer.get_input(j).nSize);
-            //            }
 
             if (_attr.b_dynamic_load_axmodel_layer)
             {
@@ -387,13 +374,6 @@ public:
                     ALOGE("init axmodel(%s) failed", layer.filename.c_str());
                 }
             }
-
-            // auto &input_k_cache = layer.layer.get_input("K_cache");
-            // unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
-            // // memcpy(input_k_cache.pVirAddr, k_caches[m].data(), sizeof(unsigned short) * k_caches[m].size());
-            // auto &input_v_cache = layer.layer.get_input("V_cache");
-            // unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
-            // // memcpy(input_v_cache.pVirAddr, v_caches[m].data(), sizeof(unsigned short) * v_caches[m].size());
 
             auto &input_indices = layer.layer.get_input(prefill_grpid, "indices");
             unsigned int *input_indices_ptr = (unsigned int *)input_indices.pVirAddr;
@@ -459,16 +439,7 @@ public:
             unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
 
             float max_val = -MAXFLOAT;
-            int max_index = 0;
-            for (int i = 0; i < _attr.tokens_embed_num; i++)
-            {
-                float tmp = bfloat16(post_out[i]).fp32();
-                if (tmp > max_val)
-                {
-                    max_val = tmp;
-                    max_index = i;
-                }
-            }
+            int max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
             next_token = max_index;
 
             token_ids.push_back(max_index);
@@ -527,13 +498,6 @@ public:
                 auto &input_mask = layer.layer.get_input(decode_grpid, "mask");
                 memcpy(input_mask.pVirAddr, mask.data(), mask.size() * sizeof(unsigned short));
 
-                // if (indices == 0 && m == 0)
-                // {
-                //     memcpy(layer.layer.get_input("input").pVirAddr,
-                //            test_embed.data() + (input_embed_num - 1) * _attr.tokens_embed_size,
-                //            _attr.tokens_embed_size * sizeof(unsigned short));
-                // }
-
                 auto &input_input = layer.layer.get_input(decode_grpid, "input");
                 memcpy(input_input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
 
@@ -555,7 +519,6 @@ public:
             }
             // ALOGI("");
             mask[indices] = 0;
-
             {
                 // post process
                 auto &input = llama_post.get_input("input");
@@ -563,23 +526,13 @@ public:
                 llama_post.inference();
                 auto &output_post = llama_post.get_output("output");
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
-
                 float max_val = -MAXFLOAT;
-                int max_index = 0;
-                for (int i = 0; i < _attr.tokens_embed_num; i++)
-                {
-                    float tmp = bfloat16(post_out[i]).fp32();
-                    if (tmp > max_val)
-                    {
-                        max_val = tmp;
-                        max_index = i;
-                    }
-                }
+                int max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
                 next_token = max_index;
 
                 if (tokenizer->isEnd(max_index))
                 {
-                    if (cached_token.size())
+                    if (cached_token.size() && _attr.runing_callback)
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
@@ -605,6 +558,7 @@ public:
                     }
                 }
             }
+
             if (_attr.runing_callback == nullptr)
                 update_cqdm(&cqdm, indices, "token", "");
             if (b_hit_eos)
@@ -615,7 +569,7 @@ public:
         printf("\n\n");
         fflush(stdout);
         float t_cost_ms = t_cost.cost();
-        // ALOGN("hit eos,avg %.2f token/s\n", token_ids.size() / (t_cost_ms / 1000));
+        ALOGN("hit eos,avg %.2f token/s\n", token_ids.size() / (t_cost_ms / 1000));
 
         // 去掉 len_of_input 那部分
         // token_ids.erase(token_ids.begin(), token_ids.begin() + len_of_input);

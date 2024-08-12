@@ -22,7 +22,7 @@ void llm_running_callback(int *p_token, int n_token, const char *p_str, float to
     if (is_ttft)
     {
         is_ttft = false;
-        // ALOGI("ttft: %.2f s", ttft.cost() / 1000);
+        ALOGI("ttft: %.2f s", ttft.cost() / 1000);
     }
     fprintf(stdout, "%s", p_str);
     fflush(stdout);
@@ -69,13 +69,9 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
-    // cmd.add<std::string>("template_prefill_filename_axmodel", 0, "axmodel path template", true, attr.template_prefill_filename_axmodel);
-
     cmd.add<bool>("bos", 0, "", false, attr.b_bos);
     cmd.add<bool>("eos", 0, "", false, attr.b_eos);
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
-    // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
-    // cmd.add<int>("prefill_token_num", 0, "prefill token num", true, attr.prefill_token_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
 
@@ -94,9 +90,6 @@ int main(int argc, char *argv[])
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
-    // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
-    // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
-    // attr.prefill_token_num = cmd.get<int>("prefill_token_num");
     attr.b_bos = cmd.get<bool>("bos");
     attr.b_eos = cmd.get<bool>("eos");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
@@ -120,17 +113,11 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    std::vector<unsigned short> prompt_data;
-
-    //     std::vector<unsigned short> _tmp_data;
-    //     lLaMa.RunVpm(src, _tmp_data);
-    //     // printf("%d \n", _tmp_data.size());
-    //     memcpy(prompt_data.data() + 5 * attr.tokens_embed_size, _tmp_data.data(), _tmp_data.size() * sizeof(unsigned short));
-    // }
-
     if (prompt != "")
     {
+        ttft.start();
         auto output = lLaMa.Run(prompt_complete(prompt, attr.tokenizer_type));
+        is_ttft = true;
         if (!b_live_print)
             printf("%s\n", output.c_str());
     }
@@ -156,8 +143,9 @@ int main(int argc, char *argv[])
         {
             continue;
         }
-
+        ttft.start();
         auto output = lLaMa.Run(prompt_complete(input, attr.tokenizer_type));
+        is_ttft = true;
         if (!b_live_print)
             printf("%s\n", output.c_str());
     }
