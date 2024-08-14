@@ -29,6 +29,9 @@ std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
         oss_prompt << "<|user|>\n"
                    << prompt << "</s><|assistant|>\n";
         break;
+    case TKT_MINICPM:
+        oss_prompt << "<用户>" << prompt << "<AI>";
+        break;
     case TKT_Phi3:
         oss_prompt << prompt << " ";
         break;
