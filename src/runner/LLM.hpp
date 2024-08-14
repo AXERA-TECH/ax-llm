@@ -29,6 +29,8 @@ struct LLMAttrType
 
     std::string filename_post_axmodel = "tinyllama-int8/tinyllama_post.axmodel";
 
+    bool b_use_topk = false;
+
     // std::string filename_vpm_resampler_axmodedl = "minicpmv/vpm_resampler_version0_fp16.axmodel";
     // int vpm_width = 280;
     // int vpm_height = 280;
@@ -124,7 +126,7 @@ public:
     bool Init(LLMAttrType attr)
     {
         ALOGI("LLM init start");
-        t_cqdm cqdm = create_cqdm(attr.axmodel_num + 4, 32);
+        t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
         tokenizer = CreateTokenizer(attr.tokenizer_type);
         if (!tokenizer->Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
@@ -214,9 +216,9 @@ public:
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
 
-        remain_cmm = get_remaining_cmm_size();
-        sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
-        update_cqdm(&cqdm, attr.axmodel_num + 3, "count", axmodel_path);
+        // int remain_cmm = get_remaining_cmm_size();
+        // sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
+        // update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
 
         if (attr.b_dynamic_load_axmodel_layer)
         {
@@ -320,7 +322,6 @@ public:
 
     std::string Run(std::vector<unsigned short> test_embed)
     {
-
         b_stop = false;
         std::string final_out;
 
@@ -349,6 +350,8 @@ public:
             mask[i] = 0;
         }
         timer t_cost;
+        timer ttft_timer;
+        ttft_timer.start();
 
         for (unsigned int m = 0; m < _attr.axmodel_num; m++)
         {
@@ -440,16 +443,25 @@ public:
             auto &input = llama_post.get_input("input");
             memcpy(input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             llama_post.inference();
-            auto &output_post = llama_post.get_output("output");
-            AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
-            unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
-
-            float max_val = -MAXFLOAT;
-            int max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
+            int max_index;
+            if (_attr.b_use_topk)
+            {
+                AX_SYS_MinvalidateCache(llama_post.get_output("indices").phyAddr, llama_post.get_output("indices").pVirAddr, llama_post.get_output("indices").nSize);
+                max_index = *(int *)llama_post.get_output("indices").pVirAddr;
+            }
+            else
+            {
+                auto &output_post = llama_post.get_output("output");
+                AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
+                unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
+                float max_val = -MAXFLOAT;
+                max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
+            }
             next_token = max_index;
 
             token_ids.push_back(max_index);
             cached_token.push_back(max_index);
+            ALOGI("ttft: %.2f ms", ttft_timer.cost());
         }
         t_cost.start();
 
@@ -533,11 +545,20 @@ public:
                 auto &input = llama_post.get_input("input");
                 memcpy(input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
                 llama_post.inference();
-                auto &output_post = llama_post.get_output("output");
-                AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
-                unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
-                float max_val = -MAXFLOAT;
-                int max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
+                int max_index;
+                if (_attr.b_use_topk)
+                {
+                    AX_SYS_MinvalidateCache(llama_post.get_output("indices").phyAddr, llama_post.get_output("indices").pVirAddr, llama_post.get_output("indices").nSize);
+                    max_index = *(int *)llama_post.get_output("indices").pVirAddr;
+                }
+                else
+                {
+                    auto &output_post = llama_post.get_output("output");
+                    AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
+                    unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
+                    float max_val = -MAXFLOAT;
+                    max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
+                }
                 next_token = max_index;
 
                 if (tokenizer->isEnd(max_index))

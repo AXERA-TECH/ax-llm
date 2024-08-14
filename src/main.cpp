@@ -14,16 +14,8 @@ void __sigExit(int iSigNo)
     return;
 }
 
-timer ttft;
-bool is_ttft = true;
-
 void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
 {
-    if (is_ttft)
-    {
-        is_ttft = false;
-        ALOGI("ttft: %.2f s", ttft.cost() / 1000);
-    }
     fprintf(stdout, "%s", p_str);
     fflush(stdout);
 }
@@ -69,6 +61,8 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
+    cmd.add<bool>("use_topk", 0, "", false, attr.b_use_topk);
+
     cmd.add<bool>("bos", 0, "", false, attr.b_bos);
     cmd.add<bool>("eos", 0, "", false, attr.b_eos);
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
@@ -90,6 +84,7 @@ int main(int argc, char *argv[])
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
+    attr.b_use_topk = cmd.get<bool>("use_topk");
     attr.b_bos = cmd.get<bool>("bos");
     attr.b_eos = cmd.get<bool>("eos");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
@@ -115,9 +110,7 @@ int main(int argc, char *argv[])
 
     if (prompt != "")
     {
-        ttft.start();
         auto output = lLaMa.Run(prompt_complete(prompt, attr.tokenizer_type));
-        is_ttft = true;
         if (!b_live_print)
             printf("%s\n", output.c_str());
     }
@@ -143,9 +136,7 @@ int main(int argc, char *argv[])
         {
             continue;
         }
-        ttft.start();
         auto output = lLaMa.Run(prompt_complete(input, attr.tokenizer_type));
-        is_ttft = true;
         if (!b_live_print)
             printf("%s\n", output.c_str());
     }
