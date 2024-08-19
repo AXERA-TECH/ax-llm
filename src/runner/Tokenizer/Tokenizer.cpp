@@ -16,6 +16,7 @@
 
 class TokenizerLLaMa : public BaseTokenizer
 {
+protected:
     sentencepiece::SentencePieceProcessor sp;
     bool _b_bos, _b_eos;
 
@@ -85,6 +86,17 @@ public:
     int GetEosID() override
     {
         return sp.eos_id();
+    }
+};
+
+class TokenizerMINICPM : public TokenizerLLaMa
+{
+public:
+    std::string Decode(const std::vector<int> input) override
+    {
+        sentencepiece::SentencePieceText spt;
+        sp.Decode(input, &spt);
+        return spt.text();
     }
 };
 
@@ -449,6 +461,8 @@ std::shared_ptr<BaseTokenizer> CreateTokenizer(TokenizerType type)
     {
     case TKT_LLaMa:
         return std::make_shared<TokenizerLLaMa>();
+    case TKT_MINICPM:
+        return std::make_shared<TokenizerMINICPM>();
     case TKT_HTTP:
         return std::make_shared<Tokenizer_Http>();
     case TKT_Qwen:

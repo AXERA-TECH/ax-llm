@@ -9,6 +9,7 @@ enum TokenizerType
     TKT_Qwen,
     TKT_HTTP,
     TKT_Phi3,
+    TKT_MINICPM,
     TKT_END
 };
 

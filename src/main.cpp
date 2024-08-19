@@ -14,17 +14,9 @@ void __sigExit(int iSigNo)
     return;
 }
 
-timer ttft;
-bool is_ttft = true;
-
 void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
 {
-    if (is_ttft)
-    {
-        is_ttft = false;
-        // ALOGI("ttft: %.2f s", ttft.cost() / 1000);
-    }
-    fprintf(stdout, "%s ", p_str);
+    fprintf(stdout, "%s", p_str);
     fflush(stdout);
 }
 
@@ -36,6 +28,10 @@ std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
     case TKT_LLaMa:
         oss_prompt << "<|user|>\n"
                    << prompt << "</s><|assistant|>\n";
+        break;
+    case TKT_MINICPM:
+        oss_prompt << "<用户><image></image>\n";
+        oss_prompt << prompt << "<AI>";
         break;
     case TKT_Phi3:
         oss_prompt << prompt << " ";
@@ -66,7 +62,7 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("image", 'i', "image", true);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
-    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3", false, attr.tokenizer_type);
+    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3 4:MINICPM", false, attr.tokenizer_type);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
@@ -127,7 +123,7 @@ int main(int argc, char *argv[])
     }
 
     std::vector<unsigned short> prompt_data;
-
+    std::vector<unsigned short> img_embed;
     //     std::vector<unsigned short> _tmp_data;
     //     lLaMa.RunVpm(src, _tmp_data);
     //     // printf("%d \n", _tmp_data.size());
@@ -138,15 +134,14 @@ int main(int argc, char *argv[])
     {
         std::string output;
         cv::Mat src = cv::imread(image_prompt, cv::IMREAD_COLOR);
-        ttft.start();
-        is_ttft = true;
         if (src.empty())
         {
             output = lLaMa.Run(prompt);
         }
         else
         {
-            lLaMa.Encode(src, prompt_data, prompt);
+            lLaMa.Encode(src, img_embed);
+            lLaMa.Encode(img_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type));
             output = lLaMa.Run(prompt_data);
         }
 
@@ -181,22 +176,19 @@ int main(int argc, char *argv[])
         std::string output;
         if (image_prompt == "")
         {
-            ttft.start();
-            is_ttft = true;
             output = lLaMa.Run(prompt);
         }
         else
         {
             cv::Mat src = cv::imread(image_prompt, cv::IMREAD_COLOR);
-            ttft.start();
-            is_ttft = true;
             if (src.empty())
             {
                 output = lLaMa.Run(prompt);
             }
             else
             {
-                lLaMa.Encode(src, prompt_data, prompt);
+                lLaMa.Encode(src, img_embed);
+                lLaMa.Encode(img_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type));
                 output = lLaMa.Run(prompt_data);
             }
         }

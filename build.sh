@@ -49,7 +49,26 @@ if [ $? -ne 0 ]; then
     fi
 fi
 
+opencv_aarch64_url=https://github.com/ZHEQIUSHUI/assets/releases/download/ax650/libopencv-4.5.5-aarch64.zip
+if [ ! -f "libopencv-4.5.5-aarch64.zip" ]; then
+    # Download the file
+    echo "Downloading $opencv_aarch64_url"
+    wget "$opencv_aarch64_url" -O "libopencv-4.5.5-aarch64.zip"
+else
+    echo "libopencv-4.5.5-aarch64.zip already exists"
+fi
+
+# Check if the folder exists
+if [ ! -d "libopencv-4.5.5-aarch64" ]; then
+    # Extract the file
+    echo "Extracting unzip libopencv-4.5.5-aarch64.zip"
+    unzip libopencv-4.5.5-aarch64.zip
+else
+    echo "libopencv-4.5.5-aarch64 already exists"
+fi
+
+
 # 开始编译
-cmake -DBSP_MSP_DIR=${BSP_MSP_DIR} -DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-none-linux-gnu.toolchain.cmake ..
+cmake -DBSP_MSP_DIR=${BSP_MSP_DIR} -DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-none-linux-gnu.toolchain.cmake -DOpenCV_DIR=$PWD/libopencv-4.5.5-aarch64/lib/cmake/opencv4 ..
 make -j16
 make install

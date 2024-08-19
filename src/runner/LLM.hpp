@@ -11,6 +11,7 @@
 #include "cqdm.h"
 #include "timer.hpp"
 #include "opencv2/opencv.hpp"
+#include "ax_sys_api.h"
 
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 
@@ -287,72 +288,83 @@ public:
         b_stop = true;
     }
 
-    int Encode(cv::Mat src, std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
+    int Encode(cv::Mat src, std::vector<unsigned short> &out_embed)
     {
-        if (src.empty())
+        cv::Mat dst;
+        cv::resize(src, dst, cv::Size(_attr.vpm_width, _attr.vpm_height), 0, 0, cv::INTER_LINEAR);
+        cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
+
+        void *data = vpm_resampler.get_input("input").pVirAddr;
+        memcpy(data, dst.data, dst.rows * dst.cols * 3);
+
+        static bool isfirst = true;
+        if (isfirst)
         {
-            ALOGE("image is empty");
+            std::vector<int> pos_embed_ids(400, 0);
+            int pos = 0;
+            for (int i = 0; i < 20; i++)
+            {
+                for (int j = 0; j < 20; j++)
+                {
+                    pos_embed_ids[pos++] = i * 70 + j;
+                }
+            }
+            memcpy(vpm_resampler.get_input("pos_embed_ids").pVirAddr, pos_embed_ids.data(), 400 * sizeof(int));
+
+            isfirst = false;
+        }
+        vpm_resampler.inference();
+        out_embed.resize(vpm_resampler.get_output("output").nSize / sizeof(unsigned short));
+        AX_SYS_MinvalidateCache(vpm_resampler.get_output("output").phyAddr, vpm_resampler.get_output("output").pVirAddr, vpm_resampler.get_output("output").nSize);
+        memcpy(out_embed.data(), vpm_resampler.get_output("output").pVirAddr, vpm_resampler.get_output("output").nSize);
+        return 0;
+    }
+
+    int Encode(std::vector<unsigned short> &img_embed, std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
+    {
+        std::vector<int> input_ids = tokenizer->Encode(prompt, true);
+        std::vector<int> tmp_img_ids((img_embed.size() / _attr.tokens_embed_size), 0);
+        input_ids.insert(input_ids.begin() + 5, tmp_img_ids.begin(), tmp_img_ids.end());
+        /*
+        <用户><image><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk><unk></image>
+        What is in the image?<AI>
+        1, 95396, 4194, 95388, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 102, 5, 5856, 1410, 1377, 1358, 3766, 74, 95396, 10850, 95388
+        */
+        // printf("%s\n", prompt.c_str());
+        // printf("input_ids: ");
+        // for (size_t i = 0; i < input_ids.size(); i++)
+        // {
+        //     printf("%d, ", input_ids[i]);
+        // }
+        // printf("\n");
+
+        if (input_ids.size() > _attr.prefill_feat_pad_num)
+        {
+            ALOGE("input_ids(%d) > prefill_feat_pad_num(%d)", input_ids.size(), _attr.prefill_feat_pad_num);
             return -1;
         }
-        else
+        out_embed.resize(input_ids.size() * _attr.tokens_embed_size);
+
+        for (size_t i = 0; i < input_ids.size(); i++)
         {
-            cv::Mat dst;
-            cv::resize(src, dst, cv::Size(_attr.vpm_width, _attr.vpm_height), 0, 0, cv::INTER_LINEAR);
-            cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
+            // std::vector<unsigned short> embed;
+            embed_selector.getByIndex(input_ids[i], out_embed.data() + i * _attr.tokens_embed_size);
 
-            void *data = vpm_resampler.get_input("input").pVirAddr;
-            memcpy(data, dst.data, dst.rows * dst.cols * 3);
-
-            static bool isfirst = true;
-            if (isfirst)
+            if (i <= 5 || i > 69)
             {
-                std::vector<int> pos_embed_ids(400, 0);
-                int pos = 0;
-                for (int i = 0; i < 20; i++)
+                unsigned short *p = out_embed.data() + i * _attr.tokens_embed_size;
+                for (size_t j = 0; j < _attr.tokens_embed_size; j++)
                 {
-                    for (int j = 0; j < 20; j++)
-                    {
-                        pos_embed_ids[pos++] = i * 70 + j;
-                    }
+                    bfloat16 bf16(bfloat16(p[j]).fp32() * 12);
+                    p[j] = bf16.data;
                 }
-                memcpy(vpm_resampler.get_input("pos_embed_ids").pVirAddr, pos_embed_ids.data(), 400 * sizeof(int));
-
-                isfirst = false;
             }
-            timer t;
-            vpm_resampler.inference();
-            // ALOGI("image encode inference time : %.2f s", t.cost() / 1000);
-
-            std::vector<int> input_ids = tokenizer->Encode(prompt, true);
-
-            if (input_ids.size() > _attr.prefill_feat_pad_num)
-            {
-                ALOGE("input_ids(%d) > prefill_feat_pad_num(%d)", input_ids.size(), _attr.prefill_feat_pad_num);
-                return -1;
-            }
-            out_embed.resize(input_ids.size() * _attr.tokens_embed_size);
-
-            for (size_t i = 0; i < input_ids.size(); i++)
-            {
-                // std::vector<unsigned short> embed;
-                embed_selector.getByIndex(input_ids[i], out_embed.data() + i * _attr.tokens_embed_size);
-
-                if (i <= 5 || i > 69)
-                {
-                    unsigned short *p = out_embed.data() + i * _attr.tokens_embed_size;
-                    for (size_t j = 0; j < _attr.tokens_embed_size; j++)
-                    {
-                        bfloat16 bf16(bfloat16(p[j]).fp32() * 12);
-                        p[j] = bf16.data;
-                    }
-                }
-                // memcpy(, embed.data(), _attr.tokens_embed_size * sizeof(unsigned short));
-            }
-
-            // std::vector<unsigned short> image_embed;
-            // image_embed.resize(vpm_resampler.get_output("output").nSize / sizeof(unsigned short));
-            memcpy(out_embed.data() + 5 * _attr.tokens_embed_size, vpm_resampler.get_output("output").pVirAddr, vpm_resampler.get_output("output").nSize);
+            // memcpy(, embed.data(), _attr.tokens_embed_size * sizeof(unsigned short));
         }
+
+        // std::vector<unsigned short> image_embed;
+        // image_embed.resize(vpm_resampler.get_output("output").nSize / sizeof(unsigned short));
+        memcpy(out_embed.data() + 5 * _attr.tokens_embed_size, img_embed.data(), img_embed.size() * sizeof(unsigned short));
 
         return 0;
     }
@@ -621,14 +633,17 @@ public:
             layer.layer.inference();
 
             auto &output_k_cache = layer.layer.get_output("K_cache_out");
+            AX_SYS_MinvalidateCache(output_k_cache.phyAddr, output_k_cache.pVirAddr, output_k_cache.nSize);
             auto &input_k_cache = layer_llama.layer.get_input("K_cache");
             memcpy(input_k_cache.pVirAddr, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.prefill_feat_pad_num * _attr.tokens_embed_size);
 
             auto &output_v_cache = layer.layer.get_output("V_cache_out");
+            AX_SYS_MinvalidateCache(output_v_cache.phyAddr, output_v_cache.pVirAddr, output_v_cache.nSize);
             auto &input_v_cache = layer_llama.layer.get_input("V_cache");
             memcpy(input_v_cache.pVirAddr, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.prefill_feat_pad_num * _attr.tokens_embed_size);
 
             auto &output = layer.layer.get_output("output");
+            AX_SYS_MinvalidateCache(output.phyAddr, output.pVirAddr, output.nSize);
             memcpy(test_embed.data(), output.pVirAddr, test_embed.size() * sizeof(unsigned short));
             if (_attr.b_dynamic_load_axmodel_layer)
             {
@@ -638,8 +653,6 @@ public:
         }
 
         // ALOGI("prefill time cost: %.2f s", t_cost.cost() / 1000);
-
-        
 
         // print token_ids
         // printf("%s\n", input_str.c_str());
@@ -664,6 +677,7 @@ public:
             memcpy(input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             llama_post.inference();
             auto &output_post = llama_post.get_output("output");
+            AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
             unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
 
             float max_val = -MAXFLOAT;
@@ -748,12 +762,15 @@ public:
                 layer.layer.inference();
 
                 auto &output_k_cache = layer.layer.get_output("K_cache_out");
+                AX_SYS_MinvalidateCache(output_k_cache.phyAddr, output_k_cache.pVirAddr, output_k_cache.nSize);
                 memcpy(input_k_cache_ptr + indices * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
 
                 auto &output_v_cache = layer.layer.get_output("V_cache_out");
+                AX_SYS_MinvalidateCache(output_v_cache.phyAddr, output_v_cache.pVirAddr, output_v_cache.nSize);
                 memcpy(input_v_cache_ptr + indices * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
 
                 auto &output = layer.layer.get_output("output");
+                AX_SYS_MinvalidateCache(output.phyAddr, output.pVirAddr, output.nSize);
                 memcpy(embed.data(), output.pVirAddr, embed.size() * sizeof(unsigned short));
                 if (_attr.b_dynamic_load_axmodel_layer)
                 {
@@ -770,6 +787,7 @@ public:
                 memcpy(input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
                 llama_post.inference();
                 auto &output_post = llama_post.get_output("output");
+                AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
 
                 float max_val = -MAXFLOAT;
