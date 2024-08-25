@@ -10,6 +10,11 @@
 
 **AX-LLM** 由 **[爱芯元智](https://www.axera-tech.com/)** 主导开发。该项目用于探索业界常用 **LLM(Large Language Model)** 在已有芯片平台上落地的可行性和相关能力边界，**方便**社区开发者进行**快速评估**和**二次开发**自己的 **LLM 应用**。
 
+### LLM Build
+
+在线文档：
+- [Pulsar2 LLM Build](https://pulsar2-docs.readthedocs.io/zh-cn/latest/appendix/build_llm.html)
+
 ### 已支持芯片
 
 - AX650A/AX650N
@@ -19,20 +24,25 @@
 
 ### 已支持模型
 
+#### LLM
 - Qwen1.5-0.5B/1.8B/4B
 - Qwen2-0.5B/1.5B
 - ChatGLM3-6B
-- MiniCPM-2B
+- MiniCPM-1B/2B
 - TinyLLaMa-1.1B
 - Llama2-7B
 - Llama3-8B
 - Phi-2
 - Phi-3-mini
 
-### 获取地址
+#### VLM
+- MiniCPM-V 2.0
 
-- [百度网盘](https://pan.baidu.com/s/1_LG-sPKnLS_LTWF3Cmcr7A?pwd=ph0e)
-- [Google Drive](https://drive.google.com/drive/folders/1i8xdD2PWDlueouds6F1dhMc72n3v_aER?usp=sharing)
+### DEMO 获取地址
+
+- [百度网盘 AX650N](https://pan.baidu.com/s/1_LG-sPKnLS_LTWF3Cmcr7A?pwd=ph0e)
+- [百度网盘 AX630C](https://pan.baidu.com/s/1X0aJTQM0bl8wsraspHnDUw?pwd=ifg5)
+
 
 ## 源码编译
 
@@ -201,6 +211,8 @@ int main() {
 - [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
 - [Qwen1.5-1.8B](https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat)
 - [Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B)
+- [MiniCPM](https://github.com/OpenBMB/MiniCPM)
+- [MiniCPMV](https://github.com/OpenBMB/MiniCPM-V)
 
 ## 技术讨论
 
