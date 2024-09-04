@@ -26,9 +26,11 @@ struct LLMAttrType
 
     std::string filename_post_axmodel = "tinyllama-int8/tinyllama_post.axmodel";
 
+    std::string filename_vpm_encoder_axmodedl = "minicpmv/vpm_resampler_version0_fp16.axmodel";
     std::string filename_vpm_resampler_axmodedl = "minicpmv/vpm_resampler_version0_fp16.axmodel";
     int vpm_width = 280;
     int vpm_height = 280;
+    bool b_vpm_two_stage = false;
 
     TokenizerType tokenizer_type = TKT_LLaMa;
     std::string filename_tokenizer_model = "tokenizer.model";
@@ -73,7 +75,7 @@ private:
     std::vector<LLMLayer> llama_layers;
     ax_runner_ax650 llama_post;
 
-    ax_runner_ax650 vpm_resampler;
+    ax_runner_ax650 vpm_encoder, vpm_resampler;
 
     int prefill_grpid = 1;
     int decode_grpid = 0;
@@ -203,43 +205,6 @@ public:
             }
         }
 
-        // for (int i = 0; i < attr.prefill_axmodel_num; i++)
-        // {
-        //     sprintf(axmodel_path, attr.template_prefill_filename_axmodel.c_str(), i);
-        //     prefill_layers[i].filename = axmodel_path;
-
-        //     if (!attr.b_dynamic_load_axmodel_layer)
-        //     {
-        //         int ret = prefill_layers[i].layer.init(prefill_layers[i].filename.c_str(), false);
-        //         if (ret != 0)
-        //         {
-        //             ALOGE("init prefill axmodel(%s) failed", prefill_layers[i].filename.c_str());
-        //             return false;
-        //         }
-        //         int remain_cmm = get_remaining_cmm_size();
-        //         sprintf(axmodel_path, "init prefill %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
-        //         update_cqdm(&cqdm, i + attr.axmodel_num + 2, "count", axmodel_path);
-        //     }
-        //     else
-        //     {
-        //         if (!attr.b_use_mmap_load_layer)
-        //         {
-        //             if (!read_file(prefill_layers[i].filename, prefill_layers[i].layer_buffer_vec))
-        //             {
-        //                 ALOGE("read_file(%s) failed", prefill_layers[i].filename.c_str());
-        //                 return false;
-        //             }
-        //         }
-        //         else
-        //         {
-        //             prefill_layers[i].layer_buffer.open_file(prefill_layers[i].filename.c_str());
-        //         }
-
-        //         sprintf(axmodel_path, "read_file %s ok", prefill_layers[i].filename.c_str());
-        //         update_cqdm(&cqdm, i + attr.axmodel_num + 2, "count", axmodel_path);
-        //     }
-        // }
-
         int ret = llama_post.init(attr.filename_post_axmodel.c_str(), false);
         if (ret != 0)
         {
@@ -250,12 +215,45 @@ public:
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
 
-        ret = vpm_resampler.init(attr.filename_vpm_resampler_axmodedl.c_str(), false);
-        if (ret != 0)
+        if (_attr.b_vpm_two_stage)
         {
-            ALOGE("init vpm axmodel(%s) failed", attr.filename_vpm_resampler_axmodedl.c_str());
-            return false;
+            ret = vpm_encoder.init(attr.filename_vpm_encoder_axmodedl.c_str(), false);
+            if (ret != 0)
+            {
+                ALOGE("init vpm axmodel(%s) failed", attr.filename_vpm_encoder_axmodedl.c_str());
+                return false;
+            }
+
+            ret = vpm_resampler.init(attr.filename_vpm_resampler_axmodedl.c_str(), false);
+            if (ret != 0)
+            {
+                ALOGE("init vpm axmodel(%s) failed", attr.filename_vpm_resampler_axmodedl.c_str());
+                return false;
+            }
         }
+        else
+        {
+            ret = vpm_resampler.init(attr.filename_vpm_resampler_axmodedl.c_str(), false);
+            if (ret != 0)
+            {
+                ALOGE("init vpm axmodel(%s) failed", attr.filename_vpm_resampler_axmodedl.c_str());
+                return false;
+            }
+        }
+        //fill pos_embed_ids
+        {
+            std::vector<int> pos_embed_ids(vpm_resampler.get_input("pos_embed_ids").nSize / sizeof(int), 0);
+            int pos = 0;
+            for (int i = 0; i < _attr.vpm_height / 14; i++)
+            {
+                for (int j = 0; j < _attr.vpm_width / 14; j++)
+                {
+                    pos_embed_ids[pos++] = i * 70 + j;
+                }
+            }
+            memcpy(vpm_resampler.get_input("pos_embed_ids").pVirAddr, pos_embed_ids.data(), pos_embed_ids.size() * sizeof(int));
+        }
+
         remain_cmm = get_remaining_cmm_size();
         sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 3, "count", axmodel_path);
@@ -319,15 +317,10 @@ public:
             llama_layers[i].layer.release();
         }
         llama_post.release();
+        vpm_encoder.release();
         vpm_resampler.release();
         embed_selector.Deinit();
     }
-
-    // void Reset()
-    // {
-    //     k_caches.resize(_attr.axmodel_num, std::vector<unsigned short>(_attr.kv_cache_num * _attr.kv_cache_size, 0));
-    //     v_caches.resize(_attr.axmodel_num, std::vector<unsigned short>(_attr.kv_cache_num * _attr.kv_cache_size, 0));
-    // }
 
     void Stop()
     {
@@ -336,36 +329,31 @@ public:
 
     int Encode(cv::Mat src, std::vector<unsigned short> &out_embed)
     {
+        timer t;
+        t.start();
         cv::Mat dst;
         cv::resize(src, dst, cv::Size(_attr.vpm_width, _attr.vpm_height), 0, 0, cv::INTER_LINEAR);
         cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
 
-        void *data = vpm_resampler.get_input("input").pVirAddr;
-        memcpy(data, dst.data, dst.rows * dst.cols * 3);
-
-        static bool isfirst = true;
-        if (isfirst)
+        if (_attr.b_vpm_two_stage)
         {
-            std::vector<int> pos_embed_ids(400, 0);
-            int pos = 0;
-            for (int i = 0; i < 20; i++)
-            {
-                for (int j = 0; j < 20; j++)
-                {
-                    pos_embed_ids[pos++] = i * 70 + j;
-                }
-            }
-            memcpy(vpm_resampler.get_input("pos_embed_ids").pVirAddr, pos_embed_ids.data(), 400 * sizeof(int));
-
-            isfirst = false;
+            void *data = vpm_encoder.get_input(0).pVirAddr;
+            memcpy(data, dst.data, dst.rows * dst.cols * 3);
+            vpm_encoder.inference();
+            AX_SYS_MinvalidateCache(vpm_encoder.get_output(0).phyAddr, vpm_encoder.get_output(0).pVirAddr, vpm_encoder.get_output(0).nSize);
+            memcpy(vpm_resampler.get_input("input").pVirAddr, vpm_encoder.get_output(0).pVirAddr, vpm_encoder.get_output(0).nSize);
         }
-        timer t;
-        t.start();
+        else
+        {
+            void *data = vpm_resampler.get_input("input").pVirAddr;
+            memcpy(data, dst.data, dst.rows * dst.cols * 3);
+        }
+
         vpm_resampler.inference();
-        ALOGI("image encode time : %f ms", t.cost());
         out_embed.resize(vpm_resampler.get_output("output").nSize / sizeof(unsigned short));
         AX_SYS_MinvalidateCache(vpm_resampler.get_output("output").phyAddr, vpm_resampler.get_output("output").pVirAddr, vpm_resampler.get_output("output").nSize);
         memcpy(out_embed.data(), vpm_resampler.get_output("output").pVirAddr, vpm_resampler.get_output("output").nSize);
+        ALOGI("image encode time : %f ms", t.cost());
         return 0;
     }
 

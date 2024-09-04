@@ -66,10 +66,11 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
-    // cmd.add<std::string>("template_prefill_filename_axmodel", 0, "axmodel path template", true, attr.template_prefill_filename_axmodel);
-    cmd.add<std::string>("filename_vpm_resampler_axmodedl", 0, "vpm resampler axmodel path", false, attr.filename_vpm_resampler_axmodedl);
+    cmd.add<std::string>("filename_vpm_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_vpm_encoder_axmodedl);
+    cmd.add<std::string>("filename_vpm_resampler_axmodedl", 0, "vpm resampler axmodel path", true, attr.filename_vpm_resampler_axmodedl);
     cmd.add<int>("vpm_width", 0, "vpm width", false, attr.vpm_width);
     cmd.add<int>("vpm_height", 0, "vpm height", false, attr.vpm_height);
+    cmd.add<bool>("vpm_two_stage", 0, "", false, attr.b_vpm_two_stage);
 
     cmd.add<bool>("bos", 0, "", false, attr.b_bos);
     cmd.add<bool>("eos", 0, "", false, attr.b_eos);
@@ -97,9 +98,12 @@ int main(int argc, char *argv[])
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
     // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
     // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
+
+    attr.filename_vpm_encoder_axmodedl = cmd.get<std::string>("filename_vpm_encoder_axmodedl");
     attr.filename_vpm_resampler_axmodedl = cmd.get<std::string>("filename_vpm_resampler_axmodedl");
     attr.vpm_width = cmd.get<int>("vpm_width");
     attr.vpm_height = cmd.get<int>("vpm_height");
+    attr.b_vpm_two_stage = cmd.get<bool>("vpm_two_stage");
     attr.b_bos = cmd.get<bool>("bos");
     attr.b_eos = cmd.get<bool>("eos");
     attr.b_use_topk = cmd.get<bool>("use_topk");
