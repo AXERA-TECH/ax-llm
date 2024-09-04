@@ -10,11 +10,8 @@
 #include "ax_cmm_utils.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
-#include "opencv2/opencv.hpp"
 
 #include <ax_sys_api.h>
-
-#include <arm_neon.h>
 
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 
