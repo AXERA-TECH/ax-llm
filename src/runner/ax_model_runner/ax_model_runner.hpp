@@ -61,6 +61,9 @@ public:
     int get_num_inputs() { return minput_tensors.size(); };
     int get_num_outputs() { return moutput_tensors.size(); };
 
+    int get_num_input_groups() { return mgroup_input_tensors.size(); };
+    int get_num_output_groups() { return mgroup_output_tensors.size(); };
+
     const ax_runner_tensor_t &get_input(int idx) { return minput_tensors[idx]; }
     const ax_runner_tensor_t *get_inputs_ptr() { return minput_tensors.data(); }
     const ax_runner_tensor_t &get_input(std::string name)
