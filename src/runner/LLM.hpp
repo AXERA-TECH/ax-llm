@@ -347,15 +347,21 @@ public:
             std::vector<unsigned short> &mask_tmp = mask_p[p];
             mask_tmp.resize((p + 1) * _attr.prefill_token_num * _attr.prefill_token_num, bf16.data);
 
-            for (size_t i = 0; i < _attr.prefill_token_num; i++)
+            size_t i = 0;
+            for (size_t t = p * _attr.prefill_token_num; t < (p + 1) * _attr.prefill_token_num; t++)
             {
-                auto t = p * _attr.prefill_token_num + i;
                 if (t < input_embed_num)
                 {
                     for (size_t j = 0; j < p * _attr.prefill_token_num + i + 1; j++)
                         mask_tmp[i * ((p + 1) * _attr.prefill_token_num) + j] = 0;
                 }
+                i++;
             }
+            // char path[128];
+            // sprintf(path, "mask_p_%d.bin", p);
+            // FILE *fp = fopen(path, "wb");
+            // fwrite(mask_tmp.data(), sizeof(unsigned short), mask_tmp.size(), fp);
+            // fclose(fp);
         }
 
         std::vector<int> cached_token;
@@ -376,15 +382,20 @@ public:
 
         for (size_t p = 0; p < prefill_split_num; p++)
         {
+            if (b_stop)
+            {
+                break;
+            }
+
             std::vector<unsigned short> &mask_tmp = mask_p[p];
             std::vector<unsigned short> embed_tmp(_attr.prefill_token_num * _attr.tokens_embed_size, 0);
-            if (p < prefill_split_num - 1)
+            if (p == (prefill_split_num - 1))
             {
-                memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, _attr.prefill_token_num * _attr.tokens_embed_size * sizeof(unsigned short));
+                memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, (input_embed_num - p * _attr.prefill_token_num) * _attr.tokens_embed_size * sizeof(unsigned short));
             }
             else
             {
-                memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, (input_embed_num - p * _attr.prefill_token_num) * _attr.tokens_embed_size * sizeof(unsigned short));
+                memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, _attr.prefill_token_num * _attr.tokens_embed_size * sizeof(unsigned short));
             }
             int prefill_grpid = p + 1;
 
@@ -423,11 +434,28 @@ public:
                     input_indices_ptr[i] = p * _attr.prefill_token_num + i;
                 }
 
+                if (p > 0)
+                {
+                    auto &input_prefill_k_cache = layer.layer.get_input(prefill_grpid, "K_cache");
+                    auto &input_prefill_v_cache = layer.layer.get_input(prefill_grpid, "V_cache");
+                    for (size_t i = 0; i < p; i++)
+                    {
+                        auto &output_k_cache = layer.layer.get_output(i + 1, "K_cache_out");
+                        memcpy((unsigned short *)input_prefill_k_cache.pVirAddr + i * _attr.prefill_token_num * _attr.kv_cache_size,
+                               output_k_cache.pVirAddr,
+                               sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+
+                        auto &output_v_cache = layer.layer.get_output(i + 1, "V_cache_out");
+                        memcpy((unsigned short *)input_prefill_v_cache.pVirAddr + i * _attr.prefill_token_num * _attr.kv_cache_size,
+                               output_v_cache.pVirAddr,
+                               sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                    }
+                }
+
                 auto &input_mask = layer.layer.get_input(prefill_grpid, "mask");
                 memcpy(input_mask.pVirAddr, mask_tmp.data(), mask_tmp.size() * sizeof(unsigned short));
 
                 auto &input_input = layer.layer.get_input(prefill_grpid, "input");
-
                 memcpy(input_input.pVirAddr, embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short));
 
                 layer.layer.inference(prefill_grpid);
@@ -451,7 +479,7 @@ public:
                 }
                 // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
             }
-            if (p == prefill_split_num - 1)
+            if (p == (prefill_split_num - 1))
             {
                 memcpy(embed.data(),
                        embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size,
