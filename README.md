@@ -47,6 +47,8 @@
 
 ### minicpm v 2.0
 
+![dog](https://github.com/user-attachments/assets/fa58faaa-48ed-4550-a37c-8d6b39eef9b8)
+
 ```shell
 root@ax650:/llm-test/minicpm-v-2.0# ./run_minicpmv-2.sh
 [I][                            Init][ 125]: LLM init start
