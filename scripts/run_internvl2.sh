@@ -1,0 +1,16 @@
+./main_internvl \
+--template_filename_axmodel "internvl/qwen2_p128_l%d_together.axmodel" \
+--axmodel_num 24 \
+--filename_vpm_resampler_axmodedl "internvl/intervl_vision_part.axmodel" \
+--tokenizer_type 2 \
+--bos 0 --eos 0 \
+--use_mmap_load_embed 1 \
+--filename_tokenizer_model "http://10.126.33.167:12345" \
+--filename_post_axmodel "internvl/qwen2_post.axmodel" \
+--use_topk 0 \
+--filename_tokens_embed "internvl/model.embed_tokens.weight.bfloat16.bin" \
+--tokens_embed_num 151655 \
+--tokens_embed_size 896 \
+--live_print 1 \
+--continue 1 \
+--prompt "$1" --image "$2"

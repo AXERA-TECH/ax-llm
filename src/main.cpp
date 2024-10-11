@@ -68,8 +68,6 @@ int main(int argc, char *argv[])
 
     cmd.add<std::string>("filename_vpm_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_vpm_encoder_axmodedl);
     cmd.add<std::string>("filename_vpm_resampler_axmodedl", 0, "vpm resampler axmodel path", true, attr.filename_vpm_resampler_axmodedl);
-    cmd.add<int>("vpm_width", 0, "vpm width", false, attr.vpm_width);
-    cmd.add<int>("vpm_height", 0, "vpm height", false, attr.vpm_height);
     cmd.add<bool>("vpm_two_stage", 0, "", false, attr.b_vpm_two_stage);
 
     cmd.add<bool>("bos", 0, "", false, attr.b_bos);
@@ -101,8 +99,6 @@ int main(int argc, char *argv[])
 
     attr.filename_vpm_encoder_axmodedl = cmd.get<std::string>("filename_vpm_encoder_axmodedl");
     attr.filename_vpm_resampler_axmodedl = cmd.get<std::string>("filename_vpm_resampler_axmodedl");
-    attr.vpm_width = cmd.get<int>("vpm_width");
-    attr.vpm_height = cmd.get<int>("vpm_height");
     attr.b_vpm_two_stage = cmd.get<bool>("vpm_two_stage");
     attr.b_bos = cmd.get<bool>("bos");
     attr.b_eos = cmd.get<bool>("eos");
@@ -183,9 +179,8 @@ int main(int argc, char *argv[])
         std::string output;
         if (image_prompt == "")
         {
-            ALOGE("image_prompt can't be empty");
-            continue;
-            // output = lLaMa.Run(prompt);
+            lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type));
+            output = lLaMa.Run(prompt_data);
         }
         else
         {
@@ -194,7 +189,9 @@ int main(int argc, char *argv[])
             {
                 // output = lLaMa.Run(prompt);
                 ALOGE("image prompt(%s) not found", image_prompt.c_str());
-                continue;
+                // continue;
+                lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type));
+                output = lLaMa.Run(prompt_data);
             }
             else
             {
