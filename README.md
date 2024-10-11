@@ -17,7 +17,7 @@
 
 ### 已支持模型
 
-- MiniCPM-V 2.0
+- InternVL2-1B
 
 ### 获取地址
 
@@ -45,33 +45,35 @@
   
 ## 运行示例
 
-### minicpm v 2.0
+### InternVL2 1B
 
 ![dog](https://github.com/user-attachments/assets/fa58faaa-48ed-4550-a37c-8d6b39eef9b8)
 
 ```shell
-root@ax650:/llm-test/minicpm-v-2.0# ./run_minicpmv-2.sh
-[I][                            Init][ 125]: LLM init start
-2% | █                                 |   1 /  44 [0.21s<9.11s, 4.83 count/s] tokenizer init ok
-[I][                            Init][  26]: LLaMaEmbedSelector use mmap
-100% | ████████████████████████████████ |  44 /  44 [33.54s<33.54s, 1.31 count/s] init vpm axmodel ok,remain_cmm(8086 MB)
-[I][                            Init][ 284]: max_token_len : 1023
-[I][                            Init][ 289]: kv_cache_size : 2304, kv_cache_num: 1023
-[I][                            Init][ 297]: prefill_token_num : 128
-[I][                            Init][ 306]: LLM init ok
+root@ax650:/llm-test/internvl2-1b# ./run_internvl2.sh
+[I][                            Init][ 127]: LLM init start
+bos_id: -1, eos_id: 151645
+  3% | ██                                |   1 /  28 [0.01s<0.14s, 200.00 count/s] tokenizer init ok[I][                            Init][  26]: LLaMaEmbedSelector use mmap
+100% | ████████████████████████████████ |  28 /  28 [1.43s<1.43s, 19.58 count/s] init vpm axmodel ok,remain_cmm(11116 MB)B)
+[I][                            Init][ 275]: max_token_len : 1023
+[I][                            Init][ 280]: kv_cache_size : 128, kv_cache_num: 1023
+[I][                            Init][ 288]: prefill_token_num : 128
+[I][                            Init][ 290]: vpm_height : 224,vpm_width : 224
+[I][                            Init][ 299]: LLM init ok
 Type "q" to exit, Ctrl+c to stop current running
 prompt >> 描述下图片
-image >> ssd_dog.jpg
-[I][                          Encode][ 365]: image encode time : 728.507019 ms
-[I][                             Run][ 589]: ttft: 520.94 ms
-这幅图片展示了一只大而毛茸茸的狗，可能是拉布拉多或类似品种，坐在黄色和红色相间的门廊上。这只狗看起来在休息，它的目光朝向相机，表情平静。在狗的后面，有一辆红色自行车，车架上有黑色的装饰，停放在门廊上。自行车上挂着几个行李袋，表明它可能用于旅行或运输。背景中，可以看到一辆白色车辆，可能是汽车，停在门廊的后面。整个场景暗示了一个家庭环境，可能是在住宅区。
+image >> images/ssd_dog.jpg
+[I][                          Encode][ 351]: image encode time : 397.944000 ms, size : 57344
+[I][                             Run][ 561]: ttft: 124.73 ms
 
-[N][                             Run][ 728]: hit eos,avg 5.55 token/s
+这张图片展示了一只狗坐在阳台上，正在用嘴咬着一辆自行车。阳台的背景是黄色的墙壁，可以看到外面的街道和一辆停着的汽车。阳台的窗户上挂着白色的窗帘，阳光透过窗户照进来，给整个场景增添了一种温暖的氛围。
+
+[N][                             Run][ 700]: hit eos,avg 31.16 token/s
 ```
 
 ## Reference
 
-- [MiniCPM-V-2](openbmb/MiniCPM-V-2)
+- [InternVL2-1B](https://huggingface.co/OpenGVLab/InternVL2-1B)
 
 ## 技术讨论
 
