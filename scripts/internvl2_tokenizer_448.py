@@ -19,7 +19,7 @@ class Tokenizer_Http():
         return input_ids
 
     def encode_vpm(self, content="Please describe the image shortly."):
-        prompt = f"<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|im_end|><|im_start|>user\n<img>" + "<IMG_CONTEXT>" * 64 + f"</img>\n{content}<|im_end|><|im_start|>assistant\n"
+        prompt = f"<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|im_end|><|im_start|>user\n<img>" + "<IMG_CONTEXT>" * 256 + f"</img>\n{content}<|im_end|><|im_start|>assistant\n"
         input_ids = self.tokenizer.encode(prompt)
         return input_ids
 
