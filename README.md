@@ -43,14 +43,14 @@
 - Phi-2
 - Phi-3-mini
 - SmolLM-135M/360M
-- OpenBuddy-3B
+- OpenBuddy-Llama3.2-1B
 
 ### 获取地址
 
 - 百度网盘
   - [AX650N](https://pan.baidu.com/s/1_LG-sPKnLS_LTWF3Cmcr7A?pwd=ph0e)
   - [AX630C](https://pan.baidu.com/s/1X0aJTQM0bl8wsraspHnDUw?pwd=ifg5)
-- [Google Drive](https://drive.google.com/drive/folders/1i8xdD2PWDlueouds6F1dhMc72n3v_aER?usp=sharing)
+- [Google Drive](https://drive.google.com/drive/folders/11aRxsFqJfGXhFMlInudj3Bi8SR-08TXl?usp=sharing)
 
 ## 源码编译
 
