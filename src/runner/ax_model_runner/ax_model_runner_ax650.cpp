@@ -11,8 +11,7 @@
 #include "sample_log.h"
 
 // #include <axcl/native/ax_sys_api.h>
-#include <axcl/axcl.h>
-#include <axcl/rt/axcl_rt_engine.h>
+#include <axcl.h>
 
 #define AX_CMM_ALIGN_SIZE 128
 
@@ -147,7 +146,9 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
             fprintf(stderr, "Malloc input(index: %d, size: %d) failed! ret=0x%x\n", i, bufSize, ret);
             return -1;
         }
-        axclrtMemset(devPtr, bufSize, 0, bufSize);
+        std::vector<char> tmp(bufSize, 0);
+        axclrtMemcpy(devPtr, tmp.data(), bufSize, axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE);
+        // axclrtMemset(devPtr, 0, bufSize);
 
         axclrtEngineIODims dims;
         ret = axclrtEngineGetInputDims(io_info, 0, i, &dims);
@@ -193,7 +194,9 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
             fprintf(stderr, "Malloc output(index: %d, size: %d) failed! ret=0x%x\n", i, bufSize, ret);
             return -1;
         }
-        axclrtMemset(devPtr, bufSize, 0, bufSize);
+        std::vector<char> tmp(bufSize, 0);
+        axclrtMemcpy(devPtr, tmp.data(), bufSize, axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE);
+        // axclrtMemset(devPtr, 0, bufSize);
         axclrtEngineIODims dims;
         ret = axclrtEngineGetOutputDims(io_info, 0, i, &dims);
         if (ret != 0)
@@ -292,7 +295,7 @@ int ax_runner_ax650::sub_init()
             tensor.phyAddr = (unsigned long long)m_handle->io_data.pOutputs[i].pBuf;
             tensor.pVirAddr = malloc(tensor.nSize);
             memset(tensor.pVirAddr, 0, tensor.nSize);
-            mtensors.push_back(tensor);
+            moutput_tensors.push_back(tensor);
         }
 
         for (size_t i = 0; i < m_handle->io_data.nInputSize; i++)
@@ -371,17 +374,42 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size)
         {
             return ret;
         }
+
+        axclrtDeviceList lst;
+        if (const auto ret = axclrtGetDeviceList(&lst); 0 != ret || 0 == lst.num)
+        {
+            ALOGE("Get AXCL device failed{0x%8x}, find total %d device.\n", ret, lst.num);
+            return -1;
+        }
+        if (const auto ret = axclrtSetDevice(lst.devices[0]); 0 != ret)
+        {
+            ALOGE("Set AXCL device failed{0x%8x}.\n", ret);
+            return -1;
+        }
+
+        ret = axclrtEngineInit(AXCL_VNPU_DISABLE);
+        if (0 != ret)
+        {
+            ALOGE("axclrtEngineInit %d\n", ret);
+            return ret;
+        }
         b_init = true;
     }
 
     // 3. create handle
+    void *devMem = nullptr;
+    axclrtMalloc(&devMem, model_size, AXCL_MEM_MALLOC_NORMAL_ONLY);
 
-    int ret = axclrtEngineLoadFromMem(model_buffer, model_size, &m_handle->handle);
+    // 4. copy model to device
+    axclrtMemcpy(devMem, model_buffer, model_size, AXCL_MEMCPY_HOST_TO_DEVICE);
+
+    int ret = axclrtEngineLoadFromMem(devMem, model_size, &m_handle->handle);
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateHandle");
         return ret;
     }
+    axclrtFree(devMem);
     // fprintf(stdout, "Engine creating handle is done.\n");
 
     return sub_init();
@@ -403,10 +431,10 @@ void ax_runner_ax650::release()
         m_handle = nullptr;
     }
 
-    mtensors.clear();
+    moutput_tensors.clear();
     minput_tensors.clear();
     map_input_tensors.clear();
-    map_tensors.clear();
+    map_output_tensors.clear();
 
     // AX_ENGINE_Deinit();
 }

@@ -62,15 +62,15 @@ link_directories(axcl/lib)
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
                     src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
-                    # src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
+                    src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
                     src/runner/Tokenizer/QwenTokenizer.cpp)
 
-    # target_link_libraries(${name} ax_engine ax_interpreter ax_sys ax_ivps)
+    target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
-    target_link_libraries(${name} ax_message axcl_runtime)
+    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt)
 
     target_link_libraries(${name} sentencepiece re2::re2)
     install(TARGETS ${name} DESTINATION bin)
@@ -94,6 +94,11 @@ if(BUILD_WITH_YOLOV5_TEST)
     add_executable(main_yolov5 src/main_yolov5.cpp src/runner/ax_model_runner/ax_model_runner_ax650.cpp src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp src/runner/utils/memory_utils.cpp)
     target_include_directories(main_yolov5 PRIVATE ${OpenCV_INCLUDE_DIRS} axcl/include)
     target_link_libraries(main_yolov5 PRIVATE ${OpenCV_LIBS})
-    target_link_libraries(main_yolov5 PRIVATE ax_message ax_pcie_dma ax_pcie_msg axcl_runtime)
-    target_link_libraries(main_yolov5 PRIVATE ax_engine ax_interpreter ax_sys ax_ivps)
+    target_link_libraries(main_yolov5 PRIVATE spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt)
+    target_link_libraries(main_yolov5 PRIVATE ax_engine ax_interpreter ax_sys)
+
+
+    add_executable(main_single src/main_single.cpp src/runner/ax_model_runner/ax_model_runner_ax650.cpp src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp src/runner/utils/memory_utils.cpp)
+    target_link_libraries(main_single PRIVATE spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt)
+    target_link_libraries(main_single PRIVATE ax_engine ax_interpreter ax_sys)
 endif()

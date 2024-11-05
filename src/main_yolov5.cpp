@@ -2,7 +2,8 @@
 #include "runner/ax_model_runner/ax_model_runner_ax650_host.hpp"
 #include "cmdline.hpp"
 #include "opencv2/opencv.hpp"
-#include <axcl/rt/axcl_rt_memory.h>
+#include <axcl.h>
+#include <axcl_rt_memory.h>
 
 typedef struct Object
 {
@@ -333,7 +334,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < runner.get_num_inputs(); i++)
     {
         axclrtMemcpy(
-            (void *)runner.get_input(i).phyAddr, runner.get_input(i).nSize,
+            (void *)runner.get_input(i).phyAddr,
             (void *)runner.get_input(i).pVirAddr, runner.get_input(i).nSize, AXCL_MEMCPY_HOST_TO_DEVICE);
     }
 
@@ -342,7 +343,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < runner.get_num_outputs(); i++)
     {
         axclrtMemcpy(
-            runner.get_output(i).pVirAddr, runner.get_output(i).nSize,
+            runner.get_output(i).pVirAddr,
             (void *)runner.get_output(i).phyAddr, runner.get_output(i).nSize, AXCL_MEMCPY_DEVICE_TO_HOST);
     }
 
@@ -394,6 +395,8 @@ int main(int argc, char **argv)
     }
 
     cv::imwrite("result.jpg", img);
+
+    axclFinalize();
 
     return 0;
 }

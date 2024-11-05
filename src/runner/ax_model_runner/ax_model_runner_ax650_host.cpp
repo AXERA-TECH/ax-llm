@@ -165,7 +165,7 @@ static inline int prepare_io(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data,
             fprintf(stderr, "Allocate input{%d} { phy: %p, vir: %p, size: %lu Bytes }. fail \n", i, (void *)buffer->phyAddr, buffer->pVirAddr, (long)meta.nSize);
             return ret;
         }
-        memset(buffer->pVirAddr, 0, meta.nSize);
+        // memset(buffer->pVirAddr, 0, meta.nSize);
         // fprintf(stderr, "Allocate input{%d} { phy: %p, vir: %p, size: %lu Bytes }. \n", i, (void*)buffer->phyAddr, buffer->pVirAddr, (long)meta.nSize);
     }
 
@@ -191,7 +191,7 @@ static inline int prepare_io(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data,
             free_io_index(io_data->pOutputs, i);
             return ret;
         }
-        memset(buffer->pVirAddr, 0, meta.nSize);
+        // memset(buffer->pVirAddr, 0, meta.nSize);
         // fprintf(stderr, "Allocate output{%d} { phy: %p, vir: %p, size: %lu Bytes }.\n", i, (void*)buffer->phyAddr, buffer->pVirAddr, (long)meta.nSize);
     }
 
@@ -251,7 +251,7 @@ int ax_runner_ax650_host::sub_init()
             }
             tensor.phyAddr = m_handle->io_data.pOutputs[i].phyAddr;
             tensor.pVirAddr = m_handle->io_data.pOutputs[i].pVirAddr;
-            mtensors.push_back(tensor);
+            moutput_tensors.push_back(tensor);
         }
 
         for (size_t i = 0; i < m_handle->io_info->nInputSize; i++)
@@ -357,10 +357,10 @@ void ax_runner_ax650_host::release()
         m_handle = nullptr;
     }
 
-    mtensors.clear();
+    moutput_tensors.clear();
     minput_tensors.clear();
     map_input_tensors.clear();
-    map_tensors.clear();
+    map_output_tensors.clear();
 
     // AX_ENGINE_Deinit();
 }

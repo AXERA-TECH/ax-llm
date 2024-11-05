@@ -39,10 +39,10 @@ typedef struct
 class ax_runner_base
 {
 protected:
-    std::vector<ax_runner_tensor_t> mtensors;
+    std::vector<ax_runner_tensor_t> moutput_tensors;
     std::vector<ax_runner_tensor_t> minput_tensors;
 
-    std::map<std::string, ax_runner_tensor_t> map_tensors;
+    std::map<std::string, ax_runner_tensor_t> map_output_tensors;
     std::map<std::string, ax_runner_tensor_t> map_input_tensors;
 
 public:
@@ -52,7 +52,7 @@ public:
     virtual void deinit() = 0;
 
     int get_num_inputs() { return minput_tensors.size(); }
-    int get_num_outputs() { return mtensors.size(); };
+    int get_num_outputs() { return moutput_tensors.size(); };
 
     const ax_runner_tensor_t &get_input(int idx) { return minput_tensors[idx]; }
     const ax_runner_tensor_t *get_inputs_ptr() { return minput_tensors.data(); }
@@ -73,23 +73,23 @@ public:
         return map_input_tensors[name];
     }
 
-    const ax_runner_tensor_t &get_output(int idx) { return mtensors[idx]; }
-    const ax_runner_tensor_t *get_outputs_ptr() { return mtensors.data(); }
+    const ax_runner_tensor_t &get_output(int idx) { return moutput_tensors[idx]; }
+    const ax_runner_tensor_t *get_outputs_ptr() { return moutput_tensors.data(); }
     const ax_runner_tensor_t &get_output(std::string name)
     {
-        if (map_tensors.size() == 0)
+        if (map_output_tensors.size() == 0)
         {
-            for (size_t i = 0; i < mtensors.size(); i++)
+            for (size_t i = 0; i < moutput_tensors.size(); i++)
             {
-                map_tensors[mtensors[i].sName] = mtensors[i];
+                map_output_tensors[moutput_tensors[i].sName] = moutput_tensors[i];
             }
         }
-        if (map_tensors.find(name) == map_tensors.end())
+        if (map_output_tensors.find(name) == map_output_tensors.end())
         {
             throw std::runtime_error("output tensor not found: " + name);
         }
 
-        return map_tensors[name];
+        return map_output_tensors[name];
     }
 
     virtual int get_algo_width() = 0;
