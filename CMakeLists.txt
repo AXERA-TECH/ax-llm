@@ -20,18 +20,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 
 # bsp
-if(NOT BSP_MSP_DIR)
-    # 判断 /soc/lib/libax_engine.so 是否存在，以确定是否为板端编译
-    if(EXISTS /soc/lib/libax_engine.so)
-        message(STATUS "Detected board,BSP_MSP_DIR = /soc")
-        set(BSP_MSP_DIR /soc)
-    else()
-        set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
-    endif()
-endif()
-message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
-include_directories(${BSP_MSP_DIR}/include)
-link_directories(${BSP_MSP_DIR}/lib)
+# if(NOT BSP_MSP_DIR)
+#     # 判断 /soc/lib/libax_engine.so 是否存在，以确定是否为板端编译
+#     if(EXISTS /soc/lib/libax_engine.so)
+#         message(STATUS "Detected board,BSP_MSP_DIR = /soc")
+#         set(BSP_MSP_DIR /soc)
+#     else()
+#         set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
+#     endif()
+# endif()
+# message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
+# include_directories(${BSP_MSP_DIR}/include)
+# link_directories(${BSP_MSP_DIR}/lib)
 
 set(SPM_ENABLE_SHARED OFF)
 add_subdirectory(third_party/sentencepiece)
@@ -53,6 +53,9 @@ include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
 
+include_directories(axcl/include)
+link_directories(axcl/lib)
+
 # if(NOT OpenCV_DIR)
 #     set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/third_party/libopencv-4.6-aarch64-none/lib/cmake/opencv4)
 # endif()
@@ -69,9 +72,10 @@ function(build_exec name main_source)
                     src/runner/Tokenizer/Tokenizer.cpp
                     src/runner/Tokenizer/QwenTokenizer.cpp)
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
+    # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
+    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt)
     target_link_libraries(${name} sentencepiece re2::re2)
-    target_link_libraries(${name} ${OpenCV_LIBS})
+    # target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 

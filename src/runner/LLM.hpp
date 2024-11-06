@@ -11,7 +11,8 @@
 #include "cqdm.h"
 #include "timer.hpp"
 
-#include <ax_sys_api.h>
+#include <axcl.h>
+// #include <ax_sys_api.h>
 
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 
@@ -238,6 +239,7 @@ public:
 
         {
             _attr.max_token_len = llama_layers[0].layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
+            printf("\n");
             ALOGI("max_token_len : %d", _attr.max_token_len);
             // auto &input_k_cache = llama_layers[0].layer.get_input("K_cache");
             // auto &output_k_cache_out = llama_layers[0].layer.get_output("K_cache_out");
@@ -277,6 +279,7 @@ public:
         }
         llama_post.release();
         embed_selector.Deinit();
+        axclFinalize();
     }
 
     // void Reset()
@@ -397,17 +400,17 @@ public:
             layer.layer.inference(prefill_grpid);
 
             auto &output_k_cache = layer.layer.get_output(prefill_grpid, "K_cache_out");
-            AX_SYS_MinvalidateCache(output_k_cache.phyAddr, output_k_cache.pVirAddr, output_k_cache.nSize);
+            // AX_SYS_MinvalidateCache(output_k_cache.phyAddr, output_k_cache.pVirAddr, output_k_cache.nSize);
             auto &input_k_cache = layer_llama.layer.get_input(decode_grpid, "K_cache");
             memcpy(input_k_cache.pVirAddr, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
 
             auto &output_v_cache = layer.layer.get_output(prefill_grpid, "V_cache_out");
-            AX_SYS_MinvalidateCache(output_v_cache.phyAddr, output_v_cache.pVirAddr, output_v_cache.nSize);
+            // AX_SYS_MinvalidateCache(output_v_cache.phyAddr, output_v_cache.pVirAddr, output_v_cache.nSize);
             auto &input_v_cache = layer_llama.layer.get_input(decode_grpid, "V_cache");
             memcpy(input_v_cache.pVirAddr, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
 
             auto &output = layer.layer.get_output(prefill_grpid, "output");
-            AX_SYS_MinvalidateCache(output.phyAddr, output.pVirAddr, output.nSize);
+            // AX_SYS_MinvalidateCache(output.phyAddr, output.pVirAddr, output.nSize);
             memcpy(test_embed.data(), output.pVirAddr, test_embed.size() * sizeof(unsigned short));
             if (_attr.b_dynamic_load_axmodel_layer)
             {
@@ -443,13 +446,13 @@ public:
             int max_index;
             if (_attr.b_use_topk)
             {
-                AX_SYS_MinvalidateCache(llama_post.get_output("indices").phyAddr, llama_post.get_output("indices").pVirAddr, llama_post.get_output("indices").nSize);
+                // AX_SYS_MinvalidateCache(llama_post.get_output("indices").phyAddr, llama_post.get_output("indices").pVirAddr, llama_post.get_output("indices").nSize);
                 max_index = *(int *)llama_post.get_output("indices").pVirAddr;
             }
             else
             {
                 auto &output_post = llama_post.get_output("output");
-                AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
+                // AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
                 float max_val = -MAXFLOAT;
                 max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
@@ -519,15 +522,15 @@ public:
                 layer.layer.inference(decode_grpid);
 
                 auto &output_k_cache = layer.layer.get_output(decode_grpid, "K_cache_out");
-                AX_SYS_MinvalidateCache(output_k_cache.phyAddr, output_k_cache.pVirAddr, output_k_cache.nSize);
+                // AX_SYS_MinvalidateCache(output_k_cache.phyAddr, output_k_cache.pVirAddr, output_k_cache.nSize);
                 memcpy(input_k_cache_ptr + indices * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
 
                 auto &output_v_cache = layer.layer.get_output(decode_grpid, "V_cache_out");
-                AX_SYS_MinvalidateCache(output_v_cache.phyAddr, output_v_cache.pVirAddr, output_v_cache.nSize);
+                // AX_SYS_MinvalidateCache(output_v_cache.phyAddr, output_v_cache.pVirAddr, output_v_cache.nSize);
                 memcpy(input_v_cache_ptr + indices * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
 
                 auto &output = layer.layer.get_output(decode_grpid, "output");
-                AX_SYS_MinvalidateCache(output.phyAddr, output.pVirAddr, output.nSize);
+                // AX_SYS_MinvalidateCache(output.phyAddr, output.pVirAddr, output.nSize);
                 memcpy(embed.data(), output.pVirAddr, embed.size() * sizeof(unsigned short));
                 if (_attr.b_dynamic_load_axmodel_layer)
                 {
@@ -545,13 +548,13 @@ public:
                 int max_index;
                 if (_attr.b_use_topk)
                 {
-                    AX_SYS_MinvalidateCache(llama_post.get_output("indices").phyAddr, llama_post.get_output("indices").pVirAddr, llama_post.get_output("indices").nSize);
+                    // AX_SYS_MinvalidateCache(llama_post.get_output("indices").phyAddr, llama_post.get_output("indices").pVirAddr, llama_post.get_output("indices").nSize);
                     max_index = *(int *)llama_post.get_output("indices").pVirAddr;
                 }
                 else
                 {
                     auto &output_post = llama_post.get_output("output");
-                    AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
+                    // AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
                     unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
                     float max_val = -MAXFLOAT;
                     max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
