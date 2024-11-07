@@ -400,11 +400,6 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size)
         // memset(&npu_attr, 0, sizeof(npu_attr));
         // npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
         // AX_SYS_Init();
-        auto ret = axclInit(nullptr);
-        if (0 != ret)
-        {
-            return ret;
-        }
 
         axclrtDeviceList lst;
         if (const auto ret = axclrtGetDeviceList(&lst); 0 != ret || 0 == lst.num)
@@ -418,7 +413,7 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size)
             return -1;
         }
 
-        ret = axclrtEngineInit(AXCL_VNPU_DISABLE);
+        int ret = axclrtEngineInit(AXCL_VNPU_DISABLE);
         if (0 != ret)
         {
             ALOGE("axclrtEngineInit %d\n", ret);
@@ -466,10 +461,17 @@ void ax_runner_ax650::release()
         m_handle = nullptr;
     }
 
-    moutput_tensors.clear();
     minput_tensors.clear();
+    moutput_tensors.clear();
+
     map_input_tensors.clear();
     map_output_tensors.clear();
+
+    mgroup_input_tensors.clear();
+    mgroup_output_tensors.clear();
+
+    map_group_input_tensors.clear();
+    map_group_output_tensors.clear();
 
     // AX_ENGINE_Deinit();
 }
@@ -504,6 +506,16 @@ int ax_runner_ax650::set_input(int grpid, int idx, unsigned long long int phy_ad
 int ax_runner_ax650::set_output(int grpid, int idx, unsigned long long int phy_addr, unsigned long size)
 {
     return axclrtEngineSetOutputBufferByIndex(m_handle->ios[grpid], idx, (void *)phy_addr, size);
+}
+
+int ax_runner_ax650::set_input(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size)
+{
+    return axclrtEngineSetInputBufferByIndex(m_handle->ios[grpid], get_input(grpid, name).nIdx, (void *)phy_addr, size);
+}
+
+int ax_runner_ax650::set_output(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size)
+{
+    return axclrtEngineSetOutputBufferByIndex(m_handle->ios[grpid], get_output(grpid, name).nIdx, (void *)phy_addr, size);
 }
 
 ax_color_space_e ax_runner_ax650::get_color_space()

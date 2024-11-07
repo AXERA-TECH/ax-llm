@@ -24,6 +24,9 @@ public:
     int set_input(int grpid, int idx, unsigned long long int phy_addr, unsigned long size);
     int set_output(int grpid, int idx, unsigned long long int phy_addr, unsigned long size);
 
+    int set_input(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size);
+    int set_output(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size);
+
     // int inference(ax_image_t *pstFrame) override;
     int inference() override;
     int inference(int grpid) override;

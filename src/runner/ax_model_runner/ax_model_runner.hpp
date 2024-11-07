@@ -38,7 +38,7 @@ typedef struct
 
 class ax_runner_base
 {
-protected:
+public:
     std::vector<ax_runner_tensor_t> moutput_tensors;
     std::vector<ax_runner_tensor_t> minput_tensors;
 
@@ -51,8 +51,8 @@ protected:
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_output_tensors;
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_input_tensors;
 
-    bool _auto_sync_before_inference = true;
-    bool _auto_sync_after_inference = true;
+    bool _auto_sync_before_inference = false;
+    bool _auto_sync_after_inference = false;
 
 public:
     virtual int init(const char *model_file, bool use_mmap = false) = 0;

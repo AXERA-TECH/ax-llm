@@ -77,6 +77,9 @@ private:
     int prefill_grpid = 1;
     int decode_grpid = 0;
 
+    unsigned int *p_indices_list;
+    unsigned short *p_mask_list;
+
     // ax_runner_ax650 vpm_resampler;
 
     // std::vector<std::vector<unsigned short>> k_caches, v_caches;
@@ -124,6 +127,12 @@ public:
     bool Init(LLMAttrType attr)
     {
         ALOGI("LLM init start");
+        if (auto ret = axclInit(0); ret != 0)
+        {
+            ALOGE("axclInit() failed");
+            return false;
+        }
+
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
         tokenizer = CreateTokenizer(attr.tokenizer_type);
@@ -213,6 +222,7 @@ public:
         int remain_cmm = get_remaining_cmm_size();
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
+        llama_post.set_auto_sync_after_inference(true);
 
         // int remain_cmm = get_remaining_cmm_size();
         // sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
@@ -261,6 +271,79 @@ public:
             layer.layer.deinit();
         }
 
+        {
+            bfloat16 bf16 = -65536.f;
+
+            axclrtMalloc((void **)&p_indices_list, _attr.max_token_len * sizeof(unsigned int), axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST);
+            axclrtMalloc((void **)&p_mask_list, _attr.max_token_len * (_attr.kv_cache_num + 1) * sizeof(unsigned short), axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST);
+
+            std::vector<unsigned int> indices_list(_attr.max_token_len, 0);
+
+            std::vector<unsigned short> tmp_mask_list(_attr.max_token_len * (_attr.kv_cache_num + 1), bf16.data);
+
+            std::vector<unsigned short> tmp_mask(_attr.kv_cache_num + 1, bf16.data);
+            tmp_mask[_attr.kv_cache_num] = 0;
+            for (unsigned int indices = 0; indices < _attr.max_token_len; indices++)
+            {
+                indices_list[indices] = indices;
+                tmp_mask[indices] = 0;
+                // printf("%d %d %d\n", indices, tmp_mask.size(), tmp_mask_list.size());
+                memcpy(tmp_mask_list.data() + indices * tmp_mask.size(), tmp_mask.data(), tmp_mask.size() * sizeof(unsigned short));
+                // axclrtMemcpy(p_mask_list + indices * tmp_mask.size(), tmp_mask.size() * sizeof(unsigned short), tmp_mask.data(), tmp_mask.size() * sizeof(unsigned short), AXCL_MEMCPY_HOST_TO_DEVICE);
+            }
+            axclrtMemcpy(p_indices_list, indices_list.data(), _attr.max_token_len * sizeof(unsigned int), AXCL_MEMCPY_HOST_TO_DEVICE);
+            axclrtMemcpy(p_mask_list, tmp_mask_list.data(), tmp_mask_list.size() * sizeof(unsigned short), AXCL_MEMCPY_HOST_TO_DEVICE);
+
+            std::vector<unsigned short> mask_p(_attr.prefill_token_num * _attr.prefill_token_num, bf16.data);
+
+            for (size_t i = 0; i < _attr.prefill_token_num; i++)
+            {
+                for (size_t j = 0; j < i + 1; j++)
+                {
+                    mask_p[i * _attr.prefill_token_num + j] = 0;
+                }
+            }
+            for (unsigned int m = 0; m < _attr.axmodel_num; m++)
+            {
+                auto &layer = llama_layers[m];
+                auto &input_indices = layer.layer.get_input(prefill_grpid, "indices");
+
+                unsigned int *input_indices_ptr = (unsigned int *)malloc(input_indices.nSize);
+                for (unsigned int i = 0; i < _attr.max_token_len; i++)
+                {
+                    input_indices_ptr[i] = i;
+                }
+                axclrtMemcpy((void *)input_indices.phyAddr, input_indices_ptr, input_indices.nSize, AXCL_MEMCPY_HOST_TO_DEVICE);
+                free(input_indices_ptr);
+
+                auto &input_mask = layer.layer.get_input(prefill_grpid, "mask");
+                axclrtMemcpy((void *)input_mask.phyAddr, mask_p.data(), input_mask.nSize, AXCL_MEMCPY_HOST_TO_DEVICE);
+
+                if (m < _attr.axmodel_num - 1)
+                {
+                    {
+                        auto &output = layer.layer.get_output(prefill_grpid, "output");
+                        auto &layer_next = llama_layers[m + 1];
+                        layer_next.layer.set_input(prefill_grpid, "input", output.phyAddr, output.nSize);
+                    }
+
+                    {
+                        auto &output = layer.layer.get_output(decode_grpid, "output");
+                        auto &layer_next = llama_layers[m + 1];
+                        layer_next.layer.set_input(decode_grpid, "input", output.phyAddr, output.nSize);
+                    }
+                }
+
+                auto &output_k_cache = layer.layer.get_output(prefill_grpid, "K_cache_out");
+                auto &input_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
+                layer.layer.set_output(prefill_grpid, "K_cache_out", input_k_cache.phyAddr, input_k_cache.nSize);
+
+                auto &output_v_cache = layer.layer.get_output(prefill_grpid, "V_cache_out");
+                auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
+                layer.layer.set_output(prefill_grpid, "V_cache_out", input_v_cache.phyAddr, input_v_cache.nSize);
+            }
+        }
+
         // Reset();
         ALOGI("LLM init ok");
         return true;
@@ -279,14 +362,10 @@ public:
         }
         llama_post.release();
         embed_selector.Deinit();
+        axclrtFree(p_indices_list);
+        axclrtFree(p_mask_list);
         axclFinalize();
     }
-
-    // void Reset()
-    // {
-    //     k_caches.resize(_attr.axmodel_num, std::vector<unsigned short>(_attr.kv_cache_num * _attr.kv_cache_size, 0));
-    //     v_caches.resize(_attr.axmodel_num, std::vector<unsigned short>(_attr.kv_cache_num * _attr.kv_cache_size, 0));
-    // }
 
     void Stop()
     {
@@ -327,15 +406,6 @@ public:
 
         bfloat16 bf16 = -65536.f;
         std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
-        std::vector<unsigned short> mask_p(_attr.prefill_token_num * _attr.prefill_token_num, bf16.data);
-
-        for (size_t i = 0; i < _attr.prefill_token_num; i++)
-        {
-            for (size_t j = 0; j < i + 1; j++)
-            {
-                mask_p[i * _attr.prefill_token_num + j] = 0;
-            }
-        }
 
         std::vector<int> cached_token;
         std::vector<int> token_ids;
@@ -352,6 +422,12 @@ public:
         timer t_cost;
         timer ttft_timer;
         ttft_timer.start();
+
+        {
+            auto &input_input = llama_layers[0].layer.get_input(prefill_grpid, "input");
+            axclrtMemcpy((void *)input_input.phyAddr, test_embed.data(), test_embed.size() * sizeof(unsigned short), AXCL_MEMCPY_HOST_TO_DEVICE);
+            test_embed.resize(_attr.prefill_token_num * _attr.tokens_embed_size);
+        }
 
         for (unsigned int m = 0; m < _attr.axmodel_num; m++)
         {
@@ -380,43 +456,20 @@ public:
                 }
             }
 
-            auto &input_indices = layer.layer.get_input(prefill_grpid, "indices");
-            unsigned int *input_indices_ptr = (unsigned int *)input_indices.pVirAddr;
-            for (unsigned int i = 0; i < input_embed_num; i++)
-            {
-                input_indices_ptr[i] = i;
-            }
-
-            auto &input_mask = layer.layer.get_input(prefill_grpid, "mask");
-            memcpy(input_mask.pVirAddr, mask_p.data(), mask_p.size() * sizeof(unsigned short));
-
-            auto &input_input = layer.layer.get_input(prefill_grpid, "input");
-            memcpy(input_input.pVirAddr, test_embed.data(), test_embed.size() * sizeof(unsigned short));
-            if (m == 0)
-            {
-                test_embed.resize(_attr.prefill_token_num * _attr.tokens_embed_size);
-            }
-
             layer.layer.inference(prefill_grpid);
 
-            auto &output_k_cache = layer.layer.get_output(prefill_grpid, "K_cache_out");
-            // AX_SYS_MinvalidateCache(output_k_cache.phyAddr, output_k_cache.pVirAddr, output_k_cache.nSize);
-            auto &input_k_cache = layer_llama.layer.get_input(decode_grpid, "K_cache");
-            memcpy(input_k_cache.pVirAddr, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
-
-            auto &output_v_cache = layer.layer.get_output(prefill_grpid, "V_cache_out");
-            // AX_SYS_MinvalidateCache(output_v_cache.phyAddr, output_v_cache.pVirAddr, output_v_cache.nSize);
-            auto &input_v_cache = layer_llama.layer.get_input(decode_grpid, "V_cache");
-            memcpy(input_v_cache.pVirAddr, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
-
-            auto &output = layer.layer.get_output(prefill_grpid, "output");
-            // AX_SYS_MinvalidateCache(output.phyAddr, output.pVirAddr, output.nSize);
-            memcpy(test_embed.data(), output.pVirAddr, test_embed.size() * sizeof(unsigned short));
             if (_attr.b_dynamic_load_axmodel_layer)
             {
                 layer.layer.deinit();
             }
             // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
+        }
+
+        // if (m == )
+        {
+            auto &output = llama_layers[_attr.axmodel_num - 1].layer.get_output(prefill_grpid, "output");
+            auto &input = llama_post.get_input("input");
+            axclrtMemcpy((void *)input.phyAddr, (unsigned short *)output.phyAddr + (input_embed_num - 1) * _attr.tokens_embed_size, output.nSize, AXCL_MEMCPY_DEVICE_TO_DEVICE);
         }
 
         // ALOGI("prefill time cost: %.2f s", t_cost.cost() / 1000);
@@ -433,26 +486,20 @@ public:
         t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
         std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
 
-        memcpy(embed.data(),
-               test_embed.data() + (input_embed_num - 1) * _attr.tokens_embed_size,
-               _attr.tokens_embed_size * sizeof(unsigned short));
+        // memcpy(embed.data(),
+        //        test_embed.data() + (input_embed_num - 1) * _attr.tokens_embed_size,
+        //        _attr.tokens_embed_size * sizeof(unsigned short));
 
         {
-
-            // post process
-            auto &input = llama_post.get_input("input");
-            memcpy(input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             llama_post.inference();
             int max_index;
             if (_attr.b_use_topk)
             {
-                // AX_SYS_MinvalidateCache(llama_post.get_output("indices").phyAddr, llama_post.get_output("indices").pVirAddr, llama_post.get_output("indices").nSize);
                 max_index = *(int *)llama_post.get_output("indices").pVirAddr;
             }
             else
             {
                 auto &output_post = llama_post.get_output("output");
-                // AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
                 float max_val = -MAXFLOAT;
                 max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
@@ -475,6 +522,10 @@ public:
 
             // ALOGI("out %d %d", indices, next_token);
             embed_selector.getByIndex(next_token, embed);
+
+            auto &input_input = llama_layers[0].layer.get_input(decode_grpid, "input");
+            // memcpy(input_input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
+            axclrtMemcpy((void *)input_input.phyAddr, embed.data(), embed.size() * sizeof(unsigned short), AXCL_MEMCPY_HOST_TO_DEVICE);
             // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
 
             for (int m = 0; m < _attr.axmodel_num; m++)
@@ -503,58 +554,40 @@ public:
                     }
                 }
 
-                auto &input_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
-                unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
-                // memcpy(input_k_cache.pVirAddr, k_caches[m].data(), sizeof(unsigned short) * k_caches[m].size());
-                auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
-                unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
-                // memcpy(input_v_cache.pVirAddr, v_caches[m].data(), sizeof(unsigned short) * v_caches[m].size());
-
-                auto &input_indices = layer.layer.get_input(decode_grpid, "indices");
-                memcpy(input_indices.pVirAddr, &indices, sizeof(indices));
-
-                auto &input_mask = layer.layer.get_input(decode_grpid, "mask");
-                memcpy(input_mask.pVirAddr, mask.data(), mask.size() * sizeof(unsigned short));
-
-                auto &input_input = layer.layer.get_input(decode_grpid, "input");
-                memcpy(input_input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
+                {
+                    layer.layer.set_input(decode_grpid, "indices", (unsigned long long)(p_indices_list + indices), sizeof(unsigned int) * _attr.max_token_len);
+                    layer.layer.set_input(decode_grpid, "mask", (unsigned long long)(p_mask_list + indices * (_attr.kv_cache_num + 1)), mask.size() * sizeof(unsigned short));
+                    unsigned short *input_k_cache_ptr = (unsigned short *)layer.layer.get_input(decode_grpid, "K_cache").phyAddr;
+                    unsigned short *input_v_cache_ptr = (unsigned short *)layer.layer.get_input(decode_grpid, "V_cache").phyAddr;
+                    layer.layer.set_output(decode_grpid, "K_cache_out", (unsigned long long)(input_k_cache_ptr + indices * _attr.kv_cache_size), sizeof(unsigned short) * _attr.kv_cache_size);
+                    layer.layer.set_output(decode_grpid, "V_cache_out", (unsigned long long)(input_v_cache_ptr + indices * _attr.kv_cache_size), sizeof(unsigned short) * _attr.kv_cache_size);
+                }
 
                 layer.layer.inference(decode_grpid);
 
-                auto &output_k_cache = layer.layer.get_output(decode_grpid, "K_cache_out");
-                // AX_SYS_MinvalidateCache(output_k_cache.phyAddr, output_k_cache.pVirAddr, output_k_cache.nSize);
-                memcpy(input_k_cache_ptr + indices * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
-
-                auto &output_v_cache = layer.layer.get_output(decode_grpid, "V_cache_out");
-                // AX_SYS_MinvalidateCache(output_v_cache.phyAddr, output_v_cache.pVirAddr, output_v_cache.nSize);
-                memcpy(input_v_cache_ptr + indices * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
-
-                auto &output = layer.layer.get_output(decode_grpid, "output");
-                // AX_SYS_MinvalidateCache(output.phyAddr, output.pVirAddr, output.nSize);
-                memcpy(embed.data(), output.pVirAddr, embed.size() * sizeof(unsigned short));
                 if (_attr.b_dynamic_load_axmodel_layer)
                 {
                     layer.layer.deinit();
                 }
                 // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
             }
+            {
+                auto &output = llama_layers[_attr.axmodel_num - 1].layer.get_output(decode_grpid, "output");
+                auto &input = llama_post.get_input("input");
+                axclrtMemcpy((void *)input.phyAddr, (void *)output.phyAddr, output.nSize, AXCL_MEMCPY_DEVICE_TO_DEVICE);
+            }
             // ALOGI("");
             mask[indices] = 0;
             {
-                // post process
-                auto &input = llama_post.get_input("input");
-                memcpy(input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
                 llama_post.inference();
                 int max_index;
                 if (_attr.b_use_topk)
                 {
-                    // AX_SYS_MinvalidateCache(llama_post.get_output("indices").phyAddr, llama_post.get_output("indices").pVirAddr, llama_post.get_output("indices").nSize);
                     max_index = *(int *)llama_post.get_output("indices").pVirAddr;
                 }
                 else
                 {
                     auto &output_post = llama_post.get_output("output");
-                    // AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
                     unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
                     float max_val = -MAXFLOAT;
                     max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
