@@ -27,7 +27,7 @@
 
 - 递归 clone 本项目，确保所有 `submodule` 正确 clone
     ```shell
-    git clone -b minicpm-v --recursive https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b internvl2 --recursive https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - 仔细阅读 `build.sh` ，并在 `build.sh` 正确修改 `BSP_MSP_DIR` 变量后，运行编译脚本
