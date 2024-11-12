@@ -4,7 +4,7 @@
 
 | Platform | Build Status |
 | -------- | ------------ |
-| AX650    | ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/AXERA-TECH/ax-llm/build_650.yml)|
+| AX650    | ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/AXERA-TECH/ax-llm/build_650.yml?internvl2)|
 
 ## 简介
 
