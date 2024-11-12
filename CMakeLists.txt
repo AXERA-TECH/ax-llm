@@ -56,13 +56,13 @@ include_directories(src/runner/utils)
 include_directories(axcl/include)
 link_directories(axcl/lib)
 
-# if(NOT OpenCV_DIR)
-#     set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/third_party/libopencv-4.6-aarch64-none/lib/cmake/opencv4)
-# endif()
+if(NOT OpenCV_DIR)
+    set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/third_party/libopencv-4.6-aarch64-none/lib/cmake/opencv4)
+endif()
 
-# message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
-# find_package(OpenCV REQUIRED)
-# include_directories(${OpenCV_INCLUDE_DIRS})
+message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
+find_package(OpenCV REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
 
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
@@ -75,7 +75,7 @@ function(build_exec name main_source)
     # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt)
     target_link_libraries(${name} sentencepiece re2::re2)
-    # target_link_libraries(${name} ${OpenCV_LIBS})
+    target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 
