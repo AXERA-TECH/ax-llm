@@ -6,9 +6,9 @@ name: build_650
 on:
   # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "master" ]
+    branches: [ "minicpm-v" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "minicpm-v" ]
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
@@ -28,6 +28,13 @@ jobs:
           submodules: true
 
       # Runs a set of commands using the runners shell
+      - name: prepare opencv-library
+        run: |
+          mkdir -p ./third_party
+          wget https://github.com/AXERA-TECH/ax-samples/releases/download/v0.1/opencv-aarch64-linux-gnu-gcc-7.5.0.zip
+          unzip opencv-aarch64-linux-gnu-gcc-7.5.0 -d ./third_party
+          mv third_party/opencv-aarch64-linux/ third_party/libopencv-4.6-aarch64-none
+      
       - name: build
         run: |
           mkdir build
