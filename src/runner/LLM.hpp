@@ -307,9 +307,8 @@ public:
             {
                 auto &layer = llama_layers[m];
                 auto &input_indices = layer.layer.get_input(prefill_grpid, "indices");
-
                 unsigned int *input_indices_ptr = (unsigned int *)malloc(input_indices.nSize);
-                for (unsigned int i = 0; i < _attr.max_token_len; i++)
+                for (unsigned int i = 0; i < _attr.prefill_token_num; i++)
                 {
                     input_indices_ptr[i] = i;
                 }
@@ -374,7 +373,7 @@ public:
 
     int Encode(std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
     {
-        std::vector<int> input_ids = tokenizer->Encode(prompt, true);
+        std::vector<int> input_ids = tokenizer->Encode(prompt, false);
         if (input_ids.size() > _attr.prefill_token_num)
         {
             ALOGE("input_ids(%d) > prefill_token_num(%d)", input_ids.size(), _attr.prefill_token_num);
