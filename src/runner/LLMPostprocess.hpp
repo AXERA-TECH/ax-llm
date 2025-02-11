@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <unordered_set>
+#include "utils/json.hpp"
+#include "utils/sample_log.h"
 
 class LLMPostprocess
 {
@@ -26,6 +29,35 @@ private:
             if (token < logits.size())
             {
                 logits[token] = logits[token] < 0 ? logits[token] * penalty : logits[token] / penalty;
+            }
+        }
+    }
+
+    void apply_repetition_penalty(std::vector<float> &logits,
+                                  const std::vector<int> &generated_tokens,
+                                  float repetition_penalty,
+                                  int penalty_window)
+    {
+        if (repetition_penalty == 1.0f || generated_tokens.empty())
+        {
+            return; // 如果 penalty = 1.0 或者没有生成 token，则不进行修改
+        }
+
+        int start_idx = std::max(0, (int)generated_tokens.size() - penalty_window);
+        std::unordered_set<int> recent_tokens(generated_tokens.begin() + start_idx, generated_tokens.end());
+
+        for (int token : recent_tokens)
+        {
+            if (token < 0 || token >= logits.size())
+                continue;
+
+            if (logits[token] > 0)
+            {
+                logits[token] /= std::sqrt(repetition_penalty);
+            }
+            else
+            {
+                logits[token] *= std::sqrt(repetition_penalty);
             }
         }
     }
@@ -189,6 +221,7 @@ private:
 
     bool enable_repetition_penalty = false;
     float repetition_penalty = 1.0f;
+    int penalty_window = 20;
 
     bool enable_diversity_penalty = false;
     std::vector<int> common_phrases;
@@ -236,12 +269,38 @@ public:
         this->top_k = top_k;
     }
 
+    bool load_config(std::string config_path)
+    {
+        std::ifstream config_file(config_path);
+        if (!config_file.is_open())
+        {
+            ALOGE("config file(%s) open failed", config_path.c_str());
+            return false;
+        }
+        nlohmann::json config = nlohmann::json::parse(config_file);
+        ALOGI("load config: \n%s\n", config.dump(4).c_str());
+
+        enable_temperature = config["enable_temperature"];
+        temperature = config["temperature"];
+
+        enable_repetition_penalty = config["enable_repetition_penalty"];
+        repetition_penalty = config["repetition_penalty"];
+        penalty_window = config["penalty_window"];
+
+        enable_top_p_sampling = config["enable_top_p_sampling"];
+        top_p = config["top_p"];
+
+        enable_top_k_sampling = config["enable_top_k_sampling"];
+        top_k = config["top_k"];
+        return true;
+    }
+
     int apply(std::vector<float> &logits, const std::vector<int> &history)
     {
         if (enable_temperature)
             apply_temperature(logits, temperature);
         if (enable_repetition_penalty)
-            apply_repetition_penalty(logits, history, repetition_penalty);
+            apply_repetition_penalty(logits, history, repetition_penalty, penalty_window);
         if (enable_diversity_penalty)
             apply_diversity_penalty(logits, common_phrases, diversity_penalty);
 

@@ -50,6 +50,8 @@ struct LLMAttrType
 
     bool b_use_mmap_load_layer = true;
 
+    std::string post_config_path = "post_config.json";
+
     // bool b_live_print = true;
     LLMRuningCallback runing_callback = nullptr;
     void *reserve = nullptr;
@@ -83,7 +85,8 @@ private:
 
     bool b_stop = false;
 
-    static int post_process(unsigned short *p, int n, std::vector<int> &history, float *val = 0)
+    LLMPostprocess postprocess;
+    static int post_process(LLMPostprocess &postprocess, unsigned short *p, int n, std::vector<int> &history, float *val = 0)
     {
         std::vector<float> logits(n);
         for (int i = 0; i < n; i++)
@@ -91,11 +94,11 @@ private:
             unsigned int proc = p[i] << 16;
             logits[i] = *reinterpret_cast<float *>(&proc);
         }
-        LLMPostprocess postprocess;
-        postprocess.set_temperature(true, 0.8f);
-        postprocess.set_repetition_penalty(true, 1.2f);
-        // postprocess.set_top_k_sampling(true, 40);
-        postprocess.set_top_p_sampling(true, 0.9f);
+
+        // postprocess.set_temperature(true, 0.9f);
+        // // postprocess.set_repetition_penalty(true, 1.1f);
+        // postprocess.set_top_k_sampling(true, 10);
+        // // postprocess.set_top_p_sampling(true, 0.9f);
 
         return postprocess.apply(logits, history);
 
@@ -254,6 +257,11 @@ public:
         {
             auto &layer = llama_layers[0];
             layer.layer.deinit();
+        }
+
+        if (!postprocess.load_config(attr.post_config_path))
+        {
+            ALOGW("load postprocess config(%s) failed", attr.post_config_path.c_str());
         }
 
         // Reset();
@@ -449,7 +457,7 @@ public:
                 AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
                 float max_val = -MAXFLOAT;
-                max_index = post_process(post_out, _attr.tokens_embed_num, token_ids, &max_val);
+                max_index = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, &max_val);
             }
             next_token = max_index;
 
@@ -551,7 +559,7 @@ public:
                     AX_SYS_MinvalidateCache(output_post.phyAddr, output_post.pVirAddr, output_post.nSize);
                     unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
                     float max_val = -MAXFLOAT;
-                    max_index = post_process(post_out, _attr.tokens_embed_num, token_ids, &max_val);
+                    max_index = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, &max_val);
                 }
                 next_token = max_index;
 
