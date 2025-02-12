@@ -17,7 +17,7 @@
 
 #define HOST_DEBUG 0
 #define DUMP_HOST_DATA 0
-#define USE_SET_INPUT 1
+#define USE_SET_INPUT 0
 
 #if HOST_DEBUG
 #include "ax_model_runner/ax_model_runner_ax650_host.hpp"

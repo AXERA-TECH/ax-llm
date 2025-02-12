@@ -36,18 +36,18 @@ if(BUILD_WITH_YOLOV5_TEST)
     link_directories(${BSP_MSP_DIR}/lib)
 endif()
 
-set(SPM_ENABLE_SHARED OFF)
-add_subdirectory(third_party/sentencepiece)
-include_directories(third_party/sentencepiece/src)
-include_directories(third_party/sentencepiece/third_party/protobuf-lite)
+# set(SPM_ENABLE_SHARED OFF)
+# add_subdirectory(third_party/sentencepiece)
+# include_directories(third_party/sentencepiece/src)
+# include_directories(third_party/sentencepiece/third_party/protobuf-lite)
 
-set(ABSL_ENABLE_INSTALL ON)
-set(ABSL_PROPAGATE_CXX_STD ON)
-add_subdirectory(third_party/abseil-cpp)
-add_subdirectory(third_party/re2)
-include_directories(third_party/abseil-cpp)
-include_directories(third_party/re2)
-link_directories(${CMAKE_BINARY_DIR}/lib)
+# set(ABSL_ENABLE_INSTALL ON)
+# set(ABSL_PROPAGATE_CXX_STD ON)
+# add_subdirectory(third_party/abseil-cpp)
+# add_subdirectory(third_party/re2)
+# include_directories(third_party/abseil-cpp)
+# include_directories(third_party/re2)
+# link_directories(${CMAKE_BINARY_DIR}/lib)
 
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
@@ -58,21 +58,24 @@ include_directories(src/runner/utils)
 
 include_directories(axcl/include)
 link_directories(axcl/lib)
+include_directories(/usr/include/axcl/)
+link_directories(/usr/lib/axcl/)
 
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
                     src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
-                    src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
+                    # src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
-                    src/runner/Tokenizer/QwenTokenizer.cpp)
+                    # src/runner/Tokenizer/QwenTokenizer.cpp
+                    )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
+    # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
     target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt)
 
-    target_link_libraries(${name} sentencepiece re2::re2)
+    # target_link_libraries(${name} sentencepiece re2::re2)
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 
