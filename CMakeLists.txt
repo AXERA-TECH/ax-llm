@@ -33,18 +33,18 @@ message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
 include_directories(${BSP_MSP_DIR}/include)
 link_directories(${BSP_MSP_DIR}/lib)
 
-set(SPM_ENABLE_SHARED OFF)
-add_subdirectory(third_party/sentencepiece)
-include_directories(third_party/sentencepiece/src)
-include_directories(third_party/sentencepiece/third_party/protobuf-lite)
+# set(SPM_ENABLE_SHARED OFF)
+# add_subdirectory(third_party/sentencepiece)
+# include_directories(third_party/sentencepiece/src)
+# include_directories(third_party/sentencepiece/third_party/protobuf-lite)
 
-set(ABSL_ENABLE_INSTALL ON)
-set(ABSL_PROPAGATE_CXX_STD ON)
-add_subdirectory(third_party/abseil-cpp)
-add_subdirectory(third_party/re2)
-include_directories(third_party/abseil-cpp)
-include_directories(third_party/re2)
-link_directories(${CMAKE_BINARY_DIR}/lib)
+# set(ABSL_ENABLE_INSTALL ON)
+# set(ABSL_PROPAGATE_CXX_STD ON)
+# add_subdirectory(third_party/abseil-cpp)
+# add_subdirectory(third_party/re2)
+# include_directories(third_party/abseil-cpp)
+# include_directories(third_party/re2)
+# link_directories(${CMAKE_BINARY_DIR}/lib)
 
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
@@ -67,10 +67,11 @@ function(build_exec name main_source)
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
-                    src/runner/Tokenizer/QwenTokenizer.cpp)
+                    # src/runner/Tokenizer/QwenTokenizer.cpp
+                    )
 
     target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
-    target_link_libraries(${name} sentencepiece re2::re2)
+    # target_link_libraries(${name} sentencepiece re2::re2)
     target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
