@@ -11,6 +11,7 @@
 #include "ax_cmm_utils.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
+#include "LLMPostprocess.hpp"
 
 #include <axcl.h>
 #include <axcl_rt_memory.h>
@@ -50,6 +51,8 @@ struct LLMAttrType
 
     bool b_use_mmap_load_layer = true;
 
+    std::string post_config_path = "post_config.json";
+
     // bool b_live_print = true;
     LLMRuningCallback runing_callback = nullptr;
     void *reserve = nullptr;
@@ -88,6 +91,19 @@ private:
     unsigned int *p_indices_list;
     unsigned short *p_mask_list;
 #endif
+
+    LLMPostprocess postprocess;
+    static int post_process(LLMPostprocess &postprocess, unsigned short *p, int n, std::vector<int> &history, float *val = 0)
+    {
+        std::vector<float> logits(n);
+        for (int i = 0; i < n; i++)
+        {
+            unsigned int proc = p[i] << 16;
+            logits[i] = *reinterpret_cast<float *>(&proc);
+        }
+
+        return postprocess.apply(logits, history);
+    }
 
 public:
     bool Init(LLMAttrType attr)
@@ -151,7 +167,7 @@ public:
                     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
                     return false;
                 }
-                int remain_cmm = get_remaining_cmm_size();
+                int remain_cmm = get_pcie_remaining_cmm_size();
                 sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
                 update_cqdm(&cqdm, i + 2, "count", axmodel_path);
             }
@@ -262,6 +278,12 @@ public:
             axclrtMemcpy(p_mask_list, tmp_mask_list.data(), tmp_mask_list.size() * sizeof(unsigned short), AXCL_MEMCPY_HOST_TO_DEVICE);
         }
 #endif
+
+        if (!postprocess.load_config(attr.post_config_path))
+        {
+            ALOGW("load postprocess config(%s) failed", attr.post_config_path.c_str());
+        }
+
         // Reset();
         ALOGI("LLM init ok");
         return true;
@@ -532,18 +554,20 @@ public:
 #endif
                 }
 #endif
-                float max_val = -MAXFLOAT;
-                int max_index = 0;
-                for (int i = 0; i < _attr.tokens_embed_num; i++)
-                {
-                    float tmp = bfloat16(post_out[i]).fp32();
-                    if (tmp > max_val)
-                    {
-                        max_val = tmp;
-                        max_index = i;
-                    }
-                }
+                auto max_index = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
                 next_token = max_index;
+                // float max_val = -MAXFLOAT;
+                // int max_index = 0;
+                // for (int i = 0; i < _attr.tokens_embed_num; i++)
+                // {
+                //     float tmp = bfloat16(post_out[i]).fp32();
+                //     if (tmp > max_val)
+                //     {
+                //         max_val = tmp;
+                //         max_index = i;
+                //     }
+                // }
+                
 
                 if (tokenizer->isEnd(max_index))
                 {
