@@ -10,6 +10,7 @@
 #include "ax_cmm_utils.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
+#include "LLMPostprocess.hpp"
 
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 
@@ -36,6 +37,8 @@ struct LLMAttrType
     bool b_dynamic_load_axmodel_layer = false;
 
     bool b_use_mmap_load_layer = true;
+
+    std::string post_config_path = "post_config.json";
 
     // bool b_live_print = true;
     LLMRuningCallback runing_callback = nullptr;
@@ -65,6 +68,18 @@ private:
 
     bool b_stop = false;
 
+    LLMPostprocess postprocess;
+    static int post_process(LLMPostprocess &postprocess, unsigned short *p, int n, std::vector<int> &history, float *val = 0)
+    {
+        std::vector<float> logits(n);
+        for (int i = 0; i < n; i++)
+        {
+            unsigned int proc = p[i] << 16;
+            logits[i] = *reinterpret_cast<float *>(&proc);
+        }
+        return postprocess.apply(logits, history);
+    }
+
 public:
     bool Init(LLMAttrType attr)
     {
@@ -72,6 +87,11 @@ public:
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
         tokenizer = CreateTokenizer(attr.tokenizer_type);
+        if (tokenizer == nullptr)
+        {
+            ALOGE("CreateTokenizer(%d) failed", attr.tokenizer_type);
+            return false;
+        }
         if (!tokenizer->Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
         {
             ALOGE("tokenizer.Init(%s, %d, %d) failed", attr.filename_tokenizer_model.c_str(), attr.b_bos, attr.b_eos);
@@ -193,6 +213,11 @@ public:
         {
             auto &layer = llama_layers[0];
             layer.layer.deinit();
+        }
+
+        if (!postprocess.load_config(attr.post_config_path))
+        {
+            ALOGW("load postprocess config(%s) failed", attr.post_config_path.c_str());
         }
 
         // Reset();
@@ -334,17 +359,7 @@ public:
                 auto &output_post = llama_post.get_output("output");
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
 
-                float max_val = -MAXFLOAT;
-                int max_index = 0;
-                for (int i = 0; i < _attr.tokens_embed_num; i++)
-                {
-                    float tmp = bfloat16(post_out[i]).fp32();
-                    if (tmp > max_val)
-                    {
-                        max_val = tmp;
-                        max_index = i;
-                    }
-                }
+                int max_index = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
                 next_token = max_index;
 
                 if (tokenizer->isEnd(max_index))

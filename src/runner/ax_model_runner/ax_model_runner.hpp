@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <stdexcept>
 
 typedef enum _color_space_e
 {
