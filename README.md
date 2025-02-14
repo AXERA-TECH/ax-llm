@@ -36,14 +36,17 @@
 
 ## 源码编译
 
-- 递归 clone 本项目，确保所有 `submodule` 正确 clone
+- 在 Host 上下载 axcl llm 对应分支
     ```shell
-    git clone --recursive https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b axcl-llm https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
-- 仔细阅读 `build.sh` ，并在 `build.sh` 正确修改 `BSP_MSP_DIR` 变量后，运行编译脚本
+- 本地编译
     ```shell
-    ./build.sh
+    mkdir build
+    cd build
+    cmake ..
+    make install -j4
     ```
 - 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
   ```
