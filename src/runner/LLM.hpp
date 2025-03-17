@@ -189,7 +189,7 @@ public:
                     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
                     return false;
                 }
-                int remain_cmm = get_remaining_cmm_size();
+                int remain_cmm = get_pcie_remaining_cmm_size(0);
                 sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
                 update_cqdm(&cqdm, i + 2, "count", axmodel_path);
             }
@@ -219,7 +219,7 @@ public:
             ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str());
             return false;
         }
-        int remain_cmm = get_remaining_cmm_size();
+        int remain_cmm = get_pcie_remaining_cmm_size(0);
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
         llama_post.set_auto_sync_after_inference(true);

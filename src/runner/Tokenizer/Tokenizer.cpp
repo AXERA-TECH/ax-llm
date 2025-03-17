@@ -8,6 +8,7 @@
 // #include "chatglm.h"
 
 #include "httplib.h"
+#include "http_utils.hpp"
 #include "json.hpp"
 
 #include "sample_log.h"
@@ -310,6 +311,15 @@ public:
     bool Init(std::string model_path = "http://localhost:8080", bool b_bos = true, bool b_eos = false) override
     {
         base_url = model_path;
+        if (!test_connect_http(base_url, 10))
+        {
+            ALOGE("connect %s failed", base_url.c_str());
+            return false;
+        }
+        else
+        {
+            ALOGI("connect %s ok", base_url.c_str());
+        }
         try
         {
             cli = std::make_shared<httplib::Client>(base_url);
