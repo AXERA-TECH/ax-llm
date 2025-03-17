@@ -46,7 +46,6 @@ struct LLMAttrType
     int kv_cache_size = 256; // auto calc
 
     bool b_use_mmap_load_embed = false;
-    bool b_dynamic_load_axmodel_layer = false;
 
     bool b_use_mmap_load_layer = true;
 
@@ -181,36 +180,15 @@ public:
             sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
             llama_layers[i].filename = axmodel_path;
 
-            if (!attr.b_dynamic_load_axmodel_layer)
+            int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), false);
+            if (ret != 0)
             {
-                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), false);
-                if (ret != 0)
-                {
-                    ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
-                    return false;
-                }
-                int remain_cmm = get_pcie_remaining_cmm_size(0);
-                sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
-                update_cqdm(&cqdm, i + 2, "count", axmodel_path);
+                ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
+                return false;
             }
-            else
-            {
-                if (!attr.b_use_mmap_load_layer)
-                {
-                    if (!read_file(llama_layers[i].filename, llama_layers[i].layer_buffer_vec))
-                    {
-                        ALOGE("read_file(%s) failed", llama_layers[i].filename.c_str());
-                        return false;
-                    }
-                }
-                else
-                {
-                    llama_layers[i].layer_buffer.open_file(llama_layers[i].filename.c_str());
-                }
-
-                sprintf(axmodel_path, "read_file %s ok", llama_layers[i].filename.c_str());
-                update_cqdm(&cqdm, i + 2, "count", axmodel_path);
-            }
+            int remain_cmm = get_pcie_remaining_cmm_size(0);
+            sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
+            update_cqdm(&cqdm, i + 2, "count", axmodel_path);
         }
 
         int ret = llama_post.init(attr.filename_post_axmodel.c_str(), false);
@@ -223,29 +201,6 @@ public:
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
         llama_post.set_auto_sync_after_inference(true);
-
-        // int remain_cmm = get_remaining_cmm_size();
-        // sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
-        // update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
-
-        if (attr.b_dynamic_load_axmodel_layer)
-        {
-            // 加载第一层获取shape信息
-            auto &layer = llama_layers[0];
-            int ret;
-            if (_attr.b_use_mmap_load_layer)
-            {
-                ret = layer.layer.init((char *)layer.layer_buffer.data(), layer.layer_buffer.size());
-            }
-            else
-            {
-                ret = layer.layer.init(layer.layer_buffer_vec.data(), layer.layer_buffer_vec.size());
-            }
-            if (ret != 0)
-            {
-                ALOGE("init axmodel(%s) failed", layer.filename.c_str());
-            }
-        }
 
         {
             _attr.max_token_len = llama_layers[0].layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
@@ -264,11 +219,6 @@ public:
 
             _attr.prefill_token_num = llama_layers[0].layer.get_input(prefill_grpid, "indices").vShape[1];
             ALOGI("prefill_token_num : %d", _attr.prefill_token_num);
-        }
-        if (attr.b_dynamic_load_axmodel_layer)
-        {
-            auto &layer = llama_layers[0];
-            layer.layer.deinit();
         }
 
         {
@@ -438,29 +388,8 @@ public:
             auto &layer = llama_layers[m];
             auto &layer_llama = llama_layers[m];
 
-            if (_attr.b_dynamic_load_axmodel_layer)
-            {
-                int ret;
-                if (_attr.b_use_mmap_load_layer)
-                {
-                    ret = layer.layer.init((char *)layer.layer_buffer.data(), layer.layer_buffer.size());
-                }
-                else
-                {
-                    ret = layer.layer.init(layer.layer_buffer_vec.data(), layer.layer_buffer_vec.size());
-                }
-                if (ret != 0)
-                {
-                    ALOGE("init axmodel(%s) failed", layer.filename.c_str());
-                }
-            }
-
             layer.layer.inference(prefill_grpid);
 
-            if (_attr.b_dynamic_load_axmodel_layer)
-            {
-                layer.layer.deinit();
-            }
             // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
         }
 
@@ -536,23 +465,6 @@ public:
 
                 auto &layer = llama_layers[m];
 
-                if (_attr.b_dynamic_load_axmodel_layer)
-                {
-                    int ret;
-                    if (_attr.b_use_mmap_load_layer)
-                    {
-                        ret = layer.layer.init((char *)layer.layer_buffer.data(), layer.layer_buffer.size());
-                    }
-                    else
-                    {
-                        ret = layer.layer.init(layer.layer_buffer_vec.data(), layer.layer_buffer_vec.size());
-                    }
-                    if (ret != 0)
-                    {
-                        ALOGE("init axmodel(%s) failed", layer.filename.c_str());
-                    }
-                }
-
                 {
                     layer.layer.set_input(decode_grpid, "indices", (unsigned long long)(p_indices_list + indices), sizeof(unsigned int) * _attr.max_token_len);
                     layer.layer.set_input(decode_grpid, "mask", (unsigned long long)(p_mask_list + indices * (_attr.kv_cache_num + 1)), mask.size() * sizeof(unsigned short));
@@ -564,10 +476,6 @@ public:
 
                 layer.layer.inference(decode_grpid);
 
-                if (_attr.b_dynamic_load_axmodel_layer)
-                {
-                    layer.layer.deinit();
-                }
                 // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
             }
             {

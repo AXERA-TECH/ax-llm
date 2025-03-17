@@ -71,7 +71,6 @@ int main(int argc, char *argv[])
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
-    cmd.add<bool>("dynamic_load_axmodel_layer", 0, "it can save cmm memory", false, attr.b_dynamic_load_axmodel_layer);
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
 
@@ -93,7 +92,6 @@ int main(int argc, char *argv[])
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
-    attr.b_dynamic_load_axmodel_layer = cmd.get<bool>("dynamic_load_axmodel_layer");
 
     bool b_live_print = cmd.get<bool>("live_print");
     if (b_live_print)
