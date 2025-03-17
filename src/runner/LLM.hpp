@@ -16,14 +16,7 @@
 #include <axcl.h>
 #include <axcl_rt_memory.h>
 
-#define HOST_DEBUG 0
-#define DUMP_HOST_DATA 0
-#define USE_SET_INPUT 0
-
-#if HOST_DEBUG
-#include "ax_model_runner/ax_model_runner_ax650_host.hpp"
-#include <sys/stat.h>
-#endif
+#define USE_SET_INPUT 1
 
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 
@@ -47,7 +40,6 @@ struct LLMAttrType
     int kv_cache_size = 256; // auto calc
 
     bool b_use_mmap_load_embed = false;
-    bool b_dynamic_load_axmodel_layer = false;
 
     bool b_use_mmap_load_layer = true;
 
@@ -69,9 +61,7 @@ private:
     struct LLMLayer
     {
         ax_runner_ax650 layer;
-#if HOST_DEBUG
-        ax_runner_ax650_host layer_host;
-#endif
+
         std::string filename;
         MMap layer_buffer;
         std::vector<char> layer_buffer_vec;
@@ -79,9 +69,6 @@ private:
 
     std::vector<LLMLayer> llama_layers;
     ax_runner_ax650 llama_post;
-#if HOST_DEBUG
-    ax_runner_ax650_host llama_post_host;
-#endif
 
     // std::vector<std::vector<unsigned short>> k_caches, v_caches;
 
@@ -156,70 +143,26 @@ public:
             sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
             llama_layers[i].filename = axmodel_path;
 
-            if (!attr.b_dynamic_load_axmodel_layer)
-            {
-                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), false);
-#if HOST_DEBUG
-                ret = llama_layers[i].layer_host.init(llama_layers[i].filename.c_str(), false);
-#endif
-                if (ret != 0)
-                {
-                    ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
-                    return false;
-                }
-                int remain_cmm = get_pcie_remaining_cmm_size();
-                sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
-                update_cqdm(&cqdm, i + 2, "count", axmodel_path);
-            }
-            else
-            {
-                if (!attr.b_use_mmap_load_layer)
-                {
-                    if (!read_file(llama_layers[i].filename, llama_layers[i].layer_buffer_vec))
-                    {
-                        ALOGE("read_file(%s) failed", llama_layers[i].filename.c_str());
-                        return false;
-                    }
-                }
-                else
-                {
-                    llama_layers[i].layer_buffer.open_file(llama_layers[i].filename.c_str());
-                }
+            int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), false);
 
-                sprintf(axmodel_path, "read_file %s ok", llama_layers[i].filename.c_str());
-                update_cqdm(&cqdm, i + 2, "count", axmodel_path);
+            if (ret != 0)
+            {
+                ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
+                return false;
             }
+            int remain_cmm = get_pcie_remaining_cmm_size();
+            sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
+            update_cqdm(&cqdm, i + 2, "count", axmodel_path);
         }
 
         int ret = llama_post.init(attr.filename_post_axmodel.c_str(), false);
-#if HOST_DEBUG
-        ret = llama_post_host.init(attr.filename_post_axmodel.c_str(), false);
-#endif
+
         if (ret != 0)
         {
             ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str());
             return false;
         }
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", "init post axmodel ok\n");
-
-        if (attr.b_dynamic_load_axmodel_layer)
-        {
-            // 加载第一层获取shape信息
-            auto &layer = llama_layers[0];
-            int ret;
-            if (_attr.b_use_mmap_load_layer)
-            {
-                ret = layer.layer.init((char *)layer.layer_buffer.data(), layer.layer_buffer.size());
-            }
-            else
-            {
-                ret = layer.layer.init(layer.layer_buffer_vec.data(), layer.layer_buffer_vec.size());
-            }
-            if (ret != 0)
-            {
-                ALOGE("init axmodel(%s) failed", layer.filename.c_str());
-            }
-        }
 
         {
             _attr.max_token_len = llama_layers[0].layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
@@ -235,11 +178,7 @@ public:
                 return false;
             }
         }
-        if (attr.b_dynamic_load_axmodel_layer)
-        {
-            auto &layer = llama_layers[0];
-            layer.layer.deinit();
-        }
+
 #if USE_SET_INPUT
         // 类似人体蜈蚣，将输入输出串联起来，减少内存拷贝
         for (int m = 0; m < _attr.axmodel_num; m++)
@@ -299,14 +238,9 @@ public:
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
             llama_layers[i].layer.release();
-#if HOST_DEBUG
-            llama_layers[i].layer_host.release();
-#endif
         }
         llama_post.release();
-#if HOST_DEBUG
-        llama_post_host.release();
-#endif
+
         embed_selector.Deinit();
 #if USE_SET_INPUT
         axclrtFree(p_indices_list);
@@ -349,9 +283,7 @@ public:
         int next_token = token_ids[0];
         t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
         std::vector<unsigned short> embed;
-#if HOST_DEBUG
-        std::vector<unsigned short> embed_host;
-#endif
+
         bool b_hit_eos = false;
         for (unsigned int indices = 0; indices < _attr.max_token_len; indices++)
         {
@@ -363,15 +295,16 @@ public:
             embed_selector.getByIndex(next_token, embed);
 
             // embed_selector.getByIndex(next_token, embed);
-#if HOST_DEBUG
-            // embed_host = embed;
-            embed_selector.getByIndex(next_token, embed_host);
-#endif
 
             axclrtMemcpy((void *)llama_layers[0].layer.get_input("input").phyAddr, embed.data(), llama_layers[0].layer.get_input("input").nSize, AXCL_MEMCPY_HOST_TO_DEVICE);
 
             // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
-
+            axclrtEngineSequence seq = nullptr;
+            if (auto ret = axclrtEngineCreateSequence(&seq); ret != 0)
+            {
+                ALOGE("axclrtEngineCreateSequence failed");
+                return "";
+            }
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
                 if (b_stop)
@@ -381,22 +314,6 @@ public:
 
                 auto &layer = llama_layers[m];
 
-                if (_attr.b_dynamic_load_axmodel_layer)
-                {
-                    int ret;
-                    if (_attr.b_use_mmap_load_layer)
-                    {
-                        ret = layer.layer.init((char *)layer.layer_buffer.data(), layer.layer_buffer.size());
-                    }
-                    else
-                    {
-                        ret = layer.layer.init(layer.layer_buffer_vec.data(), layer.layer_buffer_vec.size());
-                    }
-                    if (ret != 0)
-                    {
-                        ALOGE("init axmodel(%s) failed", layer.filename.c_str());
-                    }
-                }
 #if USE_SET_INPUT
                 // axclrtMemcpy((void *)layer.layer.get_input("indices").phyAddr, sizeof(indices), &indices, sizeof(indices), AXCL_MEMCPY_HOST_TO_DEVICE);
                 layer.layer.set_input(layer.layer.get_input("indices").nIdx, (unsigned long long)(p_indices_list + indices), sizeof(unsigned int) * _attr.max_token_len);
@@ -410,12 +327,6 @@ public:
                 // if (m == 0)
                 //     axclrtMemcpy((void *)layer.layer.get_input("input").phyAddr, layer.layer.get_input("input").nSize, embed, layer.layer.get_input("input").nSize, AXCL_MEMCPY_HOST_TO_DEVICE);
 
-#if HOST_DEBUG
-                memcpy(layer.layer_host.get_input("indices").pVirAddr, &indices, sizeof(indices));
-                memcpy(layer.layer_host.get_input("mask").pVirAddr, mask.data(), mask.size() * sizeof(unsigned short));
-                memcpy(layer.layer_host.get_input("input").pVirAddr, embed_host.data(), embed_host.size() * sizeof(unsigned short));
-                layer.layer_host.inference();
-#endif
 #if USE_SET_INPUT
                 {
                     unsigned short *input_k_cache_ptr = (unsigned short *)layer.layer.get_input("K_cache").phyAddr;
@@ -424,7 +335,12 @@ public:
                     layer.layer.set_output(layer.layer.get_output("V_cache_out").nIdx, (unsigned long long)(input_v_cache_ptr + indices * _attr.kv_cache_size), sizeof(unsigned short) * _attr.kv_cache_size);
                 }
 #endif
-                layer.layer.inference();
+                // layer.layer.inference();
+                if (auto ret = axclrtEnginePushModelTask(seq, layer.layer.getModelID(), layer.layer.getContextID(), 0, layer.layer.getIO()); ret != 0)
+                {
+                    ALOGE("axclrtEnginePushModelTask failed");
+                    return "";
+                }
 #if !USE_SET_INPUT
                 {
                     unsigned short *input_k_cache_ptr = (unsigned short *)layer.layer.get_input("K_cache").phyAddr;
@@ -442,132 +358,50 @@ public:
                     }
                 }
 #endif
-#if HOST_DEBUG
-                {
-                    axclrtMemcpy((void *)embed.data(), (const void *)layer.layer.get_output("output").phyAddr, layer.layer.get_output("output").nSize, AXCL_MEMCPY_DEVICE_TO_HOST);
-                    ALOGI("slave:%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
-                    unsigned short *input_k_cache_ptr_host = (unsigned short *)layer.layer_host.get_input("K_cache").pVirAddr;
-                    unsigned short *input_v_cache_ptr_host = (unsigned short *)layer.layer_host.get_input("V_cache").pVirAddr;
-                    memcpy(input_k_cache_ptr_host + indices * _attr.kv_cache_size, layer.layer_host.get_output("K_cache_out").pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
-                    memcpy(input_v_cache_ptr_host + indices * _attr.kv_cache_size, layer.layer_host.get_output("V_cache_out").pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
-                    memcpy(embed_host.data(), layer.layer_host.get_output("output").pVirAddr, embed_host.size() * sizeof(unsigned short));
-                    ALOGN(" host:%f %f %f %f %f", bfloat16(embed_host[0]).fp32(), bfloat16(embed_host[1]).fp32(), bfloat16(embed_host[2]).fp32(), bfloat16(embed_host[3]).fp32(), bfloat16(embed_host[4]).fp32());
-
-                    // dump host io to pcie_debug/
-                    // create dir
-#if DUMP_HOST_DATA
-                    static bool b_first = true;
-                    if (b_first == true)
-                    {
-                        b_first = false;
-                        if (access("pcie_debug", 0) != 0)
-                        {
-                            mkdir("pcie_debug", 0777);
-                        }
-
-                        for (int k = 0; k < layer.layer_host.get_num_inputs(); k++)
-                        {
-                            if (access(("pcie_debug/layer_" + std::to_string(m)).c_str(), 0) != 0)
-                            {
-                                mkdir(("pcie_debug/layer_" + std::to_string(m)).c_str(), 0777);
-                                mkdir(("pcie_debug/layer_" + std::to_string(m) + "/input").c_str(), 0777);
-                                mkdir(("pcie_debug/layer_" + std::to_string(m) + "/output").c_str(), 0777);
-                            }
-                            auto &input = layer.layer_host.get_input(k);
-                            std::string output_path = "pcie_debug/layer_" + std::to_string(m) + "/input/" + layer.layer_host.get_input(k).sName + ".bin";
-                            FILE *fp = fopen(output_path.c_str(), "wb");
-                            fwrite(input.pVirAddr, input.nSize, 1, fp);
-                            fclose(fp);
-                        }
-
-                        for (int k = 0; k < layer.layer_host.get_num_outputs(); k++)
-                        {
-                            auto &output = layer.layer_host.get_output(k);
-                            std::string output_path = "pcie_debug/layer_" + std::to_string(m) + "/output/" + layer.layer_host.get_output(k).sName + ".bin";
-                            FILE *fp = fopen(output_path.c_str(), "wb");
-                            fwrite(output.pVirAddr, output.nSize, 1, fp);
-                            fclose(fp);
-                        }
-                    }
-#endif
-                }
-#endif
-                if (_attr.b_dynamic_load_axmodel_layer)
-                {
-                    layer.layer.deinit();
-                }
             }
-#if HOST_DEBUG
-            ALOGI("");
-#endif
+
             mask[indices] = 0;
             if (indices + 1 < token_ids.size())
             {
+                if (auto ret = axclrtEngineSubmitSequence(&seq); ret != 0)
+                {
+                    ALOGE("axclrtEngineSubmitSequence failed");
+                    return "";
+                }
+                if (auto ret = axclrtEngineDestroySequence(&seq); ret != 0)
+                {
+                    ALOGE("axclrtEngineDestroySequence failed");
+                    return "";
+                }
+
                 next_token = token_ids[indices + 1];
             }
             else
             {
                 // post process
-                llama_post.inference();
+                // llama_post.inference();
+                if (auto ret = axclrtEnginePushModelTask(seq, llama_post.getModelID(), llama_post.getContextID(), 0, llama_post.getIO()); ret != 0)
+                {
+                    ALOGE("axclrtEnginePushModelTask failed");
+                    return "";
+                }
+                if (auto ret = axclrtEngineSubmitSequence(&seq); ret != 0)
+                {
+                    ALOGE("axclrtEngineSubmitSequence failed");
+                    return "";
+                }
+                if (auto ret = axclrtEngineDestroySequence(&seq); ret != 0)
+                {
+                    ALOGE("axclrtEngineDestroySequence failed");
+                    return "";
+                }
+
                 auto &output_post = llama_post.get_output("output");
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
                 axclrtMemcpy(post_out, (void *)output_post.phyAddr, output_post.nSize, AXCL_MEMCPY_DEVICE_TO_HOST);
 
-#if HOST_DEBUG
-                {
-                    ALOGI("slave: %f %f %f %f %f", bfloat16(post_out[0]).fp32(), bfloat16(post_out[1]).fp32(), bfloat16(post_out[2]).fp32(), bfloat16(post_out[3]).fp32(), bfloat16(post_out[4]).fp32());
-                    auto &input = llama_post_host.get_input("input");
-                    memcpy(input.pVirAddr, embed_host.data(), embed_host.size() * sizeof(unsigned short));
-                    llama_post_host.inference();
-                    auto &output_post = llama_post_host.get_output("output");
-                    unsigned short *post_out_host = (unsigned short *)output_post.pVirAddr;
-                    ALOGN("host: %f %f %f %f %f", bfloat16(post_out_host[0]).fp32(), bfloat16(post_out_host[1]).fp32(), bfloat16(post_out_host[2]).fp32(), bfloat16(post_out_host[3]).fp32(), bfloat16(post_out_host[4]).fp32());
-#if DUMP_HOST_DATA
-                    static bool b_first = true;
-                    if (b_first == true)
-                    {
-                        b_first = false;
-                        for (int k = 0; k < llama_post_host.get_num_inputs(); k++)
-                        {
-                            if (access("pcie_debug/post", 0) != 0)
-                            {
-                                mkdir("pcie_debug/post", 0777);
-                                mkdir("pcie_debug/post/input/", 0777);
-                                mkdir("pcie_debug/post/output/", 0777);
-                            }
-                            auto &input = llama_post_host.get_input(k);
-                            std::string output_path = "pcie_debug/post/input/" + llama_post_host.get_input(k).sName + ".bin";
-                            FILE *fp = fopen(output_path.c_str(), "wb");
-                            fwrite(input.pVirAddr, input.nSize, 1, fp);
-                            fclose(fp);
-                        }
-
-                        for (int k = 0; k < llama_post_host.get_num_outputs(); k++)
-                        {
-                            auto &output = llama_post_host.get_output(k);
-                            std::string output_path = "pcie_debug/post/output/" + llama_post_host.get_output(k).sName + ".bin";
-                            FILE *fp = fopen(output_path.c_str(), "wb");
-                            fwrite(output.pVirAddr, output.nSize, 1, fp);
-                            fclose(fp);
-                        }
-                    }
-#endif
-                }
-#endif
                 auto max_index = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
                 next_token = max_index;
-                // float max_val = -MAXFLOAT;
-                // int max_index = 0;
-                // for (int i = 0; i < _attr.tokens_embed_num; i++)
-                // {
-                //     float tmp = bfloat16(post_out[i]).fp32();
-                //     if (tmp > max_val)
-                //     {
-                //         max_val = tmp;
-                //         max_index = i;
-                //     }
-                // }
-                
 
                 if (tokenizer->isEnd(max_index))
                 {

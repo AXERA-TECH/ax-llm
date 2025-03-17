@@ -415,6 +415,21 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size)
     return sub_init();
 }
 
+unsigned long ax_runner_ax650::getModelID()
+{
+    return m_handle->handle;
+}
+
+unsigned long ax_runner_ax650::getContextID()
+{
+    return m_handle->context;
+}
+
+void *ax_runner_ax650::getIO()
+{
+    return m_handle->io;
+}
+
 void ax_runner_ax650::release()
 {
     if (m_handle && m_handle->handle)

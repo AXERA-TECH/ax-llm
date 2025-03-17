@@ -14,6 +14,10 @@ public:
     int init(const char *model_file, bool use_mmap = false) override;
     int init(char *model_buffer, size_t model_size) override;
 
+    unsigned long getModelID();
+    unsigned long getContextID();
+    void *getIO();
+
     void release();
     void deinit() override;
 
