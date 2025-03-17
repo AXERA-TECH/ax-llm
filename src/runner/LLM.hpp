@@ -376,7 +376,7 @@ public:
         std::vector<int> input_ids = tokenizer->Encode(prompt, false);
         if (input_ids.size() > _attr.prefill_token_num)
         {
-            ALOGE("input_ids(%d) > prefill_token_num(%d)", input_ids.size(), _attr.prefill_token_num);
+            ALOGE("input_ids(%ld) > prefill_token_num(%d)", input_ids.size(), _attr.prefill_token_num);
             return -1;
         }
         out_embed.resize(input_ids.size() * _attr.tokens_embed_size);
