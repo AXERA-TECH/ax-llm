@@ -18,7 +18,7 @@
 
 #define HOST_DEBUG 0
 #define DUMP_HOST_DATA 0
-#define USE_SET_INPUT 0
+#define USE_SET_INPUT 1
 
 #if HOST_DEBUG
 #include "ax_model_runner/ax_model_runner_ax650_host.hpp"
@@ -148,6 +148,29 @@ public:
         //     }
         // }
 
+        if (const auto ret = axclInit(nullptr); 0 != ret)
+        {
+            return ret;
+        }
+
+        axclrtDeviceList lst;
+        if (const auto ret = axclrtGetDeviceList(&lst); 0 != ret || 0 == lst.num)
+        {
+            ALOGE("Get AXCL device failed{0x%8x}, find total %d device.\n", ret, lst.num);
+            return -1;
+        }
+        if (const auto ret = axclrtSetDevice(lst.devices[0]); 0 != ret)
+        {
+            ALOGE("Set AXCL device failed{0x%8x}.\n", ret);
+            return -1;
+        }
+
+        if (const auto ret = axclrtEngineInit(AXCL_VNPU_DISABLE); 0 != ret)
+        {
+            ALOGE("axclrtEngineInit %d\n", ret);
+            return ret;
+        }
+
         llama_layers.resize(attr.axmodel_num);
 
         char axmodel_path[1024];
@@ -167,7 +190,7 @@ public:
                     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
                     return false;
                 }
-                int remain_cmm = get_pcie_remaining_cmm_size();
+                int remain_cmm = get_pcie_remaining_cmm_size(lst.devices[0]);
                 sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
                 update_cqdm(&cqdm, i + 2, "count", axmodel_path);
             }
