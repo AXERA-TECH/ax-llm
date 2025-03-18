@@ -134,6 +134,12 @@ public:
         //         printf("%d %0.22f\n", embed[i], val);
         //     }
         // }
+        axclrtDeviceList dev_list = {0};
+        if (auto ret = axclrtGetDeviceList(&dev_list); ret != 0 || dev_list.num == 0)
+        {
+            ALOGE("axclrtGetDeviceList failed");
+            return false;
+        }
 
         llama_layers.resize(attr.axmodel_num);
 
@@ -150,7 +156,7 @@ public:
                 ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
                 return false;
             }
-            int remain_cmm = get_pcie_remaining_cmm_size();
+            int remain_cmm = get_pcie_remaining_cmm_size(dev_list.devices[0]);
             sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
             update_cqdm(&cqdm, i + 2, "count", axmodel_path);
         }
@@ -363,12 +369,12 @@ public:
             mask[indices] = 0;
             if (indices + 1 < token_ids.size())
             {
-                if (auto ret = axclrtEngineSubmitSequence(&seq); ret != 0)
+                if (auto ret = axclrtEngineSubmitSequence(seq); ret != 0)
                 {
                     ALOGE("axclrtEngineSubmitSequence failed");
                     return "";
                 }
-                if (auto ret = axclrtEngineDestroySequence(&seq); ret != 0)
+                if (auto ret = axclrtEngineDestroySequence(seq); ret != 0)
                 {
                     ALOGE("axclrtEngineDestroySequence failed");
                     return "";
@@ -385,12 +391,12 @@ public:
                     ALOGE("axclrtEnginePushModelTask failed");
                     return "";
                 }
-                if (auto ret = axclrtEngineSubmitSequence(&seq); ret != 0)
+                if (auto ret = axclrtEngineSubmitSequence(seq); ret != 0)
                 {
                     ALOGE("axclrtEngineSubmitSequence failed");
                     return "";
                 }
-                if (auto ret = axclrtEngineDestroySequence(&seq); ret != 0)
+                if (auto ret = axclrtEngineDestroySequence(seq); ret != 0)
                 {
                     ALOGE("axclrtEngineDestroySequence failed");
                     return "";

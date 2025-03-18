@@ -63,22 +63,22 @@ static bool get_pcie_ids(std::vector<int> &ids)
     return true;
 }
 
-static int get_pcie_remaining_cmm_size()
+static int get_pcie_remaining_cmm_size(int devid)
 {
-    std::vector<int> ids;
-    if (!get_pcie_ids(ids))
-    {
-        ALOGE("get_pcie_ids failed");
-        return -1;
-    }
-    if (ids.size() == 0)
-    {
-        ALOGE("get_pcie_ids failed");
-        return -1;
-    }
+    // std::vector<int> ids;
+    // if (!get_pcie_ids(ids))
+    // {
+    //     ALOGE("get_pcie_ids failed");
+    //     return -1;
+    // }
+    // if (ids.size() == 0)
+    // {
+    //     ALOGE("get_pcie_ids failed");
+    //     return -1;
+    // }
     
     char command[128];
-    sprintf(command, "axcl-smi -d %d sh cat /proc/ax_proc/mem_cmm_info |grep 'total size'", ids[0]);
+    sprintf(command, "axcl-smi -d %d sh cat /proc/ax_proc/mem_cmm_info |grep 'total size'", devid);
     // printf("%s\n", command);
     std::string result = exec_cmd(command);
 
