@@ -134,11 +134,28 @@ public:
         //         printf("%d %0.22f\n", embed[i], val);
         //     }
         // }
-        axclrtDeviceList dev_list = {0};
-        if (auto ret = axclrtGetDeviceList(&dev_list); ret != 0 || dev_list.num == 0)
+
+        if (const auto ret = axclInit(nullptr); 0 != ret)
         {
-            ALOGE("axclrtGetDeviceList failed");
-            return false;
+            return ret;
+        }
+
+        axclrtDeviceList lst;
+        if (const auto ret = axclrtGetDeviceList(&lst); 0 != ret || 0 == lst.num)
+        {
+            ALOGE("Get AXCL device failed{0x%8x}, find total %d device.\n", ret, lst.num);
+            return -1;
+        }
+        if (const auto ret = axclrtSetDevice(lst.devices[0]); 0 != ret)
+        {
+            ALOGE("Set AXCL device failed{0x%8x}.\n", ret);
+            return -1;
+        }
+
+        if (const auto ret = axclrtEngineInit(AXCL_VNPU_DISABLE); 0 != ret)
+        {
+            ALOGE("axclrtEngineInit %d\n", ret);
+            return ret;
         }
 
         llama_layers.resize(attr.axmodel_num);
@@ -156,7 +173,7 @@ public:
                 ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
                 return false;
             }
-            int remain_cmm = get_pcie_remaining_cmm_size(dev_list.devices[0]);
+            int remain_cmm = get_pcie_remaining_cmm_size(lst.devices[0]);
             sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
             update_cqdm(&cqdm, i + 2, "count", axmodel_path);
         }
