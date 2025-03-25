@@ -52,6 +52,10 @@ endif()
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
 
+message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
+find_package(OpenCV REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
+
 include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
@@ -75,6 +79,7 @@ function(build_exec name main_source)
     # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
     target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread)
+    target_link_libraries(${name} ${OpenCV_LIBS})
 
     # target_link_libraries(${name} sentencepiece re2::re2)
     install(TARGETS ${name} DESTINATION bin)

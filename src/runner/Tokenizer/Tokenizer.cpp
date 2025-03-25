@@ -320,7 +320,7 @@ public:
         {
             ALOGI("connect %s ok", base_url.c_str());
         }
-        
+
         try
         {
             cli = std::make_shared<httplib::Client>(base_url);
@@ -363,10 +363,11 @@ public:
         return true;
     }
 
-    bool Encode(std::string input, std::vector<int> &output) override
+    bool Encode(std::string input, std::vector<int> &output, bool b_img_prompt) override
     {
         nlohmann::json j;
         j["text"] = input;
+        j["img_prompt"] = b_img_prompt;
         auto ret = cli->Post("/encode", j.dump(), "application/json");
         auto rep = ret.value();
         if (rep.status != 200)
@@ -401,10 +402,10 @@ public:
         return true;
     }
 
-    std::vector<int> Encode(std::string input) override
+    std::vector<int> Encode(std::string input, bool b_img_prompt) override
     {
         std::vector<int> output;
-        Encode(input, output);
+        Encode(input, output, b_img_prompt);
         return output;
     }
 

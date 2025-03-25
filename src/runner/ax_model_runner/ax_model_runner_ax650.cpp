@@ -11,8 +11,7 @@
 #include "sample_log.h"
 
 // #include <axcl/native/ax_sys_api.h>
-// #include <axcl.h>
-#include "utils/axcl_manager.h"
+#include "axcl_manager.h"
 
 #define AX_CMM_ALIGN_SIZE 128
 
@@ -28,7 +27,7 @@ typedef std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRA
 
 static void print_io_info(std::vector<ax_runner_tensor_t> &input, std::vector<ax_runner_tensor_t> &output)
 {
-    printf("\ninput size: %ld\n", input.size());
+    printf("\ninput size: %d\n", input.size());
     for (uint32_t i = 0; i < input.size(); ++i)
     {
         // print shape info,like [batchsize x channel x height x width]
@@ -56,7 +55,7 @@ static void print_io_info(std::vector<ax_runner_tensor_t> &input, std::vector<ax
         printf("\e[0m\n\n");
     }
 
-    printf("\noutput size: %ld\n", output.size());
+    printf("\noutput size: %d\n", output.size());
     for (uint32_t i = 0; i < output.size(); ++i)
     {
         // print shape info,like [batchsize x channel x height x width]
@@ -79,6 +78,7 @@ typedef struct
     int nIndex;
     int nSize;
     void *pBuf;
+    void *pVirAddr;
 
     std::string Name;
 
@@ -106,16 +106,18 @@ static void free_io(AXCL_IO_DATA_T *io_data, int _devid)
     for (size_t j = 0; j < io_data->nInputSize; ++j)
     {
         axcl_Free(io_data->pInputs[j].pBuf, _devid);
+        free(io_data->pInputs[j].pVirAddr);
     }
     for (size_t j = 0; j < io_data->nOutputSize; ++j)
     {
         axcl_Free(io_data->pOutputs[j].pBuf, _devid);
+        free(io_data->pOutputs[j].pVirAddr);
     }
     delete[] io_data->pInputs;
     delete[] io_data->pOutputs;
 }
 
-static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOInfo io_info, axclrtEngineIO io, AXCL_IO_DATA_T *io_data, INPUT_OUTPUT_ALLOC_STRATEGY strategy, int _devid)
+static inline int prepare_io(int grpid, axclrtEngineIOInfo io_info, axclrtEngineIO io, AXCL_IO_DATA_T *io_data, INPUT_OUTPUT_ALLOC_STRATEGY strategy, int _devid)
 {
     memset(io_data, 0, sizeof(AXCL_IO_DATA_T));
 
@@ -129,7 +131,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
     // 1. alloc inputs
     for (int32_t i = 0; i < inputNum; i++)
     {
-        auto bufSize = axcl_EngineGetInputSizeByIndex(io_info, 0, i, _devid);
+        auto bufSize = axcl_EngineGetInputSizeByIndex(io_info, grpid, i, _devid);
         void *devPtr = nullptr;
         axclError ret = 0;
         if (AX_ENGINE_ABST_DEFAULT == strategy.first)
@@ -144,7 +146,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         if (ret != 0)
         {
             free_io_index(io_data->pInputs, i, _devid);
-            fprintf(stderr, "Malloc input(index: %d, size: %ld) failed! ret=0x%x\n", i, bufSize, ret);
+            fprintf(stderr, "Malloc input(index: %d, size: %d) failed! ret=0x%x\n", i, bufSize, ret);
             return -1;
         }
         std::vector<char> tmp(bufSize, 0);
@@ -152,7 +154,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         // axclrtMemset(devPtr, 0, bufSize);
 
         axclrtEngineIODims dims;
-        ret = axcl_EngineGetInputDims(io_info, 0, i, &dims, _devid);
+        ret = axcl_EngineGetInputDims(io_info, grpid, i, &dims, _devid);
         if (ret != 0)
         {
             free_io_index(io_data->pInputs, i, _devid);
@@ -165,6 +167,8 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         io_data->pInputs[i].pBuf = devPtr;
         io_data->pInputs[i].dims = dims;
         io_data->pInputs[i].Name = axcl_EngineGetInputNameByIndex(io_info, i, _devid);
+        io_data->pInputs[i].pVirAddr = malloc(bufSize);
+        memset(io_data->pInputs[i].pVirAddr, 0, bufSize);
         ret = axcl_EngineSetInputBufferByIndex(io, i, devPtr, bufSize, _devid);
         if (ret != 0)
         {
@@ -177,7 +181,7 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
     // 2. alloc outputs
     for (int32_t i = 0; i < outputNum; i++)
     {
-        auto bufSize = axcl_EngineGetOutputSizeByIndex(io_info, 0, i, _devid);
+        auto bufSize = axcl_EngineGetOutputSizeByIndex(io_info, grpid, i, _devid);
         void *devPtr = NULL;
         axclError ret = 0;
         if (AX_ENGINE_ABST_DEFAULT == strategy.first)
@@ -192,14 +196,14 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         if (ret != 0)
         {
             free_io_index(io_data->pOutputs, i, _devid);
-            fprintf(stderr, "Malloc output(index: %d, size: %ld) failed! ret=0x%x\n", i, bufSize, ret);
+            fprintf(stderr, "Malloc output(index: %d, size: %d) failed! ret=0x%x\n", i, bufSize, ret);
             return -1;
         }
         std::vector<char> tmp(bufSize, 0);
         axcl_Memcpy(devPtr, tmp.data(), bufSize, axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, _devid);
         // axclrtMemset(devPtr, 0, bufSize);
         axclrtEngineIODims dims;
-        ret = axcl_EngineGetOutputDims(io_info, 0, i, &dims, _devid);
+        ret = axcl_EngineGetOutputDims(io_info, grpid, i, &dims, _devid);
         if (ret != 0)
         {
             free_io_index(io_data->pOutputs, i, _devid);
@@ -212,6 +216,8 @@ static inline int prepare_io(uint64_t handle, uint64_t context, axclrtEngineIOIn
         io_data->pOutputs[i].pBuf = devPtr;
         io_data->pOutputs[i].dims = dims;
         io_data->pOutputs[i].Name = axcl_EngineGetOutputNameByIndex(io_info, i, _devid);
+        io_data->pOutputs[i].pVirAddr = malloc(bufSize);
+        memset(io_data->pOutputs[i].pVirAddr, 0, bufSize);
         ret = axcl_EngineSetOutputBufferByIndex(io, i, devPtr, bufSize, _devid);
         if (ret != 0)
         {
@@ -229,8 +235,8 @@ struct ax_joint_runner_ax650_handle_t
     uint64_t handle = 0;
     uint64_t context = 0;
     axclrtEngineIOInfo io_info = 0;
-    axclrtEngineIO io = 0;
-    AXCL_IO_DATA_T io_data = {0};
+    std::vector<axclrtEngineIO> ios;
+    std::vector<AXCL_IO_DATA_T> io_datas;
 
     // int algo_width, algo_height;
     // int algo_colorformat;
@@ -239,7 +245,7 @@ struct ax_joint_runner_ax650_handle_t
 int ax_runner_ax650::sub_init()
 {
     // 4. create context
-    int ret = axcl_EngineCreateContext(m_handle->handle, &m_handle->context, _devid);
+    int ret = axcl_EngineCreateContext(m_handle->handle, &m_handle->context, dev_id);
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateContext");
@@ -249,7 +255,7 @@ int ax_runner_ax650::sub_init()
 
     // 5. set io
 
-    ret = axcl_EngineGetIOInfo(m_handle->handle, &m_handle->io_info, _devid);
+    ret = axcl_EngineGetIOInfo(m_handle->handle, &m_handle->io_info, dev_id);
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_GetIOInfo");
@@ -257,64 +263,88 @@ int ax_runner_ax650::sub_init()
     }
     // fprintf(stdout, "Engine get io info is done. \n");
 
-    // 4. create io
-    ret = axcl_EngineCreateIO(m_handle->io_info, &m_handle->io, _devid);
+    ret = axcl_EngineGetShapeGroupsCount(m_handle->io_info, &group_count, dev_id);
     if (ret != 0)
     {
-        axcl_EngineUnload(m_handle->handle, _devid);
-        fprintf(stderr, "Create io failed. ret=0x%x\n", ret);
-        return -1;
+        axcl_EngineUnload(m_handle->handle, dev_id);
+        return ret;
     }
+
+    // 4. create io
 
     // fprintf(stdout, "Engine creating io is done. \n");
 
     // 6. alloc io
     if (!_parepare_io)
     {
+        m_handle->ios.resize(group_count);
+        m_handle->io_datas.resize(group_count);
+        mgroup_input_tensors.resize(group_count);
+        mgroup_output_tensors.resize(group_count);
+
+        memset(&m_handle->io_datas[0], 0, sizeof(AXCL_IO_DATA_T) * group_count);
+
         auto malloc_strategy = std::make_pair(AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_DEFAULT);
-        ret = prepare_io(m_handle->handle, m_handle->context, m_handle->io_info, m_handle->io, &m_handle->io_data, malloc_strategy, _devid);
-        if (ret != 0)
-        {
-            free_io(&m_handle->io_data, _devid);
-            axcl_EngineDestroyIO(m_handle->io, _devid);
-            axcl_EngineUnload(m_handle->handle, _devid);
 
-            fprintf(stderr, "prepare_io failed.\n");
-            return ret;
-        }
-
-        for (size_t i = 0; i < m_handle->io_data.nOutputSize; i++)
+        for (int grpid = 0; grpid < group_count; grpid++)
         {
-            ax_runner_tensor_t tensor;
-            tensor.nIdx = i;
-            tensor.sName = m_handle->io_data.pOutputs[i].Name;
-            tensor.nSize = m_handle->io_data.pOutputs[i].nSize;
-            for (size_t j = 0; j < m_handle->io_data.pOutputs[i].dims.dimCount; j++)
+            ret = axcl_EngineCreateIO(m_handle->io_info, &m_handle->ios[grpid], dev_id);
+            if (ret != 0)
             {
-                tensor.vShape.push_back(m_handle->io_data.pOutputs[i].dims.dims[j]);
+                axcl_EngineUnload(m_handle->handle, dev_id);
+                fprintf(stderr, "Create io failed. ret=0x%x\n", ret);
+                return -1;
             }
-            tensor.phyAddr = (unsigned long long)m_handle->io_data.pOutputs[i].pBuf;
-            tensor.pVirAddr = malloc(tensor.nSize);
-            memset(tensor.pVirAddr, 0, tensor.nSize);
-            moutput_tensors.push_back(tensor);
+
+            ret = prepare_io(grpid, m_handle->io_info, m_handle->ios[grpid], &m_handle->io_datas[grpid], malloc_strategy, dev_id);
+            if (ret != 0)
+            {
+                free_io(&m_handle->io_datas[grpid], dev_id);
+                axcl_EngineDestroyIO(m_handle->ios[grpid], dev_id);
+                axcl_EngineUnload(m_handle->handle, dev_id);
+
+                fprintf(stderr, "prepare_io failed.\n");
+                return ret;
+            }
         }
 
-        for (size_t i = 0; i < m_handle->io_data.nInputSize; i++)
+        for (size_t grpid = 0; grpid < group_count; grpid++)
         {
-            ax_runner_tensor_t tensor;
-            tensor.nIdx = i;
-            tensor.sName = m_handle->io_data.pInputs[i].Name;
-            tensor.nSize = m_handle->io_data.pInputs[i].nSize;
-            for (size_t j = 0; j < m_handle->io_data.pInputs[i].dims.dimCount; j++)
+            // auto &io_info = m_handle->io_info[grpid];
+            auto &io_data = m_handle->io_datas[grpid];
+            for (size_t i = 0; i < io_data.nOutputSize; i++)
             {
-                tensor.vShape.push_back(m_handle->io_data.pInputs[i].dims.dims[j]);
+                ax_runner_tensor_t tensor;
+                tensor.nIdx = i;
+                tensor.sName = std::string(io_data.pOutputs[i].Name);
+                tensor.nSize = io_data.pOutputs[i].nSize;
+                for (size_t j = 0; j < io_data.pOutputs[i].dims.dimCount; j++)
+                {
+                    tensor.vShape.push_back(io_data.pOutputs[i].dims.dims[j]);
+                }
+                tensor.phyAddr = (unsigned long long)io_data.pOutputs[i].pBuf;
+                tensor.pVirAddr = io_data.pOutputs[i].pVirAddr;
+                mgroup_output_tensors[grpid].push_back(tensor);
             }
-            tensor.phyAddr = (unsigned long long)m_handle->io_data.pInputs[i].pBuf;
-            // tensor.pVirAddr = m_handle->io_data.pInputs[i].pVirAddr;
-            tensor.pVirAddr = malloc(tensor.nSize);
-            memset(tensor.pVirAddr, 0, tensor.nSize);
-            minput_tensors.push_back(tensor);
+
+            for (size_t i = 0; i < io_data.nInputSize; i++)
+            {
+                ax_runner_tensor_t tensor;
+                tensor.nIdx = i;
+                tensor.sName = std::string(io_data.pInputs[i].Name);
+                tensor.nSize = io_data.pInputs[i].nSize;
+                for (size_t j = 0; j < io_data.pInputs[i].dims.dimCount; j++)
+                {
+                    tensor.vShape.push_back(io_data.pInputs[i].dims.dims[j]);
+                }
+                tensor.phyAddr = (unsigned long long)io_data.pInputs[i].pBuf;
+                tensor.pVirAddr = io_data.pInputs[i].pVirAddr;
+                mgroup_input_tensors[grpid].push_back(tensor);
+            }
         }
+
+        moutput_tensors = mgroup_output_tensors[0];
+        minput_tensors = mgroup_input_tensors[0];
         _parepare_io = true;
     }
     else
@@ -325,57 +355,73 @@ int ax_runner_ax650::sub_init()
     return ret;
 }
 
-int ax_runner_ax650::init(const char *model_file, int devid, bool use_mmap)
+int ax_runner_ax650::init(const char *model_file, int devid)
 {
-    if (use_mmap)
+    this->dev_id = devid;
+    char *model_buffer;
+    size_t len;
+    if (!read_file(model_file, &model_buffer, &len))
     {
-        MMap model_buffer(model_file);
-        if (!model_buffer.data())
-        {
-            ALOGE("mmap");
-            return -1;
-        }
-        auto ret = init((char *)model_buffer.data(), model_buffer.size(), devid);
-        model_buffer.close_file();
-        return ret;
+        ALOGE("read_file");
+        return -1;
     }
-    else
-    {
-        char *model_buffer;
-        size_t len;
-        if (!read_file(model_file, &model_buffer, &len))
-        {
-            ALOGE("read_file");
-            return -1;
-        }
-        auto ret = init(model_buffer, len, devid);
-        delete[] model_buffer;
-        return ret;
-    }
+    auto ret = init(model_buffer, len);
+    delete[] model_buffer;
+    return ret;
 }
 
-int ax_runner_ax650::init(char *model_buffer, size_t model_size, int devid)
+int ax_runner_ax650::init(char *model_buffer, size_t model_size)
 {
     if (!m_handle)
     {
         m_handle = new ax_joint_runner_ax650_handle_t;
     }
     memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
-    _devid = devid;
+
+    // static bool b_init = false;
+    // if (!b_init)
+    // {
+    //     // 1. init engine
+    //     // AX_ENGINE_NPU_ATTR_T npu_attr;
+    //     // memset(&npu_attr, 0, sizeof(npu_attr));
+    //     // npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    //     // AX_SYS_Init();
+
+    //     axclrtDeviceList lst;
+    //     if (const auto ret = axclrtGetDeviceList(&lst); 0 != ret || 0 == lst.num)
+    //     {
+    //         ALOGE("Get AXCL device failed{0x%8x}, find total %d device.\n", ret, lst.num);
+    //         return -1;
+    //     }
+    //     if (const auto ret = axclrtSetDevice(lst.devices[0]); 0 != ret)
+    //     {
+    //         ALOGE("Set AXCL device failed{0x%8x}.\n", ret);
+    //         return -1;
+    //     }
+
+    //     int ret = axclrtEngineInit(AXCL_VNPU_DISABLE);
+    //     if (0 != ret)
+    //     {
+    //         ALOGE("axclrtEngineInit %d\n", ret);
+    //         return ret;
+    //     }
+    //     b_init = true;
+    // }
+
     // 3. create handle
     void *devMem = nullptr;
-    axcl_Malloc(&devMem, model_size, AXCL_MEM_MALLOC_NORMAL_ONLY, _devid);
+    axcl_Malloc(&devMem, model_size, AXCL_MEM_MALLOC_NORMAL_ONLY, dev_id);
 
     // 4. copy model to device
-    axcl_Memcpy(devMem, model_buffer, model_size, AXCL_MEMCPY_HOST_TO_DEVICE, _devid);
+    axcl_Memcpy(devMem, model_buffer, model_size, AXCL_MEMCPY_HOST_TO_DEVICE, dev_id);
 
-    int ret = axcl_EngineLoadFromMem(devMem, model_size, &m_handle->handle, _devid);
+    int ret = axcl_EngineLoadFromMem(devMem, model_size, &m_handle->handle, dev_id);
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateHandle");
         return ret;
     }
-    axcl_Free(devMem, _devid);
+    axcl_Free(devMem, dev_id);
     // fprintf(stdout, "Engine creating handle is done.\n");
 
     return sub_init();
@@ -385,9 +431,13 @@ void ax_runner_ax650::release()
 {
     if (m_handle && m_handle->handle)
     {
-        free_io(&m_handle->io_data, _devid);
-        axcl_EngineDestroyIO(m_handle->io, _devid);
-        axcl_EngineUnload(m_handle->handle, _devid);
+        for (int grpid = 0; grpid < group_count; grpid++)
+        {
+            free_io(&m_handle->io_datas[grpid], dev_id);
+            axcl_EngineDestroyIO(m_handle->ios[grpid], dev_id);
+        }
+
+        axcl_EngineUnload(m_handle->handle, dev_id);
         m_handle->handle = 0;
     }
 
@@ -397,10 +447,17 @@ void ax_runner_ax650::release()
         m_handle = nullptr;
     }
 
-    moutput_tensors.clear();
     minput_tensors.clear();
+    moutput_tensors.clear();
+
     map_input_tensors.clear();
     map_output_tensors.clear();
+
+    mgroup_input_tensors.clear();
+    mgroup_output_tensors.clear();
+
+    map_group_input_tensors.clear();
+    map_group_output_tensors.clear();
 
     // AX_ENGINE_Deinit();
 }
@@ -415,8 +472,8 @@ void ax_runner_ax650::deinit()
         // map_input_tensors.clear();
         // map_tensors.clear();
         // AX_ENGINE_DestroyHandle(m_handle->handle);
-        axcl_EngineDestroyIO(m_handle->io, _devid);
-        axcl_EngineUnload(m_handle->handle, _devid);
+        // axclrtEngineDestroyIO(m_handle->io);
+        axcl_EngineUnload(m_handle->handle, dev_id);
         m_handle->handle = 0;
         // delete m_handle;
         // m_handle = nullptr;
@@ -428,84 +485,51 @@ void ax_runner_ax650::deinit()
 int ax_runner_ax650::get_algo_width() { return -1; }
 int ax_runner_ax650::get_algo_height() { return -1; }
 
-int ax_runner_ax650::set_input(int idx, unsigned long long int phy_addr, unsigned long size)
+int ax_runner_ax650::set_input(int grpid, int idx, unsigned long long int phy_addr, unsigned long size)
 {
-    return axcl_EngineSetInputBufferByIndex(m_handle->io, idx, (void *)phy_addr, size, _devid);
+    return axcl_EngineSetInputBufferByIndex(m_handle->ios[grpid], idx, (void *)phy_addr, size, dev_id);
 }
-int ax_runner_ax650::set_output(int idx, unsigned long long int phy_addr, unsigned long size)
+int ax_runner_ax650::set_output(int grpid, int idx, unsigned long long int phy_addr, unsigned long size)
 {
-    return axcl_EngineSetOutputBufferByIndex(m_handle->io, idx, (void *)phy_addr, size, _devid);
+    return axcl_EngineSetOutputBufferByIndex(m_handle->ios[grpid], idx, (void *)phy_addr, size, dev_id);
+}
+
+int ax_runner_ax650::set_input(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size)
+{
+    return axcl_EngineSetInputBufferByIndex(m_handle->ios[grpid], get_input(grpid, name).nIdx, (void *)phy_addr, size, dev_id);
+}
+
+int ax_runner_ax650::set_output(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size)
+{
+    return axcl_EngineSetOutputBufferByIndex(m_handle->ios[grpid], get_output(grpid, name).nIdx, (void *)phy_addr, size, dev_id);
 }
 
 ax_color_space_e ax_runner_ax650::get_color_space()
 {
-    // switch (m_handle->algo_colorformat)
-    // {
-    // case AX_FORMAT_RGB888:
-    //     return ax_color_space_e::axdl_color_space_rgb;
-    // case AX_FORMAT_BGR888:
-    //     return ax_color_space_e::axdl_color_space_bgr;
-    // case AX_FORMAT_YUV420_SEMIPLANAR:
-    //     return ax_color_space_e::axdl_color_space_nv12;
-    // default:
-    //     return axdl_color_space_unknown;
-    // }
     return axdl_color_space_unknown;
 }
 
-int ax_runner_ax650::inference(ax_image_t *pstFrame)
-{
-    // unsigned char *dst = (unsigned char *)minput_tensors[0].pVirAddr;
-    // unsigned char *src = (unsigned char *)pstFrame->pVir;
-
-    // switch (m_handle->algo_colorformat)
-    // {
-    // case AX_FORMAT_RGB888:
-    // case AX_FORMAT_BGR888:
-    //     for (size_t i = 0; i < pstFrame->nHeight; i++)
-    //     {
-    //         memcpy(dst + i * pstFrame->nWidth * 3, src + i * pstFrame->tStride_W * 3, pstFrame->nWidth * 3);
-    //     }
-    //     break;
-    // case AX_FORMAT_YUV420_SEMIPLANAR:
-    // case AX_FORMAT_YUV420_SEMIPLANAR_VU:
-    //     for (size_t i = 0; i < pstFrame->nHeight * 1.5; i++)
-    //     {
-    //         memcpy(dst + i * pstFrame->nWidth, src + i * pstFrame->tStride_W, pstFrame->nWidth);
-    //     }
-    //     break;
-    // default:
-    //     break;
-    // }
-
-    // memcpy(minput_tensors[0].pVirAddr, pstFrame->pVir, minput_tensors[0].nSize);
-    return inference();
-}
 int ax_runner_ax650::inference()
 {
-    // for (size_t i = 0; i < minput_tensors.size(); i++)
-    // {
-    //     axcl_Memcpy(
-    //         (void *)minput_tensors[i].phyAddr, minput_tensors[i].nSize,
-    //         minput_tensors[i].pVirAddr, minput_tensors[i].nSize, AXCL_MEMCPY_HOST_TO_DEVICE);
-    // }
-    auto ret = axcl_EngineExecute(m_handle->handle, m_handle->context, 0, m_handle->io, _devid);
+    return inference(0);
+}
+
+int ax_runner_ax650::inference(int grpid)
+{
+    if (_auto_sync_before_inference)
+        for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
+            axcl_Memcpy((void *)mgroup_input_tensors[grpid][i].phyAddr, mgroup_input_tensors[grpid][i].pVirAddr, mgroup_input_tensors[grpid][i].nSize, AXCL_MEMCPY_HOST_TO_DEVICE, dev_id);
+
+    auto ret = axcl_EngineExecute(m_handle->handle, m_handle->context, grpid, m_handle->ios[grpid], dev_id);
     if (ret != 0)
     {
         ALOGE("AX_ENGINE_Execute");
         return ret;
     }
 
-    // for (size_t i = 0; i < mtensors.size(); i++)
-    // {
-    //     axcl_Memcpy(
-    //         mtensors[i].pVirAddr, mtensors[i].nSize,
-    //         (void *)mtensors[i].phyAddr, mtensors[i].nSize, AXCL_MEMCPY_DEVICE_TO_HOST);
-    // }
+    if (_auto_sync_after_inference)
+        for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
+            axcl_Memcpy(mgroup_output_tensors[grpid][i].pVirAddr, (void *)mgroup_output_tensors[grpid][i].phyAddr, mgroup_output_tensors[grpid][i].nSize, AXCL_MEMCPY_DEVICE_TO_HOST, dev_id);
+
     return 0;
 }
-
-// int ax_cmmcpy(unsigned long long int dst, unsigned long long int src, int size)
-// {
-//     return AX_IVPS_CmmCopyTdp(dst, src, size);
-// }
