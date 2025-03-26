@@ -189,13 +189,25 @@ int main(int argc, char *argv[])
                 // output = lLaMa.Run(prompt);
                 ALOGE("image prompt(%s) not found", image_prompt.c_str());
                 // continue;
-                lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type));
+                if (auto ret = lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type)); ret != 0)
+                {
+                    ALOGE("lLaMa.Encode failed");
+                    continue;
+                }
                 output = lLaMa.Run(prompt_data);
             }
             else
             {
-                lLaMa.Encode(src, img_embed);
-                lLaMa.Encode(img_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type));
+                if (auto ret = lLaMa.Encode(src, img_embed); ret != 0)
+                {
+                    ALOGE("lLaMa.Encode failed");
+                    continue;
+                }
+                if (auto ret = lLaMa.Encode(img_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type)); ret != 0)
+                {
+                    ALOGE("lLaMa.Encode failed");
+                    continue;
+                }
                 output = lLaMa.Run(prompt_data);
             }
         }
