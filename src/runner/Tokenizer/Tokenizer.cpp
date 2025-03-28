@@ -298,6 +298,7 @@
 
 class Tokenizer_Http : public BaseTokenizer
 {
+private:
     std::shared_ptr<httplib::Client> cli;
     bool _b_bos, _b_eos;
 
@@ -305,10 +306,10 @@ class Tokenizer_Http : public BaseTokenizer
 
     int bos_id, eos_id;
 
-private:
-    /* data */
+    std::string uid;
+
 public:
-    bool Init(std::string model_path = "http://localhost:8080", bool b_bos = true, bool b_eos = false) override
+    bool Init(std::string model_path = "http://localhost:8080") override
     {
         base_url = model_path;
         if (!test_connect_http(base_url, 10))
@@ -328,7 +329,18 @@ public:
             cli->set_read_timeout(1);
             cli->set_write_timeout(1);
             {
-                auto ret = cli->Get("/bos_id");
+                auto ret = cli->Get("/get_uid");
+                auto rep = ret.value();
+                if (rep.status != 200)
+                {
+                    ALOGE("get uid failed, status: %d", rep.status);
+                    return false;
+                }
+                nlohmann::json j = nlohmann::json::parse(rep.body);
+                uid = j["uid"];
+            }
+            {
+                auto ret = cli->Get("/bos_id?uid=" + uid);
                 auto rep = ret.value();
                 if (rep.status != 200)
                 {
@@ -340,7 +352,7 @@ public:
             }
 
             {
-                auto ret = cli->Get("/eos_id");
+                auto ret = cli->Get("/eos_id?uid=" + uid);
                 auto rep = ret.value();
                 if (rep.status != 200)
                 {
@@ -357,16 +369,31 @@ public:
             std::cerr << e.what() << '\n';
             return false;
         }
-
-        this->_b_bos = b_bos;
-        this->_b_eos = b_eos;
         return true;
     }
 
-    bool Encode(std::string input, std::vector<int> &output, bool b_img_prompt) override
+    bool Reset() override
+    {
+        auto ret = cli->Get("/reset?uid=" + uid);
+        auto rep = ret.value();
+        if (rep.status != 200)
+        {
+            ALOGE("reset failed, status: %d", rep.status);
+            return false;
+        }
+        return true;
+    }
+
+    bool Encode(std::string input, std::string last_reply, std::vector<int> &tokens, std::vector<int> &tokens_diff, bool b_img_prompt) override
     {
         nlohmann::json j;
+        j["uid"] = uid;
         j["text"] = input;
+        if (!last_reply.empty() and last_reply != "")
+        {
+            j["last_reply"] = last_reply;
+        }
+
         j["img_prompt"] = b_img_prompt;
         auto ret = cli->Post("/encode", j.dump(), "application/json");
         auto rep = ret.value();
@@ -387,26 +414,13 @@ public:
             return false;
         }
 
-        std::vector<int> out = j2["token_ids"];
-        output = out;
-        // output = sp->encode(input, 1024);
-        if (_b_bos)
-        {
-            output.insert(output.begin(), bos_id);
-        }
-        if (_b_eos)
-        {
-            output.push_back(eos_id);
-        }
+        std::vector<int> _token_ids = j2["token_ids"];
+        std::vector<int> _tokens_diff = j2["diff"];
+
+        tokens = _token_ids;
+        tokens_diff = _tokens_diff;
 
         return true;
-    }
-
-    std::vector<int> Encode(std::string input, bool b_img_prompt) override
-    {
-        std::vector<int> output;
-        Encode(input, output, b_img_prompt);
-        return output;
     }
 
     std::string Decode(const std::vector<int> input) override
@@ -417,6 +431,7 @@ public:
         {
             nlohmann::json j;
             j["token_ids"] = input;
+            j["uid"] = uid;
             auto ret = cli->Post("/decode", j.dump(), "application/json");
             auto rep = ret.value();
             if (rep.status != 200)
