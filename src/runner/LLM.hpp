@@ -552,13 +552,18 @@ public:
 
             auto &input_indices = layer.layer.get_input(prefill_grpid, "indices");
             unsigned int *input_indices_ptr = (unsigned int *)input_indices.pVirAddr;
-
+     
+            memset(input_indices_ptr, 0, _attr.prefill_token_num * position_ids.size()*sizeof(int) );
             for(unsigned int i=0; i< position_ids.size(); i++){
-                for(unsigned int j=0; j<position_ids[i].size(); j++){
-                    input_indices_ptr[ i*position_ids[0].size() + j ] = position_ids[i][j];
+                for(unsigned int j=0; j<_attr.prefill_token_num; j++){
 
-                    if(position_ids[i][j]>max_pos_id){
-                        max_pos_id = position_ids[i][j];
+                    if(j<position_ids[i].size()){
+                        input_indices_ptr[ i*_attr.prefill_token_num+j ] = position_ids[i][j];
+                        if(position_ids[i][j]>max_pos_id){
+                            max_pos_id = position_ids[i][j];
+                        }
+                    // }else{
+                    //     input_indices_ptr[i*_attr.prefill_token_num+j] = 0;   
                     }
                 }
             }
