@@ -1,8 +1,11 @@
 #include "signal.h"
 
 #include "runner/LLM.hpp"
-#include "runner/utils/memory_utils.hpp"
+
 #include "cmdline.hpp"
+
+#include <ax_sys_api.h>
+#include <ax_engine_api.h>
 
 static LLM lLaMa;
 
@@ -23,26 +26,11 @@ std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
     std::ostringstream oss_prompt;
     switch (tokenizer_type)
     {
-    case TKT_LLaMa:
-        oss_prompt << "<|user|>\n"
-                   << prompt << "</s><|assistant|>\n";
-        break;
-    case TKT_MINICPM:
-        oss_prompt << "<用户>" << prompt << "<AI>";
-        break;
-    case TKT_Phi3:
-        oss_prompt << prompt << " ";
-        break;
-    case TKT_Qwen:
-        // oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
-        // oss_prompt << "\n<|im_start|>user\n"
-        //            << prompt << "<|im_end|>\n<|im_start|>assistant\n";
-
-        oss_prompt << "<|im_start|>user\n帮我找一个穿白色上衣黑色裤子的年轻女人的图片<|im_end|>\n<|im_start|>assistant";
-        break;
     case TKT_HTTP:
-    default:
         oss_prompt << prompt;
+        break;
+    default:
+        ALOGE("tokenizer type %d not support", tokenizer_type);
         break;
     }
 
@@ -54,48 +42,39 @@ int main(int argc, char *argv[])
     signal(SIGINT, __sigExit);
     LLMAttrType attr;
     std::string prompt = "Hi";
-    bool b_continue = false;
+    bool b_continue = true;
 
     cmdline::parser cmd;
-    cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3 4:MINICPM", false, attr.tokenizer_type);
-    cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
+    cmd.add<std::string>("url_tokenizer_model", 0, "tokenizer model path", false, attr.url_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
-    cmd.add<bool>("use_topk", 0, "", false, attr.b_use_topk);
-
-    cmd.add<bool>("bos", 0, "", false, attr.b_bos);
-    cmd.add<bool>("eos", 0, "", false, attr.b_eos);
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
+    // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
-    cmd.add<bool>("dynamic_load_axmodel_layer", 0, "it can save cmm memory", false, attr.b_dynamic_load_axmodel_layer);
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
 
-    cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
-
     cmd.parse_check(argc, argv);
 
-    prompt = cmd.get<std::string>("prompt");
     attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
-    attr.filename_tokenizer_model = cmd.get<std::string>("filename_tokenizer_model");
+    attr.url_tokenizer_model = cmd.get<std::string>("url_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
-    attr.b_use_topk = cmd.get<bool>("use_topk");
-    attr.b_bos = cmd.get<bool>("bos");
-    attr.b_eos = cmd.get<bool>("eos");
+    // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
+    // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
+
     attr.axmodel_num = cmd.get<int>("axmodel_num");
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
-    attr.b_dynamic_load_axmodel_layer = cmd.get<bool>("dynamic_load_axmodel_layer");
 
     bool b_live_print = cmd.get<bool>("live_print");
     if (b_live_print)
@@ -104,94 +83,23 @@ int main(int argc, char *argv[])
         attr.reserve = 0;
     }
 
-    b_continue = cmd.get<bool>("continue");
+    // 1. init engine
+    AX_ENGINE_NPU_ATTR_T npu_attr;
+    memset(&npu_attr, 0, sizeof(npu_attr));
+    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    AX_SYS_Init();
+    auto ret = AX_ENGINE_Init(&npu_attr);
+    if (0 != ret)
+    {
+        return ret;
+    }
 
     if (!lLaMa.Init(attr))
     {
+        ALOGE("lLaMa.Init failed");
+        AX_ENGINE_Deinit();
+        AX_SYS_Deinit();
         return -1;
-    }
-
-    {
-        // set cache
-        int prefill_len = 128;
-        int precompute_len = 1202;
-        int max_kvcache_num = 2176;
-        std::vector<std::vector<unsigned short>> k_caches;
-        std::vector<std::vector<unsigned short>> v_caches;
-        std::vector<unsigned short> mask;
-
-        for (int i = 0; i < attr.axmodel_num; i++)
-        {
-            char path[256];
-            sprintf(path, "qwen2_1.5B_kvcaches/k_caches_%02d.bin", i);
-            std::vector<char> k_cache;
-            if (!read_file(path, k_cache))
-            {
-                ALOGE("read_file");
-                return -1;
-            }
-            ALOGI("k_cache %s", path);
-            k_caches.push_back(std::vector<unsigned short>(k_cache.size() / sizeof(unsigned short)));
-            memcpy(k_caches.back().data(), k_cache.data(), k_cache.size());
-
-            sprintf(path, "qwen2_1.5B_kvcaches/v_caches_%02d.bin", i);
-            std::vector<char> v_cache;
-            if (!read_file(path, v_cache))
-            {
-                ALOGE("read_file");
-                return -1;
-            }
-            ALOGI("v_cache %s", path);
-            v_caches.push_back(std::vector<unsigned short>(v_cache.size() / sizeof(unsigned short)));
-            memcpy(v_caches.back().data(), v_cache.data(), v_cache.size());
-        }
-
-        std::vector<char> tmp_mask;
-        if (!read_file("qwen2_1.5B_kvcaches/prefill_mask.bin", tmp_mask))
-        {
-            ALOGE("read_file");
-            return -1;
-        }
-        ALOGI("mask %s", "prefill_mask.bin");
-        mask.resize(tmp_mask.size() / sizeof(unsigned short));
-        memcpy(mask.data(), tmp_mask.data(), tmp_mask.size());
-
-        std::vector<unsigned short> mask_2;
-        {
-            int num_token = 21;
-            bfloat16 bf16 = -65536.f;
-            
-            mask_2.resize(1 * prefill_len * (max_kvcache_num + prefill_len), bf16.data);
-            for (size_t i = 0; i < prefill_len; i++)
-            {
-                if (i < num_token)
-                {
-                    int mask_current_start = max_kvcache_num;
-                    auto mask_ptr = mask_2.data() + i * (max_kvcache_num + prefill_len);
-                    for (int j = 0; j < precompute_len; j++)
-                    {
-                        mask_ptr[j] = 0;
-                    }
-                    for (int j = mask_current_start; j < mask_current_start + i + 1; j++)
-                    {
-                        mask_ptr[j] = 0;
-                    }
-                }
-            }
-            if (memcmp(mask.data(), mask_2.data(), mask_2.size() * sizeof(unsigned short)) == 0)
-            {
-                printf("mask ok\n");
-            }
-        }
-
-        lLaMa.set_cache_inputs(k_caches, v_caches, mask_2, precompute_len, max_kvcache_num);
-    }
-
-    if (prompt != "")
-    {
-        auto output = lLaMa.Run(prompt_complete(prompt, attr.tokenizer_type));
-        if (!b_live_print)
-            printf("%s\n", output.c_str());
     }
 
     //
@@ -200,27 +108,35 @@ int main(int argc, char *argv[])
         printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
         // lLaMa.Reset();
     }
-
+    std::vector<unsigned short> prompt_data;
+    std::string last_reply;
+    std::vector<std::vector<unsigned short>> k_caches, v_caches;
+    int precompute_len = 0;
     while (b_continue)
     {
-        printf(">> ");
+        printf("prompt >> ");
         fflush(stdout);
-        std::string input;
-        std::getline(std::cin, input);
-        if (input == "q")
+        std::getline(std::cin, prompt);
+        if (prompt == "q")
         {
             break;
         }
-        if (input == "")
+        if (prompt == "")
         {
             continue;
         }
-        auto output = lLaMa.Run(prompt_complete(input, attr.tokenizer_type));
+        std::vector<int> tokens_ids, tokens_diff;
+        lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type), last_reply, tokens_ids, tokens_diff);
+        lLaMa.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size());
+        last_reply = lLaMa.Run(prompt_data);
+        lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
+
         if (!b_live_print)
-            printf("%s\n", output.c_str());
+            printf("%s\n", last_reply.c_str());
     }
 
     lLaMa.Deinit();
-
+    AX_ENGINE_Deinit();
+    AX_SYS_Deinit();
     return 0;
 }

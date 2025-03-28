@@ -350,22 +350,6 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size)
         m_handle = new ax_joint_runner_ax650_handle_t;
     }
 
-    static bool b_init = false;
-    if (!b_init)
-    {
-        // 1. init engine
-        AX_ENGINE_NPU_ATTR_T npu_attr;
-        memset(&npu_attr, 0, sizeof(npu_attr));
-        npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
-        AX_SYS_Init();
-        auto ret = AX_ENGINE_Init(&npu_attr);
-        if (0 != ret)
-        {
-            return ret;
-        }
-        b_init = true;
-    }
-
     // 3. create handle
 
     int ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer, model_size);
@@ -432,10 +416,23 @@ void ax_runner_ax650::deinit()
 
 int ax_runner_ax650::inference()
 {
-    return AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[0]);
+    int ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[0]);
+    for (size_t i = 0; i < get_num_outputs(); i++)
+    {
+        auto &tensor = get_output(i);
+        AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+    }
+    return ret;
 }
 
 int ax_runner_ax650::inference(int grpid)
 {
-    return AX_ENGINE_RunGroupIOSync(m_handle->handle, m_handle->context, grpid, &m_handle->io_data[grpid]);
+    int ret = AX_ENGINE_RunGroupIOSync(m_handle->handle, m_handle->context, grpid, &m_handle->io_data[grpid]);
+
+    for (size_t i = 0; i < get_num_outputs(); i++)
+    {
+        auto &tensor = get_output(grpid, i);
+        AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+    }
+    return ret;
 }
