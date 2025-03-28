@@ -448,6 +448,8 @@ public:
             embed_selector.getByIndex(input_ids[i], out_embed.data() + i * _attr.tokens_embed_size);
         }
 
+        cfg.image_grid_thw.clear();
+        cfg.video_grid_thw.clear();
         GetPositionIds(input_ids, position_ids, cfg);
         return 0;
     }
