@@ -1,4 +1,5 @@
 bsp_msp_out/msp
+msp
 weights
 .vscode
 build*
