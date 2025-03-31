@@ -300,7 +300,14 @@ public:
         b_stop = true;
     }
 
-    int GenerateKVCache(std::string system_prompt)
+    int SetSystemPrompt(std::string system_prompt, std::vector<int> &_token_ids)
+    {
+        tokenizer->Reset(system_prompt, _token_ids);
+        _attr.system_prompt = system_prompt;
+        return 0;
+    }
+
+    int GenerateKVCache(std::vector<int> &_token_ids)
     {
         // clear kv cache
         for (size_t i = 0; i < _attr.axmodel_num; i++)
@@ -308,9 +315,6 @@ public:
             axcl_Memset((void *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").phyAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize, llama_layers[i].layer.get_devid());
             axcl_Memset((void *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").phyAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize, llama_layers[i].layer.get_devid());
         }
-        std::vector<int> _token_ids;
-        tokenizer->Reset(system_prompt, _token_ids);
-        _attr.system_prompt = system_prompt;
 
         bfloat16 bf16 = -65536.f;
         std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);

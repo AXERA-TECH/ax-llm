@@ -35,6 +35,91 @@ std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
 
     return oss_prompt.str();
 }
+
+bool save_kvcache(std::string target_path, std::string system_prompt, int precompute_len, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches)
+{
+    for (size_t i = 0; i < k_caches.size(); i++)
+    {
+        std::string k_cache_path = target_path + "/k_cache_" + std::to_string(i) + ".bin";
+        std::string v_cache_path = target_path + "/v_cache_" + std::to_string(i) + ".bin";
+        std::ofstream k_cache_file(k_cache_path);
+        std::ofstream v_cache_file(v_cache_path);
+        if (!k_cache_file.is_open() || !v_cache_file.is_open())
+        {
+            ALOGE("save kvcache failed");
+            return false;
+        }
+        k_cache_file.write((char *)k_caches[i].data(), k_caches[i].size() * sizeof(unsigned short));
+        v_cache_file.write((char *)v_caches[i].data(), v_caches[i].size() * sizeof(unsigned short));
+        k_cache_file.close();
+        v_cache_file.close();
+    }
+    nlohmann::json j;
+    j["system_prompt"] = system_prompt;
+    j["precompute_len"] = precompute_len;
+    std::string config_path = target_path + "/config.json";
+    std::ofstream config_file(config_path);
+    config_file << j.dump();
+    config_file.close();
+    return true;
+}
+
+bool load_kvcache(std::string target_path, int axmodel_num, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, std::string &system_prompt, int &precompute_len)
+{
+    k_caches.resize(axmodel_num);
+    v_caches.resize(axmodel_num);
+    for (size_t i = 0; i < k_caches.size(); i++)
+    {
+        std::string k_cache_path = target_path + "/k_cache_" + std::to_string(i) + ".bin";
+        std::string v_cache_path = target_path + "/v_cache_" + std::to_string(i) + ".bin";
+        if (file_exist(k_cache_path) && file_exist(v_cache_path))
+        {
+            std::vector<unsigned short> k_cache;
+            std::vector<unsigned short> v_cache;
+            std::ifstream k_cache_file(k_cache_path);
+            std::ifstream v_cache_file(v_cache_path);
+
+            k_cache_file.seekg(0, std::ios::end);
+            k_cache.resize(k_cache_file.tellg() / sizeof(unsigned short));
+            k_cache_file.seekg(0, std::ios::beg);
+
+            v_cache_file.seekg(0, std::ios::end);
+            v_cache.resize(v_cache_file.tellg() / sizeof(unsigned short));
+            v_cache_file.seekg(0, std::ios::beg);
+
+            k_cache_file.read((char *)k_cache.data(), k_cache.size() * sizeof(unsigned short));
+            v_cache_file.read((char *)v_cache.data(), v_cache.size() * sizeof(unsigned short));
+
+            k_cache_file.close();
+            v_cache_file.close();
+            k_caches[i] = k_cache;
+            v_caches[i] = v_cache;
+        }
+        else
+        {
+            ALOGE("k_cache %s or v_cache %s not exist", k_cache_path.c_str(), v_cache_path.c_str());
+            return false;
+        }
+    }
+
+    std::string config_path = target_path + "/config.json";
+    if (file_exist(config_path))
+    {
+        std::ifstream config_file(config_path);
+        nlohmann::json j;
+        config_file >> j;
+        system_prompt = j["system_prompt"].get<std::string>();
+        precompute_len = j["precompute_len"].get<int>();
+        config_file.close();
+    }
+    else
+    {
+        ALOGE("config %s not exist", config_path.c_str());
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char *argv[])
 {
     signal(SIGPIPE, SIG_IGN);
@@ -42,9 +127,11 @@ int main(int argc, char *argv[])
     LLMAttrType attr;
     std::string prompt = "Hi";
     bool b_continue = true;
+    std::string kvcache_path;
 
     cmdline::parser cmd;
     cmd.add<std::string>("system_prompt", 0, "system prompt", false, attr.system_prompt);
+    cmd.add<std::string>("kvcache_path", 0, "kvcache path", false, kvcache_path);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3 4:MINICPM", false, attr.tokenizer_type);
@@ -65,6 +152,7 @@ int main(int argc, char *argv[])
     cmd.parse_check(argc, argv);
 
     attr.system_prompt = cmd.get<std::string>("system_prompt");
+    kvcache_path = cmd.get<std::string>("kvcache_path");
     attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
     attr.url_tokenizer_model = cmd.get<std::string>("url_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
@@ -121,8 +209,29 @@ int main(int argc, char *argv[])
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     int precompute_len = 0;
 
-    lLaMa.GenerateKVCache(attr.system_prompt);
-    lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
+    std::vector<int> _token_ids;
+    lLaMa.SetSystemPrompt(attr.system_prompt, _token_ids);
+
+    if (!kvcache_path.empty() && kvcache_path != "")
+    {
+        if (!load_kvcache(kvcache_path, attr.axmodel_num, k_caches, v_caches, attr.system_prompt, precompute_len))
+        {
+            ALOGE("load kvcache failed");
+            return -1;
+        }
+        ALOGI("precompute_len: %d", precompute_len);
+        ALOGI("system_prompt: %s", attr.system_prompt.c_str());
+    }
+    else
+    {
+        lLaMa.GenerateKVCache(_token_ids);
+        lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
+        if (!save_kvcache(kvcache_path, attr.system_prompt, precompute_len, k_caches, v_caches))
+        {
+            ALOGE("save kvcache failed");
+        }
+    }
+
     while (b_continue)
     {
         printf("prompt >> ");
