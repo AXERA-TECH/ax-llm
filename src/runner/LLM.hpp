@@ -453,14 +453,24 @@ public:
         // constexpr int IMG_CONTEXT = 151667; // InternVL2.5
         constexpr int IMG_CONTEXT = 92546; // InternVL2.5-8B-MPO
         int offset = 0;
+        int img_context_count = 0;
 
         for (size_t i = 0; i < input_ids.size(); i++)
         {
             if (input_ids[i] == IMG_CONTEXT)
             {
-                offset = i;
-                break;
+                img_context_count++;
+                if (img_context_count == 1)
+                {
+                    offset = i;
+                }
             }
+        }
+        
+        if (img_context_count != img_embed.size() / _attr.tokens_embed_size)
+        {
+            ALOGE("img_context_count(%d) != img_embed.size() / tokens_embed_size(%d)", img_context_count, img_embed.size() / _attr.tokens_embed_size);
+            return -1;
         }
 
         // for (size_t i = 0; i < input_ids.size(); i++)
