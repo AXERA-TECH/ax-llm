@@ -84,15 +84,25 @@ public:
         return true;
     }
 
-    bool Reset() override
+    bool Reset(std::string system_prompt, std::vector<int> &tokens) override
     {
-        auto ret = cli->Get("/reset?uid=" + uid);
+        nlohmann::json j;
+        j["uid"] = uid;
+        if (!system_prompt.empty() and system_prompt != "")
+        {
+            j["system_prompt"] = system_prompt;
+        }
+
+        auto ret = cli->Post("/reset", j.dump(), "application/json");
         auto rep = ret.value();
         if (rep.status != 200)
         {
             ALOGE("reset failed, status: %d", rep.status);
             return false;
         }
+        nlohmann::json j_rep = nlohmann::json::parse(rep.body);
+        std::vector<int> _token_ids = j_rep["token_ids"];
+        tokens = _token_ids;
         return true;
     }
 

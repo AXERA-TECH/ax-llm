@@ -45,6 +45,7 @@ int main(int argc, char *argv[])
     bool b_continue = true;
 
     cmdline::parser cmd;
+    cmd.add<std::string>("system_prompt", 0, "system prompt", false, attr.system_prompt);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3 4:MINICPM", false, attr.tokenizer_type);
@@ -62,6 +63,7 @@ int main(int argc, char *argv[])
 
     cmd.parse_check(argc, argv);
 
+    attr.system_prompt = cmd.get<std::string>("system_prompt");
     attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
     attr.url_tokenizer_model = cmd.get<std::string>("url_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
@@ -112,6 +114,9 @@ int main(int argc, char *argv[])
     std::string last_reply;
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     int precompute_len = 0;
+
+    lLaMa.GenerateKVCache(attr.system_prompt);
+    lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
     while (b_continue)
     {
         printf("prompt >> ");

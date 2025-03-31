@@ -16,7 +16,7 @@ class BaseTokenizer
 {
 public:
     virtual bool Init(std::string model_path) = 0;
-    virtual bool Reset() = 0;
+    virtual bool Reset(std::string system_prompt, std::vector<int> &tokens) = 0;
     virtual bool Encode(std::string input, std::string last_reply, std::vector<int> &tokens, std::vector<int> &tokens_diff, bool b_img_prompt = false) = 0;
     // virtual std::vector<int> Encode(std::string input, std::string last_reply, bool b_img_prompt = false) = 0;
     virtual std::string Decode(const std::vector<int> input) = 0;
