@@ -137,7 +137,7 @@ public:
         }
         if (map_group_output_tensors.find(name) == map_group_output_tensors.end())
         {
-            throw std::runtime_error("input tensor not found: " + name);
+            throw std::runtime_error("output tensor not found: " + name);
         }
         return map_group_output_tensors[name][grpid];
     }
