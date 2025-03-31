@@ -60,10 +60,20 @@ class Tokenizer_Http():
     def eos_token(self):
         return self.tokenizer.eos_token
     
-    def reset(self):
+    def reset(self, system_prompt="You are Qwen, created by Alibaba Cloud. You are a helpful assistant."):
         self.messages = [
-            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+            {"role": "system", "content": system_prompt},
         ]
+        text = self.tokenizer.apply_chat_template(
+            self.messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        token_ids = self.tokenizer.encode(text)[:-3]
+        self.token_ids = token_ids
+        print(self.decode(token_ids))
+        return token_ids
+        
 
 class Request(BaseHTTPRequestHandler):
     timeout = 5
@@ -85,7 +95,7 @@ class Request(BaseHTTPRequestHandler):
         elif '/bos_id' in self.path:
             # 获取 uid 参数（例如 ?uid=xxx）
             uid = self.get_query_param("uid")
-            instance = tokenizers.get(uid)
+            instance: Tokenizer_Http = tokenizers.get(uid)
             if instance is None:
                 msg = json.dumps({'error': 'Invalid uid'})
             else:
@@ -93,20 +103,12 @@ class Request(BaseHTTPRequestHandler):
                 msg = json.dumps({'bos_id': bos_id if bos_id is not None else -1})
         elif '/eos_id' in self.path:
             uid = self.get_query_param("uid")
-            instance = tokenizers.get(uid)
+            instance: Tokenizer_Http = tokenizers.get(uid)
             if instance is None:
                 msg = json.dumps({'error': 'Invalid uid'})
             else:
                 eos_id = instance.eos_id
                 msg = json.dumps({'eos_id': eos_id if eos_id is not None else -1})
-        elif '/reset' in self.path:
-            uid = self.get_query_param("uid")
-            instance = tokenizers.get(uid)
-            if instance is None:
-                msg = json.dumps({'error': 'Invalid uid'})
-            else:
-                instance.reset()
-                msg = json.dumps({'success': True})
         else:
             msg = json.dumps({'error': 'Invalid GET endpoint'})
 
@@ -129,7 +131,7 @@ class Request(BaseHTTPRequestHandler):
             uid = req.get('uid')
             prompt = req.get('text')
             last_reply = req.get('last_reply')
-            instance = tokenizers.get(uid)
+            instance: Tokenizer_Http = tokenizers.get(uid)
             if instance is None:
                 msg = json.dumps({'error': 'Invalid uid'})
             else:
@@ -138,12 +140,26 @@ class Request(BaseHTTPRequestHandler):
         elif '/decode' in self.path:
             uid = req.get('uid')
             token_ids = req.get('token_ids')
-            instance = tokenizers.get(uid)
+            instance: Tokenizer_Http = tokenizers.get(uid)
             if instance is None:
                 msg = json.dumps({'error': 'Invalid uid'})
             else:
                 text = instance.decode(token_ids)
                 msg = json.dumps({'text': text})
+        elif '/reset' in self.path:
+            uid = req.get("uid")
+            system_prompt = req.get("system_prompt")
+            instance: Tokenizer_Http = tokenizers.get(uid)
+            if instance is None:
+                msg = json.dumps({'error': 'Invalid uid'})
+            else:
+                if system_prompt is not None:
+                    print("system_prompt:", system_prompt)
+                    token_ids = instance.reset(system_prompt)
+                    msg = json.dumps({'token_ids': token_ids})
+                else:
+                    token_ids = instance.reset()
+                    msg = json.dumps({'token_ids': token_ids})
         else:
             msg = json.dumps({'error': 'Invalid POST endpoint'})
 
