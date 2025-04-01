@@ -208,22 +208,23 @@ int main(int argc, char *argv[])
 
     if (!kvcache_path.empty() && kvcache_path != "")
     {
-        if (!load_kvcache(kvcache_path, attr.axmodel_num, k_caches, v_caches, attr.system_prompt, precompute_len))
+        if (load_kvcache(kvcache_path, attr.axmodel_num, k_caches, v_caches, attr.system_prompt, precompute_len))
         {
-            ALOGE("load kvcache failed");
-            return -1;
+            ALOGI("load kvcache from path: %s success,precompute_len: %d", kvcache_path.c_str(), precompute_len);
+        }
+        else
+        {
+            ALOGW("load kvcache from path: %s failed,generate kvcache", kvcache_path.c_str());
+            lLaMa.GenerateKVCache(_token_ids);
+            lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
+            if (!save_kvcache(kvcache_path, attr.system_prompt, precompute_len, k_caches, v_caches))
+            {
+                ALOGE("save kvcache failed");
+            }
+            ALOGI("generate kvcache to path: %s", kvcache_path.c_str());
         }
         ALOGI("precompute_len: %d", precompute_len);
         ALOGI("system_prompt: %s", attr.system_prompt.c_str());
-    }
-    else
-    {
-        lLaMa.GenerateKVCache(_token_ids);
-        lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
-        if (!save_kvcache(kvcache_path, attr.system_prompt, precompute_len, k_caches, v_caches))
-        {
-            ALOGE("save kvcache failed");
-        }
     }
 
     while (b_continue)
