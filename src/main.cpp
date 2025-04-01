@@ -4,7 +4,7 @@
 
 #include "cmdline.hpp"
 
-#include <opencv2/opencv.hpp>
+// #include <opencv2/opencv.hpp>
 
 static LLM lLaMa;
 

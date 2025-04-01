@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
-#include <opencv2/opencv.hpp>
+// #include <opencv2/opencv.hpp>
 #include "bfloat16.hpp"
 #include "Tokenizer/Tokenizer.hpp"
 #include "LLMEmbedSelector.hpp"

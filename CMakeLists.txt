@@ -20,22 +20,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(BUILD_WITH_YOLOV5_TEST OFF)
 
-# bsp
-if(BUILD_WITH_YOLOV5_TEST)
-    if(NOT BSP_MSP_DIR)
-        # 判断 /soc/lib/libax_engine.so 是否存在，以确定是否为板端编译
-        if(EXISTS /soc/lib/libax_engine.so)
-            message(STATUS "Detected board,BSP_MSP_DIR = /soc")
-            set(BSP_MSP_DIR /soc)
-        else()
-            set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
-        endif()
-    endif()
-    message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
-    include_directories(${BSP_MSP_DIR}/include)
-    link_directories(${BSP_MSP_DIR}/lib)
-endif()
-
 # set(SPM_ENABLE_SHARED OFF)
 # add_subdirectory(third_party/sentencepiece)
 # include_directories(third_party/sentencepiece/src)
@@ -51,10 +35,6 @@ endif()
 
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
-
-message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
-find_package(OpenCV REQUIRED)
-include_directories(${OpenCV_INCLUDE_DIRS})
 
 include_directories(src)
 include_directories(src/runner)
@@ -79,7 +59,6 @@ function(build_exec name main_source)
     # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
     target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread)
-    target_link_libraries(${name} ${OpenCV_LIBS})
 
     # target_link_libraries(${name} sentencepiece re2::re2)
     install(TARGETS ${name} DESTINATION bin)
@@ -93,21 +72,3 @@ install(FILES ${RUN_SCRIPT} DESTINATION bin/)
 
 file(GLOB LLAMA3_TOKENIZER "${CMAKE_SOURCE_DIR}/scripts/llama3_tokenizer/*")
 install(FILES ${LLAMA3_TOKENIZER} DESTINATION bin/llama3_tokenizer/)
-
-# add_executable(fp32_to_bf16 tools/fp32_to_bf16.cpp)
-
-if(BUILD_WITH_YOLOV5_TEST)
-    set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/../3rdparty/libopencv-4.5.5-aarch64/lib/cmake/opencv4)
-    find_package(OpenCV REQUIRED)
-
-    add_executable(main_yolov5 src/main_yolov5.cpp src/runner/ax_model_runner/ax_model_runner_ax650.cpp src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp src/runner/utils/memory_utils.cpp)
-    target_include_directories(main_yolov5 PRIVATE ${OpenCV_INCLUDE_DIRS} axcl/include)
-    target_link_libraries(main_yolov5 PRIVATE ${OpenCV_LIBS})
-    target_link_libraries(main_yolov5 PRIVATE spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt)
-    target_link_libraries(main_yolov5 PRIVATE ax_engine ax_interpreter ax_sys)
-
-
-    add_executable(main_single src/main_single.cpp src/runner/ax_model_runner/ax_model_runner_ax650.cpp src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp src/runner/utils/memory_utils.cpp)
-    target_link_libraries(main_single PRIVATE spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt)
-    target_link_libraries(main_single PRIVATE ax_engine ax_interpreter ax_sys)
-endif()
