@@ -466,7 +466,7 @@ public:
                 }
             }
         }
-        
+
         if (img_context_count != img_embed.size() / _attr.tokens_embed_size)
         {
             ALOGE("img_context_count(%d) != img_embed.size() / tokens_embed_size(%d)", img_context_count, img_embed.size() / _attr.tokens_embed_size);
@@ -803,16 +803,11 @@ public:
 
         for (size_t i = 0; i < _attr.axmodel_num; i++)
         {
-            int prefill_split_num = _attr.prefill_max_token_num / _attr.prefill_token_num;
-            for (size_t p = 0; p < prefill_split_num; p++)
+            for (size_t j = 0; j < llama_layers[i].layer.get_num_input_groups(); j++)
             {
-                int prefill_grpid = p + 1;
-                memset(llama_layers[i].layer.get_input(prefill_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(prefill_grpid, "K_cache").nSize);
-                memset(llama_layers[i].layer.get_input(prefill_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(prefill_grpid, "V_cache").nSize);
+                axcl_Memset((void *)llama_layers[i].layer.get_input(j, "K_cache").phyAddr, 0, llama_layers[i].layer.get_input(j, "K_cache").nSize, llama_layers[i].layer.get_devid());
+                axcl_Memset((void *)llama_layers[i].layer.get_input(j, "V_cache").phyAddr, 0, llama_layers[i].layer.get_input(j, "V_cache").nSize, llama_layers[i].layer.get_devid());
             }
-
-            memset(llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize);
-            memset(llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize);
         }
 
         return final_out;
