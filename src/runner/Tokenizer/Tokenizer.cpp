@@ -34,12 +34,16 @@ public:
             ALOGI("connect %s ok", base_url.c_str());
         }
 
-        try
+        cli = std::make_shared<httplib::Client>(base_url);
+        cli->set_connection_timeout(10);
+        cli->set_read_timeout(10);
+        cli->set_write_timeout(10);
+
+        int try_count = 10;
+        int count = try_count;
+        while (count-- > 0)
         {
-            cli = std::make_shared<httplib::Client>(base_url);
-            cli->set_connection_timeout(1);
-            cli->set_read_timeout(1);
-            cli->set_write_timeout(1);
+            try
             {
                 auto ret = cli->Get("/get_uid");
                 auto rep = ret.value();
@@ -50,7 +54,21 @@ public:
                 }
                 nlohmann::json j = nlohmann::json::parse(rep.body);
                 uid = j["uid"];
+                ALOGI("uid: %s", uid.c_str());
+                break;
             }
+            catch (const std::exception &e)
+            {
+                std::cerr << e.what() << '\n';
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            ALOGE("get uid failed, try again %d/%d", count, try_count);
+        }
+
+        count = 10;
+        while (count-- > 0)
+        {
+            try
             {
                 auto ret = cli->Get("/bos_id?uid=" + uid);
                 auto rep = ret.value();
@@ -61,8 +79,20 @@ public:
                 }
                 nlohmann::json j = nlohmann::json::parse(rep.body);
                 bos_id = j["bos_id"];
+                break;
             }
+            catch (const std::exception &e)
+            {
+                std::cerr << e.what() << '\n';
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            ALOGE("get bos_id failed, try again %d/%d", count, try_count);
+        }
 
+        count = 10;
+        while (count-- > 0)
+        {
+            try
             {
                 auto ret = cli->Get("/eos_id?uid=" + uid);
                 auto rep = ret.value();
@@ -73,14 +103,18 @@ public:
                 }
                 nlohmann::json j = nlohmann::json::parse(rep.body);
                 eos_id = j["eos_id"];
+                break;
             }
-            printf("bos_id: %d, eos_id: %d\n", bos_id, eos_id);
+            catch (const std::exception &e)
+            {
+                std::cerr << e.what() << '\n';
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            ALOGE("get eos_id failed, try again %d/%d", count, try_count);
         }
-        catch (const std::exception &e)
-        {
-            std::cerr << e.what() << '\n';
-            return false;
-        }
+
+        printf("bos_id: %d, eos_id: %d\n", bos_id, eos_id);
+
         return true;
     }
 
