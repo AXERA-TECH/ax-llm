@@ -242,7 +242,11 @@ int main(int argc, char *argv[])
         }
         std::vector<int> tokens_ids, tokens_diff;
         lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type), last_reply, tokens_ids, tokens_diff);
-        lLaMa.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size());
+        if (auto ret = lLaMa.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
+        {
+            ALOGE("SetKVCache failed: %d", ret);
+            break;
+        }
         last_reply = lLaMa.Run(prompt_data);
         lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
 

@@ -322,7 +322,7 @@ public:
                 break;
             }
         }
-        ALOGI("precompute_len:%d", precompute_len);
+        ALOGI("precompute_len:%d, remaining:%d", precompute_len, _attr.prefill_max_kv_cache_num_grp[_attr.prefill_max_kv_cache_num_grp.size() - 1] - precompute_len);
         k_caches.resize(_attr.axmodel_num);
         v_caches.resize(_attr.axmodel_num);
         for (size_t i = 0; i < _attr.axmodel_num; i++)
