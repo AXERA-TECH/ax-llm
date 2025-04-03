@@ -247,7 +247,7 @@ public:
             for (size_t i = 0; i < llama_layers[0].layer.get_num_input_groups() - 1; i++)
             {
                 int prefill_max_kv_cache_num = llama_layers[0].layer.get_input(i + 1, "K_cache").vShape[1];
-                ALOGI("grp: %d, prefill_max_token_num : %d", i + 1, prefill_max_kv_cache_num);
+                ALOGI("grp: %ld, prefill_max_token_num : %d", i + 1, prefill_max_kv_cache_num);
                 _attr.prefill_max_kv_cache_num_grp.push_back(prefill_max_kv_cache_num);
             }
         }
@@ -416,7 +416,7 @@ public:
                 break;
             }
         }
-        ALOGI("precompute_len:%d", precompute_len);
+        ALOGI("precompute_len:%d, remaining:%d", precompute_len, _attr.prefill_max_kv_cache_num_grp[_attr.prefill_max_kv_cache_num_grp.size() - 1] - precompute_len);
         k_caches.resize(_attr.axmodel_num);
         v_caches.resize(_attr.axmodel_num);
         for (size_t i = 0; i < _attr.axmodel_num; i++)
@@ -502,13 +502,13 @@ public:
 
         if (k_caches.size() != v_caches.size())
         {
-            ALOGE("k_caches.size(%d) != v_caches.size(%d)", k_caches.size(), v_caches.size());
+            ALOGE("k_caches.size(%ld) != v_caches.size(%ld)", k_caches.size(), v_caches.size());
             return -1;
         }
 
         if (k_caches.size() != _attr.axmodel_num)
         {
-            ALOGE("k_caches.size(%d) != _attr.axmodel_num(%d)", k_caches.size(), _attr.axmodel_num);
+            ALOGE("k_caches.size(%ld) != _attr.axmodel_num(%d)", k_caches.size(), _attr.axmodel_num);
             return -1;
         }
 
@@ -538,12 +538,12 @@ public:
 
             if (k_cache.size() != _attr.precompute_len * _attr.kv_cache_size)
             {
-                ALOGE("k_cache.size(%d) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), _attr.precompute_len, _attr.kv_cache_size);
+                ALOGE("k_cache.size(%ld) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), _attr.precompute_len, _attr.kv_cache_size);
                 return -1;
             }
             if (v_cache.size() < _attr.precompute_len * _attr.kv_cache_size)
             {
-                ALOGE("v_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), _attr.precompute_len, _attr.kv_cache_size);
+                ALOGE("v_cache.size(%ld) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), _attr.precompute_len, _attr.kv_cache_size);
                 return -1;
             }
 
