@@ -221,17 +221,20 @@ int main(int argc, char *argv[])
         else
         {
             ALOGW("load kvcache from path: %s failed,generate kvcache", kvcache_path.c_str());
-            lLaMa.GenerateKVCache(_token_ids);
-            lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
+            lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
             if (!save_kvcache(kvcache_path, attr.system_prompt, precompute_len, k_caches, v_caches))
             {
                 ALOGE("save kvcache failed");
             }
             ALOGI("generate kvcache to path: %s", kvcache_path.c_str());
         }
-        ALOGI("precompute_len: %d", precompute_len);
-        ALOGI("system_prompt: %s", attr.system_prompt.c_str());
     }
+    else
+    {
+        lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
+    }
+    ALOGI("precompute_len: %d", precompute_len);
+    ALOGI("system_prompt: %s", attr.system_prompt.c_str());
 
     while (b_continue)
     {
@@ -246,12 +249,19 @@ int main(int argc, char *argv[])
         {
             continue;
         }
+        if (prompt == "reset")
+        {
+            ALOGI("reset kvcache");
+            lLaMa.SetSystemPrompt(attr.system_prompt, _token_ids);
+            lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
+            continue;
+        }
         std::vector<int> tokens_ids, tokens_diff;
         lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type), last_reply, tokens_ids, tokens_diff);
         if (auto ret = lLaMa.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
         {
-            ALOGE("SetKVCache failed: %d", ret);
-            break;
+            ALOGE("SetKVCache failed: %d,the context may be full,input \"reset\" to reset context", ret);
+            continue;
         }
         last_reply = lLaMa.Run(prompt_data);
         lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
