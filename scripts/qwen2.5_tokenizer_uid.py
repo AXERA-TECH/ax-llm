@@ -15,6 +15,8 @@ class Tokenizer_Http():
             {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
         ]
         self.token_ids = []
+        
+        self.token_ids_cache = []
 
     def encode(self, prompt, last_reply=None):
         if last_reply is not None:
@@ -42,7 +44,15 @@ class Tokenizer_Http():
         return token_ids, diff
 
     def decode(self, token_ids):
-        return self.tokenizer.decode(token_ids)
+        self.token_ids_cache += token_ids
+        text = self.tokenizer.decode(self.token_ids_cache)
+        if "\ufffd" in text:
+            print("text 中包含非法字符")
+            return ""
+        else:
+            self.token_ids_cache.clear()
+            return text
+        
 
     @property
     def bos_id(self):

@@ -624,11 +624,6 @@ public:
             return -1;
         }
 
-        if (tokens_diff.size() > _attr.prefill_token_num)
-        {
-            ALOGE("input_ids(%ld) > prefill_token_num(%d)", tokens_diff.size(), _attr.prefill_token_num);
-            return -1;
-        }
         out_embed.resize(tokens_diff.size() * _attr.tokens_embed_size);
 
         for (size_t i = 0; i < tokens_diff.size(); i++)
@@ -657,12 +652,6 @@ public:
         int input_embed_num = test_embed.size() / _attr.tokens_embed_size;
         int prefill_split_num = ceil((double)input_embed_num / _attr.prefill_token_num);
         ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
-
-        if (input_embed_num > _attr.prefill_token_num)
-        {
-            ALOGE("input token num(%d) > prefill_token_num(%d)", input_embed_num, _attr.prefill_token_num);
-            return "";
-        }
 
         mask[_attr.kv_cache_num] = 0;
         for (size_t i = 0; i < _attr.precompute_len + input_embed_num; i++)
@@ -791,11 +780,6 @@ public:
 
         int next_token = -1;
         t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
-        std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
-
-        memcpy(embed.data(),
-               test_embed.data() + (input_embed_num - 1) * _attr.tokens_embed_size,
-               _attr.tokens_embed_size * sizeof(unsigned short));
 
         {
 
