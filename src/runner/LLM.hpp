@@ -299,6 +299,11 @@ public:
             axcl_Exit(devid);
     }
 
+    LLMPostprocess *getPostprocess()
+    {
+        return &postprocess;
+    }
+
     void Stop()
     {
         b_stop = true;
