@@ -40,10 +40,14 @@ include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
 
-include_directories(axcl/include)
-link_directories(axcl/lib)
-include_directories(/usr/include/axcl/)
-link_directories(/usr/lib/axcl/)
+if (NOT AXCL_DIR)
+    include_directories(/usr/include/axcl/)
+    link_directories(/usr/lib/axcl/)
+else()
+    include_directories(${AXCL_DIR}/include)
+    include_directories(${AXCL_DIR}/include/include)
+    link_directories(${AXCL_DIR}/lib)
+endif()
 
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
