@@ -4,8 +4,6 @@
 #include <fstream>
 #include <queue>
 #include <signal.h>
-#include <ax_sys_api.h>
-#include <ax_engine_api.h>
 
 #include "runner/utils/httplib.h"
 #include "runner/utils/json.hpp"
@@ -19,6 +17,13 @@
 #endif
 #include <future>
 #include <cmdline.hpp>
+
+#define IS_AXCL 0
+
+#if !IS_AXCL
+#include <ax_sys_api.h>
+#include <ax_engine_api.h>
+#endif
 
 std::vector<std::string> glob(const std::string &pattern)
 {
@@ -60,6 +65,7 @@ const std::string UPLOAD_DIR = "uploads/";
 const std::string MODEL_DIR = "models/";
 
 static std::queue<std::string> g_msg_queue;
+static std::mutex g_msg_locker;
 
 void __sigExit(int iSigNo)
 {
@@ -71,6 +77,7 @@ void llm_running_callback(int *p_token, int n_token, const char *p_str, float to
 {
     fprintf(stdout, "%s", p_str);
     fflush(stdout);
+    std::lock_guard<std::mutex> tmp_locker(g_msg_locker);
     g_msg_queue.push(p_str);
 }
 
@@ -320,38 +327,29 @@ void set_llm_config(nlohmann::json &body)
     }
 }
 
-bool content_provider(size_t offset, httplib::DataSink &sink)
+void content_provider(const httplib::Request &req, httplib::Response &res)
 {
+    std::lock_guard<std::mutex> tmp_locker(g_msg_locker);
     std::string bot_response;
-    while (worker.gllm_runing || !g_msg_queue.empty())
+
+    while (!g_msg_queue.empty())
     {
-        while (!g_msg_queue.empty())
-        {
-            auto str = g_msg_queue.front(); // 用 front 取出
-            g_msg_queue.pop();
+        auto str = g_msg_queue.front(); // 用 front 取出
+        g_msg_queue.pop();
 
-            bot_response += str;
-
-            nlohmann::json chunk;
-            chunk["response"] = str;
-            chunk["done"] = false;
-
-            auto msg = chunk.dump() + "\n";
-            sink.write(msg.data(), msg.size());
-        }
-        usleep(1000);
+        bot_response += str;
     }
 
     // 最后发送 done=true
     nlohmann::json chunk;
-    chunk["response"] = ""; // 最后不再补发内容，避免重复
-    chunk["done"] = true;
+    chunk["response"] = bot_response; // 最后不再补发内容，避免重复
+    if (worker.gllm_runing)
+        chunk["done"] = false;
+    else
+        chunk["done"] = true;
 
-    auto msg = chunk.dump() + "\n";
-    sink.write(msg.data(), msg.size());
-
-    sink.done();
-    return true;
+    res.status = 200;
+    res.set_content(chunk.dump(), "application/json");
 }
 
 void handle_generate(const httplib::Request &req, httplib::Response &res)
@@ -375,8 +373,8 @@ void handle_generate(const httplib::Request &req, httplib::Response &res)
     std::string prompt = body["prompt"];
     ALOGI("%s", prompt.c_str());
     worker.RunAsync(prompt);
-
-    res.set_chunked_content_provider("text/event-stream", content_provider);
+    res.status = 200;
+    res.set_content("{\"status\": \"ok\"}", "application/json");
 }
 
 void handle_stop(const httplib::Request &req, httplib::Response &res)
@@ -460,27 +458,6 @@ void handle_chat(const httplib::Request &req, httplib::Response &res)
     return;
 }
 
-void handle_upload(const httplib::Request &req, httplib::Response &res)
-{
-    const auto &file = req.get_file_value("image");
-    std::string file_path = UPLOAD_DIR + file.filename;
-
-    std::ofstream ofs(file_path, std::ios::binary);
-    if (!ofs)
-    {
-        res.status = 500;
-        res.set_content("{\"error\": \"Failed to save file\"}", "application/json");
-        return;
-    }
-    ofs.write(file.content.data(), file.content.size());
-    ofs.close();
-
-    nlohmann::json response;
-    response["message"] = "File uploaded successfully";
-    response["file_path"] = file_path;
-    res.set_content(response.dump(), "application/json");
-}
-
 int main(int argc, char *argv[])
 {
     signal(SIGPIPE, SIG_IGN);
@@ -501,6 +478,10 @@ int main(int argc, char *argv[])
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
+
+#if IS_AXCL
+    cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
+#endif
     cmd.parse_check(argc, argv);
 
     attr.system_prompt = cmd.get<std::string>("system_prompt");
@@ -516,6 +497,24 @@ int main(int argc, char *argv[])
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
 
+#if IS_AXCL
+    auto devices_str = cmd.get<std::string>("devices");
+    std::vector<int> devices;
+    std::stringstream ss(devices_str);
+    std::string item;
+    while (std::getline(ss, item, ','))
+    {
+        devices.push_back(std::stoi(item));
+    }
+
+    attr.dev_ids = devices;
+
+    auto ret = axclInit(nullptr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#else
     AX_ENGINE_NPU_ATTR_T npu_attr;
     memset(&npu_attr, 0, sizeof(npu_attr));
     npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
@@ -525,12 +524,18 @@ int main(int argc, char *argv[])
     {
         return ret;
     }
+#endif
 
     if (!worker.gllm.Init(attr))
     {
         ALOGE("lLaMa.Init failed");
+
+#if IS_AXCL
+        axclFinalize();
+#else
         AX_ENGINE_Deinit();
         AX_SYS_Deinit();
+#endif
         return -1;
     }
     worker.gllm_init = true;
@@ -539,8 +544,8 @@ int main(int argc, char *argv[])
     svr.Get("/api/stop", handle_stop);
     svr.Post("/api/reset", handle_reset);
     svr.Post("/api/generate", handle_generate);
+    svr.Get("/api/generate_provider", content_provider);
     svr.Post("/api/chat", handle_chat);
-    svr.Post("/api/upload", handle_upload);
 
     svr.set_pre_routing_handler([](const httplib::Request &req, httplib::Response &res) -> httplib::Server::HandlerResponse
                                 {
@@ -559,8 +564,11 @@ int main(int argc, char *argv[])
     svr.listen("0.0.0.0", PORT);
     worker.Stop();
     worker.gllm.Deinit();
-
+#if IS_AXCL
+    axclFinalize();
+#else
     AX_ENGINE_Deinit();
     AX_SYS_Deinit();
+#endif
     return 0;
 }
