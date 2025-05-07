@@ -41,33 +41,31 @@ def stream_generate(history, message, temperature, repetition_penalty, top_p, to
         "top-k": top_k
     }
     try:
-        response = requests.post(f"{API_URL}/api/generate", json=payload, stream=True, timeout=(3.05, None))
+        response = requests.post(f"{API_URL}/api/generate", json=payload, timeout=(3.05, None))
         response.raise_for_status()
     except Exception as e:
         history[-1] = (message, f"Error: {str(e)}")
         yield history, ""
         return
     time.sleep(0.1)
-    bot_response = ""
-    for line in response.iter_lines():
-        if not line:
-            time.sleep(0.01)
-            continue
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            # Skip malformed chunk
-            time.sleep(0.01)
-            continue
-        chunk = data.get("response", "")
-        bot_response += chunk
-        history[-1] = (message, bot_response)
-        yield history, ""
-        if data.get("done") is True:
-            print("Done")
-            break
+    
+    while True:
         time.sleep(0.01)
-    response.close()
+        response = requests.get(
+                "http://localhost:8000/api/generate_provider"
+            )
+        data = response.json()
+        chunk:str = data.get("response", "") 
+        done = data.get("done", False)
+        if done:
+            break
+        if chunk.strip() == "":
+            continue
+        history[-1] = (message, history[-1][1] + chunk)
+        yield history, ""
+       
+    print("end")
+    
 
 def stop_generate():
     try:
@@ -76,28 +74,28 @@ def stop_generate():
         print(e)
     
 # Build the Gradio interface optimized for PC with spacious layout
-custom_css = """
-.gradio-container {
-    max-width: 1400px;
-    margin: auto;
-    padding: 20px;
-}
-.gradio-container > * {
-    margin-bottom: 20px;
-}
-#chatbox .overflow-y-auto {
-    height: 600px !important;
-}
-"""
+# custom_css = """
+# .gradio-container {
+#     max-width: 1400px;
+#     margin: auto;
+#     padding: 20px;
+# }
+# .gradio-container > * {
+#     margin-bottom: 20px;
+# }
+# #chatbox .overflow-y-auto {
+#     height: 600px !important;
+# }
+# """
 
 # Build the Gradio interface优化布局
-with gr.Blocks(theme=gr.themes.Soft(), css=custom_css, fill_width=True) as demo:
+with gr.Blocks(theme=gr.themes.Soft(), fill_width=True) as demo:
     gr.Markdown("<h2 style='text-align:center;'>🚀 Chatbot Demo with Axare API Backend</h2>")
     
     # 使用Row包裹左右两个主要区域
     with gr.Row():
         # 左侧聊天主区域（占3/4宽度）
-        with gr.Column(scale=7):
+        with gr.Column(scale=3):
             system_prompt = gr.Textbox(label="System Prompt", placeholder="Optional system prompt", lines=2, value="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.")
             reset_button = gr.Button("🔄 Reset Chat")
             chatbot = gr.Chatbot(elem_id="chatbox", label="Axera Chat",height=500)
@@ -107,12 +105,11 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css, fill_width=True) as demo:
                 stop_button = gr.Button("🛑 Stop", variant="stop")
 
         # 右侧参数设置区域（占1/4宽度）
-        with gr.Column(scale=3):
-            with gr.Accordion("⚙️ Sampling Parameters", open=True):
-                temperature = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.7, label="Temperature")
-                repetition_penalty = gr.Slider(minimum=1.0, maximum=2.0, step=0.01, value=1.0, label="Repetition Penalty")
-                top_p = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.9, label="Top-p Sampling")
-                top_k = gr.Slider(minimum=0, maximum=100, step=1, value=40, label="Top-k Sampling")
+        with gr.Column(scale=1):
+            temperature = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.7, label="Temperature")
+            repetition_penalty = gr.Slider(minimum=1.0, maximum=2.0, step=0.01, value=1.0, label="Repetition Penalty")
+            top_p = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.9, label="Top-p Sampling")
+            top_k = gr.Slider(minimum=0, maximum=100, step=1, value=40, label="Top-k Sampling")
 
     # Wire up events: reset clears chat and input
     reset_button.click(fn=reset_chat, inputs=system_prompt, outputs=[chatbot, user_input])
