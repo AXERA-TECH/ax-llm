@@ -33,6 +33,7 @@ def stream_generate(history, message, temperature, repetition_penalty, top_p, to
     Clears input after sending. On error, shows error in chat.
     """
     history = history + [(message, "")]
+    yield history, ""
     payload = {
         "prompt": message,
         "temperature": temperature,
@@ -52,7 +53,7 @@ def stream_generate(history, message, temperature, repetition_penalty, top_p, to
     while True:
         time.sleep(0.01)
         response = requests.get(
-                "http://localhost:8000/api/generate_provider"
+                f"{API_URL}/api/generate_provider"
             )
         data = response.json()
         chunk:str = data.get("response", "") 
