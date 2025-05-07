@@ -90,7 +90,7 @@ def stop_generate():
 # """
 
 # Build the Gradio interface优化布局
-with gr.Blocks(theme=gr.themes.Soft(), fill_width=True) as demo:
+with gr.Blocks(theme=gr.themes.Soft(font="Consolas"), fill_width=True) as demo:
     gr.Markdown("<h2 style='text-align:center;'>🚀 Chatbot Demo with Axare API Backend</h2>")
     
     # 使用Row包裹左右两个主要区域

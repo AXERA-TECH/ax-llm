@@ -46,12 +46,12 @@ class Tokenizer_Http():
     def decode(self, token_ids):
         self.token_ids_cache += token_ids
         text = self.tokenizer.decode(self.token_ids_cache)
-        if "\ufffd" in text:
+        if "\ufffd" in text and len(self.token_ids_cache) < 9:
             print("text 中包含非法字符")
             return ""
         else:
             self.token_ids_cache.clear()
-            return text
+            return text.replace("\ufffd","")
         
 
     @property
