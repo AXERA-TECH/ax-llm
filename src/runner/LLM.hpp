@@ -338,6 +338,11 @@ public:
         return true;
     }
 
+    LLMPostprocess *getPostprocess()
+    {
+        return &postprocess;
+    }
+
     LLMAttrType *getAttr()
     {
         return &_attr;
