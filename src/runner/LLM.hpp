@@ -313,6 +313,7 @@ public:
     {
         tokenizer->Reset(system_prompt, _token_ids);
         _attr.system_prompt = system_prompt;
+        _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_max_kv_cache_num_grp.size() - 1];
         return 0;
     }
 

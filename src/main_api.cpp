@@ -225,6 +225,8 @@ public:
         gllm.Encode(prompt_data, prompt, last_reply, tokens_ids, tokens_diff);
         if (auto ret = gllm.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
         {
+            gllm_runing = false;
+            g_msg_queue.push("error: SetKVCache failed: %d,the context may be full,please reset");
             return "error: SetKVCache failed: %d,the context may be full,please reset";
         }
         last_reply = gllm.Run(prompt_data);
