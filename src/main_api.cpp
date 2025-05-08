@@ -19,6 +19,13 @@
 #include <future>
 #include <cmdline.hpp>
 
+#define IS_AXCL 0
+
+#if !IS_AXCL
+#include <ax_sys_api.h>
+#include <ax_engine_api.h>
+#endif
+
 std::vector<std::string> glob(const std::string &pattern)
 {
     std::vector<std::string> results;
@@ -524,7 +531,9 @@ int main(int argc, char *argv[])
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
 
+#if IS_AXCL
     cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
+#endif
 
     cmd.parse_check(argc, argv);
 
@@ -547,6 +556,7 @@ int main(int argc, char *argv[])
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
 
+#if IS_AXCL
     auto devices_str = cmd.get<std::string>("devices");
     std::vector<int> devices;
     std::stringstream ss(devices_str);
@@ -563,11 +573,27 @@ int main(int argc, char *argv[])
     {
         return ret;
     }
+#else
+    AX_ENGINE_NPU_ATTR_T npu_attr;
+    memset(&npu_attr, 0, sizeof(npu_attr));
+    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    AX_SYS_Init();
+    auto ret = AX_ENGINE_Init(&npu_attr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#endif
 
     if (!worker.gllm.Init(attr))
     {
         ALOGE("lLaMa.Init failed");
+#if IS_AXCL
         axclFinalize();
+#else
+        AX_ENGINE_Deinit();
+        AX_SYS_Deinit();
+#endif
         return -1;
     }
     worker.gllm_init = true;
@@ -597,6 +623,11 @@ int main(int argc, char *argv[])
     worker.Stop();
     worker.gllm.Deinit();
 
+#if IS_AXCL
     axclFinalize();
+#else
+    AX_ENGINE_Deinit();
+    AX_SYS_Deinit();
+#endif
     return 0;
 }

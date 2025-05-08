@@ -95,15 +95,16 @@ def respond(prompt, image:gr.File, temp, rep_penalty, tp, tk, history=None):
 
 
 def chat_interface():
-    with gr.Blocks() as demo:
+    with gr.Blocks(theme=gr.themes.Soft(font="Consolas"), fill_width=True) as demo:
         gr.Markdown("## Chat with LLM\nUpload an image and chat with the model!")
         with gr.Row():
             with gr.Column(scale=3):
                 chatbot = gr.Chatbot()
                 prompt = gr.Textbox(placeholder="Type your message...", label="Prompt", value="描述一下这张图片")
                 image = gr.File(label="Upload Image", file_types=[".png", ".jpg", ".jpeg"])
-                btn_chat = gr.Button("Chat", variant="primary")
-                btn_stop = gr.Button("Stop", variant="stop")
+                with gr.Row():
+                    btn_chat = gr.Button("Chat", variant="primary")
+                    btn_stop = gr.Button("Stop", variant="stop")
 
             with gr.Column(scale=1):
                 temperature = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.7, label="Temperature")
