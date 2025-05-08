@@ -19,7 +19,7 @@
 #include <future>
 #include <cmdline.hpp>
 
-#define IS_AXCL 0
+#define IS_AXCL 1
 
 #if !IS_AXCL
 #include <ax_sys_api.h>
