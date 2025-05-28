@@ -20,6 +20,7 @@
 | `/api/reset`    | POST | 重置 LLM 上下文     |
 | `/api/stop`     | GET  | 停止当前推理任务       |
 | `/api/content`  | GET  | 获取推理结果         |
+| `/api/upload`   | POST | 上传文件到服务器       |
 
 ---
 
@@ -41,6 +42,7 @@
 | 参数名                  | 类型     | 是否必须 | 默认值 | 描述                  |
 | -------------------- | ------ | ---- | --- | ------------------- |
 | `prompt`             | string | ✅    | -   | 用户输入的文本 prompt      |
+| `file_path`          | string | ❌    | -   | 上传图片的路径（由 `/api/upload` 返回） |
 | `temperature`        | float  | ❌    | -   | 温度参数，控制生成的随机性       |
 | `repetition_penalty` | float  | ❌    | -   | 重复惩罚系数，大于 1 可降低复读概率 |
 | `top-p`              | float  | ❌    | -   | Top-P 采样策略阈值        |
