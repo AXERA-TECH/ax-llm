@@ -757,19 +757,19 @@ public:
 
                 memcpy((unsigned short *)input_decoder_k_cache.pVirAddr + kv_offset,
                        (void *)output_k_cache.pVirAddr,
-                       sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                       sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
 
                 memcpy((unsigned short *)input_decoder_v_cache.pVirAddr + kv_offset,
                        (void *)output_v_cache.pVirAddr,
-                       sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                       sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
 
                 memcpy((unsigned short *)input_prefill_k_cache.pVirAddr + kv_offset,
                        (void *)output_k_cache.pVirAddr,
-                       sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                       sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
 
                 memcpy((unsigned short *)input_prefill_v_cache.pVirAddr + kv_offset,
                        (void *)output_v_cache.pVirAddr,
-                       sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                       sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
 
                 auto &output = layer.layer.get_output(_attr.prefill_grpid, "output");
                 memcpy(embed_tmp.data(), (void *)output.pVirAddr, embed_tmp.size() * sizeof(unsigned short));
