@@ -19,15 +19,8 @@
 
 ### 已支持模型
 
-- Qwen1.5-0.5B/1.8B/4B
-- Qwen2-0.5B/1.5B
-- ChatGLM3-6B
-- MiniCPM-2B
-- TinyLLaMa-1.1B
-- Llama2-7B
-- Llama3-8B
-- Phi-2
-- Phi-3-mini
+- Qwen2.5-0.5B/1.5B/3B/7B
+- Qwen3-0.6B/1.7B/4B/8B
 
 ### 获取地址
 
@@ -36,7 +29,7 @@
 
 ## 源码编译
 
-- 递归 clone 本项目，确保所有 `submodule` 正确 clone
+- clone 本项目
     ```shell
     git clone --recursive https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
@@ -45,162 +38,149 @@
     ```shell
     ./build.sh
     ```
-- 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
+- 正确编译后，`build/install/` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
   ```
-  $ tree install/bin/
-    install/bin/
-    ├── main
-    ├── run_bf16.sh
-    └── run_qwen_1.8B.sh
+  $ tree install
+    install
+    └── bin
+        ├── gradio_demo.py
+        ├── main
+        ├── main_api
+        └── qwen2.5_tokenizer_uid.py
   ```
   
 ## 运行示例
 
-### Phi-3-mini-int8
+### Qwen2.5-1.5B-ctx
 
+#### 运行支持上下文的 tokenizer 服务器
 ```shell
-./run_phi3_mini.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  35 /  35 [28.39s<28.39s, 1.23 count/s] init post axmodel okremain_cmm(9045 MB))
-[I][                            Init][ 180]: max_token_len : 1023
-[I][                            Init][ 185]: kv_cache_size : 3072, kv_cache_num: 1023
-[I][                            Init][ 199]: LLM init ok
-Type "q" to exit, Ctrl+c to stop current running
->>
->> who are you?
- I am Phi, an AI developed by Microsoft, designed to assist and provide information to users across a wide range of topics. How can I assist you today?
+python qwen2.5_tokenizer_uid.py 
+Server running at http://127.0.0.1:12345
+```
 
-[N][                             Run][ 388]: hit eos,avg 4.40 token/s
-
->>
->> use c program language implement calculate sum 1-9
- Certainly! To calculate the sum of numbers from 1 to 9 in C, you can use a simple loop. Here's a small program that does exactly that:
-
-`c
-#include <stdio.h>
-
-int main() {
-    int sum = 0; // Initialize sum to 0
-
-    // Loop from 1 to 9 and add each number to sum
-    for(int i = 1; i <= 9; i++) {
-        sum += i;
-    }
-
-    printf("The sum of numbers from 1 to 9 is: %d\n", sum);
-
-    return 0;
+#### 运行命令行 llm
+```shell
+./run_qwen2.5_1.5b_ctx_ax650.sh 
+[I][                            Init][ 110]: LLM init start
+[I][                            Init][  34]: connect http://127.0.0.1:12345 ok
+[I][                            Init][  57]: uid: 4bba0928-fada-4329-903e-3b6e52d68791
+bos_id: -1, eos_id: 151645
+100% | ████████████████████████████████ |  31 /  31 [18.94s<18.94s, 1.64 count/s] init post axmodel ok,remain_cmm(1464 MB)
+[I][                            Init][ 188]: max_token_len : 2559
+[I][                            Init][ 193]: kv_cache_size : 256, kv_cache_num: 2559
+[I][                            Init][ 201]: prefill_token_num : 128
+[I][                            Init][ 205]: grp: 1, prefill_max_token_num : 1
+[I][                            Init][ 205]: grp: 2, prefill_max_token_num : 512
+[I][                            Init][ 205]: grp: 3, prefill_max_token_num : 1024
+[I][                            Init][ 205]: grp: 4, prefill_max_token_num : 1536
+[I][                            Init][ 205]: grp: 5, prefill_max_token_num : 2048
+[I][                            Init][ 209]: prefill_max_token_num : 2048
+[I][                     load_config][ 282]: load config: 
+{
+    "enable_repetition_penalty": false,
+    "enable_temperature": true,
+    "enable_top_k_sampling": true,
+    "enable_top_p_sampling": false,
+    "penalty_window": 20,
+    "repetition_penalty": 1.2,
+    "temperature": 0.9,
+    "top_k": 10,
+    "top_p": 0.8
 }
-`
 
-This program initializes a variable `sum` to 0. It then iterates from 1 to 9, adding each number to `sum`. Finally, it prints the result.
+[I][                            Init][ 218]: LLM init ok
+Type "q" to exit, Ctrl+c to stop current running
+[I][          GenerateKVCachePrefill][ 271]: input token num : 21, prefill_split_num : 1 prefill_grpid : 2
+[I][          GenerateKVCachePrefill][ 308]: input_num_token:21
+[I][                            main][ 230]: precompute_len: 21
+[I][                            main][ 231]: system_prompt: You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
+prompt >> hello,my name is allen,who are you
+[I][                      SetKVCache][ 531]: prefill_grpid:2 kv_cache_num:512 precompute_len:21 input_num_token:18
+[I][                      SetKVCache][ 534]: current prefill_max_token_num:1920
+[I][                             Run][ 660]: input token num : 18, prefill_split_num : 1
+[I][                             Run][ 686]: input_num_token:18
+[I][                             Run][ 829]: ttft: 539.49 ms
+Hello Allen! I'm sorry, but I'm an AI language model and I don't have a name. I'm just here to help you with any questions or information you need. How can I assist you today?
 
-The sum of numbers from 1 to 9 is 45, as calculated by the loop in the program.
+[N][                             Run][ 943]: hit eos,avg 10.80 token/s
 
-[N][                             Run][ 388]: hit eos,avg 4.37 token/s
+[I][                      GetKVCache][ 500]: precompute_len:83, remaining:1965
+prompt >> 我叫什么名字
+[I][                      SetKVCache][ 531]: prefill_grpid:2 kv_cache_num:512 precompute_len:83 input_num_token:12
+[I][                      SetKVCache][ 534]: current prefill_max_token_num:1920
+[I][                             Run][ 660]: input token num : 12, prefill_split_num : 1
+[I][                             Run][ 686]: input_num_token:12
+[I][                             Run][ 829]: ttft: 538.67 ms
+你的名字是Allen。
+
+[N][                             Run][ 943]: hit eos,avg 10.57 token/s
+
+[I][                      GetKVCache][ 500]: precompute_len:100, remaining:1948
 
 ```
 
-### TinyLLaMa-1.1B-BF16
-
-
-https://github.com/AXERA-TECH/ax-llm/assets/46700201/e592f78a-03ca-4824-b2d3-46d48740dbef
-
-
+#### 运行api以及gradio demo
+##### 启动服务器
 ```shell
-# ./run_bf16.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  25 /  25 [21.82s<21.82s, 1.15 count/s] init post axmodel okremain_cmm(3760 MB)
-[I][                            Init][ 162]: max_token_len : 1023
-[I][                            Init][ 167]: kv_cache_size : 256, kv_cache_num: 1023
-[I][                            Init][ 176]: LLM init ok
-Type "q" to exit, Ctrl+c to stop current running
->> write a c++ program to calculate 1-9 sum
-
-`c++
-#include <iostream>
-
-using namespace std;
-
-int main() {
-    int sum = 0;
-    int num;
-
-    cout << "Enter a number: ";
-    cin >> num;
-
-    for (int I = 1; I <= num; i++) {
-        sum += i;
-    }
-
-    cout << "The sum of 1 to " << num << " is: " << sum << endl;
-
-    return 0;
+./run_qwen2.5_1.5b_ctx_ax650_api.sh 
+[I][                            Init][ 110]: LLM init start
+[I][                            Init][  34]: connect http://10.126.33.124:12345 ok
+[I][                            Init][  57]: uid: 13c64c2a-9b4e-4875-91f4-fa9f426e3726
+bos_id: -1, eos_id: 151645
+  3% | ██                                |   1 /  31 [0.15s<4.77s, 6.49 count/s] tokenizer init ok[I][                            Init][  26]: LLaMaEmbedSelector use mmap
+100% | ████████████████████████████████ |  31 /  31 [2.97s<2.97s, 10.44 count/s] init post axmodel ok,remain_cmm(1464 MB)[I][                            Init][ 188]: max_token_len : 2559
+[I][                            Init][ 193]: kv_cache_size : 256, kv_cache_num: 2559
+[I][                            Init][ 201]: prefill_token_num : 128
+[I][                            Init][ 205]: grp: 1, prefill_max_token_num : 1
+[I][                            Init][ 205]: grp: 2, prefill_max_token_num : 512
+[I][                            Init][ 205]: grp: 3, prefill_max_token_num : 1024
+[I][                            Init][ 205]: grp: 4, prefill_max_token_num : 1536
+[I][                            Init][ 205]: grp: 5, prefill_max_token_num : 2048
+[I][                            Init][ 209]: prefill_max_token_num : 2048
+[I][                     load_config][ 282]: load config: 
+{
+    "enable_repetition_penalty": false,
+    "enable_temperature": true,
+    "enable_top_k_sampling": true,
+    "enable_top_p_sampling": false,
+    "penalty_window": 20,
+    "repetition_penalty": 1.2,
+    "temperature": 0.9,
+    "top_k": 10,
+    "top_p": 0.8
 }
-`
 
+[I][                            Init][ 218]: LLM init ok
+Server running on port 8000...
+```
+获取板端 ip，并修改 gradio 代码中的 ip 地址
+```
+import time
+import gradio as gr
+import requests
+import json
 
-this program prompts the user to enter a number, then calculates the sum of 1 to `num` using a loop. The loop iterates from 1 to `num`, adding each number to the sum variable `sum`. Finally, the program prints the sum of 1 to `num`.
-
-[N][                             Run][ 366]: hit eos,avg 10.14 token/s
-
->> where is shenzhen
-Shenzhen is a city located in southern China, on the southern coast of the Pearl River Delta. It is the capital of Guangdong province and one of the most important economic and cultural centers in China. Shenzhen is known for its innovation, technology, and entrepreneurship, and it is home to many of China's largest companies, including Huawei, Lenovo, and Xiaomi. The city is also a hub for international trade and investment, with many multinational corporations and financial institutions setting up offices and operations in Shenzhen
-
-[N][                             Run][ 366]: hit eos,avg 10.16 token/s
+# Base URL of your API server; adjust host and port as needed
+API_URL = "http://x.x.x.x:8000"
+...
 
 ```
+运行 gradio_demo.py
+```
+python gradio_demo.py 
+/home/axera/ax-llm/scripts/gradio_demo.py:102: UserWarning: You have not specified a value for the `type` parameter. Defaulting to the 'tuples' format for chatbot messages, but this is deprecated and will be removed in a future version of Gradio. Please set type='messages' instead, which uses openai-style dictionaries with 'role' and 'content' keys.
+  chatbot = gr.Chatbot(elem_id="chatbox", label="Axera Chat",height=500)
+* Running on local URL:  http://0.0.0.0:7860
 
-### Qwen1.5-1.8B-int8
-
-
-https://github.com/AXERA-TECH/ax-llm/assets/46700201/6788565f-19a5-45cb-9d17-41e2260886a2
-
-
-```shell
-# ./run_qwen_1.8B.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  27 /  27 [23.68s<23.68s, 1.14 count/s] init post axmodel okremain_cmm(4140 MB)
-[I][                            Init][ 162]: max_token_len : 1023
-[I][                            Init][ 167]: kv_cache_size : 2048, kv_cache_num: 1023
-[I][                            Init][ 176]: LLM init ok
-Type "q" to exit, Ctrl+c to stop current running
->> 给我写个C++代码计算1-9的和
-以下是一个简单的C++代码，用于计算1-9的和：
-
-`cpp
-#include <iostream>
-
-int main() {
-    int sum = 1;
-    for (int i = 1; i <= 9; i++) {
-        sum += i;
-    }
-    std::cout << "The sum of 1-9 is: " << sum << std::endl;
-    return 0;
-}
-`
-
-在这个代码中，我们首先定义了一个变量`sum`，并将其初始化为1。然后，我们使用一个`for`循环，从1开始，每次增加1，直到10。在每次循环中，我们都会将当前的数`i`加到`sum`中。最后，我们在主函数中打印出`sum`的值，即1-9的和。
-
-
-[N][                             Run][ 366]: hit eos,avg 8.00 token/s
-
->> 深圳在哪
-深圳位于中国广东省南部，珠江口东侧，东临大亚湾，西濒珠江口，南界深圳湾，北界香港特别行政区，是中国四大一线城市之一，也是中国经济最发达的城市之一。
-
-
-[N][                             Run][ 366]: hit eos,avg 8.44 token/s
+To create a public link, set `share=True` in `launch()`.
 ```
 
-
+![](scripts/gradio_demo.png)
 
 ## Reference
 
-- [Phi-3-mini](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
-- [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
-- [Qwen1.5-1.8B](https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat)
-- [Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B)
+- [Qwen](https://huggingface.co/Qwen)
 
 ## 技术讨论
 
