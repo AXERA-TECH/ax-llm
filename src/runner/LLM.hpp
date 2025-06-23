@@ -3,20 +3,37 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
-#include <opencv2/opencv.hpp>
-#include "bfloat16.hpp"
-#include "Tokenizer/Tokenizer.hpp"
-#include "LLMEmbedSelector.hpp"
-#include "ax_model_runner/ax_model_runner_ax650.hpp"
 
-// #include "ax_cmm_utils.hpp"
+#include <opencv2/opencv.hpp>
+
+#include "bfloat16.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
+#include "axcl_manager.h"
+
+#include "Tokenizer/Tokenizer.hpp"
+#include "ax_model_runner/ax_model_runner_ax650.hpp"
+
+#include "LLMEmbedSelector.hpp"
 #include "LLMPostprocess.hpp"
 
-// #include <axcl.h>
-// #include <axcl_rt_memory.h>
-#include "utils/axcl_manager.h"
+/**
+ * @brief 说明图像编码器输入数据的格式和预处理要求
+ *
+ * 当定义了 IMAGE_ENCODER_INPUT_NCHW 且其值为 1 时，图像编码器的输入数据格式为 [1*3*h*w] 的浮点型数据，
+ * 该数据需要进行归一化处理，具体操作是 (像素值/255 - 均值) / 标准差。
+ *
+ * 当 IMAGE_ENCODER_INPUT_NCHW 的值为 0 时，图像编码器的输入数据格式为 [1*h*w*3] 的无符号 8 位整型数据。
+ */
+int IMAGE_ENCODER_INPUT_NCHW = -1;
+
+/**
+ * @brief 说明图像编码器输出数据的格式
+ *
+ * 当 IMAGE_ENCODER_OUTPUT_BF16 为 1 时，图像编码器的输出数据格式为 bfloat16 半精度浮点型数据，
+ * 否则为float32数据。
+ */
+int IMAGE_ENCODER_OUTPUT_BF16 = -1;
 
 typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
 
@@ -34,9 +51,9 @@ struct LLMAttrType
     int prefill_token_num = 96; // auto calc
     int prefill_max_token_num = 512;
 
-    TokenizerType tokenizer_type = TKT_LLaMa;
-    std::string filename_tokenizer_model = "tokenizer.model";
-    bool b_bos = true, b_eos = false;
+    TokenizerType tokenizer_type = TKT_HTTP;
+    std::string filename_tokenizer_model = "http://127.0.0.1:12345";
+    bool b_bos = false, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
     int tokens_embed_num = 32000;
     int tokens_embed_size = 2048;
@@ -55,6 +72,18 @@ struct LLMAttrType
     // bool b_live_print = true;
     LLMRuningCallback runing_callback = nullptr;
     void *reserve = nullptr;
+
+    /**
+     * 151667 for InternVL 2.5/3
+     * 92546 for InternVL 2.5-8B-MPO
+     */
+    int IMAGE_CONTEXT = 151667;
+
+    /**
+     * 151665 for InternVL 2.5/3
+     * 92544 for InternVL 2.5-8B-MPO
+     */
+    int IMAGE_START_CONTEXT = 151665;
 };
 
 class LLM
@@ -124,7 +153,6 @@ private:
 public:
     bool Init(LLMAttrType attr)
     {
-
         ALOGI("LLM init start");
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
@@ -178,24 +206,30 @@ public:
 
         auto dev_assignments = distributeModels(_attr.dev_ids.size(), attr.axmodel_num);
 
-        char axmodel_path[1024];
+        std::vector<int> rets(attr.axmodel_num);
+#pragma omp parallel for
         for (int i = 0; i < attr.axmodel_num; i++)
         {
+            char axmodel_path[1024];
             sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
             llama_layers[i].filename = axmodel_path;
 
             int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), _attr.dev_ids[dev_assignments[i]]);
             // llama_layers[i].layer.set_auto_sync_after_inference(true);
             // llama_layers[i].layer.set_auto_sync_before_inference(true);
+            rets[i] = ret;
+            int remain_cmm = axcl_GetCMMRemain(_attr.dev_ids[dev_assignments[i]]);
+            sprintf(axmodel_path, "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, _attr.dev_ids[dev_assignments[i]], remain_cmm);
+            update_cqdm(&cqdm, i + 2, "count", axmodel_path);
+        }
 
-            if (ret != 0)
+        for (int i = 0; i < attr.axmodel_num; i++)
+        {
+            if (rets[i] != 0)
             {
                 ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
                 return false;
             }
-            int remain_cmm = axcl_GetCMMRemain(_attr.dev_ids[dev_assignments[i]]);
-            sprintf(axmodel_path, "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, _attr.dev_ids[dev_assignments[i]], remain_cmm);
-            update_cqdm(&cqdm, i + 2, "count", axmodel_path);
         }
 
         int ret = llama_post.init(attr.filename_post_axmodel.c_str(), llama_layers[llama_layers.size() - 1].layer.get_devid());
@@ -206,6 +240,7 @@ public:
             return false;
         }
         int remain_cmm = axcl_GetCMMRemain(llama_post.get_devid());
+        char axmodel_path[1024];
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
 
@@ -215,10 +250,72 @@ public:
             ALOGE("init vpm axmodel(%s) failed", attr.filename_image_encoder_axmodedl.c_str());
             return false;
         }
+        image_encoder.print_info(0);
         image_encoder.set_auto_sync_after_inference(true);
         image_encoder.set_auto_sync_before_inference(true);
-        _attr.image_encoder_height = image_encoder.get_input(0).vShape[2];
-        _attr.image_encoder_width = image_encoder.get_input(0).vShape[3];
+
+        ALOGI("IMAGE_CONTEXT: %d, IMAGE_START_CONTEXT: %d", attr.IMAGE_CONTEXT, attr.IMAGE_START_CONTEXT);
+
+        IMAGE_ENCODER_INPUT_NCHW = -1;
+        for (size_t i = 1; i < image_encoder.get_input(0).vShape.size(); i++)
+        {
+            if (image_encoder.get_input(0).vShape[i] == 3)
+            {
+                if (i == 1)
+                {
+                    IMAGE_ENCODER_INPUT_NCHW = 1;
+                }
+                else if (i == 3)
+                {
+                    IMAGE_ENCODER_INPUT_NCHW = 0;
+                }
+            }
+        }
+        if (IMAGE_ENCODER_INPUT_NCHW == -1)
+        {
+            ALOGE("image encoder input nchw or nhwc not found");
+            return false;
+        }
+
+        if (IMAGE_ENCODER_INPUT_NCHW)
+        {
+            ALOGI("image encoder input nchw@float32, context: %d", _attr.IMAGE_CONTEXT);
+            _attr.image_encoder_height = image_encoder.get_input(0).vShape[2];
+            _attr.image_encoder_width = image_encoder.get_input(0).vShape[3];
+        }
+        else
+        {
+            ALOGI("image encoder input nhwc@uint8, context: %d", _attr.IMAGE_CONTEXT);
+            _attr.image_encoder_height = image_encoder.get_input(0).vShape[1];
+            _attr.image_encoder_width = image_encoder.get_input(0).vShape[2];
+        }
+
+        if (_attr.image_encoder_height != _attr.image_encoder_width)
+        {
+            ALOGE("image encoder height != width");
+            return false;
+        }
+        int output_elem_size = 1;
+        for (int i = 0; i < image_encoder.get_output(0).vShape.size(); i++)
+        {
+            output_elem_size *= image_encoder.get_output(0).vShape[i];
+        }
+
+        if (output_elem_size * 2 == image_encoder.get_output(0).nSize)
+        {
+            IMAGE_ENCODER_OUTPUT_BF16 = 1;
+            ALOGI("image encoder output bf16");
+        }
+        else if (output_elem_size * 4 == image_encoder.get_output(0).nSize)
+        {
+            IMAGE_ENCODER_OUTPUT_BF16 = 0;
+            ALOGI("image encoder output float32");
+        }
+        else
+        {
+            ALOGE("image encoder output not support");
+            return false;
+        }
 
         printf("\n");
         {
@@ -369,47 +466,49 @@ public:
 
     int Encode(cv::Mat src, std::vector<unsigned short> &out_embed)
     {
-        std::vector<float> mean = {0.485, 0.456, 0.406};
-        std::vector<float> scale = {0.229, 0.224, 0.225};
         timer t;
         t.start();
-        cv::Mat dst;
-        cv::resize(src, dst, cv::Size(_attr.image_encoder_width, _attr.image_encoder_height));
-        cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
-
-        // std::vector<float> input_data(dst.rows * dst.cols * 3);
-
-        float *input_data = (float *)image_encoder.get_input(0).pVirAddr;
-
-        unsigned char *img_data = dst.data;
-        int letterbox_rows = dst.rows;
-        int letterbox_cols = dst.cols;
-
-        for (int h = 0; h < letterbox_rows; h++)
+        if (IMAGE_ENCODER_INPUT_NCHW)
         {
-            for (int w = 0; w < letterbox_cols; w++)
+            std::vector<float> mean = {0.485, 0.456, 0.406};
+            std::vector<float> scale = {0.229, 0.224, 0.225};
+
+            cv::Mat dst;
+            cv::resize(src, dst, cv::Size(_attr.image_encoder_width, _attr.image_encoder_height));
+            cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
+
+            // std::vector<float> input_data(dst.rows * dst.cols * 3);
+
+            float *input_data = (float *)image_encoder.get_input(0).pVirAddr;
+
+            unsigned char *img_data = dst.data;
+            int letterbox_rows = dst.rows;
+            int letterbox_cols = dst.cols;
+
+            for (int h = 0; h < letterbox_rows; h++)
             {
-                for (int c = 0; c < 3; c++)
+                for (int w = 0; w < letterbox_cols; w++)
                 {
-                    int in_index = h * letterbox_cols * 3 + w * 3 + c;
-                    int out_index = c * letterbox_rows * letterbox_cols + h * letterbox_cols + w;
-                    input_data[out_index] = (float(img_data[in_index]) / 255.0 - mean[c]) / scale[c];
+                    for (int c = 0; c < 3; c++)
+                    {
+                        int in_index = h * letterbox_cols * 3 + w * 3 + c;
+                        int out_index = c * letterbox_rows * letterbox_cols + h * letterbox_cols + w;
+                        input_data[out_index] = (float(img_data[in_index]) / 255.0 - mean[c]) / scale[c];
+                    }
                 }
             }
+            image_encoder.inference();
+        }
+        else
+        {
+            cv::Mat dst;
+            cv::resize(src, dst, cv::Size(_attr.image_encoder_width, _attr.image_encoder_height));
+            cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
+            void *data = image_encoder.get_input(0).pVirAddr;
+            memcpy(data, dst.data, dst.rows * dst.cols * 3);
+            image_encoder.inference();
         }
 
-        // void *data = image_encoder.get_input("input").pVirAddr;
-        // memcpy(data, dst.data, dst.rows * dst.cols * 3);
-
-        // std::vector<char> vit_in;
-        // if (!read_file("/home/axera/internvl2_5-8b-mpo_ax-infer/img.bin", vit_in))
-        // {
-        //     ALOGE("read img.bin failed");
-        //     return -1;
-        // }
-        // memcpy(input_data, vit_in.data(), image_encoder.get_input(0).nSize);
-
-        image_encoder.inference();
         int size = 1;
         for (size_t i = 0; i < image_encoder.get_output(0).vShape.size(); i++)
         {
@@ -418,21 +517,26 @@ public:
 
         out_embed.resize(size);
 
-        float *out_data = (float *)image_encoder.get_output(0).pVirAddr;
-
-        for (size_t i = 0; i < size; i++)
+        if (IMAGE_ENCODER_OUTPUT_BF16)
+            memcpy(out_embed.data(), image_encoder.get_output(0).pVirAddr, image_encoder.get_output(0).nSize);
+        else
         {
-            out_embed[i] = bfloat16(out_data[i]).data;
+            float *out_data = (float *)image_encoder.get_output(0).pVirAddr;
+            for (size_t i = 0; i < size; i++)
+            {
+                out_embed[i] = bfloat16(out_data[i]).data;
+            }
         }
 
-        // memcpy(out_embed.data(), image_encoder.get_output(0).pVirAddr, image_encoder.get_output(0).nSize);
         ALOGI("image encode time : %0.2f ms, size : %ld", t.cost(), out_embed.size());
         return 0;
     }
 
     int Encode(std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
     {
-        std::vector<int> input_ids = tokenizer->Encode(prompt, false);
+        ImageInfo img_info;
+        img_info.img_prompt = false;
+        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
         if (input_ids.size() > _attr.prefill_token_num)
         {
             ALOGE("input_ids(%ld) > prefill_token_num(%d)", input_ids.size(), _attr.prefill_token_num);
@@ -450,19 +554,93 @@ public:
         return 0;
     }
 
+    int Encode(std::vector<std::vector<unsigned short>> &imgs_embed, std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
+    {
+        ImageInfo img_info;
+        img_info.img_prompt = true;
+        img_info.num_img = imgs_embed.size();
+        img_info.imgsz = _attr.image_encoder_width;
+        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
+
+        std::vector<int> img_start_index;
+        for (size_t i = 0; i < input_ids.size(); i++)
+        {
+            if (input_ids[i] == _attr.IMAGE_START_CONTEXT)
+            {
+                img_start_index.push_back(i);
+            }
+        }
+
+        if (img_start_index.size() != imgs_embed.size())
+        {
+            ALOGE("img_start_index.size() != imgs_embed.size(), img_start_index.size() : %ld, imgs_embed.size() : %ld", img_start_index.size(), imgs_embed.size());
+
+            printf("input_ids : ");
+            for (size_t i = 0; i < input_ids.size(); i++)
+            {
+                printf("%d ", input_ids[i]);
+            }
+            printf("\n");
+
+            return -1;
+        }
+
+        if (input_ids.size() > _attr.prefill_max_token_num)
+        {
+            ALOGE("input_ids(%ld) > prefill_max_token_num(%d)", input_ids.size(), _attr.prefill_max_token_num);
+            return -1;
+        }
+        out_embed.resize(input_ids.size() * _attr.tokens_embed_size);
+
+        for (size_t i = 0; i < input_ids.size(); i++)
+        {
+            embed_selector.getByIndex(input_ids[i], out_embed.data() + i * _attr.tokens_embed_size);
+        }
+        for (size_t i = 0; i < imgs_embed.size(); i++)
+        {
+            int offset = img_start_index[i] + 1;
+            auto &img_embed = imgs_embed[i];
+
+            int img_context_count = 0;
+            for (size_t j = offset; j < input_ids.size(); j++)
+            {
+                if (input_ids[j] == _attr.IMAGE_CONTEXT)
+                {
+                    img_context_count++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (img_context_count != img_embed.size() / _attr.tokens_embed_size)
+            {
+                ALOGE("img_context_count(%d) != img_embed.size() / tokens_embed_size(%ld)", img_context_count, img_embed.size() / _attr.tokens_embed_size);
+                return -1;
+            }
+
+            memcpy(out_embed.data() + offset * _attr.tokens_embed_size, img_embed.data(), img_embed.size() * sizeof(unsigned short));
+            ALOGI("offset : %d out_embed.size() : %ld", offset, out_embed.size());
+        }
+
+        return 0;
+    }
+
     int Encode(std::vector<unsigned short> &img_embed, std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
     {
-        std::vector<int> input_ids = tokenizer->Encode(prompt, true);
+        ImageInfo img_info;
+        img_info.img_prompt = true;
+        img_info.num_img = 1;
+        img_info.imgsz = _attr.image_encoder_width;
+        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
 
-        // constexpr int IMG_CONTEXT = 151648;	// InternVL2
-        // constexpr int IMG_CONTEXT = 151667; // InternVL2.5
-        constexpr int IMG_CONTEXT = 92546; // InternVL2.5-8B-MPO
         int offset = 0;
         int img_context_count = 0;
 
         for (size_t i = 0; i < input_ids.size(); i++)
         {
-            if (input_ids[i] == IMG_CONTEXT)
+            if (input_ids[i] == _attr.IMAGE_CONTEXT)
             {
                 img_context_count++;
                 if (img_context_count == 1)
@@ -474,15 +652,9 @@ public:
 
         if (img_context_count != img_embed.size() / _attr.tokens_embed_size)
         {
-            ALOGE("img_context_count(%d) != img_embed.size() / tokens_embed_size(%d)", img_context_count, img_embed.size() / _attr.tokens_embed_size);
+            ALOGE("img_context_count(%d) != img_embed.size() / tokens_embed_size(%ld)", img_context_count, img_embed.size() / _attr.tokens_embed_size);
             return -1;
         }
-
-        // for (size_t i = 0; i < input_ids.size(); i++)
-        // {
-        //     printf("%d ", input_ids[i]);
-        // }
-        // printf("\n");
 
         if (input_ids.size() > _attr.prefill_max_token_num)
         {
@@ -497,14 +669,6 @@ public:
         }
         memcpy(out_embed.data() + offset * _attr.tokens_embed_size, img_embed.data(), img_embed.size() * sizeof(unsigned short));
         ALOGI("offset : %d out_embed.size() : %ld", offset, out_embed.size());
-
-        // std::vector<char> data_tmp;
-        // if (!read_file("/home/axera/internvl2_5-8b-mpo_ax-infer/prefill_data.bin", data_tmp))
-        // {
-        //     ALOGE("read img.bin failed");
-        //     return -1;
-        // }
-        // memcpy(out_embed.data(), data_tmp.data(), out_embed.size() * sizeof(unsigned short));
 
         return 0;
     }

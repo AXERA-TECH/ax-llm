@@ -1,10 +1,17 @@
-#include "signal.h"
+#include <signal.h>
+#include <opencv2/opencv.hpp>
 
 #include "runner/LLM.hpp"
-
 #include "cmdline.hpp"
 
-#include <opencv2/opencv.hpp>
+#define IS_AXCL 1
+
+#if IS_AXCL
+#include <axcl.h>
+#else
+#include <ax_sys_api.h>
+#include <ax_engine_api.h>
+#endif
 
 static LLM lLaMa;
 
@@ -45,17 +52,14 @@ int main(int argc, char *argv[])
 
     cmdline::parser cmd;
     cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
-    cmd.add<std::string>("image", 'i', "image", true);
+    cmd.add<std::string>("image", 'i', "single image file or .txt file for images list", true);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
-    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3 4:MINICPM", false, attr.tokenizer_type);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
     cmd.add<std::string>("filename_image_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodedl);
 
-    cmd.add<bool>("bos", 0, "", false, attr.b_bos);
-    cmd.add<bool>("eos", 0, "", false, attr.b_eos);
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
     // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
@@ -63,7 +67,12 @@ int main(int argc, char *argv[])
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
 
+    cmd.add<int>("image_context", 0, "image context, 151667 for InternVL 2.5/3, 92546 for InternVL 2.5-8B-MPO", false, attr.IMAGE_CONTEXT);
+    cmd.add<int>("image_start_context", 0, "image start context, 151665 for InternVL 2.5/3, 92544 for InternVL 2.5-8B-MPO", false, attr.IMAGE_START_CONTEXT);
+
+#if IS_AXCL
     cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
+#endif
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
 
@@ -73,7 +82,6 @@ int main(int argc, char *argv[])
 
     prompt = cmd.get<std::string>("prompt");
     auto image_prompt = cmd.get<std::string>("image");
-    attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
     attr.filename_tokenizer_model = cmd.get<std::string>("filename_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
@@ -82,14 +90,15 @@ int main(int argc, char *argv[])
     // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
 
     attr.filename_image_encoder_axmodedl = cmd.get<std::string>("filename_image_encoder_axmodedl");
-    attr.b_bos = cmd.get<bool>("bos");
-    attr.b_eos = cmd.get<bool>("eos");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
+    attr.IMAGE_CONTEXT = cmd.get<int>("image_context");
+    attr.IMAGE_START_CONTEXT = cmd.get<int>("image_start_context");
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
 
+#if IS_AXCL
     auto devices_str = cmd.get<std::string>("devices");
     std::vector<int> devices;
     std::stringstream ss(devices_str);
@@ -101,6 +110,23 @@ int main(int argc, char *argv[])
 
     attr.dev_ids = devices;
 
+    auto ret = axclInit(nullptr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#else
+    AX_ENGINE_NPU_ATTR_T npu_attr;
+    memset(&npu_attr, 0, sizeof(npu_attr));
+    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    AX_SYS_Init();
+    auto ret = AX_ENGINE_Init(&npu_attr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#endif
+
     bool b_live_print = cmd.get<bool>("live_print");
     if (b_live_print)
     {
@@ -110,16 +136,15 @@ int main(int argc, char *argv[])
 
     b_continue = cmd.get<bool>("continue");
 
-    auto ret = axclInit(nullptr);
-    if (0 != ret)
-    {
-        return ret;
-    }
-
     if (!lLaMa.Init(attr))
     {
         ALOGE("lLaMa.Init failed");
+#if IS_AXCL
         axclFinalize();
+#else
+        AX_ENGINE_Deinit();
+        AX_SYS_Deinit();
+#endif
         return -1;
     }
 
@@ -218,7 +243,12 @@ int main(int argc, char *argv[])
 
     lLaMa.Deinit();
 
+#if IS_AXCL
     axclFinalize();
+#else
+    AX_ENGINE_Deinit();
+    AX_SYS_Deinit();
+#endif
 
     return 0;
 }

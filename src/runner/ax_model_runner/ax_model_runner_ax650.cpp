@@ -52,7 +52,7 @@ static void print_io_info(std::vector<ax_runner_tensor_t> &input, std::vector<ax
                 printf(" x ");
             }
         }
-        printf("\e[0m\n\n");
+        printf("\e[0m size:%d\n\n", info.nSize);
     }
 
     printf("\noutput size: %ld\n", output.size());
@@ -69,7 +69,7 @@ static void print_io_info(std::vector<ax_runner_tensor_t> &input, std::vector<ax
                 printf(" x ");
             }
         }
-        printf("\e[0m\n\n");
+        printf("\e[0m size:%d\n\n", info.nSize);
     }
 }
 
@@ -230,7 +230,7 @@ static inline int prepare_io(int grpid, axclrtEngineIOInfo io_info, axclrtEngine
     return 0;
 }
 
-struct ax_joint_runner_ax650_handle_t
+struct ax_runner_ax650_handle_t
 {
     uint64_t handle = 0;
     uint64_t context = 0;
@@ -374,9 +374,9 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size)
 {
     if (!m_handle)
     {
-        m_handle = new ax_joint_runner_ax650_handle_t;
+        m_handle = new ax_runner_ax650_handle_t;
     }
-    memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
+    memset(m_handle, 0, sizeof(ax_runner_ax650_handle_t));
 
     // static bool b_init = false;
     // if (!b_init)
@@ -480,6 +480,11 @@ void ax_runner_ax650::deinit()
     }
 
     // AX_ENGINE_Deinit();
+}
+
+void ax_runner_ax650::print_info(int grpid)
+{
+    print_io_info(mgroup_input_tensors[grpid], mgroup_output_tensors[grpid]);
 }
 
 int ax_runner_ax650::get_algo_width() { return -1; }

@@ -4,7 +4,7 @@
 class ax_runner_ax650 : public ax_runner_base
 {
 protected:
-    struct ax_joint_runner_ax650_handle_t *m_handle = nullptr;
+    struct ax_runner_ax650_handle_t *m_handle = nullptr;
     int group_count = 0;
     bool _parepare_io = false;
 
@@ -16,6 +16,8 @@ public:
 
     void release();
     void deinit() override;
+
+    void print_info(int grpid);
 
     int get_algo_width() override;
     int get_algo_height() override;
