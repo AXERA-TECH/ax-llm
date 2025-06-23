@@ -621,7 +621,7 @@ public:
             }
 
             memcpy(out_embed.data() + offset * _attr.tokens_embed_size, img_embed.data(), img_embed.size() * sizeof(unsigned short));
-            ALOGI("offset : %d out_embed.size() : %ld", offset, out_embed.size());
+            ALOGI("idx:%ld offset : %d out_embed.size() : %ld", i, offset, out_embed.size());
         }
 
         return 0;
@@ -629,48 +629,8 @@ public:
 
     int Encode(std::vector<unsigned short> &img_embed, std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
     {
-        ImageInfo img_info;
-        img_info.img_prompt = true;
-        img_info.num_img = 1;
-        img_info.imgsz = _attr.image_encoder_width;
-        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
-
-        int offset = 0;
-        int img_context_count = 0;
-
-        for (size_t i = 0; i < input_ids.size(); i++)
-        {
-            if (input_ids[i] == _attr.IMAGE_CONTEXT)
-            {
-                img_context_count++;
-                if (img_context_count == 1)
-                {
-                    offset = i;
-                }
-            }
-        }
-
-        if (img_context_count != img_embed.size() / _attr.tokens_embed_size)
-        {
-            ALOGE("img_context_count(%d) != img_embed.size() / tokens_embed_size(%ld)", img_context_count, img_embed.size() / _attr.tokens_embed_size);
-            return -1;
-        }
-
-        if (input_ids.size() > _attr.prefill_max_token_num)
-        {
-            ALOGE("input_ids(%ld) > prefill_max_token_num(%d)", input_ids.size(), _attr.prefill_max_token_num);
-            return -1;
-        }
-        out_embed.resize(input_ids.size() * _attr.tokens_embed_size);
-
-        for (size_t i = 0; i < input_ids.size(); i++)
-        {
-            embed_selector.getByIndex(input_ids[i], out_embed.data() + i * _attr.tokens_embed_size);
-        }
-        memcpy(out_embed.data() + offset * _attr.tokens_embed_size, img_embed.data(), img_embed.size() * sizeof(unsigned short));
-        ALOGI("offset : %d out_embed.size() : %ld", offset, out_embed.size());
-
-        return 0;
+        std::vector<std::vector<unsigned short>> imgs_embed = {img_embed};
+        return Encode(imgs_embed, out_embed, prompt);
     }
 
     std::string Run(std::vector<unsigned short> &test_embed)
