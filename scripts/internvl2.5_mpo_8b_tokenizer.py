@@ -54,11 +54,11 @@ class Tokenizer_Http():
 
     @property
     def img_start_token(self):
-        return self.tokenizer.encode("<img>")[0]
+        return 92544
 
     @property
     def img_context_token(self):
-        return self.tokenizer.encode("<IMG_CONTEXT>")[0]
+        return 92546
 
 
 tokenizer = Tokenizer_Http()
