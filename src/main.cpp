@@ -48,11 +48,11 @@ int main(int argc, char *argv[])
     signal(SIGINT, __sigExit);
     LLMAttrType attr;
     std::string prompt = "Hi";
-    bool b_continue = false;
+    bool b_continue = true;
 
     cmdline::parser cmd;
-    cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
-    cmd.add<std::string>("image", 'i', "single image file or .txt file for images list", true);
+    // cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
+    // cmd.add<std::string>("image", 'i', "single image file or .txt file for images list", true);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
@@ -76,12 +76,10 @@ int main(int argc, char *argv[])
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
 
-    cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
-
     cmd.parse_check(argc, argv);
 
-    prompt = cmd.get<std::string>("prompt");
-    auto image_prompt = cmd.get<std::string>("image");
+    // prompt = cmd.get<std::string>("prompt");
+    // auto image_prompt = cmd.get<std::string>("image");
     attr.filename_tokenizer_model = cmd.get<std::string>("filename_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
@@ -134,8 +132,6 @@ int main(int argc, char *argv[])
         attr.reserve = 0;
     }
 
-    b_continue = cmd.get<bool>("continue");
-
     if (!lLaMa.Init(attr))
     {
         ALOGE("lLaMa.Init failed");
@@ -150,37 +146,10 @@ int main(int argc, char *argv[])
 
     std::vector<unsigned short> prompt_data;
     std::vector<unsigned short> img_embed;
-    //     std::vector<unsigned short> _tmp_data;
-    //     lLaMa.RunVpm(src, _tmp_data);
-    //     // printf("%d \n", _tmp_data.size());
-    //     memcpy(prompt_data.data() + 5 * attr.tokens_embed_size, _tmp_data.data(), _tmp_data.size() * sizeof(unsigned short));
-    // }
 
-    if (prompt != "")
-    {
-        std::string output;
-        cv::Mat src = cv::imread(image_prompt, cv::IMREAD_COLOR);
-        if (src.empty())
-        {
-            // output = lLaMa.Run(prompt);
-            ALOGE("image_prompt can't be empty");
-        }
-        else
-        {
-            lLaMa.Encode(src, img_embed);
-            lLaMa.Encode(img_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type));
-            output = lLaMa.Run(prompt_data);
-        }
-
-        if (!b_live_print && !output.empty())
-            printf("%s\n", output.c_str());
-    }
-
-    //
     if (b_continue)
     {
         printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
-        // lLaMa.Reset();
     }
 
     while (b_continue)
@@ -199,6 +168,7 @@ int main(int argc, char *argv[])
 
         printf("image >> ");
         fflush(stdout);
+        std::string image_prompt;
         std::getline(std::cin, image_prompt);
         std::string output;
         if (image_prompt == "")

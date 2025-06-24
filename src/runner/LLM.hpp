@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <atomic>
 
 #include <opencv2/opencv.hpp>
 
@@ -207,6 +208,7 @@ public:
         auto dev_assignments = distributeModels(_attr.dev_ids.size(), attr.axmodel_num);
 
         std::vector<int> rets(attr.axmodel_num);
+        std::atomic<int> process_idx = 2;
 #pragma omp parallel for
         for (int i = 0; i < attr.axmodel_num; i++)
         {
@@ -220,7 +222,7 @@ public:
             rets[i] = ret;
             int remain_cmm = axcl_GetCMMRemain(_attr.dev_ids[dev_assignments[i]]);
             sprintf(axmodel_path, "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, _attr.dev_ids[dev_assignments[i]], remain_cmm);
-            update_cqdm(&cqdm, i + 2, "count", axmodel_path);
+            update_cqdm(&cqdm, process_idx++, "count", axmodel_path);
         }
 
         for (int i = 0; i < attr.axmodel_num; i++)
@@ -532,6 +534,22 @@ public:
         return 0;
     }
 
+    int Encode(std::vector<cv::Mat> srcs, std::vector<std::vector<unsigned short>> &out_embeds)
+    {
+        out_embeds.resize(srcs.size());
+        for (size_t i = 0; i < srcs.size(); i++)
+        {
+            auto ret = Encode(srcs[i], out_embeds[i]);
+            if (ret != 0)
+            {
+                ALOGE("Encode image failed");
+                return -1;
+            }
+        }
+
+        return 0;
+    }
+
     int Encode(std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
     {
         ImageInfo img_info;
@@ -759,14 +777,14 @@ public:
         {
 
             // post process
-            auto &input = llama_post.get_input("input");
+            auto &input = llama_post.get_input(0);
             // memcpy(input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             axcl_Memcpy((void *)input.phyAddr, embed.data(), embed.size() * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, llama_post.get_devid());
             llama_post.inference();
 
             int max_index;
 
-            auto &output_post = llama_post.get_output("output");
+            auto &output_post = llama_post.get_output(0);
             axcl_Memcpy(output_post.pVirAddr, (void *)output_post.phyAddr, output_post.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_HOST, llama_post.get_devid());
             unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
             float max_val = -MAXFLOAT;
@@ -841,16 +859,16 @@ public:
                 {
                     if (llama_post.get_devid() == layer.layer.get_devid())
                     {
-                        axcl_Memcpy((void *)llama_post.get_input("input").phyAddr,
-                                    (void *)layer.layer.get_output(decode_grpid, "output").phyAddr, llama_post.get_input("input").nSize, AXCL_MEMCPY_DEVICE_TO_DEVICE, llama_post.get_devid());
+                        axcl_Memcpy((void *)llama_post.get_input(0).phyAddr,
+                                    (void *)layer.layer.get_output(decode_grpid, "output").phyAddr, llama_post.get_input(0).nSize, AXCL_MEMCPY_DEVICE_TO_DEVICE, llama_post.get_devid());
                     }
                     else
                     {
                         axcl_Memcpy((void *)layer.layer.get_output(decode_grpid, "output").pVirAddr,
                                     (void *)layer.layer.get_output(decode_grpid, "output").phyAddr, layer.layer.get_output(decode_grpid, "output").nSize, AXCL_MEMCPY_DEVICE_TO_HOST, layer.layer.get_devid());
 
-                        axcl_Memcpy((void *)llama_post.get_input("input").phyAddr,
-                                    (void *)layer.layer.get_output(decode_grpid, "output").pVirAddr, llama_post.get_input("input").nSize, AXCL_MEMCPY_HOST_TO_DEVICE, llama_post.get_devid());
+                        axcl_Memcpy((void *)llama_post.get_input(0).phyAddr,
+                                    (void *)layer.layer.get_output(decode_grpid, "output").pVirAddr, llama_post.get_input(0).nSize, AXCL_MEMCPY_HOST_TO_DEVICE, llama_post.get_devid());
                     }
                 }
                 else if (m < _attr.axmodel_num - 1)
@@ -881,7 +899,7 @@ public:
                 // axcl_Memcpy((void *)input.phyAddr, embed.data(), embed.size() * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, llama_post.get_devid());
                 llama_post.inference();
 
-                auto &output_post = llama_post.get_output("output");
+                auto &output_post = llama_post.get_output(0);
                 axcl_Memcpy(output_post.pVirAddr, (void *)output_post.phyAddr, output_post.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_HOST, llama_post.get_devid());
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
                 float max_val = -MAXFLOAT;
