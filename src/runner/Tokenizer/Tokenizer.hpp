@@ -28,6 +28,8 @@ public:
     virtual std::string Decode(const std::vector<int> input) = 0;
     virtual int GetBosID() = 0;
     virtual int GetEosID() = 0;
+    virtual int GetImgStartID() = 0;
+    virtual int GetImgContextID() = 0;
 
     virtual bool isEnd(int id) { return id == GetEosID(); }
 };

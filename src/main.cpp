@@ -3,6 +3,7 @@
 
 #include "runner/LLM.hpp"
 #include "cmdline.hpp"
+#include "string_utility.hpp"
 
 #define IS_AXCL 1
 
@@ -67,8 +68,8 @@ int main(int argc, char *argv[])
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
 
-    cmd.add<int>("image_context", 0, "image context, 151667 for InternVL 2.5/3, 92546 for InternVL 2.5-8B-MPO", false, attr.IMAGE_CONTEXT);
-    cmd.add<int>("image_start_context", 0, "image start context, 151665 for InternVL 2.5/3, 92544 for InternVL 2.5-8B-MPO", false, attr.IMAGE_START_CONTEXT);
+    // cmd.add<int>("image_context", 0, "image context, 151667 for InternVL 2.5/3, 92546 for InternVL 2.5-8B-MPO", false, attr.IMAGE_CONTEXT);
+    // cmd.add<int>("image_start_context", 0, "image start context, 151665 for InternVL 2.5/3, 92544 for InternVL 2.5-8B-MPO", false, attr.IMAGE_START_CONTEXT);
 
 #if IS_AXCL
     cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
@@ -91,8 +92,8 @@ int main(int argc, char *argv[])
     attr.axmodel_num = cmd.get<int>("axmodel_num");
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
-    attr.IMAGE_CONTEXT = cmd.get<int>("image_context");
-    attr.IMAGE_START_CONTEXT = cmd.get<int>("image_start_context");
+    // attr.IMAGE_CONTEXT = cmd.get<int>("image_context");
+    // attr.IMAGE_START_CONTEXT = cmd.get<int>("image_start_context");
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
 
@@ -145,7 +146,6 @@ int main(int argc, char *argv[])
     }
 
     std::vector<unsigned short> prompt_data;
-    std::vector<unsigned short> img_embed;
 
     if (b_continue)
     {
@@ -178,13 +178,34 @@ int main(int argc, char *argv[])
         }
         else
         {
-            cv::Mat src = cv::imread(image_prompt);
-            if (src.empty())
+            if (string_utility<std::string>::ends_with(image_prompt, ".txt"))
             {
-                // output = lLaMa.Run(prompt);
-                ALOGE("image prompt(%s) not found", image_prompt.c_str());
-                // continue;
-                if (auto ret = lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type)); ret != 0)
+                std::vector<std::string> lines;
+                std::ifstream ifs(image_prompt);
+                while (std::getline(ifs, image_prompt))
+                {
+                    lines.push_back(image_prompt);
+                }
+                ifs.close();
+
+                std::vector<cv::Mat> imgs;
+                for (auto &line : lines)
+                {
+                    cv::Mat src = cv::imread(line);
+                    if (src.empty())
+                    {
+                        ALOGE("image prompt(%s) not found", line.c_str());
+                        continue;
+                    }
+                    imgs.push_back(src);
+                }
+                std::vector<std::vector<unsigned short>> imgs_embed;
+                if (auto ret = lLaMa.Encode(imgs, imgs_embed); ret != 0)
+                {
+                    ALOGE("lLaMa.Encode failed");
+                    continue;
+                }
+                if (auto ret = lLaMa.Encode(imgs_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type)); ret != 0)
                 {
                     ALOGE("lLaMa.Encode failed");
                     continue;
@@ -193,17 +214,27 @@ int main(int argc, char *argv[])
             }
             else
             {
-                if (auto ret = lLaMa.Encode(src, img_embed); ret != 0)
+                cv::Mat src = cv::imread(image_prompt);
+                if (src.empty())
                 {
-                    ALOGE("lLaMa.Encode failed");
+                    ALOGE("image prompt(%s) not found", image_prompt.c_str());
                     continue;
                 }
-                if (auto ret = lLaMa.Encode(img_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type)); ret != 0)
+                else
                 {
-                    ALOGE("lLaMa.Encode failed");
-                    continue;
+                    std::vector<unsigned short> img_embed;
+                    if (auto ret = lLaMa.Encode(src, img_embed); ret != 0)
+                    {
+                        ALOGE("lLaMa.Encode failed");
+                        continue;
+                    }
+                    if (auto ret = lLaMa.Encode(img_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type)); ret != 0)
+                    {
+                        ALOGE("lLaMa.Encode failed");
+                        continue;
+                    }
+                    output = lLaMa.Run(prompt_data);
                 }
-                output = lLaMa.Run(prompt_data);
             }
         }
 

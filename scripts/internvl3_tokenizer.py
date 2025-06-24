@@ -31,13 +31,14 @@ class Tokenizer_Http():
         else:
             print(f"imgsz is {imgsz}")
             return
+        print("context_len is ", context_len)
         
         if num_of_images > 0:
             for idx in range(num_of_images):
                 prompt += "\n<img>" + "<IMG_CONTEXT>" * context_len + "</img>\n"
         
         prompt += "<|im_end|>\n<|im_start|>assistant"
-        # print(f"prompt is {prompt}")
+        print(f"prompt is {prompt}")
         token_ids = self.tokenizer.encode(prompt)
         return token_ids
     
@@ -62,13 +63,18 @@ class Tokenizer_Http():
     def eos_token(self):
         return self.tokenizer.eos_token
 
-    
+    @property
+    def img_start_token(self):
+        return self.tokenizer.encode("<img>")[0]
 
+    @property
+    def img_context_token(self):
+        return self.tokenizer.encode("<IMG_CONTEXT>")[0]
 
 tokenizer = Tokenizer_Http()
 
 print(tokenizer.bos_id, tokenizer.bos_token, tokenizer.eos_id,
-      tokenizer.eos_token)
+      tokenizer.eos_token, tokenizer.img_start_token, tokenizer.img_context_token)
 token_ids = tokenizer.encode_with_image("你好", 1, 448)
 print(token_ids)
 print(len(token_ids))
@@ -103,6 +109,18 @@ class Request(BaseHTTPRequestHandler):
                 msg = json.dumps({'eos_id': -1})
             else:
                 msg = json.dumps({'eos_id': eos_id})
+        elif self.path == '/img_start_token':
+            img_start_token = tokenizer.img_start_token
+            if img_start_token is None:
+                msg = json.dumps({'img_start_token': -1})
+            else:
+                msg = json.dumps({'img_start_token': img_start_token})
+        elif self.path == '/img_context_token':
+            img_context_token = tokenizer.img_context_token
+            if img_context_token is None:
+                msg = json.dumps({'img_context_token': -1})
+            else:
+                msg = json.dumps({'img_context_token': img_context_token})
         else:
             msg = 'error'
 

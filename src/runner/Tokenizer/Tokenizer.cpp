@@ -16,6 +16,7 @@ class Tokenizer_Http : public BaseTokenizer
     std::string base_url;
 
     int bos_id, eos_id;
+    int img_start_token, img_context_token;
 
 private:
     /* data */
@@ -63,6 +64,32 @@ public:
                 eos_id = j["eos_id"];
             }
             printf("bos_id: %d, eos_id: %d\n", bos_id, eos_id);
+
+            {
+                auto ret = cli->Get("/img_start_token");
+                auto rep = ret.value();
+                if (rep.status != 200)
+                {
+                    ALOGE("get img_start_token failed, status: %d", rep.status);
+                    return false;
+                }
+                nlohmann::json j = nlohmann::json::parse(rep.body);
+                img_start_token = j["img_start_token"];
+            }
+            printf("img_start_token: %d\n", img_start_token);
+
+            {
+                auto ret = cli->Get("/img_context_token");
+                auto rep = ret.value();
+                if (rep.status != 200)
+                {
+                    ALOGE("get img_context_token failed, status: %d", rep.status);
+                    return false;
+                }
+                nlohmann::json j = nlohmann::json::parse(rep.body);
+                img_context_token = j["img_context_token"];
+            }
+            printf("img_context_token: %d\n", img_context_token);
         }
         catch (const std::exception &e)
         {
@@ -165,6 +192,16 @@ public:
     int GetEosID() override
     {
         return eos_id;
+    }
+
+    int GetImgStartID() override
+    {
+        return img_start_token;
+    }
+
+    int GetImgContextID() override
+    {
+        return img_context_token;
     }
 };
 

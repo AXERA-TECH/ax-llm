@@ -530,8 +530,8 @@ int main(int argc, char *argv[])
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
 
-    cmd.add<int>("image_context", 0, "image context, 151667 for InternVL 2.5/3, 92546 for InternVL 2.5-8B-MPO", false, attr.IMAGE_CONTEXT);
-    cmd.add<int>("image_start_context", 0, "image start context, 151665 for InternVL 2.5/3, 92544 for InternVL 2.5-8B-MPO", false, attr.IMAGE_START_CONTEXT);
+    // cmd.add<int>("image_context", 0, "image context, 151667 for InternVL 2.5/3, 92546 for InternVL 2.5-8B-MPO", false, attr.IMAGE_CONTEXT);
+    // cmd.add<int>("image_start_context", 0, "image start context, 151665 for InternVL 2.5/3, 92544 for InternVL 2.5-8B-MPO", false, attr.IMAGE_START_CONTEXT);
 
 #if IS_AXCL
     cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
@@ -546,9 +546,9 @@ int main(int argc, char *argv[])
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
     // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
-    // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
-    attr.IMAGE_CONTEXT = cmd.get<int>("image_context");
-    attr.IMAGE_START_CONTEXT = cmd.get<int>("image_start_context");
+    // // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
+    // attr.IMAGE_CONTEXT = cmd.get<int>("image_context");
+    // attr.IMAGE_START_CONTEXT = cmd.get<int>("image_start_context");
 
     attr.filename_image_encoder_axmodedl = cmd.get<std::string>("filename_image_encoder_axmodedl");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
