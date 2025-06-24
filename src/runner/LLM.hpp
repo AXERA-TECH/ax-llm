@@ -794,22 +794,22 @@ public:
 
                 axcl_Memcpy((unsigned short *)input_decoder_k_cache.phyAddr + kv_offset,
                             (void *)output_k_cache.phyAddr,
-                            sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size,
+                            sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
                             AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
 
                 axcl_Memcpy((unsigned short *)input_decoder_v_cache.phyAddr + kv_offset,
                             (void *)output_v_cache.phyAddr,
-                            sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size,
+                            sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
                             AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
 
                 axcl_Memcpy((unsigned short *)input_prefill_k_cache.phyAddr + kv_offset,
                             (void *)output_k_cache.phyAddr,
-                            sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size,
+                            sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
                             AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
 
                 axcl_Memcpy((unsigned short *)input_prefill_v_cache.phyAddr + kv_offset,
                             (void *)output_v_cache.phyAddr,
-                            sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size,
+                            sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
                             AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
 
                 auto &output = layer.layer.get_output(_attr.prefill_grpid, "output");
