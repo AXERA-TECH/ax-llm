@@ -18,20 +18,31 @@ class Tokenizer_Http():
         input_ids = self.tokenizer.encode(prompt)
         return input_ids
 
-    def encode_vpm(self, content="Please describe the image shortly."):
-        # prompt = f"<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型, 英文名叫 InternVL2_5, 是一个有用无害的人工智能助手.<|im_end|><|im_start|>user\n<img>"+"<IMG_CONTEXT>"*256+f"</img>\n{content}<|im_end|><|im_start|>assistant\n"
-        # print(prompt)
-        prompt = "<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型, 英文名叫 InternVL2_5, 是一个有用无害的人工智能助手.<|im_end|><|im_start|>user\n<img>"
-        prompt += "<IMG_CONTEXT>" * 256
-        # prompt += "<image>" * 256
-        # question = "请告诉我 y = 2x^2 + 3 的导数是多少? 告诉我详细的步骤!"
-        question = content
-        # question = "Please describe the image shortly."
-        prompt += "</img>\n<|im_end|>" + question + "<|im_start|>assistant\n"
-        print(prompt)
-        input_ids = self.tokenizer.encode(prompt)
-        return input_ids
+    def encode_with_image(self, question, num_of_images, imgsz) -> list:
+        prompt = "<|im_start|>system\n你是书生·万象, 英文名是InternVL, 是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型.<|im_end|>\n"
+     
+        prompt += "<|im_start|>user\n" + question
 
+        context_len = 64
+        if imgsz == 448:
+            context_len = 256
+        elif imgsz == 224:
+            context_len = 64
+        else:
+            print(f"imgsz is {imgsz}")
+            return
+        print("context_len is ", context_len)
+        
+        if num_of_images > 0:
+            for idx in range(num_of_images):
+                prompt += "\n<img>" + "<IMG_CONTEXT>" * context_len + "</img>\n"
+        
+        prompt += "<|im_end|>\n<|im_start|>assistant"
+        print(f"prompt is {prompt}")
+        token_ids = self.tokenizer.encode(prompt)
+        return token_ids
+    
+    
     def decode(self, token_ids):
         return self.tokenizer.decode(token_ids,
                                      clean_up_tokenization_spaces=False)
@@ -64,14 +75,8 @@ class Tokenizer_Http():
 tokenizer = Tokenizer_Http()
 
 print(tokenizer.bos_id, tokenizer.bos_token, tokenizer.eos_id,
-      tokenizer.eos_token)
-token_ids = tokenizer.encode_vpm()
-# [151644, 8948, 198, 56568, 104625, 100633, 104455, 104800, 101101, 32022, 102022, 99602, 100013, 9370, 90286, 21287, 42140, 53772, 35243, 26288, 104949, 3837, 105205, 109641, 67916, 30698, 11, 54851, 46944, 115404, 42192, 99441, 100623, 48692, 100168, 110498, 1773, 151645, 151644, 872, 198, 
-# 151646, 
-# 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 151648, 
-# 151647, 
-# 198, 5501, 7512, 279, 2168, 19620, 13, 151645, 151644, 77091, 198]
-# 118
+      tokenizer.eos_token, tokenizer.img_start_token, tokenizer.img_context_token)
+token_ids = tokenizer.encode_with_image("你好", 1, 448)
 print(token_ids)
 print(len(token_ids))
 token_ids = tokenizer.encode("hello world")
@@ -145,7 +150,9 @@ class Request(BaseHTTPRequestHandler):
             if 'img_prompt' in req:
                 b_img_prompt = req['img_prompt']
             if b_img_prompt:
-                token_ids = tokenizer.encode_vpm(prompt)
+                num_img = req['num_img']
+                imgsz = req['imgsz']
+                token_ids = tokenizer.encode_with_image(prompt, num_img, imgsz)
             else:
                 token_ids = tokenizer.encode(prompt)
             if token_ids is None:
