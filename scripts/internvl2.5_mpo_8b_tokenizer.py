@@ -18,11 +18,31 @@ class Tokenizer_Http():
         input_ids = self.tokenizer.encode(prompt)
         return input_ids
 
-    def encode_with_image(self, question, num_of_images, imgsz) -> list:
-        prompt = "<|im_start|>system\n你是书生·万象, 英文名是InternVL, 是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型.<|im_end|>\n"
+    # def encode_with_image(self, question, num_of_images, imgsz):
+    #     prompt = "<|im_start|>system\n你是书生·万象, 英文名是InternVL, 是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型.<|im_end|>\n"
      
-        prompt += "<|im_start|>user\n" + question
+    #     prompt += "<|im_start|>user\n" + question
 
+    #     context_len = 64
+    #     if imgsz == 448:
+    #         context_len = 256
+    #     elif imgsz == 224:
+    #         context_len = 64
+    #     else:
+    #         print(f"imgsz is {imgsz}")
+    #         return
+    #     print("context_len is ", context_len)
+        
+    #     if num_of_images > 0:
+    #         for idx in range(num_of_images):
+    #             prompt += "\n<img>" + "<IMG_CONTEXT>" * context_len + "</img>\n"
+        
+    #     prompt += "<|im_end|>\n<|im_start|>assistant"
+    #     print(f"prompt is {prompt}")
+    #     token_ids = self.tokenizer.encode(prompt)
+    #     return token_ids
+    
+    def encode_with_image(self, question, num_of_images, imgsz):
         context_len = 64
         if imgsz == 448:
             context_len = 256
@@ -33,15 +53,13 @@ class Tokenizer_Http():
             return
         print("context_len is ", context_len)
         
-        if num_of_images > 0:
-            for idx in range(num_of_images):
-                prompt += "\n<img>" + "<IMG_CONTEXT>" * context_len + "</img>\n"
-        
-        prompt += "<|im_end|>\n<|im_start|>assistant"
-        print(f"prompt is {prompt}")
-        token_ids = self.tokenizer.encode(prompt)
-        return token_ids
-    
+        prompt = "<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型, 英文名叫 InternVL2_5, 是一个有用无害的人工智能助手.<|im_end|><|im_start|>user\n"
+        for i in range(num_of_images):
+            prompt += "<img>" + "<IMG_CONTEXT>" * context_len + "</img>\n"
+        prompt += "<|im_end|>" + question + "<|im_start|>assistant\n"
+        print(prompt)
+        input_ids = self.tokenizer.encode(prompt)
+        return input_ids
     
     def decode(self, token_ids):
         return self.tokenizer.decode(token_ids,
