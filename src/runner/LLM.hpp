@@ -671,6 +671,12 @@ public:
                 break;
             }
 
+            int input_num_token = _attr.prefill_token_num;
+            if (p == prefill_split_num - 1)
+            {
+                input_num_token = input_embed_num - p * _attr.prefill_token_num;
+            }
+
             std::vector<unsigned short> embed_tmp(_attr.prefill_token_num * _attr.tokens_embed_size, 0);
             if (p == (prefill_split_num - 1))
             {
@@ -701,19 +707,19 @@ public:
                         auto &output_k_cache = layer.layer.get_output(i + 1, "K_cache_out");
                         // memcpy((unsigned short *)input_prefill_k_cache.pVirAddr + i * _attr.prefill_token_num * _attr.kv_cache_size,
                         //        output_k_cache.pVirAddr,
-                        //        sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                        //        sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
                         axcl_Memcpy((unsigned short *)input_prefill_k_cache.phyAddr + i * _attr.prefill_token_num * _attr.kv_cache_size,
                                     (void *)output_k_cache.phyAddr,
-                                    sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size,
+                                    sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
                                     axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
 
                         auto &output_v_cache = layer.layer.get_output(i + 1, "V_cache_out");
                         // memcpy((unsigned short *)input_prefill_v_cache.pVirAddr + i * _attr.prefill_token_num * _attr.kv_cache_size,
                         //        output_v_cache.pVirAddr,
-                        //        sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                        //        sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
                         axcl_Memcpy((unsigned short *)input_prefill_v_cache.phyAddr + i * _attr.prefill_token_num * _attr.kv_cache_size,
                                     (void *)output_v_cache.phyAddr,
-                                    sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size,
+                                    sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
                                     axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
                     }
                 }
@@ -726,13 +732,13 @@ public:
 
                 auto &output_k_cache = layer.layer.get_output(prefill_grpid, "K_cache_out");
                 auto &input_k_cache = layer_llama.layer.get_input(decode_grpid, "K_cache");
-                // memcpy((unsigned short *)input_k_cache.pVirAddr + p * _attr.prefill_token_num * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
-                axcl_Memcpy((unsigned short *)input_k_cache.phyAddr + p * _attr.prefill_token_num * _attr.kv_cache_size, (void *)output_k_cache.phyAddr, sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer_llama.layer.get_devid());
+                // memcpy((unsigned short *)input_k_cache.pVirAddr + p * _attr.prefill_token_num * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
+                axcl_Memcpy((unsigned short *)input_k_cache.phyAddr + p * _attr.prefill_token_num * _attr.kv_cache_size, (void *)output_k_cache.phyAddr, sizeof(unsigned short) * input_num_token * _attr.kv_cache_size, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer_llama.layer.get_devid());
 
                 auto &output_v_cache = layer.layer.get_output(prefill_grpid, "V_cache_out");
                 auto &input_v_cache = layer_llama.layer.get_input(decode_grpid, "V_cache");
-                // memcpy((unsigned short *)input_v_cache.pVirAddr + p * _attr.prefill_token_num * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
-                axcl_Memcpy((unsigned short *)input_v_cache.phyAddr + p * _attr.prefill_token_num * _attr.kv_cache_size, (void *)output_v_cache.phyAddr, sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer_llama.layer.get_devid());
+                // memcpy((unsigned short *)input_v_cache.pVirAddr + p * _attr.prefill_token_num * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
+                axcl_Memcpy((unsigned short *)input_v_cache.phyAddr + p * _attr.prefill_token_num * _attr.kv_cache_size, (void *)output_v_cache.phyAddr, sizeof(unsigned short) * input_num_token * _attr.kv_cache_size, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer_llama.layer.get_devid());
 
                 auto &output = layer.layer.get_output(prefill_grpid, "output");
                 axcl_Memcpy(embed_tmp.data(), (void *)output.phyAddr, embed_tmp.size() * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_HOST, layer.layer.get_devid());
