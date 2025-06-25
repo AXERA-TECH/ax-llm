@@ -29,16 +29,16 @@
 - Phi-2
 - Phi-3-mini
 
-### 获取地址
+### 关联项目
 
-- [百度网盘](https://pan.baidu.com/s/1_LG-sPKnLS_LTWF3Cmcr7A?pwd=ph0e)
-- [Google Drive](https://drive.google.com/drive/folders/1i8xdD2PWDlueouds6F1dhMc72n3v_aER?usp=sharing)
+- [Huggingface](https://huggingface.co/AXERA-TECH)
 
 ## 源码编译
 
 - 在 Host 上下载 axcl llm 对应分支
+- 
     ```shell
-    git clone -b axcl-llm https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b axcl-context-kvcache https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - 本地编译
@@ -50,160 +50,85 @@
     ```
 - 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
   ```
-  $ tree install/bin/
-    install/bin/
-    ├── main
-    ├── run_bf16.sh
-    └── run_qwen_1.8B.sh
+  (base) axera@dell:~/samples/ax-llm/build$ tree install
+  install
+  └── bin
+      ├── main
+      ├── main_api
   ```
   
 ## 运行示例
 
-### Phi-3-mini-int8
+### Qwen2.5-1.5B-Instruct
+
+完整的内容获取请参考 [huggingface.co/AXERA-TECH/Qwen2.5-1.5B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-1.5B-Instruct)
 
 ```shell
-./run_phi3_mini.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  35 /  35 [28.39s<28.39s, 1.23 count/s] init post axmodel okremain_cmm(9045 MB))
-[I][                            Init][ 180]: max_token_len : 1023
-[I][                            Init][ 185]: kv_cache_size : 3072, kv_cache_num: 1023
-[I][                            Init][ 199]: LLM init ok
-Type "q" to exit, Ctrl+c to stop current running
->>
->> who are you?
- I am Phi, an AI developed by Microsoft, designed to assist and provide information to users across a wide range of topics. How can I assist you today?
-
-[N][                             Run][ 388]: hit eos,avg 4.40 token/s
-
->>
->> use c program language implement calculate sum 1-9
- Certainly! To calculate the sum of numbers from 1 to 9 in C, you can use a simple loop. Here's a small program that does exactly that:
-
-`c
-#include <stdio.h>
-
-int main() {
-    int sum = 0; // Initialize sum to 0
-
-    // Loop from 1 to 9 and add each number to sum
-    for(int i = 1; i <= 9; i++) {
-        sum += i;
-    }
-
-    printf("The sum of numbers from 1 to 9 is: %d\n", sum);
-
-    return 0;
+(base) axera@dell:~/qtang/llm-test/qwen2.5-1.5b-ctx$ ./run_qwen2.5_1.5b_ctx_axcl_x86.sh
+[I][                            Init][ 136]: LLM init start
+[I][                            Init][  34]: connect http://127.0.0.1:12345 ok
+[I][                            Init][  57]: uid: 13c9ef69-1330-46b4-aa67-5fb88fd7a569
+bos_id: -1, eos_id: 151645
+  6% | ███                               |   2 /  31 [4.26s<65.97s, 0.47 count/s] embed_selector init ok
+[I][                             run][  30]: AXCLWorker start with devid 0
+100% | ████████████████████████████████ |  31 /  31 [48.95s<48.95s, 0.63 count/s] init post axmodel ok,remain_cmm(4610 MB)4853 MB)
+[I][                            Init][ 237]: max_token_len : 2047
+[I][                            Init][ 240]: kv_cache_size : 256, kv_cache_num: 2047
+[I][                            Init][ 248]: prefill_token_num : 128
+[I][                            Init][ 252]: grp: 1, prefill_max_token_num : 1
+[I][                            Init][ 252]: grp: 2, prefill_max_token_num : 128
+[I][                            Init][ 252]: grp: 3, prefill_max_token_num : 256
+[I][                            Init][ 252]: grp: 4, prefill_max_token_num : 384
+[I][                            Init][ 252]: grp: 5, prefill_max_token_num : 512
+[I][                            Init][ 252]: grp: 6, prefill_max_token_num : 640
+[I][                            Init][ 252]: grp: 7, prefill_max_token_num : 768
+[I][                            Init][ 252]: grp: 8, prefill_max_token_num : 896
+[I][                            Init][ 252]: grp: 9, prefill_max_token_num : 1024
+[I][                            Init][ 256]: prefill_max_token_num : 1024
+________________________
+|    ID| remain cmm(MB)|
+========================
+|     0|           4610|
+¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯
+[I][                     load_config][ 282]: load config:
+{
+    "enable_repetition_penalty": false,
+    "enable_temperature": true,
+    "enable_top_k_sampling": true,
+    "enable_top_p_sampling": false,
+    "penalty_window": 20,
+    "repetition_penalty": 1.2,
+    "temperature": 0.9,
+    "top_k": 10,
+    "top_p": 0.8
 }
-`
 
-This program initializes a variable `sum` to 0. It then iterates from 1 to 9, adding each number to `sum`. Finally, it prints the result.
-
-The sum of numbers from 1 to 9 is 45, as calculated by the loop in the program.
-
-[N][                             Run][ 388]: hit eos,avg 4.37 token/s
-
-```
-
-### TinyLLaMa-1.1B-BF16
-
-
-https://github.com/AXERA-TECH/ax-llm/assets/46700201/e592f78a-03ca-4824-b2d3-46d48740dbef
-
-
-```shell
-# ./run_bf16.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  25 /  25 [21.82s<21.82s, 1.15 count/s] init post axmodel okremain_cmm(3760 MB)
-[I][                            Init][ 162]: max_token_len : 1023
-[I][                            Init][ 167]: kv_cache_size : 256, kv_cache_num: 1023
-[I][                            Init][ 176]: LLM init ok
+[I][                            Init][ 279]: LLM init ok
 Type "q" to exit, Ctrl+c to stop current running
->> write a c++ program to calculate 1-9 sum
+[I][          GenerateKVCachePrefill][ 336]: input token num : 21, prefill_split_num : 1 prefill_grpid : 2
+[I][          GenerateKVCachePrefill][ 373]: input_num_token:21
+[I][                            main][ 236]: precompute_len: 21
+[I][                            main][ 237]: system_prompt: You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
+prompt >> who are you
+[I][                      SetKVCache][ 629]: prefill_grpid:2 kv_cache_num:128 precompute_len:21 input_num_token:11
+[I][                      SetKVCache][ 632]: current prefill_max_token_num:896
+[I][                             Run][ 870]: input token num : 11, prefill_split_num : 1
+[I][                             Run][ 902]: input_num_token:11
+[I][                             Run][1031]: ttft: 418.11 ms
+I am Qwen, a large language model created by Alibaba Cloud. I'm here to help you with questions and provide information on a variety of topics.
+Please ask your question or let me know if you'd like to discuss something, and I'll do my best to assist you.
 
-`c++
-#include <iostream>
+[N][                             Run][1183]: hit eos,avg 8.88 token/s
 
-using namespace std;
-
-int main() {
-    int sum = 0;
-    int num;
-
-    cout << "Enter a number: ";
-    cin >> num;
-
-    for (int I = 1; I <= num; i++) {
-        sum += i;
-    }
-
-    cout << "The sum of 1 to " << num << " is: " << sum << endl;
-
-    return 0;
-}
-`
-
-
-this program prompts the user to enter a number, then calculates the sum of 1 to `num` using a loop. The loop iterates from 1 to `num`, adding each number to the sum variable `sum`. Finally, the program prints the sum of 1 to `num`.
-
-[N][                             Run][ 366]: hit eos,avg 10.14 token/s
-
->> where is shenzhen
-Shenzhen is a city located in southern China, on the southern coast of the Pearl River Delta. It is the capital of Guangdong province and one of the most important economic and cultural centers in China. Shenzhen is known for its innovation, technology, and entrepreneurship, and it is home to many of China's largest companies, including Huawei, Lenovo, and Xiaomi. The city is also a hub for international trade and investment, with many multinational corporations and financial institutions setting up offices and operations in Shenzhen
-
-[N][                             Run][ 366]: hit eos,avg 10.16 token/s
-
+[I][                      GetKVCache][ 598]: precompute_len:89, remaining:935
+prompt >> q
+[I][                             run][  80]: AXCLWorker exit with devid 0
+(base) axera@dell:~/qtang/llm-test/qwen2.5-1.5b-ctx$
 ```
-
-### Qwen1.5-1.8B-int8
-
-
-https://github.com/AXERA-TECH/ax-llm/assets/46700201/6788565f-19a5-45cb-9d17-41e2260886a2
-
-
-```shell
-# ./run_qwen_1.8B.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  27 /  27 [23.68s<23.68s, 1.14 count/s] init post axmodel okremain_cmm(4140 MB)
-[I][                            Init][ 162]: max_token_len : 1023
-[I][                            Init][ 167]: kv_cache_size : 2048, kv_cache_num: 1023
-[I][                            Init][ 176]: LLM init ok
-Type "q" to exit, Ctrl+c to stop current running
->> 给我写个C++代码计算1-9的和
-以下是一个简单的C++代码，用于计算1-9的和：
-
-`cpp
-#include <iostream>
-
-int main() {
-    int sum = 1;
-    for (int i = 1; i <= 9; i++) {
-        sum += i;
-    }
-    std::cout << "The sum of 1-9 is: " << sum << std::endl;
-    return 0;
-}
-`
-
-在这个代码中，我们首先定义了一个变量`sum`，并将其初始化为1。然后，我们使用一个`for`循环，从1开始，每次增加1，直到10。在每次循环中，我们都会将当前的数`i`加到`sum`中。最后，我们在主函数中打印出`sum`的值，即1-9的和。
-
-
-[N][                             Run][ 366]: hit eos,avg 8.00 token/s
-
->> 深圳在哪
-深圳位于中国广东省南部，珠江口东侧，东临大亚湾，西濒珠江口，南界深圳湾，北界香港特别行政区，是中国四大一线城市之一，也是中国经济最发达的城市之一。
-
-
-[N][                             Run][ 366]: hit eos,avg 8.44 token/s
-```
-
-
 
 ## Reference
 
-- [Phi-3-mini](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
-- [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
-- [Qwen1.5-1.8B](https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat)
-- [Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B)
+- [Qwen2.5-1.5B](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct)
 
 ## 技术讨论
 
