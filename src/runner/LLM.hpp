@@ -3,19 +3,17 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
-// #include <opencv2/opencv.hpp>
+#include <atomic>
+
 #include "bfloat16.hpp"
 #include "Tokenizer/Tokenizer.hpp"
 #include "LLMEmbedSelector.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
 
-// #include "ax_cmm_utils.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
 #include "LLMPostprocess.hpp"
 
-// #include <axcl.h>
-// #include <axcl_rt_memory.h>
 #include "utils/axcl_manager.h"
 
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
@@ -29,10 +27,6 @@ struct LLMAttrType
     int axmodel_num = 22;
 
     std::string filename_post_axmodel = "tinyllama-int8/tinyllama_post.axmodel";
-
-    // std::string filename_image_encoder_axmodedl = "minicpmv/vpm_resampler_version0_fp16.axmodel";
-    // int image_encoder_width = 448;
-    // int image_encoder_height = 448;
 
     int prefill_token_num = 96; // auto calc
     int prefill_max_token_num = 512;
@@ -188,24 +182,25 @@ public:
 
         auto dev_assignments = distributeModels(_attr.dev_ids.size(), attr.axmodel_num);
 
-        char axmodel_path[1024];
+        std::vector<int> rets(attr.axmodel_num);
+        std::atomic<int> process_idx = 2;
+#pragma omp parallel for
         for (int i = 0; i < attr.axmodel_num; i++)
         {
+            char axmodel_path[1024];
             sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
             llama_layers[i].filename = axmodel_path;
 
             int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), _attr.dev_ids[dev_assignments[i]]);
-            // llama_layers[i].layer.set_auto_sync_after_inference(true);
-            // llama_layers[i].layer.set_auto_sync_before_inference(true);
-
-            if (ret != 0)
-            {
-                ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
-                return false;
-            }
+            rets[i] = ret;
+            // if (ret != 0)
+            // {
+            //     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
+            //     return false;
+            // }
             int remain_cmm = axcl_GetCMMRemain(_attr.dev_ids[dev_assignments[i]]);
             sprintf(axmodel_path, "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, _attr.dev_ids[dev_assignments[i]], remain_cmm);
-            update_cqdm(&cqdm, i + 2, "count", axmodel_path);
+            update_cqdm(&cqdm, process_idx++, "count", axmodel_path);
         }
 
         int ret = llama_post.init(attr.filename_post_axmodel.c_str(), llama_layers[llama_layers.size() - 1].layer.get_devid());
@@ -216,23 +211,12 @@ public:
             return false;
         }
         int remain_cmm = axcl_GetCMMRemain(llama_post.get_devid());
+        char axmodel_path[1024];
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
 
-        // ret = image_encoder.init(attr.filename_image_encoder_axmodedl.c_str(), llama_layers[0].layer.get_devid());
-        // if (ret != 0)
-        // {
-        //     ALOGE("init vpm axmodel(%s) failed", attr.filename_image_encoder_axmodedl.c_str());
-        //     return false;
-        // }
-        // image_encoder.set_auto_sync_after_inference(true);
-        // image_encoder.set_auto_sync_before_inference(true);
-        // _attr.image_encoder_height = image_encoder.get_input(0).vShape[2];
-        // _attr.image_encoder_width = image_encoder.get_input(0).vShape[3];
-
         printf("\n");
         {
-            // ALOGI("image_encoder_height : %d, image_encoder_width: %d", _attr.image_encoder_height, _attr.image_encoder_width);
             _attr.max_token_len = llama_layers[0].layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
             ALOGI("max_token_len : %d", _attr.max_token_len);
             _attr.kv_cache_size = llama_layers[0].layer.get_output("K_cache_out").nSize / sizeof(unsigned short);

@@ -1,5 +1,7 @@
 #include "memory_utils.hpp"
 
+#include <fstream>
+
 bool file_exist(const std::string &path)
 {
     auto flag = false;

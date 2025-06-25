@@ -36,6 +36,8 @@ option(BUILD_WITH_YOLOV5_TEST OFF)
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
 
+find_package(OpenMP REQUIRED)
+
 include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
@@ -62,7 +64,7 @@ function(build_exec name main_source)
 
     # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
-    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread)
+    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX)
 
     # target_link_libraries(${name} sentencepiece re2::re2)
     install(TARGETS ${name} DESTINATION bin)
