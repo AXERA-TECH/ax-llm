@@ -41,7 +41,7 @@
     cmake ..
     make install -j4
     ```
-- 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
+- 正确编译后，`build/install/bin` 目录
   ```
   $ tree install/bin/
     install/bin/
