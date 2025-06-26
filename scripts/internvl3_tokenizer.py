@@ -45,7 +45,7 @@ class Tokenizer_Http():
     
     def decode(self, token_ids):
         return self.tokenizer.decode(token_ids,
-                                     clean_up_tokenization_spaces=False)
+                                     clean_up_tokenization_spaces=False, skip_special_tokens=True)
 
     @property
     def bos_id(self):
