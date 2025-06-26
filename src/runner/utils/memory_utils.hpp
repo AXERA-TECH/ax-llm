@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <fstream>
 #include <vector>
+#include <unistd.h>
+#include <string.h>
 
 bool file_exist(const std::string &path);
 
@@ -67,8 +69,21 @@ public:
         fseek(file_fp, 0, SEEK_END);
         *model_size = ftell(file_fp);
         fclose(file_fp);
-        int fd = open(model_file, O_RDWR, 0644);
-        void *mmap_add = mmap(NULL, *model_size, PROT_WRITE, MAP_SHARED, fd, 0);
-        return mmap_add;
+        int fd = open(model_file, O_RDONLY);
+        if (fd < 0)
+        {
+            fprintf(stderr, "[MMap] open failed for file %s: %s\n", model_file, strerror(errno));
+            return nullptr;
+        }
+
+        void *mmap_addr = mmap(NULL, *model_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (mmap_addr == MAP_FAILED)
+        {
+            fprintf(stderr, "[MMap] mmap failed for file %s: %s\n", model_file, strerror(errno));
+            close(fd);
+            return nullptr;
+        }
+        close(fd);
+        return mmap_addr;
     }
 };
