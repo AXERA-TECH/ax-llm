@@ -19,18 +19,19 @@
 
 ### 已支持模型
 
-- InternVL-2.5/3
+- InternVL2.5
+- InternVL3
 
 ### 获取地址
 
-- [百度网盘](https://pan.baidu.com/s/1_LG-sPKnLS_LTWF3Cmcr7A?pwd=ph0e)
-- [Google Drive](https://drive.google.com/drive/folders/1i8xdD2PWDlueouds6F1dhMc72n3v_aER?usp=sharing)
+- [Huggingface](https://huggingface.co/AXERA-TECH)
+  - [InternVL3-2B](https://huggingface.co/AXERA-TECH/InternVL3-2B)
 
 ## 源码编译
 
 - 在 Host 上下载 axcl llm 对应分支
     ```shell
-    git clone -b axcl-llm https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b ax-internvl https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - 本地编译
