@@ -305,6 +305,10 @@ public:
     {
         bfloat16 bf16 = -65536.f;
         int input_embed_num = _token_ids.size();
+        precompute_len = _token_ids.size();
+        k_caches.resize(_attr.axmodel_num);
+        v_caches.resize(_attr.axmodel_num);
+
         int prefill_split_num = ceil((double)input_embed_num / _attr.prefill_token_num);
 
         int prefill_grpid = _attr.prefill_max_kv_cache_num_grp.size();
@@ -326,6 +330,17 @@ public:
             axcl_Memset((void *)llama_layers[i].layer.get_input(prefill_grpid, "V_cache").phyAddr, 0, llama_layers[i].layer.get_input(prefill_grpid, "V_cache").nSize, llama_layers[i].layer.get_devid());
         }
 
+        if (input_embed_num == 0)
+        {
+            for (size_t i = 0; i < _attr.axmodel_num; i++)
+            {
+                k_caches[i].resize(precompute_len * _attr.kv_cache_size);
+                v_caches[i].resize(precompute_len * _attr.kv_cache_size);
+            }
+            ALOGI("input token num is 0, skip");
+            return 0;
+        }
+
         int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[prefill_grpid - 1];
 
         std::vector<unsigned short> test_embed;
@@ -341,11 +356,6 @@ public:
 
         for (size_t p = 0; p < prefill_split_num; p++)
         {
-            if (b_stop)
-            {
-                break;
-            }
-
             std::vector<unsigned short> mask_tmp;
             mask_tmp.resize(1 * _attr.prefill_token_num * (kv_cache_num + _attr.prefill_token_num), bf16.data);
             int input_num_token = _attr.prefill_token_num;
@@ -386,11 +396,6 @@ public:
 
             for (unsigned int m = 0; m < _attr.axmodel_num; m++)
             {
-                if (b_stop)
-                {
-                    break;
-                }
-
                 auto &layer = llama_layers[m];
                 // set indices
                 auto &input_indices = layer.layer.get_input(prefill_grpid, "indices");
@@ -452,10 +457,6 @@ public:
             }
         }
 
-        precompute_len = _token_ids.size();
-
-        k_caches.resize(_attr.axmodel_num);
-        v_caches.resize(_attr.axmodel_num);
         for (size_t i = 0; i < _attr.axmodel_num; i++)
         {
             auto &layer = llama_layers[i];
