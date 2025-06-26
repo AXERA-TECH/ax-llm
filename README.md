@@ -19,15 +19,7 @@
 
 ### 已支持模型
 
-- Qwen1.5-0.5B/1.8B/4B
-- Qwen2-0.5B/1.5B
-- ChatGLM3-6B
-- MiniCPM-2B
-- TinyLLaMa-1.1B
-- Llama2-7B
-- Llama3-8B
-- Phi-2
-- Phi-3-mini
+- InternVL-2.5/3
 
 ### 获取地址
 
@@ -59,151 +51,79 @@
   
 ## 运行示例
 
-### Phi-3-mini-int8
+### InternVL-3
 
 ```shell
-./run_phi3_mini.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  35 /  35 [28.39s<28.39s, 1.23 count/s] init post axmodel okremain_cmm(9045 MB))
-[I][                            Init][ 180]: max_token_len : 1023
-[I][                            Init][ 185]: kv_cache_size : 3072, kv_cache_num: 1023
-[I][                            Init][ 199]: LLM init ok
-Type "q" to exit, Ctrl+c to stop current running
->>
->> who are you?
- I am Phi, an AI developed by Microsoft, designed to assist and provide information to users across a wide range of topics. How can I assist you today?
+./run_internvl_3_2b_448.sh 
+[I][                            Init][ 134]: LLM init start
+[I][                            Init][  34]: connect http://10.126.33.124:12345 ok
+bos_id: -1, eos_id: 151645
+img_start_token: 151665
+img_context_token: 151667
+100% | ████████████████████████████████ |  31 /  31 [12.41s<12.41s, 2.50 count/s] init post axmodel ok,remain_cmm(8233 MB)
+[I][                            Init][ 226]: IMAGE_CONTEXT_TOKEN: 151667, IMAGE_START_TOKEN: 151665
+[I][                            Init][ 251]: image encoder input nchw@float32
+[I][                            Init][ 281]: image encoder output float32
 
-[N][                             Run][ 388]: hit eos,avg 4.40 token/s
-
->>
->> use c program language implement calculate sum 1-9
- Certainly! To calculate the sum of numbers from 1 to 9 in C, you can use a simple loop. Here's a small program that does exactly that:
-
-`c
-#include <stdio.h>
-
-int main() {
-    int sum = 0; // Initialize sum to 0
-
-    // Loop from 1 to 9 and add each number to sum
-    for(int i = 1; i <= 9; i++) {
-        sum += i;
-    }
-
-    printf("The sum of numbers from 1 to 9 is: %d\n", sum);
-
-    return 0;
+[I][                            Init][ 291]: image_encoder_height : 448, image_encoder_width: 448
+[I][                            Init][ 293]: max_token_len : 2559
+[I][                            Init][ 296]: kv_cache_size : 256, kv_cache_num: 2559
+[I][                            Init][ 304]: prefill_token_num : 128
+[I][                            Init][ 308]: grp: 1, prefill_max_token_num : 1
+[I][                            Init][ 308]: grp: 2, prefill_max_token_num : 128
+[I][                            Init][ 308]: grp: 3, prefill_max_token_num : 256
+[I][                            Init][ 308]: grp: 4, prefill_max_token_num : 384
+[I][                            Init][ 308]: grp: 5, prefill_max_token_num : 512
+[I][                            Init][ 308]: grp: 6, prefill_max_token_num : 640
+[I][                            Init][ 308]: grp: 7, prefill_max_token_num : 768
+[I][                            Init][ 308]: grp: 8, prefill_max_token_num : 896
+[I][                            Init][ 308]: grp: 9, prefill_max_token_num : 1024
+[I][                            Init][ 308]: grp: 10, prefill_max_token_num : 1152
+[I][                            Init][ 308]: grp: 11, prefill_max_token_num : 1280
+[I][                            Init][ 308]: grp: 12, prefill_max_token_num : 1408
+[I][                            Init][ 308]: grp: 13, prefill_max_token_num : 1536
+[I][                            Init][ 308]: grp: 14, prefill_max_token_num : 1664
+[I][                            Init][ 308]: grp: 15, prefill_max_token_num : 1792
+[I][                            Init][ 308]: grp: 16, prefill_max_token_num : 1920
+[I][                            Init][ 308]: grp: 17, prefill_max_token_num : 2048
+[I][                            Init][ 312]: prefill_max_token_num : 2048
+[I][                     load_config][ 282]: load config: 
+{
+    "enable_repetition_penalty": false,
+    "enable_temperature": false,
+    "enable_top_k_sampling": true,
+    "enable_top_p_sampling": false,
+    "penalty_window": 20,
+    "repetition_penalty": 1.2,
+    "temperature": 0.9,
+    "top_k": 1,
+    "top_p": 0.8
 }
-`
 
-This program initializes a variable `sum` to 0. It then iterates from 1 to 9, adding each number to `sum`. Finally, it prints the result.
-
-The sum of numbers from 1 to 9 is 45, as calculated by the loop in the program.
-
-[N][                             Run][ 388]: hit eos,avg 4.37 token/s
-
-```
-
-### TinyLLaMa-1.1B-BF16
-
-
-https://github.com/AXERA-TECH/ax-llm/assets/46700201/e592f78a-03ca-4824-b2d3-46d48740dbef
-
-
-```shell
-# ./run_bf16.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  25 /  25 [21.82s<21.82s, 1.15 count/s] init post axmodel okremain_cmm(3760 MB)
-[I][                            Init][ 162]: max_token_len : 1023
-[I][                            Init][ 167]: kv_cache_size : 256, kv_cache_num: 1023
-[I][                            Init][ 176]: LLM init ok
+[I][                            Init][ 321]: LLM init ok
 Type "q" to exit, Ctrl+c to stop current running
->> write a c++ program to calculate 1-9 sum
+prompt >> 描述一下这张图片
+image >> image.png
+[I][                          Encode][ 415]: image encode time : 403.51 ms, size : 393216
+[I][                          Encode][ 524]: idx:0 offset : 49 out_embed.size() : 477696
+[I][                             Run][ 551]: input token num : 311, prefill_split_num : 3
+[I][                             Run][ 566]: prefill grpid 4
+[I][                             Run][ 593]: input_num_token:128
+[I][                             Run][ 593]: input_num_token:128
+[I][                             Run][ 593]: input_num_token:55
+[I][                             Run][ 717]: ttft: 1330.75 ms
+这张图片展示了三名宇航员站在一片森林中。他们穿着白色的宇航服，头戴透明的头盔，头盔的镜片反射出周围的环境。宇航员们似乎处于一种放松或沉思的状态，其中一人双手举起，另一人弯腰，第三个人则站立着。背景是一片茂密的森林，树木和植被显得非常茂盛，营造出一种神秘而宁静的氛围。整个画面色调偏暗，给人一种神秘和未来感的视觉效果。
 
-`c++
-#include <iostream>
-
-using namespace std;
-
-int main() {
-    int sum = 0;
-    int num;
-
-    cout << "Enter a number: ";
-    cin >> num;
-
-    for (int I = 1; I <= num; i++) {
-        sum += i;
-    }
-
-    cout << "The sum of 1 to " << num << " is: " << sum << endl;
-
-    return 0;
-}
-`
-
-
-this program prompts the user to enter a number, then calculates the sum of 1 to `num` using a loop. The loop iterates from 1 to `num`, adding each number to the sum variable `sum`. Finally, the program prints the sum of 1 to `num`.
-
-[N][                             Run][ 366]: hit eos,avg 10.14 token/s
-
->> where is shenzhen
-Shenzhen is a city located in southern China, on the southern coast of the Pearl River Delta. It is the capital of Guangdong province and one of the most important economic and cultural centers in China. Shenzhen is known for its innovation, technology, and entrepreneurship, and it is home to many of China's largest companies, including Huawei, Lenovo, and Xiaomi. The city is also a hub for international trade and investment, with many multinational corporations and financial institutions setting up offices and operations in Shenzhen
-
-[N][                             Run][ 366]: hit eos,avg 10.16 token/s
-
+[N][                             Run][ 826]: hit eos,avg 11.15 token/s
 ```
+### InternVL-3 web demo
 
-### Qwen1.5-1.8B-int8
-
-
-https://github.com/AXERA-TECH/ax-llm/assets/46700201/6788565f-19a5-45cb-9d17-41e2260886a2
-
-
-```shell
-# ./run_qwen_1.8B.sh
-[I][                            Init][  71]: LLM init start
-100% | ████████████████████████████████ |  27 /  27 [23.68s<23.68s, 1.14 count/s] init post axmodel okremain_cmm(4140 MB)
-[I][                            Init][ 162]: max_token_len : 1023
-[I][                            Init][ 167]: kv_cache_size : 2048, kv_cache_num: 1023
-[I][                            Init][ 176]: LLM init ok
-Type "q" to exit, Ctrl+c to stop current running
->> 给我写个C++代码计算1-9的和
-以下是一个简单的C++代码，用于计算1-9的和：
-
-`cpp
-#include <iostream>
-
-int main() {
-    int sum = 1;
-    for (int i = 1; i <= 9; i++) {
-        sum += i;
-    }
-    std::cout << "The sum of 1-9 is: " << sum << std::endl;
-    return 0;
-}
-`
-
-在这个代码中，我们首先定义了一个变量`sum`，并将其初始化为1。然后，我们使用一个`for`循环，从1开始，每次增加1，直到10。在每次循环中，我们都会将当前的数`i`加到`sum`中。最后，我们在主函数中打印出`sum`的值，即1-9的和。
-
-
-[N][                             Run][ 366]: hit eos,avg 8.00 token/s
-
->> 深圳在哪
-深圳位于中国广东省南部，珠江口东侧，东临大亚湾，西濒珠江口，南界深圳湾，北界香港特别行政区，是中国四大一线城市之一，也是中国经济最发达的城市之一。
-
-
-[N][                             Run][ 366]: hit eos,avg 8.44 token/s
-```
-
-
+![](scripts/gradio_demo.png)
 
 ## Reference
 
-- [Phi-3-mini](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
-- [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
-- [Qwen1.5-1.8B](https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat)
-- [Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B)
+- [InternVL-3](https://huggingface.co/OpenGVLab/InternVL3-2B)
+- [InternVL-2.5](https://huggingface.co/OpenGVLab/InternVL2_5-1B)
 
 ## 技术讨论
 
