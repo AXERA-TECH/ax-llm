@@ -24,7 +24,10 @@
 
 ### 获取地址
 
+预编译模型、执行脚本请参考
+
 - [Huggingface](https://huggingface.co/AXERA-TECH)
+  - [InternVL3-1B](https://huggingface.co/AXERA-TECH/InternVL3-1B)  
   - [InternVL3-2B](https://huggingface.co/AXERA-TECH/InternVL3-2B)
 
 ## 源码编译
@@ -37,18 +40,25 @@
 - 本地编译
     ```shell
     mkdir build
-    cd build
-    cmake ..
+    cd build && cmake ..
     make install -j4
     ```
-- 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
+- 正确编译后，`build/install/bin` 目录
+
   ```
-  $ tree install/bin/
-    install/bin/
-    ├── main
-    ├── run_bf16.sh
-    └── run_qwen_1.8B.sh
+  (base) axera@dell:~/samples/ax-llm-axcl-internvl/build$ tree install/bin/
+  install/bin/
+  ├── gradio_demo.py
+  ├── internvl2.5_mpo_8b_tokenizer.py
+  ├── internvl2.5_tokenizer_448.py
+  ├── internvl3_tokenizer.py
+  ├── main
+  ├── main_api
+  ├── run_qwen2.5_14B_int8_pcie_dev.sh
+  └── run_qwen2.5_14B_pcie_dev.sh
+  1 directory, 8 files
   ```
+  其中 `main` 就是在最终在 axcl 环境下的执行程序 `main_axcl_x86`, 我只是进行了重命名而已，类似如果是 aarch64 的 Host 平台，则是 `main_axcl_aarch64`
   
 ## 运行示例
 
