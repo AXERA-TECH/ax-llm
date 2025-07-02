@@ -13,9 +13,9 @@
 ### 已支持芯片
 
 - AX650A/AX650N
-  - SDK ≥ v1.45.0_P31
+  - SDK ≥ v3.0.0
 - AX630C
-  - SDK ≥ v2.0.0_P7
+  - SDK ≥ v3.0.0
 
 ### 已支持模型
 
@@ -25,6 +25,7 @@
 ### 获取地址
 
 - [Huggingface](https://huggingface.co/AXERA-TECH)
+  - [InternVL3-1B](https://huggingface.co/AXERA-TECH/InternVL3-1B) 
   - [InternVL3-2B](https://huggingface.co/AXERA-TECH/InternVL3-2B)
 
 ## 源码编译
@@ -49,6 +50,7 @@
     ├── run_bf16.sh
     └── run_qwen_1.8B.sh
   ```
+  其中 `main` 就是 Huggingface 仓库中对应的 `main_ax650`
   
 ## 运行示例
 
