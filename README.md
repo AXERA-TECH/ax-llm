@@ -10,22 +10,38 @@
 
 **AX-LLM** 由 **[爱芯元智](https://www.axera-tech.com/)** 主导开发。该项目用于探索业界常用 **LLM(Large Language Model)** 在已有芯片平台上落地的可行性和相关能力边界，**方便**社区开发者进行**快速评估**和**二次开发**自己的 **LLM 应用**。
 
+### 分支说明
+
+- [ax-context(default)](https://github.com/AXERA-TECH/ax-llm/tree/ax-context)
+  - AX650A/AX650N/AX8850/AX630C Host 运行 LLM 使用
+- [ax-internvl](https://github.com/AXERA-TECH/ax-llm/tree/ax-internvl)
+  - AX650A/AX650N/AX8850/AX630C Host 运行 InternVL 系列使用
+- [axcl-context](https://github.com/AXERA-TECH/ax-llm/tree/axcl-context)
+  - AX650N/AX8850 EP 的主控运行 LLM 系列使用
+- [axcl-internvl](https://github.com/AXERA-TECH/ax-llm/tree/axcl-internvl)
+  - AX650N/AX8850 EP 的主控运行 InternVL 系列使用
+
 ### 已支持芯片
 
 - AX650A/AX650N
-  - SDK ≥ v1.45.0_P31
+  - SDK ≥ v3.0.0
 - AX630C
-  - SDK ≥ v2.0.0_P7
+  - SDK ≥ v3.0.0
 
 ### 已支持模型
 
-- Qwen2.5-0.5B/1.5B/3B/7B
-- Qwen3-0.6B/1.7B/4B/8B
+- Qwen2.5
+- Qwen3
+- MiniCPM
+- SmolLM2
+- Llama3
 
 ### 获取地址
 
-- [百度网盘](https://pan.baidu.com/s/1_LG-sPKnLS_LTWF3Cmcr7A?pwd=ph0e)
-- [Google Drive](https://drive.google.com/drive/folders/1i8xdD2PWDlueouds6F1dhMc72n3v_aER?usp=sharing)
+我们的 ModelZoo 已迁移到 [Huggingface](https://huggingface.co/AXERA-TECH), 例如：
+
+- [Qwen2.5-7B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-7B-Instruct)
+- [Qwen2.5-1.5B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-1.5B-Instruct)
 
 ## 源码编译
 
@@ -38,7 +54,7 @@
     ```shell
     ./build.sh
     ```
-- 正确编译后，`build/install/` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
+- 正确编译后，`build/install/` 目录
   ```
   $ tree install
     install
@@ -48,12 +64,15 @@
         ├── main_api
         └── qwen2.5_tokenizer_uid.py
   ```
+
+  其中 `main` 就是 Huggingface 仓库中对应的 `main_ax650`
   
 ## 运行示例
 
-### Qwen2.5-1.5B-ctx
+### Qwen2.5-1.5B-Instruct
 
 #### 运行支持上下文的 tokenizer 服务器
+
 ```shell
 python qwen2.5_tokenizer_uid.py 
 Server running at http://127.0.0.1:12345
