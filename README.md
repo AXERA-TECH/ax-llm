@@ -12,43 +12,39 @@
 
 ### 已支持芯片
 
-- AX650A/AX650N
-  - SDK ≥ v1.45.0_P31
-- AX630C
-  - SDK ≥ v2.0.0_P7
+- AX650N/AX8850
+  - SDK ≥ v3.0.0
 
 ### 已支持模型
 
-- Qwen1.5-0.5B/1.8B/4B
-- Qwen2-0.5B/1.5B
-- ChatGLM3-6B
-- MiniCPM-2B
-- TinyLLaMa-1.1B
-- Llama2-7B
-- Llama3-8B
-- Phi-2
-- Phi-3-mini
+- Qwen2.5
+- Qwen3
+- MiniCPM
+- SmolLM2
+- Llama3
 
-### 关联项目
+### 获取地址
 
-- [Huggingface](https://huggingface.co/AXERA-TECH)
+我们的 ModelZoo 已迁移到 [Huggingface](https://huggingface.co/AXERA-TECH), 例如：
+
+- [Qwen2.5-7B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-7B-Instruct)
+- [Qwen2.5-1.5B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-1.5B-Instruct)
 
 ## 源码编译
 
 - 在 Host 上下载 axcl llm 对应分支
 - 
     ```shell
-    git clone -b axcl-context-kvcache https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b axcl-context https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - 本地编译
     ```shell
     mkdir build
-    cd build
-    cmake ..
+    cd build && cmake ..
     make install -j4
     ```
-- 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
+- 正确编译后，`build/install/bin` 目录
   ```
   (base) axera@dell:~/samples/ax-llm/build$ tree install
   install
@@ -56,6 +52,7 @@
       ├── main
       ├── main_api
   ```
+  其中 `main` 就是 Huggingface 仓库中对应的 `main_axcl_x86` 或 `main_axcl_aarch64`
   
 ## 运行示例
 
