@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <utility>
 #include <stdexcept>
 
 typedef enum _color_space_e
@@ -33,13 +34,13 @@ typedef struct
     unsigned int nIdx;
     std::vector<unsigned int> vShape;
     int nSize;
-    unsigned long phyAddr;
+    unsigned long long phyAddr;
     void *pVirAddr;
 } ax_runner_tensor_t;
 
 class ax_runner_base
 {
-protected:
+public:
     std::vector<ax_runner_tensor_t> moutput_tensors;
     std::vector<ax_runner_tensor_t> minput_tensors;
 
@@ -52,14 +53,24 @@ protected:
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_output_tensors;
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_input_tensors;
 
+    bool _auto_sync_before_inference = false;
+    bool _auto_sync_after_inference = false;
+
+    int dev_id = 0;
+
 public:
-    virtual int init(const char *model_file, bool use_mmap = false) = 0;
+    virtual int init(const char *model_file, int devid) = 0;
     virtual int init(char *model_buffer, size_t model_size) = 0;
 
     virtual void deinit() = 0;
 
+    int get_devid() { return dev_id; }
+
     int get_num_inputs() { return minput_tensors.size(); };
     int get_num_outputs() { return moutput_tensors.size(); };
+
+    int get_num_input_groups() { return mgroup_input_tensors.size(); };
+    int get_num_output_groups() { return mgroup_output_tensors.size(); };
 
     const ax_runner_tensor_t &get_input(int idx) { return minput_tensors[idx]; }
     const ax_runner_tensor_t *get_inputs_ptr() { return minput_tensors.data(); }
@@ -142,13 +153,13 @@ public:
         return map_group_output_tensors[name][grpid];
     }
 
+    virtual int get_algo_width() = 0;
+    virtual int get_algo_height() = 0;
+    virtual ax_color_space_e get_color_space() = 0;
+
+    void set_auto_sync_before_inference(bool sync) { _auto_sync_before_inference = sync; }
+    void set_auto_sync_after_inference(bool sync) { _auto_sync_after_inference = sync; }
+
     virtual int inference() = 0;
     virtual int inference(int grpid) = 0;
-
-    int operator()()
-    {
-        return inference();
-    }
 };
-
-// int ax_cmmcpy(unsigned long long int dst, unsigned long long int src, int size);

@@ -1,16 +1,18 @@
-#include "signal.h"
-
-#include "runner/LLM.hpp"
-
-#include "cmdline.hpp"
-
+#include <signal.h>
 #include <opencv2/opencv.hpp>
 
-#include "runner/utils/image_processor.hpp"
+#include "runner/LLM.hpp"
+#include "cmdline.hpp"
+#include "string_utility.hpp"
 
-#include "runner/utils/files.hpp"
+#define IS_AXCL 1
 
-#include "runner/utils/mrope.hpp"
+#if IS_AXCL
+#include <axcl.h>
+#else
+#include <ax_sys_api.h>
+#include <ax_engine_api.h>
+#endif
 
 static LLM lLaMa;
 
@@ -31,25 +33,11 @@ std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
     std::ostringstream oss_prompt;
     switch (tokenizer_type)
     {
-    case TKT_LLaMa:
-        oss_prompt << "<|user|>\n"
-                   << prompt << "</s><|assistant|>\n";
-        break;
-    case TKT_MINICPM:
-        oss_prompt << "<用户><image></image>\n";
-        oss_prompt << prompt << "<AI>";
-        break;
-    case TKT_Phi3:
-        oss_prompt << prompt << " ";
-        break;
-    case TKT_Qwen:
-        oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
-        oss_prompt << "\n<|im_start|>user\n"
-                   << prompt << "<|im_end|>\n<|im_start|>assistant\n";
-        break;
     case TKT_HTTP:
-    default:
         oss_prompt << prompt;
+        break;
+    default:
+        ALOGE("tokenizer type %d not support", tokenizer_type);
         break;
     }
 
@@ -61,35 +49,34 @@ int main(int argc, char *argv[])
     signal(SIGINT, __sigExit);
     LLMAttrType attr;
     std::string prompt = "Hi";
-    bool b_continue = false;
+    bool b_continue = true;
 
     cmdline::parser cmd;
-    cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
-    cmd.add<std::string>("image", 'i', "image", true);
+    // cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
+    // cmd.add<std::string>("image", 'i', "single image file or .txt file for images list", true);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
-    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3 4:MINICPM", false, attr.tokenizer_type);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
-    cmd.add<std::string>("filename_vpm_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_vpm_encoder_axmodedl);
-    cmd.add<std::string>("filename_vpm_resampler_axmodedl", 0, "vpm resampler axmodel path", true, attr.filename_vpm_resampler_axmodedl);
-    cmd.add<bool>("vpm_two_stage", 0, "", false, attr.b_vpm_two_stage);
+    cmd.add<std::string>("filename_image_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodedl);
 
-    cmd.add<bool>("bos", 0, "", false, attr.b_bos);
-    cmd.add<bool>("eos", 0, "", false, attr.b_eos);
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
     // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
 
-    cmd.add<bool>("use_topk", 0, "", false, attr.b_use_topk);
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
-    cmd.add<bool>("dynamic_load_axmodel_layer", 0, "it can save cmm memory", false, attr.b_dynamic_load_axmodel_layer);
+
+    // cmd.add<int>("image_context", 0, "image context, 151667 for InternVL 2.5/3, 92546 for InternVL 2.5-8B-MPO", false, attr.IMAGE_CONTEXT);
+    // cmd.add<int>("image_start_context", 0, "image start context, 151665 for InternVL 2.5/3, 92544 for InternVL 2.5-8B-MPO", false, attr.IMAGE_START_CONTEXT);
+
+#if IS_AXCL
+    cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
+#endif
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
 
-    cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
     cmd.add<int>("img_width", 'w', "image width", true);
     cmd.add<int>("img_height", 'h', "image height", true);
     cmd.add<int>("img_token_id", 0, "image token id", false, 151655); 
@@ -106,9 +93,8 @@ int main(int argc, char *argv[])
 
     cmd.parse_check(argc, argv);
 
-    prompt = cmd.get<std::string>("prompt");
-    auto image_prompt = cmd.get<std::string>("image");
-    attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
+    // prompt = cmd.get<std::string>("prompt");
+    // auto image_prompt = cmd.get<std::string>("image");
     attr.filename_tokenizer_model = cmd.get<std::string>("filename_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
@@ -116,19 +102,43 @@ int main(int argc, char *argv[])
     // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
     // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
 
-    attr.filename_vpm_encoder_axmodedl = cmd.get<std::string>("filename_vpm_encoder_axmodedl");
-    attr.filename_vpm_resampler_axmodedl = cmd.get<std::string>("filename_vpm_resampler_axmodedl");
-    attr.b_vpm_two_stage = cmd.get<bool>("vpm_two_stage");
-    attr.b_bos = cmd.get<bool>("bos");
-    attr.b_eos = cmd.get<bool>("eos");
-    attr.b_use_topk = cmd.get<bool>("use_topk");
+    attr.filename_image_encoder_axmodedl = cmd.get<std::string>("filename_image_encoder_axmodedl");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
+    // attr.IMAGE_CONTEXT = cmd.get<int>("image_context");
+    // attr.IMAGE_START_CONTEXT = cmd.get<int>("image_start_context");
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
-    attr.b_dynamic_load_axmodel_layer = cmd.get<bool>("dynamic_load_axmodel_layer");
-    attr.post_config_path = cmd.get<std::string>("post_config_path");
+
+#if IS_AXCL
+    auto devices_str = cmd.get<std::string>("devices");
+    std::vector<int> devices;
+    std::stringstream ss(devices_str);
+    std::string item;
+    while (std::getline(ss, item, ','))
+    {
+        devices.push_back(std::stoi(item));
+    }
+
+    attr.dev_ids = devices;
+
+    auto ret = axclInit(nullptr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#else
+    AX_ENGINE_NPU_ATTR_T npu_attr;
+    memset(&npu_attr, 0, sizeof(npu_attr));
+    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    AX_SYS_Init();
+    auto ret = AX_ENGINE_Init(&npu_attr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#endif
 
     bool b_live_print = cmd.get<bool>("live_print");
     if (b_live_print)
@@ -137,10 +147,15 @@ int main(int argc, char *argv[])
         attr.reserve = 0;
     }
 
-    b_continue = cmd.get<bool>("continue");
-
     if (!lLaMa.Init(attr))
     {
+        ALOGE("lLaMa.Init failed");
+#if IS_AXCL
+        axclFinalize();
+#else
+        AX_ENGINE_Deinit();
+        AX_SYS_Deinit();
+#endif
         return -1;
     }
 
@@ -160,32 +175,10 @@ int main(int argc, char *argv[])
     config.image_token_id =  cmd.get<int>("img_token_id");
     config.video_token_id = cmd.get<int>("video_token_id");
     config.vision_start_token_id = cmd.get<int>("vision_start_token_id");
-
-    if (prompt != "")
-    {
-        std::string output;
-        auto src =  ReadImages(image_prompt);
-        if (src.empty())
-        {
-            // output = lLaMa.Run(prompt);
-            ALOGE("image_prompt can't be empty");
-        }
-        else
-        {
-            lLaMa.Encode(src, img_embed, config);
-            lLaMa.Encode(img_embed, prompt_data, position_ids, config, prompt_complete(prompt, attr.tokenizer_type));
-            output = lLaMa.Run(prompt_data, position_ids);
-        }
-
-        if (!b_live_print && !output.empty())
-            printf("%s\n", output.c_str());
-    }
-
     //
     if (b_continue)
     {
         printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
-        // lLaMa.Reset();
     }
 
     while (b_continue)
@@ -204,6 +197,7 @@ int main(int argc, char *argv[])
 
         printf("image >> ");
         fflush(stdout);
+        std::string image_prompt;
         std::getline(std::cin, image_prompt);
         std::string output;
         if (image_prompt == "")
@@ -235,6 +229,13 @@ int main(int argc, char *argv[])
     }
 
     lLaMa.Deinit();
+
+#if IS_AXCL
+    axclFinalize();
+#else
+    AX_ENGINE_Deinit();
+    AX_SYS_Deinit();
+#endif
 
     return 0;
 }

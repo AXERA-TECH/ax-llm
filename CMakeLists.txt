@@ -49,21 +49,26 @@ link_directories(${BSP_MSP_DIR}/lib)
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
 
-include_directories(src)
-include_directories(src/runner)
-include_directories(src/runner/utils)
-
-if(NOT OpenCV_DIR)
-    set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/third_party/libopencv-4.6-aarch64-none/lib/cmake/opencv4)
-endif()
-
 message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
+find_package(OpenMP REQUIRED)
+
+include_directories(src)
+include_directories(src/runner)
+include_directories(src/runner/utils)
+
+include_directories(axcl/include)
+link_directories(axcl/lib)
+include_directories(/usr/include/axcl/)
+link_directories(/usr/lib/axcl/)
+
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
                     src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
+                    # src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
+                    src/runner/utils/axcl_manager.cpp
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
@@ -72,7 +77,9 @@ function(build_exec name main_source)
                     src/runner/utils/mrope.cpp
                     )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
+    # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
+    
+    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX)
     target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
@@ -83,7 +90,7 @@ build_exec(main src/main.cpp)
 file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*.py" "${CMAKE_SOURCE_DIR}/scripts/*.sh")
 install(FILES ${RUN_SCRIPT} DESTINATION bin/)
 
-file(GLOB LLAMA3_TOKENIZER "${CMAKE_SOURCE_DIR}/scripts/llama3_tokenizer/*")
-install(FILES ${LLAMA3_TOKENIZER} DESTINATION bin/llama3_tokenizer/)
+file(GLOB QWEN2_TOKENIZER "${CMAKE_SOURCE_DIR}/scripts/qwen2_tokenizer/*")
+install(FILES ${QWEN2_TOKENIZER} DESTINATION bin/qwen2_tokenizer/)
 
 # add_executable(fp32_to_bf16 tools/fp32_to_bf16.cpp)
