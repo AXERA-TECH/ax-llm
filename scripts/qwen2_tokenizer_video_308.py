@@ -115,6 +115,13 @@ class Tokenizer_Http():
     def eos_token(self):
         return self.tokenizer.eos_token
 
+    @property
+    def img_start_token(self):
+        return self.tokenizer.encode("<|vision_start|>")[0]
+
+    @property
+    def img_context_token(self):
+        return self.tokenizer.encode("<|video_pad|>")[0]
 
 tokenizer = Tokenizer_Http()
 
@@ -162,6 +169,18 @@ class Request(BaseHTTPRequestHandler):
                 msg = json.dumps({'eos_id': -1})
             else:
                 msg = json.dumps({'eos_id': eos_id})
+        elif self.path == '/img_start_token':
+            img_start_token = tokenizer.img_start_token
+            if img_start_token is None:
+                msg = json.dumps({'img_start_token': -1})
+            else:
+                msg = json.dumps({'img_start_token': img_start_token})
+        elif self.path == '/img_context_token':
+            img_context_token = tokenizer.img_context_token
+            if img_context_token is None:
+                msg = json.dumps({'img_context_token': -1})
+            else:
+                msg = json.dumps({'img_context_token': img_context_token})
         else:
             msg = 'error'
 
