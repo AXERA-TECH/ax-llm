@@ -21,6 +21,16 @@
 #include "mrope.hpp"
 
 /**
+ * @brief 说明图像编码器输入数据的格式和预处理要求
+ *
+ * 当定义了 IMAGE_ENCODER_INPUT_NCHW 且其值为 1 时，图像编码器的输入数据格式为 [1*3*h*w] 的浮点型数据，
+ * 该数据需要进行归一化处理，具体操作是 (像素值/255 - 均值) / 标准差。
+ *
+ * 当 IMAGE_ENCODER_INPUT_NCHW 的值为 0 时，图像编码器的输入数据格式为 [1*h*w*3] 的无符号 8 位整型数据。
+ */
+int IMAGE_ENCODER_INPUT_NCHW = -1;
+
+/**
  * @brief 说明图像编码器输出数据的格式
  *
  * 当 IMAGE_ENCODER_OUTPUT_BF16 为 1 时，图像编码器的输出数据格式为 bfloat16 半精度浮点型数据，
@@ -300,7 +310,7 @@ public:
         // {
         //     ALOGE("image encoder height != width");
         //     return false;
-        }
+        // }
         int output_elem_size = 1;
         for (int i = 0; i < image_encoder.get_output(0).vShape.size(); i++)
         {
@@ -325,7 +335,7 @@ public:
 
         printf("\n");
         {
-            ALOGI("image_encoder_height : %d, image_encoder_width: %d", _attr.image_encoder_height, _attr.image_encoder_width);
+            // ALOGI("image_encoder_height : %d, image_encoder_width: %d", _attr.image_encoder_height, _attr.image_encoder_width);
             _attr.max_token_len = llama_layers[0].layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
             ALOGI("max_token_len : %d", _attr.max_token_len);
             _attr.kv_cache_size = llama_layers[0].layer.get_output("K_cache_out").nSize / sizeof(unsigned short);
@@ -543,9 +553,9 @@ public:
         ImageInfo img_info;
         img_info.img_prompt = false;
         std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
-        if (input_ids.size() > _attr.prefill_token_num)
+        if (input_ids.size() > _attr.prefill_max_token_num)
         {
-            ALOGE("input_ids(%d) > prefill_token_num(%d)", input_ids.size(), _attr.prefill_token_num);
+            ALOGE("input_ids(%d) > prefill_max_token_num(%d)", input_ids.size(), _attr.prefill_max_token_num);
             return -1;
         }
         out_embed.resize(input_ids.size() * _attr.tokens_embed_size);
@@ -565,7 +575,7 @@ public:
     {
         ImageInfo img_info;
         img_info.img_prompt = true;
-        img_info.img_token_num = img_token_num.size();
+        img_info.img_token_num = img_embed.size()/_attr.tokens_embed_size;
         std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
 
         int offset = -1;
@@ -597,7 +607,7 @@ public:
         return 0;
     }
 
-    std::string Run(std::vector<unsigned short> test_embed,  std::vector<std::vector<int>> &position_ids)
+    std::string Run(std::vector<unsigned short>& test_embed,  std::vector<std::vector<int>> &position_ids)
     {
         b_stop = false;
         std::string final_out;
@@ -699,18 +709,16 @@ public:
                 unsigned int *input_indices_ptr = (unsigned int *)input_indices.pVirAddr;
                 memset(input_indices_ptr, 0, input_indices.nSize);
                 for(unsigned int i=0; i< position_ids.size(); i++){
-                    for(unsigned int j=0; j<_attr.prefill_token_num; j++){
 
+                    for(unsigned int j=_attr.precompute_len + p * _attr.prefill_token_num; j<_attr.precompute_len + (p + 1) * _attr.prefill_token_num; j++){
                         if(j<position_ids[i].size()){
                             input_indices_ptr[ i*_attr.prefill_token_num+j ] = position_ids[i][j];
                             if(position_ids[i][j]>max_pos_id){
                                 max_pos_id = position_ids[i][j];
-                            }
-                        // }else{
-                        //     input_indices_ptr[i*_attr.prefill_token_num+j] = 0;   
+                            }  
                         }
                     }
-                }                
+                }    
                 axcl_Memcpy((void *)input_indices.phyAddr, input_indices_ptr, input_indices.nSize, AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
 
                 // set mask

@@ -17,6 +17,7 @@ struct ImageInfo
     int imgsz = 448;
     int num_img = 1;
     bool img_prompt = false;
+    int img_token_num = -1;
 };
 
 class BaseTokenizer
