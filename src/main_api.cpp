@@ -494,6 +494,7 @@ void handle_upload(const httplib::Request &req, httplib::Response &res)
     std::ofstream ofs(abs_path, std::ios::binary);
     if (!ofs)
     {
+        ALOGE("Failed to save file %s\n", abs_path.string().c_str());
         res.status = 500;
         res.set_content("{\"error\": \"Failed to save file\"}", "application/json");
         return;

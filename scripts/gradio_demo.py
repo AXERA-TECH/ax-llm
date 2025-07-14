@@ -4,11 +4,13 @@ import gradio as gr
 import requests
 import json, time
 
-def upload_image(image):
-    if image is None:
+base_url = "http://0.0.0.0:8000"
+
+def upload_image(file_path):
+    if file_path is None:
         return None
     # Gradio File component returns a tempfile-like object
-    file_path = image.name
+    # file_path = image.name
     filename = os.path.basename(file_path)
     # Guess MIME type
     mime_type, _ = mimetypes.guess_type(filename)
@@ -22,20 +24,26 @@ def upload_image(image):
     }
     # Send to upload endpoint
     resp = requests.post(
-        'http://localhost:8000/api/upload',
+        f'{base_url}/api/upload',
         files=files
     )
     resp.raise_for_status()
     data = resp.json()
     return data.get('file_path')
 
+def get_local_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("8.8.8.8", 80))
+    return s.getsockname()[0]
+
 def stop_generation():
     try:
-        requests.get("http://localhost:8000/api/stop")
+        requests.get(f'{base_url}/api/stop')
     except:
         pass
 
-def respond(prompt, image:gr.File, temp, rep_penalty, tp, tk, history=None):
+def respond(prompt, image:gr.Image, temp, rep_penalty, tp, tk, history=None):
     if history is None:
         history = []
     if not prompt.strip():
@@ -68,7 +76,7 @@ def respond(prompt, image:gr.File, temp, rep_penalty, tp, tk, history=None):
         payload["file_path"] = file_path
 
     response = requests.post(
-        "http://localhost:8000/api/generate",
+        f'{base_url}/api/generate',
         json=payload
     )
     response.raise_for_status()
@@ -77,7 +85,7 @@ def respond(prompt, image:gr.File, temp, rep_penalty, tp, tk, history=None):
     while True:
         time.sleep(0.01)
         response = requests.get(
-                "http://localhost:8000/api/generate_provider"
+                f'{base_url}/api/generate_provider'
             )
         data = response.json()
         chunk:str = data.get("response", "") 
@@ -98,10 +106,10 @@ def chat_interface():
     with gr.Blocks(theme=gr.themes.Soft(font="Consolas"), fill_width=True) as demo:
         gr.Markdown("## Chat with LLM\nUpload an image and chat with the model!")
         with gr.Row():
+            image = gr.Image(label="Upload Image", type="filepath")
             with gr.Column(scale=3):
-                chatbot = gr.Chatbot()
+                chatbot = gr.Chatbot(height=600)
                 prompt = gr.Textbox(placeholder="Type your message...", label="Prompt", value="描述一下这张图片")
-                image = gr.File(label="Upload Image", file_types=[".png", ".jpg", ".jpeg"])
                 with gr.Row():
                     btn_chat = gr.Button("Chat", variant="primary")
                     btn_stop = gr.Button("Stop", variant="stop")
@@ -118,8 +126,8 @@ def chat_interface():
                 inputs=[prompt, image, temperature, repetition_penalty, top_p, top_k, chatbot],
                 outputs=chatbot
             )
-
-        demo.launch(server_name="0.0.0.0", server_port=7860, allowed_paths=["../build/uploads/","./"])
+        print("http://"+get_local_ip()+":7860")
+        demo.launch(server_name="0.0.0.0", server_port=7860)
 
 if __name__ == "__main__":
     chat_interface()
