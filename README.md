@@ -12,42 +12,51 @@
 
 ### 已支持芯片
 
-- AX650A/AX650N
-  - SDK ≥ v1.45.0_P31
-- AX630C
-  - SDK ≥ v2.0.0_P7
+- AX650N/AX8850
+  - SDK ≥ v3.0.0
 
 ### 已支持模型
 
-- InternVL-2.5/3
+- InternVL2.5
+- InternVL3
 
 ### 获取地址
 
-- [百度网盘](https://pan.baidu.com/s/1_LG-sPKnLS_LTWF3Cmcr7A?pwd=ph0e)
-- [Google Drive](https://drive.google.com/drive/folders/1i8xdD2PWDlueouds6F1dhMc72n3v_aER?usp=sharing)
+预编译模型、执行脚本请参考
+
+- [Huggingface](https://huggingface.co/AXERA-TECH)
+  - [InternVL3-1B](https://huggingface.co/AXERA-TECH/InternVL3-1B)  
+  - [InternVL3-2B](https://huggingface.co/AXERA-TECH/InternVL3-2B)
 
 ## 源码编译
 
 - 在 Host 上下载 axcl llm 对应分支
     ```shell
-    git clone -b axcl-llm https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b axcl-internvl https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - 本地编译
     ```shell
     mkdir build
-    cd build
-    cmake ..
+    cd build && cmake ..
     make install -j4
     ```
-- 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
+- 正确编译后，`build/install/bin` 目录
+
   ```
-  $ tree install/bin/
-    install/bin/
-    ├── main
-    ├── run_bf16.sh
-    └── run_qwen_1.8B.sh
+  (base) axera@dell:~/samples/ax-llm-axcl-internvl/build$ tree install/bin/
+  install/bin/
+  ├── gradio_demo.py
+  ├── internvl2.5_mpo_8b_tokenizer.py
+  ├── internvl2.5_tokenizer_448.py
+  ├── internvl3_tokenizer.py
+  ├── main
+  ├── main_api
+  ├── run_qwen2.5_14B_int8_pcie_dev.sh
+  └── run_qwen2.5_14B_pcie_dev.sh
+  1 directory, 8 files
   ```
+  其中 `main` 就是在最终在 axcl 环境下的执行程序 `main_axcl_x86`, 我只是进行了重命名而已，类似如果是 aarch64 的 Host 平台，则是 `main_axcl_aarch64`
   
 ## 运行示例
 
