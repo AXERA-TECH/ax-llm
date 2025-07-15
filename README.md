@@ -30,14 +30,12 @@ comming soon
     git clone  https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
-- clone `ax650n_bsp_sdk` 代码  
-    ```shell
-    git cloen https://github.com/AXERA-TECH/ax650n_bsp_sdk
-    ```
-- 仔细阅读 `build.sh` ，并在 `build.sh` 正确修改 `BSP_MSP_DIR` 变量后(该变量表示`ax650n_bsp_sdk`代码位置)，运行编译脚本  
-    ```shell
-    ./build.sh
-    ```
+- 编译  
+  ```
+  mkdir build 
+  cd build && cmake ..
+  make install -j4
+  ```
 - 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
   ```
   $ tree install/bin/
