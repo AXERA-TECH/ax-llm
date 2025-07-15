@@ -709,10 +709,9 @@ public:
                 unsigned int *input_indices_ptr = (unsigned int *)input_indices.pVirAddr;
                 memset(input_indices_ptr, 0, input_indices.nSize);
                 for(unsigned int i=0; i< position_ids.size(); i++){
-
-                    for(unsigned int j=_attr.precompute_len + p * _attr.prefill_token_num; j<_attr.precompute_len + (p + 1) * _attr.prefill_token_num; j++){
+                    for(unsigned int j=_attr.precompute_len + p * _attr.prefill_token_num, jj=0; j<_attr.precompute_len + (p + 1) * _attr.prefill_token_num; j++,jj++){
                         if(j<position_ids[i].size()){
-                            input_indices_ptr[ i*_attr.prefill_token_num+j ] = position_ids[i][j];
+                            input_indices_ptr[ i*_attr.prefill_token_num+jj ] = position_ids[i][j];
                             if(position_ids[i][j]>max_pos_id){
                                 max_pos_id = position_ids[i][j];
                             }  
