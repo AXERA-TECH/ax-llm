@@ -629,17 +629,7 @@ public:
             return "";
         }
 
-        for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
-        {
-            if (input_embed_num <= _attr.prefill_max_kv_cache_num_grp[i])
-            {
-                _attr.prefill_grpid = i + 1;
-                break;
-            }
-        }
-        ALOGI("prefill grpid %d", _attr.prefill_grpid);
-        int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_grpid - 1];
-
+        int kv_cache_num;
         mask[_attr.kv_cache_num] = 0;
         for (size_t i = 0; i < input_embed_num; i++)
         {
@@ -656,7 +646,8 @@ public:
             {
                 break;
             }
-
+            _attr.prefill_grpid = p + 1;
+            kv_cache_num = p * _attr.prefill_token_num;
             std::vector<unsigned short> mask_tmp;
             mask_tmp.resize(1 * _attr.prefill_token_num * (kv_cache_num + _attr.prefill_token_num), bf16.data);
             int input_num_token = _attr.prefill_token_num;
@@ -733,9 +724,6 @@ public:
                 auto &input_decoder_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
                 auto &input_decoder_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
 
-                auto &input_prefill_k_cache = layer.layer.get_input(_attr.prefill_grpid, "K_cache");
-                auto &input_prefill_v_cache = layer.layer.get_input(_attr.prefill_grpid, "V_cache");
-
                 auto &output_k_cache = layer.layer.get_output(_attr.prefill_grpid, "K_cache_out");
                 auto &output_v_cache = layer.layer.get_output(_attr.prefill_grpid, "V_cache_out");
 
@@ -751,15 +739,22 @@ public:
                             sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
                             AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
 
-                axcl_Memcpy((unsigned short *)input_prefill_k_cache.phyAddr + kv_offset,
-                            (void *)output_k_cache.phyAddr,
-                            sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
-                            AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
-
-                axcl_Memcpy((unsigned short *)input_prefill_v_cache.phyAddr + kv_offset,
-                            (void *)output_v_cache.phyAddr,
-                            sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
-                            AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
+                for(int gid=_attr.prefill_grpid+1; gid<prefill_split_num+1; gid++){
+                    auto &input_prefill_k_cache = layer.layer.get_input(gid, "K_cache");
+                    axcl_Memcpy((unsigned short *)input_prefill_k_cache.phyAddr + kv_offset,
+                                (void *)output_k_cache.phyAddr,
+                                sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
+                                AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
+                }
+                
+                for(int gid=_attr.prefill_grpid+1; gid<prefill_split_num+1; gid++){
+                    auto &input_prefill_v_cache = layer.layer.get_input(gid, "V_cache");
+                    axcl_Memcpy((unsigned short *)input_prefill_v_cache.phyAddr + kv_offset,
+                                (void *)output_v_cache.phyAddr,
+                                sizeof(unsigned short) * input_num_token * _attr.kv_cache_size,
+                                AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid());
+                }
+                
 
                 auto &output = layer.layer.get_output(_attr.prefill_grpid, "output");
                 axcl_Memcpy(embed_tmp.data(), (void *)output.phyAddr, embed_tmp.size() * sizeof(unsigned short), AXCL_MEMCPY_DEVICE_TO_HOST, layer.layer.get_devid());
