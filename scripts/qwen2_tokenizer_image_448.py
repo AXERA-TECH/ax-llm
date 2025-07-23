@@ -79,8 +79,8 @@ class Tokenizer_Http():
 
     def encode(self, content):
         text = [f'<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n']
-        input_ids = self.tokenizer.encode(prompt)
-        return input_ids
+        input_ids = self.tokenizer(text)
+        return input_ids["input_ids"][0]
 
     def encode_vpm(self, content="Describe this image."):
 
