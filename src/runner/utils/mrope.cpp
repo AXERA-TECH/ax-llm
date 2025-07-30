@@ -130,21 +130,21 @@ std::vector<std::vector<int>> get_rope_index(
         }
         
         int image_nums = 0, video_nums = 0;
-        // for(size_t i=vision_start_idx+1; i<ids.size(); ++i){
-        //     if(filtered_ids[i]==config.image_token_id){
-        //         image_nums++;
-        //     }
-        //     if(filtered_ids[i]==config.video_token_id){
-        //         video_nums++;
-        //     }
-        // }
+        for(size_t i=vision_start_idx+1; i<ids.size(); ++i){
+            if(filtered_ids[i]==config.image_token_id){
+                image_nums++;
+            }
+            if(filtered_ids[i]==config.video_token_id){
+                video_nums++;
+            }
+        }
 
-        if(filtered_ids[vision_start_idx+1]==config.image_token_id){
-            image_nums =1;
-        }
-        if(filtered_ids[vision_start_idx+1]==config.video_token_id){
-            video_nums =1;
-        }
+        // if(filtered_ids[vision_start_idx+1]==config.image_token_id){
+        //     image_nums =1;
+        // }
+        // if(filtered_ids[vision_start_idx+1]==config.video_token_id){
+        //     video_nums =1;
+        // }
 
         int image_index = 0, video_index = 0;
         int ed_image = 0, ed_video = 0 ;

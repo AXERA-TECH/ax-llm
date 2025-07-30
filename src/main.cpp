@@ -76,7 +76,7 @@ int main(int argc, char *argv[])
 #endif
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
-
+    cmd.add<bool>("video", 0, "inputs are video", false);
     cmd.add<int>("img_width", 'w', "image width", true);
     cmd.add<int>("img_height", 'h', "image height", true);
     cmd.add<int>("img_token_id", 0, "image token id", false, 151655); 
@@ -175,6 +175,8 @@ int main(int argc, char *argv[])
     config.image_token_id =  cmd.get<int>("img_token_id");
     config.video_token_id = cmd.get<int>("video_token_id");
     config.vision_start_token_id = cmd.get<int>("vision_start_token_id");
+
+    bool b_video = cmd.get<bool>("video");
     //
     if (b_continue)
     {
@@ -218,7 +220,7 @@ int main(int argc, char *argv[])
             }
             else
             {
-                lLaMa.Encode(src, img_embed, config);
+                lLaMa.Encode(src, b_video, img_embed, config);
                 lLaMa.Encode(img_embed, prompt_data, position_ids, config, prompt_complete(prompt, attr.tokenizer_type));
                 output = lLaMa.Run(prompt_data, position_ids);
             }

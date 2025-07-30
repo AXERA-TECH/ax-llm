@@ -486,7 +486,7 @@ public:
         b_stop = true;
     }
 
-    int Encode(std::vector<cv::Mat>& src, std::vector<unsigned short> &out_embed, Config & cfg)
+    int Encode(std::vector<cv::Mat>& src, bool b_video, std::vector<std::vector<unsigned short>> &out_embed, Config & cfg)
     {
         int temporal_patch_size=cfg.vision_config.temporal_patch_size;
         int merge_size=cfg.vision_config.spatial_merge_size;
@@ -508,30 +508,32 @@ public:
 
         int channel = src[0].channels();
         int hwc = grid_h * grid_w * temporal_patch_size * patch_size * patch_size * channel;
-
-        if(src.size()==1){
-            int grid_t = 1;
-            cfg.image_grid_thw = {{grid_t, grid_h, grid_w}};
+        ALOGI("pixel_values size:",pixel_values.size());
+        if(!b_video){
+            cfg.image_grid_thw = {{pixel_values.size(), grid_h, grid_w}};
         }else{
             cfg.video_grid_thw = {{pixel_values.size(), grid_h, grid_w}};
         }
         
         int cnt = 0;
-        for(auto &pixel : pixel_values){
+        if(out_embed.empty()){
+            out_embed.resize(pixel_values.size());
+        }
+        for(int i=0; i<pixel_values.size(); i++){
 
             void *data = image_encoder.get_input(0).pVirAddr;
-            memcpy(data, pixel.data(), hwc);
+            memcpy(data, pixel_values[i].data(), hwc);
             image_encoder.inference();
 
             size_t size = image_encoder.get_output(0).nSize / sizeof(float);
-            if(out_embed.empty()){
-                out_embed.resize( size * pixel_values.size() );
+            if(out_embed[i].empty()){
+                out_embed[i].resize( size  );
             }
 
             float *output_data = (float *)image_encoder.get_output(0).pVirAddr;
-            for (size_t i = 0; i < size; i++)
+            for (size_t j = 0; j < size; j++)
             {
-                out_embed[cnt++] = bfloat16(output_data[i]).data;
+                out_embed[i][j] = bfloat16(output_data[j]).data;
             }
 
         }
@@ -571,21 +573,22 @@ public:
         return 0;
     }
 
-    int Encode(std::vector<unsigned short> &img_embed, std::vector<unsigned short> &out_embed, std::vector<std::vector<int>> &position_ids, Config &cfg, std::string prompt = "What is in the image?")
+    int Encode(std::vector<std::vector<unsigned short>> &img_embed, std::vector<unsigned short> &out_embed, std::vector<std::vector<int>> &position_ids, Config &cfg, std::string prompt = "What is in the image?")
     {
         ImageInfo img_info;
         img_info.img_prompt = true;
-        img_info.img_token_num = img_embed.size()/_attr.tokens_embed_size;
+        img_info.img_token_num = img_embed[0].size()/_attr.tokens_embed_size;
+        img_info.num_img = img_emged.size();
         std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
 
-        int offset = -1;
+        std::vector<int> offsets(img_embed.size(), -1);
         int vision_start_token_id = cfg.vision_start_token_id;
         for (size_t i = 0; i < input_ids.size()-1; i++)
         {
             if (input_ids[i] == vision_start_token_id)
             {
-                offset = i+1;
-                break;
+                int offset = i+1;
+                offsets.push_back(offset);
             }
         }
 
@@ -600,7 +603,12 @@ public:
         {
             embed_selector.getByIndex(input_ids[i], out_embed.data() + i * _attr.tokens_embed_size);
         }
-        memcpy(out_embed.data() + offset * _attr.tokens_embed_size, img_embed.data(), img_embed.size() * sizeof(unsigned short));
+
+        for(int i=0; i<img_embed.size();i++)
+        {
+            memcpy(out_embed.data() + offsets[i] * _attr.tokens_embed_size, img_embed[i].data(), img_embed[i].size() * sizeof(unsigned short));
+        }
+        
 
         GetPositionIds(input_ids, position_ids, cfg);
 

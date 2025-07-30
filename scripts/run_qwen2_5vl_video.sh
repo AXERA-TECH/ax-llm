@@ -11,6 +11,7 @@ AXMODEL_DIR=../Qwen2.5-VL-3B-Instruct-AX650-chunk_prefill_512
 --tokens_embed_num 151936 \
 --tokens_embed_size 2048 \
 --live_print 1 \
+--video 1 \
 --img_width 308 \
 --img_height 308 \
 --vision_start_token_id 151652 \
