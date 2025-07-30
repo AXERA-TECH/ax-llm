@@ -502,19 +502,27 @@ public:
 
         int w=cfg.vision_config.width, h=cfg.vision_config.height;
         
-        Qwen2VideoProcessor(  src, pixel_values,
-                        h, w,
-                        temporal_patch_size, merge_size, patch_size);
+        
 
         int channel = src[0].channels();
         int hwc = grid_h * grid_w * temporal_patch_size * patch_size * patch_size * channel;
-        ALOGI("pixel_values size:",pixel_values.size());
+        
         if(!b_video){
+            for(int i=0; i<src.size();i++){
+                std::vector<std::vector<unsigned char>> img_values;
+                Qwen2VideoProcessor(  src, img_values,
+                        h, w,
+                        temporal_patch_size, merge_size, patch_size);
+                pixel_values.push_back(img_values[0]);
+            }
             cfg.image_grid_thw = {{pixel_values.size(), grid_h, grid_w}};
         }else{
+            Qwen2VideoProcessor(  src, pixel_values,
+                        h, w,
+                        temporal_patch_size, merge_size, patch_size);
             cfg.video_grid_thw = {{pixel_values.size(), grid_h, grid_w}};
         }
-        
+        ALOGI("pixel_values size: %d",pixel_values.size());
         int cnt = 0;
         if(out_embed.empty()){
             out_embed.resize(pixel_values.size());
@@ -578,16 +586,17 @@ public:
         ImageInfo img_info;
         img_info.img_prompt = true;
         img_info.img_token_num = img_embed[0].size()/_attr.tokens_embed_size;
-        img_info.num_img = img_emged.size();
+        img_info.num_img = img_embed.size();
         std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
-
-        std::vector<int> offsets(img_embed.size(), -1);
+        ALOGI("input_ids size:%d",input_ids.size());
+        std::vector<int> offsets;
         int vision_start_token_id = cfg.vision_start_token_id;
         for (size_t i = 0; i < input_ids.size()-1; i++)
         {
             if (input_ids[i] == vision_start_token_id)
             {
                 int offset = i+1;
+                ALOGI("offset %d",offset);
                 offsets.push_back(offset);
             }
         }
@@ -609,9 +618,9 @@ public:
             memcpy(out_embed.data() + offsets[i] * _attr.tokens_embed_size, img_embed[i].data(), img_embed[i].size() * sizeof(unsigned short));
         }
         
-
+        ALOGI("out_embed size:%d", out_embed.size());
         GetPositionIds(input_ids, position_ids, cfg);
-
+        ALOGI("position_ids size:%d", position_ids[0].size());
         return 0;
     }
 

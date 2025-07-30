@@ -109,6 +109,7 @@ public:
         j["img_prompt"] = img_info.img_prompt;
         j["imgsz"] = img_info.imgsz;
         j["num_img"] = img_info.num_img;
+        j["img_token_num"] = img_info.img_token_num;
         auto ret = cli->Post("/encode", j.dump(), "application/json");
         auto rep = ret.value();
         if (rep.status != 200)

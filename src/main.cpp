@@ -160,7 +160,7 @@ int main(int argc, char *argv[])
     }
 
     std::vector<unsigned short> prompt_data;
-    std::vector<unsigned short> img_embed;
+    std::vector<std::vector<unsigned short>> img_embed;
     std::vector<std::vector<int>> position_ids;
 
     Config config;    
