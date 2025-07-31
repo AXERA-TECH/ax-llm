@@ -510,19 +510,22 @@ public:
         if(!b_video){
             for(int i=0; i<src.size();i++){
                 std::vector<std::vector<unsigned char>> img_values;
-                Qwen2VideoProcessor(  src, img_values,
+                std::vector<cv::Mat> si{src[i]};
+                Qwen2VideoProcessor(  si, img_values,
                         h, w,
                         temporal_patch_size, merge_size, patch_size);
                 pixel_values.push_back(img_values[0]);
             }
-            cfg.image_grid_thw = {{pixel_values.size(), grid_h, grid_w}};
+            for(int i=0; i<pixel_values.size(); i++){
+                cfg.image_grid_thw.push_back({1, grid_h, grid_w});
+            }
         }else{
             Qwen2VideoProcessor(  src, pixel_values,
                         h, w,
                         temporal_patch_size, merge_size, patch_size);
             cfg.video_grid_thw = {{pixel_values.size(), grid_h, grid_w}};
         }
-        ALOGI("pixel_values size: %d",pixel_values.size());
+
         int cnt = 0;
         if(out_embed.empty()){
             out_embed.resize(pixel_values.size());
