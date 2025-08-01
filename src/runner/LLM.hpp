@@ -520,6 +520,7 @@ public:
                 cfg.image_grid_thw.push_back({1, grid_h, grid_w});
             }
         }else{
+            // 只支持一个视频
             Qwen2VideoProcessor(  src, pixel_values,
                         h, w,
                         temporal_patch_size, merge_size, patch_size);
@@ -614,6 +615,14 @@ public:
         for (size_t i = 0; i < input_ids.size(); i++)
         {
             embed_selector.getByIndex(input_ids[i], out_embed.data() + i * _attr.tokens_embed_size);
+        }
+        ALOGI("img_embed.size:%d, %d",img_embed.size(), img_embed[0].size());
+
+        if(offsets.size()==1 && img_embed.size()>1){
+            for(int i=1; i<img_embed.size();i++){
+                offsets.push_back(offsets[i-1]+img_embed[i-1].size()/_attr.tokens_embed_size);
+                ALOGI("offset:%d",offsets[i-1]+img_embed[i-1].size()/_attr.tokens_embed_size);
+            }
         }
 
         for(int i=0; i<img_embed.size();i++)
