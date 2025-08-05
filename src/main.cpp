@@ -31,25 +31,11 @@ std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
     std::ostringstream oss_prompt;
     switch (tokenizer_type)
     {
-    case TKT_LLaMa:
-        oss_prompt << "<|user|>\n"
-                   << prompt << "</s><|assistant|>\n";
-        break;
-    case TKT_MINICPM:
-        oss_prompt << "<用户><image></image>\n";
-        oss_prompt << prompt << "<AI>";
-        break;
-    case TKT_Phi3:
-        oss_prompt << prompt << " ";
-        break;
-    case TKT_Qwen:
-        oss_prompt << "<|im_start|>system\nYou are a helpful assistant.<|im_end|>";
-        oss_prompt << "\n<|im_start|>user\n"
-                   << prompt << "<|im_end|>\n<|im_start|>assistant\n";
-        break;
     case TKT_HTTP:
-    default:
         oss_prompt << prompt;
+        break;
+    default:
+        ALOGE("tokenizer type %d not support", tokenizer_type);
         break;
     }
 
@@ -61,20 +47,17 @@ int main(int argc, char *argv[])
     signal(SIGINT, __sigExit);
     LLMAttrType attr;
     std::string prompt = "Hi";
-    bool b_continue = false;
+    bool b_continue = true;
 
     cmdline::parser cmd;
-    cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
-    cmd.add<std::string>("image", 'i', "image", true);
+    // cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
+    // cmd.add<std::string>("image", 'i', "single image file or .txt file for images list", true);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
-    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3 4:MINICPM", false, attr.tokenizer_type);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
-    cmd.add<std::string>("filename_vpm_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_vpm_encoder_axmodedl);
-    cmd.add<std::string>("filename_vpm_resampler_axmodedl", 0, "vpm resampler axmodel path", true, attr.filename_vpm_resampler_axmodedl);
-    cmd.add<bool>("vpm_two_stage", 0, "", false, attr.b_vpm_two_stage);
+    cmd.add<std::string>("filename_image_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodedl);
 
     cmd.add<bool>("bos", 0, "", false, attr.b_bos);
     cmd.add<bool>("eos", 0, "", false, attr.b_eos);
@@ -88,7 +71,7 @@ int main(int argc, char *argv[])
     cmd.add<bool>("dynamic_load_axmodel_layer", 0, "it can save cmm memory", false, attr.b_dynamic_load_axmodel_layer);
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
-
+	cmd.add<bool>("video", 0, "inputs are video", false);
     cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
     cmd.add<int>("img_width", 'w', "image width", true);
     cmd.add<int>("img_height", 'h', "image height", true);
@@ -106,9 +89,9 @@ int main(int argc, char *argv[])
 
     cmd.parse_check(argc, argv);
 
-    prompt = cmd.get<std::string>("prompt");
-    auto image_prompt = cmd.get<std::string>("image");
-    attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
+    // prompt = cmd.get<std::string>("prompt");
+    // auto image_prompt = cmd.get<std::string>("image");
+    // attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
     attr.filename_tokenizer_model = cmd.get<std::string>("filename_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
@@ -116,9 +99,7 @@ int main(int argc, char *argv[])
     // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
     // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
 
-    attr.filename_vpm_encoder_axmodedl = cmd.get<std::string>("filename_vpm_encoder_axmodedl");
-    attr.filename_vpm_resampler_axmodedl = cmd.get<std::string>("filename_vpm_resampler_axmodedl");
-    attr.b_vpm_two_stage = cmd.get<bool>("vpm_two_stage");
+    attr.filename_image_encoder_axmodedl = cmd.get<std::string>("filename_image_encoder_axmodedl");
     attr.b_bos = cmd.get<bool>("bos");
     attr.b_eos = cmd.get<bool>("eos");
     attr.b_use_topk = cmd.get<bool>("use_topk");
@@ -145,7 +126,7 @@ int main(int argc, char *argv[])
     }
 
     std::vector<unsigned short> prompt_data;
-    std::vector<unsigned short> img_embed;
+    std::vector<std::vector<unsigned short>> img_embed;
     std::vector<std::vector<int>> position_ids;
 
     Config config;    
@@ -161,25 +142,7 @@ int main(int argc, char *argv[])
     config.video_token_id = cmd.get<int>("video_token_id");
     config.vision_start_token_id = cmd.get<int>("vision_start_token_id");
 
-    if (prompt != "")
-    {
-        std::string output;
-        auto src =  ReadImages(image_prompt);
-        if (src.empty())
-        {
-            // output = lLaMa.Run(prompt);
-            ALOGE("image_prompt can't be empty");
-        }
-        else
-        {
-            lLaMa.Encode(src, img_embed, config);
-            lLaMa.Encode(img_embed, prompt_data, position_ids, config, prompt_complete(prompt, attr.tokenizer_type));
-            output = lLaMa.Run(prompt_data, position_ids);
-        }
-
-        if (!b_live_print && !output.empty())
-            printf("%s\n", output.c_str());
-    }
+	bool b_video = cmd.get<bool>("video");
 
     //
     if (b_continue)
@@ -204,6 +167,7 @@ int main(int argc, char *argv[])
 
         printf("image >> ");
         fflush(stdout);
+        std::string image_prompt;
         std::getline(std::cin, image_prompt);
         std::string output;
         if (image_prompt == "")
@@ -224,7 +188,7 @@ int main(int argc, char *argv[])
             }
             else
             {
-                lLaMa.Encode(src, img_embed, config);
+                lLaMa.Encode(src, b_video, img_embed, config);
                 lLaMa.Encode(img_embed, prompt_data, position_ids, config, prompt_complete(prompt, attr.tokenizer_type));
                 output = lLaMa.Run(prompt_data, position_ids);
             }

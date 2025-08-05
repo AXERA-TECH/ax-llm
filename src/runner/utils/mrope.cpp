@@ -118,32 +118,19 @@ std::vector<std::vector<int>> get_rope_index(
         for (size_t i = 0; i < ids.size(); ++i) {
             if (mask[i]) filtered_ids.push_back(ids[i]);
         }
-
-        // 查找vision_start位置
-        // std::vector<int> vision_start_indices;
-        int vision_start_idx=-2;
-        for (size_t i = 0; i < filtered_ids.size(); ++i) {
-            if (filtered_ids[i] == vision_start_token_id) {
-                vision_start_idx = i;
-                break;
-            }
-        }
+    
         
         int image_nums = 0, video_nums = 0;
-        // for(size_t i=vision_start_idx+1; i<ids.size(); ++i){
-        //     if(filtered_ids[i]==config.image_token_id){
-        //         image_nums++;
-        //     }
-        //     if(filtered_ids[i]==config.video_token_id){
-        //         video_nums++;
-        //     }
-        // }
 
-        if(filtered_ids[vision_start_idx+1]==config.image_token_id){
-            image_nums =1;
-        }
-        if(filtered_ids[vision_start_idx+1]==config.video_token_id){
-            video_nums =1;
+        for (size_t i = 0; i < filtered_ids.size()-1; ++i){
+            if (filtered_ids[i] == vision_start_token_id) {
+                if(filtered_ids[i+1]==config.image_token_id){
+                    image_nums++;
+                }
+                if(filtered_ids[i+1]==config.video_token_id){
+                    video_nums++;
+                }
+            }
         }
 
         int image_index = 0, video_index = 0;
@@ -158,7 +145,7 @@ std::vector<std::vector<int>> get_rope_index(
         for(size_t i_=0; i_<image_nums+video_nums; ++i_){
             
             if(remain_images>0){
-                for(size_t j=0; j<filtered_ids.size(); ++j){
+                for(size_t j=st; j<filtered_ids.size(); ++j){
                     if(filtered_ids[j]==config.image_token_id){
                         ed_image = j;
                         break;
@@ -170,7 +157,7 @@ std::vector<std::vector<int>> get_rope_index(
             }
 
             if(remain_videos>0){
-                for(size_t j=0; j<filtered_ids.size(); ++j){
+                for(size_t j=st; j<filtered_ids.size(); ++j){
                     if(filtered_ids[j]==config.video_token_id){
                         ed_video = j;
                         break;

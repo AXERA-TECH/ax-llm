@@ -1,6 +1,7 @@
 #include "Tokenizer.hpp"
 
 #include "httplib.h"
+#include "http_utils.hpp"
 #include "json.hpp"
 
 #include "sample_log.h"
@@ -15,6 +16,7 @@ class Tokenizer_Http : public BaseTokenizer
     std::string base_url;
 
     int bos_id, eos_id;
+    int img_start_token, img_context_token;
 
 private:
     /* data */
@@ -22,6 +24,16 @@ public:
     bool Init(std::string model_path = "http://localhost:8080", bool b_bos = true, bool b_eos = false) override
     {
         base_url = model_path;
+        if (!test_connect_http(base_url, 10))
+        {
+            ALOGE("connect %s failed", base_url.c_str());
+            return false;
+        }
+        else
+        {
+            ALOGI("connect %s ok", base_url.c_str());
+        }
+
         try
         {
             cli = std::make_shared<httplib::Client>(base_url);
@@ -52,6 +64,32 @@ public:
                 eos_id = j["eos_id"];
             }
             printf("bos_id: %d, eos_id: %d\n", bos_id, eos_id);
+
+            {
+                auto ret = cli->Get("/img_start_token");
+                auto rep = ret.value();
+                if (rep.status != 200)
+                {
+                    ALOGE("get img_start_token failed, status: %d", rep.status);
+                    return false;
+                }
+                nlohmann::json j = nlohmann::json::parse(rep.body);
+                img_start_token = j["img_start_token"];
+            }
+            printf("img_start_token: %d\n", img_start_token);
+
+            {
+                auto ret = cli->Get("/img_context_token");
+                auto rep = ret.value();
+                if (rep.status != 200)
+                {
+                    ALOGE("get img_context_token failed, status: %d", rep.status);
+                    return false;
+                }
+                nlohmann::json j = nlohmann::json::parse(rep.body);
+                img_context_token = j["img_context_token"];
+            }
+            printf("img_context_token: %d\n", img_context_token);
         }
         catch (const std::exception &e)
         {
@@ -64,11 +102,14 @@ public:
         return true;
     }
 
-    bool Encode(std::string input, std::vector<int> &output, bool b_img_prompt = false) override
+    bool Encode(std::string input, std::vector<int> &output, ImageInfo img_info) override
     {
         nlohmann::json j;
         j["text"] = input;
-        j["img_prompt"] = b_img_prompt;
+        j["img_prompt"] = img_info.img_prompt;
+        j["imgsz"] = img_info.imgsz;
+        j["num_img"] = img_info.num_img;
+        j["img_token_num"] = img_info.img_token_num;
         auto ret = cli->Post("/encode", j.dump(), "application/json");
         auto rep = ret.value();
         if (rep.status != 200)
@@ -103,10 +144,10 @@ public:
         return true;
     }
 
-    std::vector<int> Encode(std::string input, bool b_img_prompt = false) override
+    std::vector<int> Encode(std::string input, ImageInfo img_info) override
     {
         std::vector<int> output;
-        Encode(input, output, b_img_prompt);
+        Encode(input, output, img_info);
         return output;
     }
 
@@ -153,23 +194,26 @@ public:
     {
         return eos_id;
     }
+
+    int GetImgStartID() override
+    {
+        return img_start_token;
+    }
+
+    int GetImgContextID() override
+    {
+        return img_context_token;
+    }
 };
 
 std::shared_ptr<BaseTokenizer> CreateTokenizer(TokenizerType type)
 {
     switch (type)
     {
-    case TKT_LLaMa:
-        return nullptr;
-    case TKT_MINICPM:
-        return nullptr;
     case TKT_HTTP:
         return std::make_shared<Tokenizer_Http>();
-    case TKT_Qwen:
-        return nullptr;
-    case TKT_Phi3:
-        return nullptr;
     default:
+        ALOGE("unknown tokenizer type: %d", type);
         return nullptr;
     }
 }
