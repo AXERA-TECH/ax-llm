@@ -35,7 +35,7 @@ struct LLMAttrType
     // int vpm_width = 280;
     // int vpm_height = 280;
 
-    TokenizerType tokenizer_type = TKT_LLaMa;
+    TokenizerType tokenizer_type = TKT_HTTP;
     std::string url_tokenizer_model = "http://127.0.0.1:12345";
     bool b_bos = true, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
