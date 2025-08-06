@@ -358,20 +358,20 @@ int ax_runner_ax650::sub_init()
 int ax_runner_ax650::init(const char *model_file, int devid)
 {
     this->dev_id = devid;
-    char *model_buffer;
+    std::vector<char> model_buffer;
     size_t len;
-    if (!read_file(model_file, &model_buffer, &len))
+    if (!read_file(model_file, model_buffer))
     {
         ALOGE("read_file");
         return -1;
     }
-    auto ret = init(model_buffer, len);
-    delete[] model_buffer;
+    auto ret = init(model_buffer.data(), model_buffer.size(), devid);
     return ret;
 }
 
-int ax_runner_ax650::init(char *model_buffer, size_t model_size)
+int ax_runner_ax650::init(char *model_buffer, size_t model_size, int devid)
 {
+    this->dev_id = devid;
     if (!m_handle)
     {
         m_handle = new ax_joint_runner_ax650_handle_t;
@@ -517,8 +517,11 @@ int ax_runner_ax650::inference()
 int ax_runner_ax650::inference(int grpid)
 {
     if (_auto_sync_before_inference)
+    {
+        ALOGI("sync before inference");
         for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
             axcl_Memcpy((void *)mgroup_input_tensors[grpid][i].phyAddr, mgroup_input_tensors[grpid][i].pVirAddr, mgroup_input_tensors[grpid][i].nSize, AXCL_MEMCPY_HOST_TO_DEVICE, dev_id);
+    }
 
     auto ret = axcl_EngineExecute(m_handle->handle, m_handle->context, grpid, m_handle->ios[grpid], dev_id);
     if (ret != 0)
@@ -528,8 +531,11 @@ int ax_runner_ax650::inference(int grpid)
     }
 
     if (_auto_sync_after_inference)
+    {
+        ALOGI("sync after inference");
         for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
             axcl_Memcpy(mgroup_output_tensors[grpid][i].pVirAddr, (void *)mgroup_output_tensors[grpid][i].phyAddr, mgroup_output_tensors[grpid][i].nSize, AXCL_MEMCPY_DEVICE_TO_HOST, dev_id);
+    }
 
     return 0;
 }

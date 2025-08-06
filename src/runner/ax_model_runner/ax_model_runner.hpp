@@ -4,6 +4,7 @@
 #include <map>
 #include <utility>
 #include <stdexcept>
+#include <sample_log.h>
 
 typedef enum _color_space_e
 {
@@ -60,7 +61,7 @@ public:
 
 public:
     virtual int init(const char *model_file, int devid) = 0;
-    virtual int init(char *model_buffer, size_t model_size) = 0;
+    virtual int init(char *model_buffer, size_t model_size, int devid) = 0;
 
     virtual void deinit() = 0;
 
@@ -69,8 +70,7 @@ public:
     int get_num_inputs() { return minput_tensors.size(); };
     int get_num_outputs() { return moutput_tensors.size(); };
 
-    int get_num_input_groups() { return mgroup_input_tensors.size(); };
-    int get_num_output_groups() { return mgroup_output_tensors.size(); };
+    int get_num_groups() { return mgroup_input_tensors.size(); };
 
     const ax_runner_tensor_t &get_input(int idx) { return minput_tensors[idx]; }
     const ax_runner_tensor_t *get_inputs_ptr() { return minput_tensors.data(); }
@@ -85,6 +85,15 @@ public:
         }
         if (map_input_tensors.find(name) == map_input_tensors.end())
         {
+            // ALOGD("input tensor not found: %s, try to find a similar name", name.c_str());
+            // for(auto &it : map_input_tensors)
+            // {
+            //     if(it.first.find(name)!= std::string::npos)
+            //     {
+            //         ALOGD("input tensor not found: %s, but found a similar name: %s", name.c_str(), it.first.c_str());
+            //         return it.second;
+            //     }
+            // }
             throw std::runtime_error("input tensor not found: " + name);
         }
 
@@ -126,6 +135,15 @@ public:
         }
         if (map_output_tensors.find(name) == map_output_tensors.end())
         {
+            // ALOGD("output tensor not found: %s, try to find a similar name", name.c_str());
+            // for(auto &it : map_output_tensors)
+            // {
+            //     if(it.first.find(name) != std::string::npos)
+            //     {
+            //         ALOGD("output tensor not found: %s, but found a similar name: %s", name.c_str(), it.first.c_str());
+            //         return it.second;
+            //     }
+            // }
             throw std::runtime_error("output tensor not found: " + name);
         }
 

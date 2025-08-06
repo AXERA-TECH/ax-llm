@@ -53,10 +53,11 @@ endif()
 
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
-                    src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
+                    src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+                    src/runner/ax_model_runner/untar.cpp
                     # src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
                     src/runner/utils/axcl_manager.cpp
-                    src/runner/utils/memory_utils.cpp 
+                    src/runner/utils/memory_utils.cpp
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
                     # src/runner/Tokenizer/QwenTokenizer.cpp
@@ -71,7 +72,8 @@ function(build_exec name main_source)
 endfunction()
 
 build_exec(main src/main.cpp)
-build_exec(main_api src/main_api.cpp)
+build_exec(main_single src/main_single.cpp)
+# build_exec(main_api src/main_api.cpp)
 
 file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*.py" "${CMAKE_SOURCE_DIR}/scripts/*.sh")
 install(FILES ${RUN_SCRIPT} DESTINATION bin/)
