@@ -134,7 +134,6 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("kvcache_path", 0, "kvcache path", false, kvcache_path);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
-    cmd.add<int>("tokenizer_type", 0, "tokenizer type 0:LLaMa 1:Qwen 2:HTTP 3:Phi3 4:MINICPM", false, attr.tokenizer_type);
     cmd.add<std::string>("url_tokenizer_model", 0, "tokenizer model path", false, attr.url_tokenizer_model);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
@@ -153,7 +152,6 @@ int main(int argc, char *argv[])
 
     attr.system_prompt = cmd.get<std::string>("system_prompt");
     kvcache_path = cmd.get<std::string>("kvcache_path");
-    attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
     attr.url_tokenizer_model = cmd.get<std::string>("url_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
