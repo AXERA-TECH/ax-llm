@@ -358,8 +358,11 @@ public:
         }
         if (attr.b_dynamic_load_axmodel_layer)
         {
-            auto &layer = llama_layers[0];
-            layer.layer.deinit();
+            for(int i=0; i<attr.axmodel_num;i++)
+            {
+                auto &layer = llama_layers[i];
+                layer.layer.deinit();
+            }
         }
 
         // Reset();
@@ -661,6 +664,24 @@ public:
 
                 auto &layer = llama_layers[m];
 
+                if (_attr.b_dynamic_load_axmodel_layer)
+                {
+                    int ret;
+                    if (_attr.b_use_mmap_load_layer)
+                    {
+                        ret = layer.layer.init((char *)layer.layer_buffer.data(), layer.layer_buffer.size());
+                    }
+                    else
+                    {
+                        ret = layer.layer.init(layer.layer_buffer_vec.data(), layer.layer_buffer_vec.size());
+                    }
+                    if (ret != 0)
+                    {
+                        ALOGE("init axmodel(%s) failed", layer.filename.c_str());
+                    }
+                }
+
+
                 // set indices
                 auto &input_indices = layer.layer.get_input(_attr.prefill_grpid, "indices");
                 unsigned int *input_indices_ptr = (unsigned int *)input_indices.pVirAddr;
@@ -744,6 +765,11 @@ public:
                 memcpy(embed_tmp.data(), (void *)output.pVirAddr, embed_tmp.size() * sizeof(unsigned short) );
 
                 // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
+                if (_attr.b_dynamic_load_axmodel_layer)
+                {
+                    layer.layer.deinit();
+                }
+
             }
             if (p == (prefill_split_num - 1))
             {
