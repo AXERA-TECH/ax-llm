@@ -17,7 +17,7 @@
 
 #include "utils/axcl_manager.h"
 
-#define ENABLE_COST 1
+#define ENABLE_COST 0
 
 #if ENABLE_COST
 
@@ -58,6 +58,7 @@ void print_cost_statistics()
         cost_records[#func].push_back(cost); \
     } while (0);
 #else
+void print_cost_statistics() {}
 #define COST(func) func
 #endif
 
@@ -532,7 +533,7 @@ public:
                 layer.layer.set_input(prefill_grpid, "input", embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short));
 
                 layer.layer.inference(prefill_grpid);
-
+#pragma omp parallel for
                 for (int rankid = 0; rankid < layer.layer.get_devids().size(); rankid++)
                 {
                     auto &input_decoder_k_cache = layer.layer.get_rank_input(rankid, decode_grpid, "K_cache");
@@ -791,7 +792,7 @@ public:
         for (size_t i = 0; i < _attr.axmodel_num; i++)
         {
             auto &layer = llama_layers[i];
-            // #pragma omp parallel for
+#pragma omp parallel for
             for (int rankid = 0; rankid < layer.layer.get_devids().size(); rankid++)
             {
                 axcl_Memset((void *)layer.layer.get_rank_input(rankid, _attr.prefill_grpid, "K_cache").phyAddr, 0, layer.layer.get_rank_input(rankid, _attr.prefill_grpid, "K_cache").nSize, layer.layer.get_devid(rankid));
@@ -989,6 +990,7 @@ public:
                 layer.layer.inference(_attr.prefill_grpid);
 
                 int kv_offset = (_attr.precompute_len + p * _attr.prefill_token_num) * _attr.kv_cache_size;
+#pragma omp parallel for
                 for (int rankid = 0; rankid < layer.layer.get_devids().size(); rankid++)
                 {
                     auto &input_decoder_k_cache = layer.layer.get_rank_input(rankid, decode_grpid, "K_cache");
