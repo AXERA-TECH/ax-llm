@@ -123,6 +123,8 @@ public:
         m_dev_ids.clear();
     }
 
+    std::vector<std::shared_ptr<ax_runner_ax650>> &get_runners() { return m_runners; }
+
     // Device ID accessors
     std::vector<int> get_devids() { return m_dev_ids; }
     int get_devid() { return get_devid(0); }
