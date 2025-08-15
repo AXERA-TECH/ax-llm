@@ -376,37 +376,15 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int devid)
     {
         m_handle = new ax_joint_runner_ax650_handle_t;
     }
-    memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
-
-    // static bool b_init = false;
-    // if (!b_init)
-    // {
-    //     // 1. init engine
-    //     // AX_ENGINE_NPU_ATTR_T npu_attr;
-    //     // memset(&npu_attr, 0, sizeof(npu_attr));
-    //     // npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
-    //     // AX_SYS_Init();
-
-    //     axclrtDeviceList lst;
-    //     if (const auto ret = axclrtGetDeviceList(&lst); 0 != ret || 0 == lst.num)
-    //     {
-    //         ALOGE("Get AXCL device failed{0x%8x}, find total %d device.\n", ret, lst.num);
-    //         return -1;
-    //     }
-    //     if (const auto ret = axclrtSetDevice(lst.devices[0]); 0 != ret)
-    //     {
-    //         ALOGE("Set AXCL device failed{0x%8x}.\n", ret);
-    //         return -1;
-    //     }
-
-    //     int ret = axclrtEngineInit(AXCL_VNPU_DISABLE);
-    //     if (0 != ret)
-    //     {
-    //         ALOGE("axclrtEngineInit %d\n", ret);
-    //         return ret;
-    //     }
-    //     b_init = true;
-    // }
+    else
+    {
+        m_handle->handle = 0;
+        m_handle->context = 0;
+        m_handle->io_info = 0;
+        m_handle->ios.clear();
+        m_handle->io_datas.clear();
+    }
+    // memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
 
     // 3. create handle
     void *devMem = nullptr;
@@ -478,8 +456,6 @@ void ax_runner_ax650::deinit()
         // delete m_handle;
         // m_handle = nullptr;
     }
-
-    // AX_ENGINE_Deinit();
 }
 
 int ax_runner_ax650::get_algo_width() { return -1; }
@@ -526,7 +502,7 @@ int ax_runner_ax650::inference(int grpid)
     auto ret = axcl_EngineExecute(m_handle->handle, m_handle->context, grpid, m_handle->ios[grpid], dev_id);
     if (ret != 0)
     {
-        ALOGE("AX_ENGINE_Execute");
+        ALOGE("axcl_EngineExecute in grpid %d dev %d,ret=0x%x", grpid, dev_id, ret);
         return ret;
     }
 

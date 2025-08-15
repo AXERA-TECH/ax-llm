@@ -72,7 +72,7 @@ public:
         tarFile.close();
         if (rank_models.size() != dev_ids.size())
         {
-            ALOGE("model file num %d not equal to dev_ids num %d", rank_models.size(), dev_ids.size());
+            ALOGE("model file num %ld not equal to dev_ids num %ld", rank_models.size(), dev_ids.size());
             return -1;
         }
         m_runners.resize(rank_models.size());

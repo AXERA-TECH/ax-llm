@@ -217,7 +217,6 @@ public:
 
         auto dev_assignments = distributeModels(_attr.dev_ids.size(), attr.axmodel_num);
 
-        std::vector<int> rets(attr.axmodel_num);
         std::atomic<int> process_idx = 2;
         // #pragma omp parallel for
         for (int i = 0; i < attr.axmodel_num; i++)
@@ -227,12 +226,12 @@ public:
             llama_layers[i].filename = axmodel_path;
 
             int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), _attr.dev_ids);
-            rets[i] = ret;
-            // if (ret != 0)
-            // {
-            //     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
-            //     return false;
-            // }
+
+            if (ret != 0)
+            {
+                ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
+                return false;
+            }
             int remain_cmm = axcl_GetCMMRemain(_attr.dev_ids[dev_assignments[i]]);
             sprintf(axmodel_path, "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, _attr.dev_ids[dev_assignments[i]], remain_cmm);
             update_cqdm(&cqdm, process_idx++, "count", axmodel_path);
@@ -270,6 +269,16 @@ public:
                 int prefill_max_kv_cache_num = llama_layers[0].layer.get_input(i + 1, "K_cache").vShape[1];
                 ALOGI("grp: %ld, prefill_max_token_num : %d", i + 1, prefill_max_kv_cache_num);
                 _attr.prefill_max_kv_cache_num_grp.push_back(prefill_max_kv_cache_num);
+            }
+            if (_attr.prefill_max_kv_cache_num_grp.size() == 0)
+            {
+                ALOGE("should load model with context");
+                return false;
+            }
+            else if (_attr.prefill_max_kv_cache_num_grp.size() == 1 && _attr.prefill_max_kv_cache_num_grp[0] == 1)
+            {
+                ALOGE("should load model with context");
+                return false;
             }
             _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_max_kv_cache_num_grp.size() - 1];
             ALOGI("prefill_max_token_num : %d", _attr.prefill_max_token_num);
@@ -352,7 +361,7 @@ public:
 
         int prefill_split_num = ceil((double)input_embed_num / _attr.prefill_token_num);
 
-        int prefill_grpid = _attr.prefill_max_kv_cache_num_grp.size();
+        int prefill_grpid = -1;
 
         for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
         {
@@ -363,6 +372,11 @@ public:
             }
         }
         ALOGI("input token num : %d, prefill_split_num : %d prefill_grpid : %d", input_embed_num, prefill_split_num, prefill_grpid);
+        if (prefill_grpid == -1)
+        {
+            ALOGE("input token num(%d) > prefill_max_token_num(%d)", input_embed_num, _attr.prefill_max_token_num);
+            return -1;
+        }
 
         // clear kv cache
         for (size_t i = 0; i < _attr.axmodel_num; i++)
@@ -394,6 +408,7 @@ public:
         }
 
         int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[prefill_grpid - 1];
+        ALOGI("kv_cache_num : %d", kv_cache_num);
 
         std::vector<unsigned short> test_embed;
         test_embed.resize(_token_ids.size() * _attr.tokens_embed_size);
@@ -928,7 +943,7 @@ public:
                 layer.layer.set_input(_attr.prefill_grpid, "input", embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short));
 
                 layer.layer.inference(_attr.prefill_grpid);
-                
+
                 int kv_offset = (_attr.precompute_len + p * _attr.prefill_token_num) * _attr.kv_cache_size;
                 for (int rankid = 0; rankid < layer.layer.get_devids().size(); rankid++)
                 {

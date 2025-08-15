@@ -99,7 +99,7 @@ int main(int argc, char **argv)
             std::cout << "read file failed" << std::endl;
             return -1;
         }
-        printf("input name: %s, size: %d, data: %d\n", input.sName.c_str(), input.nSize, in_data.size());
+        printf("input name: %s, size: %d, data: %ld\n", input.sName.c_str(), input.nSize, in_data.size());
         axcl_Memcpy((void *)input.phyAddr, in_data.data(), input.nSize, AXCL_MEMCPY_HOST_TO_DEVICE, 0);
     }
 
@@ -130,7 +130,7 @@ int main(int argc, char **argv)
                 std::cout << "read file failed" << std::endl;
                 return -1;
             }
-            printf("input name: %s - %s, size: %d, data: %d\n", input.sName.c_str(), path.c_str(), input.nSize, in_data.size());
+            printf("input name: %s - %s, size: %d, data: %ld\n", input.sName.c_str(), path.c_str(), input.nSize, in_data.size());
             axcl_Memcpy((void *)input.phyAddr, in_data.data(), input.nSize, AXCL_MEMCPY_HOST_TO_DEVICE, runner.get_devid(rankid));
         }
         // auto input = runner.get_input(i);
@@ -201,7 +201,7 @@ int main(int argc, char **argv)
         std::vector<float> buffer_out_fp32(runner.get_rank_output(rankid, "output").nSize / sizeof(unsigned short));
 
         unsigned short *buffer_out_fp16 = (unsigned short *)runner.get_rank_output(rankid, "output").pVirAddr;
-        printf("rank-%d size: %d\n", rankid, runner.get_rank_output(rankid, "output").nSize);
+        printf("rank-%ld size: %d\n", rankid, runner.get_rank_output(rankid, "output").nSize);
         printf("(");
         for (size_t i = 0; i < buffer_out_fp32.size(); i++)
         {
@@ -218,7 +218,7 @@ int main(int argc, char **argv)
         }
 
         float sim = consine_similarity(output_data_650.data(), buffer_out_fp32.data(), output_data_650.size());
-        printf("rank %d similarity: %f\n", rankid, sim);
+        printf("rank %ld similarity: %f\n", rankid, sim);
     }
 
     axclrtDestoryP2PUnit(p2p_handle);
