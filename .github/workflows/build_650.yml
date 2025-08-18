@@ -28,17 +28,22 @@ jobs:
           submodules: true
 
       # Runs a set of commands using the runners shell
-      - name: build
+      - name: build aarch64
         run: |
-          mkdir build
-          cd build
-          git clone https://github.com/AXERA-TECH/ax650n_bsp_sdk.git
-          export ax_bsp=$PWD/ax650n_bsp_sdk/msp/out/
-          echo $ax_bsp          
-          wget https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
-          tar -xf gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
-          export PATH=$PATH:gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu/bin/
-          aarch64-none-linux-gnu-gcc -v
-          cmake -DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-none-linux-gnu.toolchain.cmake -DBSP_MSP_DIR=${ax_bsp}/ ..
-          make -j8
-          make install
+          sh ./build_aarch64.sh
+      
+      - name: Upload aarch64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-axcl-3.6.2-axcl-context-aarch64
+          path: build_aarch64/install/
+      
+      - name: build x86
+        run: |
+          sh ./build_x86.sh
+      
+      - name: Upload x86 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-axcl-3.6.2-axcl-context-x86
+          path: build_x86/install/
