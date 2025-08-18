@@ -4,7 +4,7 @@
 # 绝对路径 绝对路径 绝对路径 
 
 # build_dir 修改为自己想要的编译目录名称
-build_dir=build_test
+build_dir=build
 echo "build dir: ${build_dir}"
 mkdir ${build_dir}
 cd ${build_dir}
