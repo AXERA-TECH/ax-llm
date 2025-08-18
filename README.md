@@ -43,6 +43,12 @@
 - [Qwen2.5-7B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-7B-Instruct)
 - [Qwen2.5-1.5B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-1.5B-Instruct)
 
+## CI Status
+
+| Architecture | Status |Download|
+|--------------|--------|--------|
+| x86          | ![Build](https://github.com/AXERA-TECH/ax-llm/actions/workflows/build.yml/badge.svg?branch=ax-context&label=ax650&job=build) |[download](https://nightly.link/AXERA-TECH/ax-llm/workflows/build/ax-context/build-ax650-3.6.2-ax-context.zip) |
+
 ## 源码编译
 
 - clone 本项目
