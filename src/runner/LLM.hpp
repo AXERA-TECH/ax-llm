@@ -130,7 +130,7 @@ private:
     std::vector<LLMLayer> llama_layers;
     ax_runner_ax650 llama_post;
     ax_runner_ax650 image_encoder;
-
+    int deepstack_features_num = 3;
     // int prefill_grpid = 1;
     int decode_grpid = 0;
 
@@ -391,44 +391,9 @@ public:
         b_stop = true;
     }
 
-    // int Encode(cv::Mat& src, std::vector<unsigned short> &out_embed, int height, int width)
-    // {
-    //     timer t;
-    //     t.start();
-    //     cv::Mat dst;
-    //     cv::resize(src, dst, cv::Size(width, height));
-    //     cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
-
-    //     if (_attr.b_vpm_two_stage)
-    //     {
-    //         void *data = vpm_encoder.get_input(0).pVirAddr;
-    //         memcpy(data, dst.data, dst.rows * dst.cols * 3);
-    //         vpm_encoder.inference();
-    //         AX_SYS_MinvalidateCache(vpm_encoder.get_output(0).phyAddr, vpm_encoder.get_output(0).pVirAddr, vpm_encoder.get_output(0).nSize);
-    //         memcpy(vpm_resampler.get_input(0).pVirAddr, vpm_encoder.get_output(0).pVirAddr, vpm_encoder.get_output(0).nSize);
-    //     }
-    //     else
-    //     {
-    //         void *data = vpm_resampler.get_input(0).pVirAddr;
-    //         memcpy(data, dst.data, dst.rows * dst.cols * 3);
-    //     }
-
-    //     vpm_resampler.inference();
-    //     out_embed.resize(vpm_resampler.get_output(0).nSize / sizeof(float));
-    //     AX_SYS_MinvalidateCache(vpm_resampler.get_output(0).phyAddr, vpm_resampler.get_output(0).pVirAddr, vpm_resampler.get_output(0).nSize);
-
-    //     float *output_data = (float *)vpm_resampler.get_output(0).pVirAddr;
-    //     for (size_t i = 0; i < out_embed.size(); i++)
-    //     {
-    //         out_embed[i] = bfloat16(output_data[i]).data;
-    //     }
-
-    //     // memcpy(out_embed.data(), vpm_resampler.get_output(0).pVirAddr, vpm_resampler.get_output(0).nSize);
-    //     ALOGI("image encode time : %f ms, size : %d", t.cost(), out_embed.size());
-    //     return 0;
-    // }
-
-    int Encode(std::vector<cv::Mat>& src, bool b_video, std::vector<std::vector<unsigned short>> &out_embed, Config & cfg)
+    int EncodeImage(std::vector<cv::Mat>& src, bool b_video,  Config & cfg, 
+        std::vector<std::vector<unsigned short>> &out_embed, 
+        std::vector<std::vector<unsigned short>> &deepstack_features)
     {
         int temporal_patch_size=cfg.vision_config.temporal_patch_size;
         int merge_size=cfg.vision_config.spatial_merge_size;
@@ -467,10 +432,14 @@ public:
             cfg.video_grid_thw = {{pixel_values.size(), grid_h, grid_w}};
         }
 
+        ALOGI("pixel_values size %d",pixel_values.size());
+        ALOGI("grid_h %d grid_w %d", grid_h, grid_w);
         int cnt = 0;
         if(out_embed.empty()){
             out_embed.resize(pixel_values.size());
         }
+
+        deepstack_features.clear();
         for(int i=0; i<pixel_values.size(); i++){
 
             void *data = image_encoder.get_input(0).pVirAddr;
@@ -488,6 +457,35 @@ public:
                 out_embed[i][j] = bfloat16(output_data[j]).data;
             }
 
+            
+            for(int j=0; j<deepstack_features_num; j++)
+            {
+                
+                size_t size = image_encoder.get_output(j+1).nSize / sizeof(float);
+                std::vector<unsigned short> feature(size);
+               
+
+                float *output_data = (float *)image_encoder.get_output(j+1).pVirAddr;
+                for (size_t j = 0; j < size; j++)
+                {
+                    feature[j] = bfloat16(output_data[j]).data;
+                }
+
+                // 将不同image 的 deepstack feature 拼接到一起
+                if(i==0)
+                {
+                    deepstack_features.push_back(feature);
+                }
+                else
+                {
+                    deepstack_features[j].insert(deepstack_features[j].end(), feature.begin(), feature.end());
+                }
+
+            }
+
+           
+
+            
         }
 
         ALOGI("image encode time : %f ms, size : %d", t.cost(), out_embed.size());
@@ -499,7 +497,7 @@ public:
     {
         std::vector<double> second_per_grid_ts = {cfg.vision_config.temporal_patch_size/cfg.vision_config.fps}; // temporal_patch_size / fps
 
-        position_ids = get_rope_index(cfg, input_ids, cfg.image_grid_thw, cfg.video_grid_thw, second_per_grid_ts);
+        position_ids = get_rope_index(cfg, input_ids, cfg.image_grid_thw, cfg.video_grid_thw);
         return 0;
     }
 
@@ -526,7 +524,9 @@ public:
         return 0;
     }
 
-    int Encode(std::vector<std::vector<unsigned short>> &img_embed, std::vector<unsigned short> &out_embed, std::vector<std::vector<int>> &position_ids, Config &cfg, std::string prompt = "What is in the image?")
+    int Encode(std::vector<std::vector<unsigned short>> &img_embed, std::vector<unsigned short> &out_embed, 
+            std::vector<std::vector<int>> &position_ids, std::vector<int> &visual_pos_mask, 
+            Config &cfg, std::string prompt = "What is in the image?")
     {
         ImageInfo img_info;
         img_info.img_prompt = true;
@@ -543,6 +543,19 @@ public:
                 int offset = i+1;
                 ALOGI("offset %d",offset);
                 offsets.push_back(offset);
+            }
+        }
+
+        visual_pos_mask.resize(input_ids.size());
+        for (size_t i = 0; i < input_ids.size(); i++)
+        {
+            if(input_ids[i] == cfg.image_token_id)
+            {
+                visual_pos_mask[i] = 1;
+            }
+            else
+            {
+                visual_pos_mask[i] = 0;
             }
         }
 
@@ -572,12 +585,16 @@ public:
         }
         
         ALOGI("out_embed size:%d", out_embed.size());
+        ALOGI("input_ids size %d",input_ids.size());
         GetPositionIds(input_ids, position_ids, cfg);
         ALOGI("position_ids size:%d", position_ids[0].size());
         return 0;
     }
 
-    std::string Run(std::vector<unsigned short>& test_embed,  std::vector<std::vector<int>> &position_ids)
+    std::string Run(std::vector<unsigned short>& test_embed, 
+                    std::vector<std::vector<int>> &position_ids,
+                    std::vector<std::vector<unsigned short>> &deepstack_features, 
+                    std::vector<int> &visual_pos_mask)
     {
         b_stop = false;
         std::string final_out;
@@ -646,15 +663,32 @@ public:
             }
 
             std::vector<unsigned short> embed_tmp(_attr.prefill_token_num * _attr.tokens_embed_size, 0);
+            int start, offset;
+            
+            start = p * _attr.prefill_token_num ;
             if (p == (prefill_split_num - 1))
             {
-                memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, (input_embed_num - p * _attr.prefill_token_num) * _attr.tokens_embed_size * sizeof(unsigned short));
+                offset = (input_embed_num - p * _attr.prefill_token_num);
+                memcpy(embed_tmp.data(), test_embed.data() + start * _attr.tokens_embed_size,  offset * _attr.tokens_embed_size * sizeof(unsigned short));
             }
             else
             {
-                memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, _attr.prefill_token_num * _attr.tokens_embed_size * sizeof(unsigned short));
+                offset = _attr.prefill_token_num;
+                memcpy(embed_tmp.data(), test_embed.data() + start * _attr.tokens_embed_size, offset * _attr.tokens_embed_size * sizeof(unsigned short));
             }
 
+            int start_deepstack_feat=0, offset_deepstack_feat=0;
+            for(int j=0; j<start; j++)
+            {
+                start_deepstack_feat += visual_pos_mask[j];
+            }
+            std::cout<<std::endl;
+            for(int j=start; j<start + offset; j++)
+            {
+                offset_deepstack_feat += visual_pos_mask[j];
+            }
+            std::cout<<std::endl;
+            
             for (unsigned int m = 0; m < _attr.axmodel_num; m++)
             {
                 if (b_stop)
@@ -764,6 +798,31 @@ public:
                 // axcl_Memcpy(embed_tmp.data(), (void *)output.phyAddr, embed_tmp.size() * sizeof(unsigned short), AXCL_MEMCPY_DEVICE_TO_HOST, layer.layer.get_devid());
                 memcpy(embed_tmp.data(), (void *)output.pVirAddr, embed_tmp.size() * sizeof(unsigned short) );
 
+                if(m < deepstack_features_num)
+                {
+                    int k=0;
+                    for(int j=start, k=start_deepstack_feat; j<start+offset; j++)
+                    {
+                        if(visual_pos_mask[j]==0)
+                        {
+                            continue;
+                        }
+                        for(int di=0; di<_attr.tokens_embed_size; di++)
+                        {
+                            // bfloat16 to float32
+                            unsigned int tmp_bf16_1 = embed_tmp[(j-start)*_attr.tokens_embed_size+di] << 16;
+                            float tmp_fp32_1 = *reinterpret_cast<float *>(&tmp_bf16_1);
+
+                            unsigned int tmp_bf16_2 = deepstack_features[m][k*_attr.tokens_embed_size+di];
+                            float tmp_fp32_2 = *reinterpret_cast<float *>(&tmp_bf16_2);
+                            
+                            // float32 to bfloat16
+                            embed_tmp[(j-start)*_attr.tokens_embed_size+di] = bfloat16(tmp_fp32_1 + tmp_fp32_2).data;
+                        }
+                        k++;
+                    }
+                   
+                }
                 // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
                 if (_attr.b_dynamic_load_axmodel_layer)
                 {
