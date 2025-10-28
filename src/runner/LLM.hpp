@@ -545,7 +545,7 @@ public:
         visual_pos_mask.resize(input_ids.size());
         for (size_t i = 0; i < input_ids.size(); i++)
         {
-            if(input_ids[i] == cfg.image_token_id)
+            if(input_ids[i] == cfg.image_token_id || input_ids[i] == cfg.video_token_id)
             {
                 visual_pos_mask[i] = 1;
             }
