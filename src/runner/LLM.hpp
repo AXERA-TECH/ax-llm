@@ -154,6 +154,9 @@ public:
     bool Init(LLMAttrType attr)
     {
         ALOGI("LLM init start");
+        int remain_cmm = get_remaining_cmm_size();
+        ALOGI("Total CMM:%d MB", remain_cmm);
+
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
         tokenizer = CreateTokenizer(attr.tokenizer_type);
@@ -240,7 +243,7 @@ public:
             ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str());
             return false;
         }
-        int remain_cmm = get_remaining_cmm_size();
+        remain_cmm = get_remaining_cmm_size();
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
 
@@ -367,6 +370,8 @@ public:
 
         // Reset();
         ALOGI("LLM init ok");
+        remain_cmm = get_remaining_cmm_size();
+        ALOGI("Left CMM:%d MB", remain_cmm);
         return true;
     }
 
@@ -457,18 +462,16 @@ public:
                 out_embed[i][j] = bfloat16(output_data[j]).data;
             }
 
-            
             for(int j=0; j<deepstack_features_num; j++)
             {
                 
                 size_t size = image_encoder.get_output(j+1).nSize / sizeof(float);
                 std::vector<unsigned short> feature(size);
                
-
                 float *output_data = (float *)image_encoder.get_output(j+1).pVirAddr;
-                for (size_t j = 0; j < size; j++)
+                for (size_t k = 0; k < size; k++)
                 {
-                    feature[j] = bfloat16(output_data[j]).data;
+                    feature[k] = bfloat16(output_data[k]).data;
                 }
 
                 // 将不同image 的 deepstack feature 拼接到一起
@@ -480,12 +483,7 @@ public:
                 {
                     deepstack_features[j].insert(deepstack_features[j].end(), feature.begin(), feature.end());
                 }
-
             }
-
-           
-
-            
         }
 
         ALOGI("image encode time : %f ms, size : %d", t.cost(), out_embed.size());
@@ -805,6 +803,7 @@ public:
                     {
                         if(visual_pos_mask[j]==0)
                         {
+                            ALOGI("visual_pos_mask[%d] = %d", j, visual_pos_mask[j]);
                             continue;
                         }
                         for(int di=0; di<_attr.tokens_embed_size; di++)
