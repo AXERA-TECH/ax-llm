@@ -72,7 +72,7 @@ class Tokenizer_Http():
 
     def __init__(self):
 
-        path = 'qwen2_tokenizer'
+        path = 'qwen3-vl-tokenizeren2_tokenizer'
         self.tokenizer = AutoTokenizer.from_pretrained(path,
                                                        trust_remote_code=True,
                                                        use_fast=False)
