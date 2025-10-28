@@ -398,7 +398,7 @@ public:
 
     int EncodeImage(std::vector<cv::Mat>& src, bool b_video,  Config & cfg, 
         std::vector<std::vector<unsigned short>> &out_embed, 
-        std::vector<std::vector<unsigned short>> &deepstack_features)
+        std::vector<std::vector<float>> &deepstack_features)
     {
         int temporal_patch_size=cfg.vision_config.temporal_patch_size;
         int merge_size=cfg.vision_config.spatial_merge_size;
@@ -466,12 +466,12 @@ public:
             {
                 
                 size_t size = image_encoder.get_output(j+1).nSize / sizeof(float);
-                std::vector<unsigned short> feature(size);
+                std::vector<float> feature(size);
                
                 float *output_data = (float *)image_encoder.get_output(j+1).pVirAddr;
                 for (size_t k = 0; k < size; k++)
                 {
-                    feature[k] = bfloat16(output_data[k]).data;
+                    feature[k] = output_data[k];
                 }
 
                 // 将不同image 的 deepstack feature 拼接到一起
@@ -589,7 +589,7 @@ public:
 
     std::string Run(std::vector<unsigned short>& test_embed, 
                     std::vector<std::vector<int>> &position_ids,
-                    std::vector<std::vector<unsigned short>> &deepstack_features, 
+                    std::vector<std::vector<float>> &deepstack_features, 
                     std::vector<int> &visual_pos_mask)
     {
         b_stop = false;
@@ -809,9 +809,7 @@ public:
                             unsigned int tmp_bf16_1 = embed_tmp[(j-start)*_attr.tokens_embed_size+di] << 16;
                             float tmp_fp32_1 = *reinterpret_cast<float *>(&tmp_bf16_1);
 
-                            unsigned int tmp_bf16_2 = deepstack_features[m][k*_attr.tokens_embed_size+di];
-                            float tmp_fp32_2 = *reinterpret_cast<float *>(&tmp_bf16_2);
-                            
+                            float tmp_fp32_2 = deepstack_features[m][k*_attr.tokens_embed_size+di];
                             // float32 to bfloat16
                             embed_tmp[(j-start)*_attr.tokens_embed_size+di] = bfloat16(tmp_fp32_1 + tmp_fp32_2).data;
                         }

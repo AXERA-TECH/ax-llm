@@ -127,7 +127,7 @@ int main(int argc, char *argv[])
 
     std::vector<unsigned short> prompt_data;
     std::vector<std::vector<unsigned short>> img_embed;
-    std::vector<std::vector<unsigned short>> deepstack_features;
+    std::vector<std::vector<float>> deepstack_features;
     std::vector<int> visual_pos_mask;
     std::vector<std::vector<int>> position_ids;
 
