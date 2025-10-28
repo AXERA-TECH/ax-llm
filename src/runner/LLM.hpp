@@ -493,8 +493,6 @@ public:
 
     int GetPositionIds(std::vector<int> &input_ids, std::vector<std::vector<int>> &position_ids, Config &cfg)
     {
-        std::vector<double> second_per_grid_ts = {cfg.vision_config.temporal_patch_size/cfg.vision_config.fps}; // temporal_patch_size / fps
-
         position_ids = get_rope_index(cfg, input_ids, cfg.image_grid_thw, cfg.video_grid_thw);
         return 0;
     }
@@ -803,7 +801,6 @@ public:
                     {
                         if(visual_pos_mask[j]==0)
                         {
-                            ALOGI("visual_pos_mask[%d] = %d", j, visual_pos_mask[j]);
                             continue;
                         }
                         for(int di=0; di<_attr.tokens_embed_size; di++)
