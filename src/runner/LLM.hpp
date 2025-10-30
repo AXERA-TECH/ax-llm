@@ -678,12 +678,12 @@ public:
             {
                 start_deepstack_feat += visual_pos_mask[j];
             }
-            std::cout<<std::endl;
+            
             for(int j=start; j<start + offset; j++)
             {
                 offset_deepstack_feat += visual_pos_mask[j];
             }
-            std::cout<<std::endl;
+            
             
             for (unsigned int m = 0; m < _attr.axmodel_num; m++)
             {
