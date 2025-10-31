@@ -199,7 +199,15 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        printf("image >> ");
+        if(b_video)
+        {
+            printf("video >> ");
+        }
+        else
+        {
+            printf("image >> ");
+        }
+        
         fflush(stdout);
         std::string image_prompt;
         std::getline(std::cin, image_prompt);
