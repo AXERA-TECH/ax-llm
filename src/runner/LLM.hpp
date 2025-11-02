@@ -368,6 +368,11 @@ public:
             }
         }
 
+        if (!postprocess.load_config(attr.post_config_path))
+        {
+            ALOGW("load postprocess config(%s) failed", attr.post_config_path.c_str());
+        }
+
         // Reset();
         ALOGI("LLM init ok");
         remain_cmm = get_remaining_cmm_size();
