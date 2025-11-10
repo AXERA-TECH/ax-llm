@@ -385,6 +385,11 @@ public:
         return &_attr;
     }
 
+    LLMPostprocess *getPostprocess()
+    {
+        return &postprocess;
+    }
+
     void Deinit()
     {
         for (int i = 0; i < _attr.axmodel_num; i++)
