@@ -1,8 +1,24 @@
 # gradio_chat_single_turn.py
+import re
+import subprocess
 import gradio as gr
 import base64, cv2, os, tempfile
 from openai import OpenAI
 import requests
+
+def get_all_local_ips():
+    result = subprocess.run(['ip', 'a'], capture_output=True, text=True)
+    output = result.stdout
+
+    # 匹配所有IPv4
+    ips = re.findall(r'inet (\d+\.\d+\.\d+\.\d+)', output)
+
+    # 过滤掉回环地址
+    real_ips = [ip for ip in ips if not ip.startswith('127.')]
+
+    return real_ips
+
+
 
 # ---------- Helpers ----------
 def img_to_data_url_from_cvframe(frame):
@@ -22,6 +38,10 @@ def video_to_data_urls(video_path: str, frame_stride: int = 30, max_frames: int 
     import cv2, base64
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    if total / frame_stride > max_frames:
+        frame_stride = int(total/max_frames)
+    
     urls = []
     idx = 0
     first_preview = None
@@ -216,4 +236,8 @@ with gr.Blocks(title="Vision Chat - 单轮对话") as demo:
     clear_btn.click(clear_all, None, [chatbot, prompt, image, video, prefer_video, frame_stride, max_frames])
 
 if __name__ == "__main__":
-    demo.launch()
+    ips = get_all_local_ips()
+    for ip in ips:
+        print(f"* Running on local URL:  http://{ip}:7860")
+    ip = "0.0.0.0"
+    demo.launch(server_name=ip, server_port=7860)
