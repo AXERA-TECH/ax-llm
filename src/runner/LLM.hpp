@@ -766,14 +766,17 @@ public:
             }
 
             int start_deepstack_feat=0, offset_deepstack_feat=0;
-            for(int j=0; j<start; j++)
+            if(!visual_pos_mask.empty())
             {
-                start_deepstack_feat += visual_pos_mask[j];
-            }
-            
-            for(int j=start; j<start + offset; j++)
-            {
-                offset_deepstack_feat += visual_pos_mask[j];
+                for(int j=0; j<start; j++)
+                {
+                    start_deepstack_feat += visual_pos_mask[j];
+                }
+                
+                for(int j=start; j<start + offset; j++)
+                {
+                    offset_deepstack_feat += visual_pos_mask[j];
+                }
             }
 
             for (unsigned int m = 0; m < _attr.axmodel_num; m++)
@@ -849,7 +852,7 @@ public:
                 auto &output = layer.layer.get_output(_attr.prefill_grpid, "output");
                 axcl_Memcpy(embed_tmp.data(), (void *)output.phyAddr, embed_tmp.size() * sizeof(unsigned short), AXCL_MEMCPY_DEVICE_TO_HOST, layer.layer.get_devid());
 
-                if(m < deepstack_features_num)
+                if(!visual_pos_mask.empty() && m < deepstack_features.size())
                 {
                     int k=0;
                     for(int j=start, k=start_deepstack_feat; j<start+offset; j++)

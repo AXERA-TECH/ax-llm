@@ -238,6 +238,25 @@ int main(int argc, char *argv[])
 
         if (!b_live_print)
             printf("%s\n", output.c_str());
+
+        std::vector<unsigned short>().swap(prompt_data);
+
+        for (auto& inner_vec : img_embed) {
+            std::vector<unsigned short>().swap(inner_vec); 
+        }
+        std::vector<std::vector<unsigned short>>().swap(img_embed);
+
+        for (auto& inner_vec : deepstack_features) {
+            std::vector<float>().swap(inner_vec); 
+        }
+        std::vector<std::vector<float>>().swap(deepstack_features);
+
+        std::vector<int>().swap(visual_pos_mask);
+
+        for (auto& inner_vec : position_ids) {
+            std::vector<int>().swap(inner_vec); 
+        }
+        std::vector<std::vector<int>>().swap(position_ids);
     }
 
     lLaMa.Deinit();
