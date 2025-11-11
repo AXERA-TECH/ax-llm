@@ -692,7 +692,10 @@ bool handle_body(const nlohmann::json &body, std::string &prompt, std::vector<st
                 {
                     if (item["image_url"].is_array())
                     {
-                        b_video = item["is_video"];
+                        if (item.contains("is_video") && item["is_video"].is_boolean())
+                        {
+                            b_video = item["is_video"];
+                        }
                         for (auto &img : item["image_url"])
                         {
                             image_paths.push_back(img);

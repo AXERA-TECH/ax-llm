@@ -63,24 +63,19 @@ def build_messages(prompt: str, image_path: str | None, video_path: str | None,
 
     if video_path and os.path.exists(video_path) and prefer_video:
         urls, first_preview = video_to_data_urls(video_path, frame_stride=frame_stride, max_frames=max_frames)
-        for u in urls:
-            content.append({"type": "image_url", "image_url": u})
-        preview = save_preview_image_from_data_url(urls[0]) if urls else None
+        content.append({"type": "image_url", "is_video":True, "image_url": urls})
         media_desc = f"（视频抽帧：{len(urls)} 帧，步长 {frame_stride}）"
         return {"role": "user", "content": content}, first_preview, media_desc
 
     if image_path and os.path.exists(image_path):
         u = img_to_data_url_from_path(image_path)
         content.append({"type": "image_url", "image_url": u})
-        preview = save_preview_image_from_data_url(u)
         media_desc = "（已附带图片）"
         return {"role": "user", "content": content}, u, media_desc
 
     if video_path and os.path.exists(video_path):
         urls, first_preview = video_to_data_urls(video_path, frame_stride=frame_stride, max_frames=max_frames)
-        for u in urls:
-            content.append({"type": "image_url", "image_url": u})
-        preview = save_preview_image_from_data_url(urls[0]) if urls else None
+        content.append({"type": "image_url", "is_video":True, "image_url": urls})
         media_desc = f"（视频抽帧：{len(urls)} 帧，步长 {frame_stride}）"
         return {"role": "user", "content": content}, first_preview, media_desc
 
