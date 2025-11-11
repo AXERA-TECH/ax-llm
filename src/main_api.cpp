@@ -400,7 +400,7 @@ public:
                 ALOGE("lLaMa.Encode failed");
                 return "";
             }
-            if (auto ret = gllm.Encode(img_embed, prompt_data, position_ids, visual_pos_mask, config, prompt); ret != 0)
+            if (auto ret = gllm.Encode(img_embed, b_video, prompt_data, position_ids, visual_pos_mask, config, prompt); ret != 0)
             {
                 ALOGE("lLaMa.Encode failed");
                 return "";

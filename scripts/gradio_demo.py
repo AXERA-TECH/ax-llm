@@ -202,7 +202,7 @@ with gr.Blocks(title="Vision Chat - 单轮对话") as demo:
             with gr.Row():
                 prefer_video = gr.Checkbox(True, label="如果有视频，优先使用视频抽帧")
                 frame_stride = gr.Slider(1, 90, value=30, step=1, label="视频抽帧间隔")
-                max_frames = gr.Slider(1, 32, value=8, step=1, label="最多抽帧数")
+                max_frames = gr.Slider(1, 8, value=8, step=1, label="最多抽帧数")
             
 
     # 单轮对话需要一个 state 来承载当前这轮的气泡

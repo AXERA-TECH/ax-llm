@@ -610,12 +610,13 @@ public:
         return 0;
     }
 
-    int Encode(std::vector<std::vector<unsigned short>> &img_embed, std::vector<unsigned short> &out_embed, 
+    int Encode(std::vector<std::vector<unsigned short>> &img_embed, bool b_video, std::vector<unsigned short> &out_embed, 
             std::vector<std::vector<int>> &position_ids, std::vector<int> &visual_pos_mask, 
             Config &cfg, std::string prompt = "What is in the image?")
     {
         ImageInfo img_info;
         img_info.img_prompt = true;
+        img_info.video_prompt = b_video;
         img_info.img_token_num = img_embed[0].size()/_attr.tokens_embed_size;
         img_info.num_img = img_embed.size();
         std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
