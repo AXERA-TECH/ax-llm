@@ -30,9 +30,7 @@ def img_to_data_url_from_cvframe(frame):
 def img_to_data_url_from_path(img_path: str) -> str:
     import cv2, base64
     img = cv2.imread(img_path)
-    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-    b64 = base64.b64encode(buf).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
+    return img_to_data_url_from_cvframe(img)
 
 def video_to_data_urls(video_path: str, frame_stride: int = 30, max_frames: int = 8):
     import cv2, base64
@@ -170,8 +168,27 @@ def run_single_turn(prompt, image_file, video_file, prefer_video, frame_stride, 
         yield chatbot_state
 
 # ---------- Gradio UI ----------
-with gr.Blocks(title="Vision Chat - 单轮对话") as demo:
-    gr.Markdown("## 💬 Vision Chat（单轮气泡对话，支持 Markdown 渲染）\n上传**图片/视频**并填写 Prompt，点击发送。")
+with gr.Blocks(css="""
+    #chat, 
+    #chat * {
+        font-size: 18px !important;
+        line-height: 1.6 !important;
+    }
+
+    #chat .message,
+    #chat [data-testid="bot"],
+    #chat [data-testid="user"] {
+        font-size: 18px !important;
+    }
+""",title="AXERA Qwen3 VL") as demo:
+    axera_logo = img_to_data_url_from_path("/home/axera/ax-llm/build/axera_logo.png")
+    gr.Markdown(
+        f"""
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <img src="{axera_logo}" alt="axera_logo" style="height: 60px;">
+        </div>
+        """
+    )
 
     chatbot = gr.Chatbot(
         label="对话",
@@ -182,6 +199,7 @@ with gr.Blocks(title="Vision Chat - 单轮对话") as demo:
                           {"left": "$", "right": "$", "display": False}],
         show_copy_button=True,
         render_markdown=True,
+        elem_id="chat"
     )
 
     with gr.Row():
@@ -202,7 +220,7 @@ with gr.Blocks(title="Vision Chat - 单轮对话") as demo:
             with gr.Row():
                 prefer_video = gr.Checkbox(True, label="如果有视频，优先使用视频抽帧")
                 frame_stride = gr.Slider(1, 90, value=30, step=1, label="视频抽帧间隔")
-                max_frames = gr.Slider(1, 32, value=8, step=1, label="最多抽帧数")
+                max_frames = gr.Slider(1, 8, value=8, step=1, label="最多抽帧数")
             
 
     # 单轮对话需要一个 state 来承载当前这轮的气泡

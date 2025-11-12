@@ -130,6 +130,28 @@ private:
     std::condition_variable condition;
     std::atomic<bool> stop_flag;
 
+    void reset()
+    {
+        std::vector<unsigned short>().swap(prompt_data);
+
+        for (auto& inner_vec : img_embed) {
+            std::vector<unsigned short>().swap(inner_vec); 
+        }
+        std::vector<std::vector<unsigned short>>().swap(img_embed);
+
+        for (auto& inner_vec : deepstack_features) {
+            std::vector<float>().swap(inner_vec); 
+        }
+        std::vector<std::vector<float>>().swap(deepstack_features);
+
+        std::vector<int>().swap(visual_pos_mask);
+
+        for (auto& inner_vec : position_ids) {
+            std::vector<int>().swap(inner_vec); 
+        }
+        std::vector<std::vector<int>>().swap(position_ids);
+    }
+    
     void run()
     {
         while (true)
@@ -400,7 +422,7 @@ public:
                 ALOGE("lLaMa.Encode failed");
                 return "";
             }
-            if (auto ret = gllm.Encode(img_embed, prompt_data, position_ids, visual_pos_mask, config, prompt); ret != 0)
+            if (auto ret = gllm.Encode(img_embed, b_video, prompt_data, position_ids, visual_pos_mask, config, prompt); ret != 0)
             {
                 ALOGE("lLaMa.Encode failed");
                 return "";
@@ -411,6 +433,7 @@ public:
         gllm_runing = false;
         g_msg_cv.notify_all(); // 唤醒 content_provider_stream 的等待
         std::cout << "Chat result: " << output << std::endl;
+        reset();
         return output;
     }
 };

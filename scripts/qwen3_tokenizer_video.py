@@ -71,8 +71,8 @@ def get_image_prompt_string(
 class Tokenizer_Http():
 
     def __init__(self):
-
-        path = 'qwen3-vl-tokenizeren2_tokenizer'
+        self.token_ids_cache = []
+        path = 'qwen3-vl-tokenizer'
         self.tokenizer = AutoTokenizer.from_pretrained(path,
                                                        trust_remote_code=True,
                                                        use_fast=False)
@@ -82,10 +82,14 @@ class Tokenizer_Http():
         input_ids = self.tokenizer(text)
         return input_ids["input_ids"][0]
 
-    def encode_vpm(self, content="Describe this image.", num_img=1, img_token_num=256):
+    def encode_vpm(self, content="Describe this image.", num_img=1, img_token_num=256, video_prompt=False):
 
         # official implementation 
-        imgs_token = '<|vision_start|>' +  '<|video_pad|>'*img_token_num*num_img + '<|vision_end|>'
+        if video_prompt:
+            pad_token = '<|video_pad|>'
+        else:
+            pad_token = '<|image_pad|>'
+        imgs_token = '<|vision_start|>' +  pad_token*img_token_num*num_img + '<|vision_end|>'
         
         text = f'<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{imgs_token}{content}<|im_end|>\n<|im_start|>assistant\n'
         
@@ -95,8 +99,18 @@ class Tokenizer_Http():
         return text_inputs["input_ids"].tolist()[0]
 
     def decode(self, token_ids):
-        return self.tokenizer.decode(token_ids,
-                                     clean_up_tokenization_spaces=False)
+        self.token_ids_cache += token_ids
+        text = self.tokenizer.decode(self.token_ids_cache)
+        if "\ufffd" in text and len(self.token_ids_cache) < 9:
+            print("text 中包含非法字符")
+            return ""
+        else:
+            self.token_ids_cache.clear()
+            return text.replace("\ufffd","")
+    
+    # def decode(self, token_ids):
+    #     return self.tokenizer.decode(token_ids,
+    #                                  clean_up_tokenization_spaces=False)
 
     @property
     def bos_id(self):
@@ -120,6 +134,10 @@ class Tokenizer_Http():
 
     @property
     def img_context_token(self):
+        return self.tokenizer.encode("<|image_pad|>")[0]
+    
+    @property
+    def video_context_token(self):
         return self.tokenizer.encode("<|video_pad|>")[0]
 
 tokenizer = Tokenizer_Http()
@@ -180,6 +198,12 @@ class Request(BaseHTTPRequestHandler):
                 msg = json.dumps({'img_context_token': -1})
             else:
                 msg = json.dumps({'img_context_token': img_context_token})
+        elif self.path == '/video_context_token':
+            video_context_token = tokenizer.video_context_token
+            if video_context_token is None:
+                msg = json.dumps({'video_context_token': -1})
+            else:
+                msg = json.dumps({'video_context_token': video_context_token})
         else:
             msg = 'error'
 
@@ -206,7 +230,7 @@ class Request(BaseHTTPRequestHandler):
             if 'img_prompt' in req:
                 b_img_prompt = req['img_prompt']
             if b_img_prompt:
-                token_ids = tokenizer.encode_vpm(prompt, req["num_img"], req["img_token_num"])
+                token_ids = tokenizer.encode_vpm(prompt, req["num_img"], req["img_token_num"], req["video_prompt"])
             else:
                 token_ids = tokenizer.encode(prompt)
             

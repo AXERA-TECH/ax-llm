@@ -199,7 +199,7 @@ int main(int argc, char *argv[])
             else
             {
                 lLaMa.EncodeImage(src, b_video, config, img_embed, deepstack_features);
-                lLaMa.Encode(img_embed, prompt_data, position_ids, visual_pos_mask, config, prompt_complete(prompt, attr.tokenizer_type));
+                lLaMa.Encode(img_embed, b_video, prompt_data, position_ids, visual_pos_mask, config, prompt_complete(prompt, attr.tokenizer_type));
                 output = lLaMa.Run(prompt_data, position_ids, deepstack_features, visual_pos_mask);
             }
         }
