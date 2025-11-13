@@ -181,7 +181,7 @@ with gr.Blocks(css="""
         font-size: 18px !important;
     }
 """,title="AXERA Qwen3 VL") as demo:
-    axera_logo = img_to_data_url_from_path("/home/axera/ax-llm/build/axera_logo.png")
+    axera_logo = img_to_data_url_from_path("./axera_logo.png")
     gr.Markdown(
         f"""
         <div style="display: flex; align-items: center; gap: 10px;">
