@@ -181,7 +181,7 @@ with gr.Blocks(css="""
         font-size: 18px !important;
     }
 """,title="AXERA Qwen3 VL") as demo:
-    axera_logo = img_to_data_url_from_path("/home/axera/ax-llm/build/axera_logo.png")
+    axera_logo = img_to_data_url_from_path("./axera_logo.png")
     gr.Markdown(
         f"""
         <div style="display: flex; align-items: center; gap: 10px;">
@@ -234,8 +234,8 @@ with gr.Blocks(css="""
         queue=True,
     )
     
-    def stop_stream():
-        url = "http://localhost:8000/v1/stop"
+    def stop_stream(base_url):
+        url = f"{base_url.strip()}/stop"
         response = requests.get(url)
         if response.status_code == 200:
             print("Stream stopped successfully")
@@ -244,6 +244,7 @@ with gr.Blocks(css="""
 
     stop_btn.click(
         fn=stop_stream,
+        inputs=[base_url],
         outputs=chatbot,
         show_progress=True,
         queue=True,

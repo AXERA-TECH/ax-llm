@@ -18,34 +18,6 @@ add_compile_options(-std=c++17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-
-# bsp
-if(NOT BSP_MSP_DIR)
-    # 判断 /soc/lib/libax_engine.so 是否存在，以确定是否为板端编译
-    if(EXISTS /soc/lib/libax_engine.so)
-        message(STATUS "Detected board,BSP_MSP_DIR = /soc")
-        set(BSP_MSP_DIR /soc)
-    else()
-        set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
-    endif()
-endif()
-message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
-include_directories(${BSP_MSP_DIR}/include)
-link_directories(${BSP_MSP_DIR}/lib)
-
-# set(SPM_ENABLE_SHARED OFF)
-# add_subdirectory(third_party/sentencepiece)
-# include_directories(third_party/sentencepiece/src)
-# include_directories(third_party/sentencepiece/third_party/protobuf-lite)
-
-# set(ABSL_ENABLE_INSTALL ON)
-# set(ABSL_PROPAGATE_CXX_STD ON)
-# add_subdirectory(third_party/abseil-cpp)
-# add_subdirectory(third_party/re2)
-# include_directories(third_party/abseil-cpp)
-# include_directories(third_party/re2)
-# link_directories(${CMAKE_BINARY_DIR}/lib)
-
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
 
@@ -59,8 +31,11 @@ include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
 
-include_directories(axcl/include)
-link_directories(axcl/lib)
+if (AXCL_DIR)
+    message(STATUS "AXCL_DIR Path: ${AXCL_DIR}")
+    include_directories(${AXCL_DIR}/include)
+    link_directories(${AXCL_DIR}/lib)
+endif()
 include_directories(/usr/include/axcl/)
 link_directories(/usr/lib/axcl/)
 
