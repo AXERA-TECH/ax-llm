@@ -1,10 +1,26 @@
+import subprocess
 import time
 import gradio as gr
+from openai import OpenAI
 import requests
 import json
+import re
 
 # Base URL of your API server; adjust host and port as needed
-API_URL = "http://localhost:8000"
+API_URL = "http://0.0.0.0:8000/v1"
+MODEL = "AXERA-TECH/Qwen3-1.7B"
+
+def get_all_local_ips():
+    result = subprocess.run(['ip', 'a'], capture_output=True, text=True)
+    output = result.stdout
+
+    # 匹配所有IPv4
+    ips = re.findall(r'inet (\d+\.\d+\.\d+\.\d+)', output)
+
+    # 过滤掉回环地址
+    real_ips = [ip for ip in ips if not ip.startswith('127.')]
+
+    return real_ips
 
 
 def reset_chat(system_prompt):
@@ -17,7 +33,7 @@ def reset_chat(system_prompt):
     if system_prompt:
         payload["system_prompt"] = system_prompt
     try:
-        response = requests.post(f"{API_URL}/api/reset", json=payload)
+        response = requests.post(f"{API_URL}/reset", json=payload)
         response.raise_for_status()
     except Exception as e:
         # Return error in chat if reset fails
@@ -26,68 +42,77 @@ def reset_chat(system_prompt):
     return [], ""
 
 
-def stream_generate(history, message, temperature, repetition_penalty, top_p, top_k):
-    """
-    Sends the user message and sampling parameters to /api/generate.
-    Streams the response chunks and updates the last bot message in history.
-    Clears input after sending. On error, shows error in chat.
-    """
-    history = history + [(message, "")]
-    yield history, ""
-    payload = {
-        "prompt": message,
-        "temperature": temperature,
-        "repetition_penalty": repetition_penalty,
-        "top-p": top_p,
-        "top-k": top_k
-    }
+def build_messages(prompt: str):
+    content = []
+    if prompt and prompt.strip():
+        content.append({"type": "text", "text": prompt.strip()})
+
+    return {"role": "user", "content": content if content else [{"type": "text", "text": prompt or ""}]}
+
+# ---------- Gradio callback (single-turn, stream) ----------
+def run_single_turn(prompt, chatbot_state):
     try:
-        response = requests.post(f"{API_URL}/api/generate", json=payload, timeout=(3.05, None))
-        response.raise_for_status()
+        # 清空历史（单轮），构造用户气泡
+        # chatbot_state = []
+
+        # 构造 messages 和预览
+        messages = build_messages(
+            prompt=prompt or "",
+        )
+
+        user_md = (prompt or "").strip()
+
+        chatbot_state.append((user_md or "(空提示)", ""))  # assistant 先空字符串，等待流式填充
+        yield chatbot_state, chatbot_state  # 先把用户气泡渲染出来
+
+        # 调后端（流式）
+        client = OpenAI(api_key="not-needed", base_url=API_URL.strip())
+        stream = client.chat.completions.create(
+            model=MODEL.strip(),
+            messages=messages,
+            stream=True,
+        )
+
+        bot_chunks = []
+        # 先补一个空 assistant 气泡
+        # if len(chatbot_state) == 1:
+        chatbot_state[-1] = (chatbot_state[-1][0], "")
+        yield chatbot_state, chatbot_state 
+
+        # 逐 chunk 更新 assistant 气泡（Markdown）
+        for ev in stream:
+            delta = getattr(ev.choices[0], "delta", None)
+            if delta and getattr(delta, "content", None):
+                ctx = delta.content
+                if "<think>" in delta.content:
+                    ctx = delta.content.replace("<think>", "【思考中】")
+                
+                if "</think>" in delta.content:
+                    ctx = delta.content.replace("</think>", "【思考结束】")
+                
+                bot_chunks.append(ctx)
+                chatbot_state[-1] = (chatbot_state[-1][0], "".join(bot_chunks))
+                yield chatbot_state, chatbot_state 
+
+        # 结束再确保收尾
+        chatbot_state[-1] = (chatbot_state[-1][0], "".join(bot_chunks) if bot_chunks else "(empty response)")
+        yield chatbot_state, chatbot_state 
+
     except Exception as e:
-        history[-1] = (message, f"Error: {str(e)}")
-        yield history, ""
-        return
-    time.sleep(0.1)
-    
-    while True:
-        time.sleep(0.01)
-        response = requests.get(
-                f"{API_URL}/api/generate_provider"
-            )
-        data = response.json()
-        chunk:str = data.get("response", "") 
-        done = data.get("done", False)
-        if done:
-            break
-        if chunk.strip() == "":
-            continue
-        history[-1] = (message, history[-1][1] + chunk)
-        yield history, ""
-       
-    print("end")
-    
+        chatbot_state.append((
+            chatbot_state[-1][0] if chatbot_state else "(request)",
+            f"**Error:** {e}"
+        ))
+        yield chatbot_state, chatbot_state 
+
+
 
 def stop_generate():
     try:
-        requests.get(f"{API_URL}/api/stop")
+        requests.get(f"{API_URL}/stop")
     except Exception as e:
         print(e)
     
-# Build the Gradio interface optimized for PC with spacious layout
-# custom_css = """
-# .gradio-container {
-#     max-width: 1400px;
-#     margin: auto;
-#     padding: 20px;
-# }
-# .gradio-container > * {
-#     margin-bottom: 20px;
-# }
-# #chatbox .overflow-y-auto {
-#     height: 600px !important;
-# }
-# """
 
 # Build the Gradio interface优化布局
 with gr.Blocks(theme=gr.themes.Soft(font="Consolas"), fill_width=True) as demo:
@@ -111,26 +136,32 @@ with gr.Blocks(theme=gr.themes.Soft(font="Consolas"), fill_width=True) as demo:
             repetition_penalty = gr.Slider(minimum=1.0, maximum=2.0, step=0.01, value=1.0, label="Repetition Penalty")
             top_p = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.9, label="Top-p Sampling")
             top_k = gr.Slider(minimum=0, maximum=100, step=1, value=40, label="Top-k Sampling")
-
-    # Wire up events: reset clears chat and input
-    reset_button.click(fn=reset_chat, inputs=system_prompt, outputs=[chatbot, user_input])
-    # send streams chat and clears input
+    
+    
+    chat_state = gr.State([])
+        
+    reset_button.click(
+        fn=reset_chat,
+        inputs=system_prompt,
+        outputs=[chatbot, user_input],  
+    ).then(
+        lambda: [],
+        inputs=None,
+        outputs=chat_state
+    )
+    
     send_button.click(
-        fn=stream_generate,
-        inputs=[chatbot, user_input, temperature, repetition_penalty, top_p, top_k],
-        outputs=[chatbot, user_input]
+        fn=run_single_turn,
+        inputs=[user_input, chat_state],  
+        outputs=[chatbot, chat_state],      
+        show_progress=True,
+        queue=True,
     )
     
     stop_button.click(
         fn=stop_generate
     )
     
-    # allow Enter key to send
-    user_input.submit(
-        fn=stream_generate,
-        inputs=[chatbot, user_input, temperature, repetition_penalty, top_p, top_k],
-        outputs=[chatbot, user_input]
-    )
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)  # adjust as needed
