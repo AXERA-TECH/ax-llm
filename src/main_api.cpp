@@ -4,6 +4,7 @@
 #include <fstream>
 #include <queue>
 #include <signal.h>
+#include <filesystem> // C++17
 
 #include "runner/utils/httplib.h"
 #include "runner/utils/json.hpp"
@@ -20,7 +21,9 @@
 
 #define IS_AXCL 0
 
-#if !IS_AXCL
+#if IS_AXCL
+#include <axcl.h>
+#else
 #include <ax_sys_api.h>
 #include <ax_engine_api.h>
 #endif
@@ -59,12 +62,13 @@ std::vector<std::string> glob(const std::string &pattern)
     return results;
 }
 
+static const char *kModelName = "AXERA-TECH/Qwen3-1.7B"; // 保持和聊天里返回的 model 一致
+
 httplib::Server svr;
 const int PORT = 8000;
-const std::string UPLOAD_DIR = "uploads/";
-const std::string MODEL_DIR = "models/";
 
 static std::queue<std::string> g_msg_queue;
+static std::condition_variable g_msg_cv;
 static std::mutex g_msg_locker;
 
 void __sigExit(int iSigNo)
@@ -77,8 +81,18 @@ void llm_running_callback(int *p_token, int n_token, const char *p_str, float to
 {
     fprintf(stdout, "%s", p_str);
     fflush(stdout);
-    std::lock_guard<std::mutex> tmp_locker(g_msg_locker);
-    g_msg_queue.push(p_str);
+
+    const size_t CHUNK = 256;
+    std::string s = p_str ? std::string(p_str) : "";
+    for (size_t i = 0; i < s.size(); i += CHUNK)
+    {
+        std::string part = s.substr(i, CHUNK);
+        {
+            std::lock_guard<std::mutex> lk(g_msg_locker);
+            g_msg_queue.push(std::move(part));
+        }
+        g_msg_cv.notify_one();
+    }
 }
 
 template <typename T>
@@ -99,7 +113,6 @@ public:
     bool gllm_init = false;
     bool gllm_initing = false;
 
-    std::vector<int> _token_ids;
     std::vector<unsigned short> prompt_data;
     std::string last_reply;
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
@@ -112,6 +125,11 @@ private:
     std::mutex queue_mutex;
     std::condition_variable condition;
     std::atomic<bool> stop_flag;
+
+    void reset()
+    {
+        std::vector<unsigned short>().swap(prompt_data);
+    }
 
     void run()
     {
@@ -186,12 +204,17 @@ public:
         }
     }
 
-    // **支持带参数的任务**
-    void RunAsync(std::string prompt)
+    void ResetSync(std::string system_prompt)
     {
-
-        addTask([this, prompt]()
-                { RunSync(prompt, llm_running_callback); });
+        if (gllm_runing)
+        {
+            return;
+        }
+        gllm_runing = true;
+        std::vector<int> _token_ids;
+        gllm.SetSystemPrompt(system_prompt, _token_ids);
+        gllm.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
+        gllm_runing = false;
     }
 
     void ResetASync(std::string system_prompt)
@@ -200,40 +223,34 @@ public:
                 { ResetSync(system_prompt); });
     }
 
-    void ResetSync(std::string system_prompt)
+    // **支持带参数的任务**
+    void RunAsync(std::string prompt)
     {
-        if (gllm_runing)
-        {
-            return;
-        }
-        gllm_runing = true;
-        gllm.SetSystemPrompt(system_prompt, _token_ids);
-        gllm.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
-        gllm_runing = false;
+        addTask([this, prompt]()
+                { RunSync(prompt, llm_running_callback); });
     }
 
     std::string RunSync(std::string prompt, LLMRuningCallback cb)
     {
-        if (gllm_runing)
-        {
-            return "";
-        }
         gllm_runing = true;
         gllm.getAttr()->runing_callback = cb;
-        // auto output = gllm.Run(prompt);
+
+        // std::string output;
+
         std::vector<int> tokens_ids, tokens_diff;
         gllm.Encode(prompt_data, prompt, last_reply, tokens_ids, tokens_diff);
         if (auto ret = gllm.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
         {
-            gllm_runing = false;
-            g_msg_queue.push("error: SetKVCache failed: %d,the context may be full,please reset");
-            return "error: SetKVCache failed: %d,the context may be full,please reset";
+            ALOGE("SetKVCache failed: %d,the context may be full,input \"reset\" to reset context", ret);
+            return "";
         }
         last_reply = gllm.Run(prompt_data);
         gllm.GetKVCache(k_caches, v_caches, precompute_len);
 
         gllm_runing = false;
-        // std::cout << "Chat result: " << output << std::endl;
+        g_msg_cv.notify_all(); // 唤醒 content_provider_stream 的等待
+        std::cout << "Chat result: " << last_reply << std::endl;
+        reset();
         return last_reply;
     }
 };
@@ -268,6 +285,51 @@ bool check_model_available(const httplib::Request &req, httplib::Response &res)
     }
 
     return true;
+}
+
+// ====== 处理函数 ======
+void handle_models_list(const httplib::Request &req, httplib::Response &res)
+{
+    nlohmann::json model;
+    model["id"] = kModelName;
+    model["object"] = "model";
+    model["created"] = std::time(nullptr);
+    model["owned_by"] = "owner";
+
+    nlohmann::json resp;
+    resp["object"] = "list";
+    resp["data"] = nlohmann::json::array({model});
+
+    res.status = 200;
+    res.set_content(resp.dump(), "application/json");
+}
+
+void handle_model_get(const httplib::Request &req, httplib::Response &res)
+{
+    // 路由里捕获的 {id}
+    auto id = req.matches.size() > 1 ? req.matches[1].str() : "";
+
+    if (id == kModelName)
+    {
+        nlohmann::json model;
+        model["id"] = kModelName;
+        model["object"] = "model";
+        model["created"] = std::time(nullptr);
+        model["owned_by"] = "owner";
+        res.status = 200;
+        res.set_content(model.dump(), "application/json");
+    }
+    else
+    {
+        nlohmann::json err;
+        err["error"] = {
+            {"message", "Model not found"},
+            {"type", "invalid_request_error"},
+            {"param", "model"},
+            {"code", "model_not_found"}};
+        res.status = 404;
+        res.set_content(err.dump(), "application/json");
+    }
 }
 
 void set_llm_config(nlohmann::json &body)
@@ -354,15 +416,174 @@ void content_provider(const httplib::Request &req, httplib::Response &res)
     res.set_content(chunk.dump(), "application/json");
 }
 
+bool content_provider_stream(size_t /*offset*/, httplib::DataSink &sink)
+{
+    auto send_sse = [&](const std::string &json_str)
+    {
+        sink.write("data: ", 6);
+        sink.write(json_str.data(), json_str.size());
+        sink.write("\n\n", 2);
+    };
+
+    const std::string id = "cmpl-" + std::to_string(std::time(nullptr));
+    const long created = std::time(nullptr);
+    const std::string model_name = kModelName;
+
+    // 先发一帧角色（可选，兼容性更好）
+    {
+        nlohmann::json first;
+        first["id"] = id;
+        first["object"] = "chat.completion.chunk";
+        first["created"] = created;
+        first["model"] = model_name;
+        nlohmann::json ch;
+        ch["index"] = 0;
+        ch["delta"] = {{"role", "assistant"}};
+        ch["finish_reason"] = nullptr;
+        first["choices"] = nlohmann::json::array({ch});
+        send_sse(first.dump());
+    }
+
+    for (;;)
+    {
+        std::string str;
+
+        // 阻塞等待：直到队列非空或推理结束
+        {
+            std::unique_lock<std::mutex> lk(g_msg_locker);
+            g_msg_cv.wait(lk, [&]
+                          { return !g_msg_queue.empty() || !worker.gllm_runing.load(); });
+
+            if (!g_msg_queue.empty())
+            {
+                str = std::move(g_msg_queue.front());
+                g_msg_queue.pop();
+            }
+            else
+            {
+                // 队列空且不再运行 -> 退出发送循环
+                break;
+            }
+        }
+
+        // 发送一个 OpenAI 样式 chunk
+        nlohmann::json chunk;
+        chunk["id"] = id;
+        chunk["object"] = "chat.completion.chunk";
+        chunk["created"] = created;
+        chunk["model"] = model_name;
+
+        nlohmann::json choice;
+        choice["index"] = 0;
+        choice["delta"] = {{"content", str}};
+        choice["finish_reason"] = nullptr;
+        chunk["choices"] = nlohmann::json::array({choice});
+
+        send_sse(chunk.dump());
+    }
+
+    // 收尾：空 delta + finish_reason=stop
+    {
+        nlohmann::json final_chunk;
+        final_chunk["id"] = id;
+        final_chunk["object"] = "chat.completion.chunk";
+        final_chunk["created"] = created;
+        final_chunk["model"] = model_name;
+
+        nlohmann::json choice;
+        choice["index"] = 0;
+        choice["delta"] = nlohmann::json::object();
+        choice["finish_reason"] = "stop";
+        final_chunk["choices"] = nlohmann::json::array({choice});
+
+        send_sse(final_chunk.dump());
+    }
+
+    // 最后一条 [DONE]
+    sink.write("data: [DONE]\n\n", 14);
+    sink.done();
+    return true;
+}
+
+bool handle_body(const nlohmann::json &body, std::string &prompt, std::vector<std::string> &image_paths, bool &b_video, bool &stream)
+{
+    if (body.contains("stream") && body["stream"].is_boolean())
+    {
+        stream = body["stream"];
+    }
+    std::string model = body["model"];
+    ALOGI("model:%s\n", model.c_str());
+
+    nlohmann::json messages = body["messages"];
+
+    if (messages.contains("role") &&
+        messages["role"] == "user" &&
+        messages.contains("content"))
+    {
+        if (messages["content"].is_array())
+        {
+            for (auto &item : messages["content"])
+            {
+                if (item.contains("type") && item["type"] == "text")
+                {
+                    prompt = item["text"];
+                }
+                else if (item.contains("type") && item["type"] == "image_url")
+                {
+                    if (item["image_url"].is_array())
+                    {
+                        if (item.contains("is_video") && item["is_video"].is_boolean())
+                        {
+                            b_video = item["is_video"];
+                        }
+                        for (auto &img : item["image_url"])
+                        {
+                            image_paths.push_back(img);
+                        }
+                    }
+                    else
+                    {
+                        image_paths.push_back(item["image_url"]);
+                    }
+                }
+            }
+        }
+        else if (messages["content"].is_string())
+        {
+            prompt = messages["content"];
+        }
+        else
+        {
+            ALOGE("content type not support");
+            return false;
+        }
+    }
+    else
+    {
+        ALOGE("content type not support");
+        return false;
+    }
+    return true;
+}
+
 void handle_generate(const httplib::Request &req, httplib::Response &res)
 {
     auto body = nlohmann::json::parse(req.body, nullptr, false);
-    if (body.is_discarded() || !body.contains("prompt"))
+    if (body.is_discarded())
     {
         res.status = 400;
         res.set_content("{\"error\": \"Invalid request format\"}", "application/json");
         return;
     }
+
+    if (worker.gllm_runing.load())
+    {
+        res.status = 400;
+        res.set_content("{\"error\": \"LLM is running\"}", "application/json");
+        return;
+    }
+
+    // printf("body:%s\n", body.dump(4).c_str());
 
     if (!check_model_available(req, res))
     {
@@ -372,20 +593,59 @@ void handle_generate(const httplib::Request &req, httplib::Response &res)
 
     set_llm_config(body);
 
-    std::string prompt = body["prompt"];
-    ALOGI("%s", prompt.c_str());
-    worker.RunAsync(prompt);
-    res.status = 200;
-    res.set_content("{\"status\": \"ok\"}", "application/json");
-}
+    std::string prompt;
+    std::vector<std::string> image_paths;
+    bool b_video = false;
+    bool stream = false;
+    if (!handle_body(body, prompt, image_paths, b_video, stream))
+    {
+        res.status = 400;
+        res.set_content("{\"error\": \"Invalid request format\"}", "application/json");
+        return;
+    }
 
-void handle_stop(const httplib::Request &req, httplib::Response &res)
-{
-    worker.gllm.Stop();
+    ALOGI("prompt:%s  stream:%d", prompt.c_str(), stream);
 
-    res.status = 200;
-    res.set_content("{\"status\": \"ok\"}", "application/json");
-    return;
+    if (stream)
+    {
+        worker.gllm_runing = true;
+        worker.RunAsync(prompt);
+
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Connection", "keep-alive");
+        // httplib 会在 set_chunked_content_provider 时自动设置 Transfer-Encoding: chunked
+        res.set_chunked_content_provider(
+            "text/event-stream", // ✅ SSE
+            content_provider_stream);
+        return; // ✅ 这里不要再 set_content，否则会覆盖
+    }
+    else
+    {
+        auto output = worker.RunSync(prompt, nullptr);
+
+        nlohmann::json response;
+        response["id"] = "cmpl-" + std::to_string(std::time(nullptr));
+        response["object"] = "chat.completion";
+        response["created"] = std::time(nullptr);
+        response["model"] = kModelName;
+
+        nlohmann::json choice;
+        choice["index"] = 0;
+        choice["message"] = {
+            {"role", "assistant"},
+            {"content", output}};
+        choice["finish_reason"] = "stop";
+
+        response["choices"] = nlohmann::json::array({choice});
+        // 可选：统计用
+        response["usage"] = {
+            {"prompt_tokens", prompt.size()},
+            {"completion_tokens", output.size()},
+            {"total_tokens", prompt.size() + output.size()}};
+
+        res.status = 200;
+        res.set_content(response.dump(), "application/json");
+    }
 }
 
 void handle_reset(const httplib::Request &req, httplib::Response &res)
@@ -417,46 +677,12 @@ void handle_reset(const httplib::Request &req, httplib::Response &res)
     return;
 }
 
-void handle_chat(const httplib::Request &req, httplib::Response &res)
+void handle_stop(const httplib::Request &req, httplib::Response &res)
 {
-    auto body = nlohmann::json::parse(req.body, nullptr, false);
+    worker.gllm.Stop();
 
-    if (body.is_discarded() || !body.contains("messages"))
-    {
-        ALOGE("Invalid request format");
-        res.status = 400;
-        res.set_content("{\"error\": \"Invalid request format\"}", "application/json");
-        return;
-    }
-    if (!check_model_available(req, res))
-    {
-        ALOGE("model not available");
-        return;
-    }
-
-    set_llm_config(body);
-
-    std::vector<nlohmann::json> messages = body["messages"];
-
-    for (auto &message : messages)
-    {
-        if (message.contains("role") && message.contains("content"))
-        {
-            auto output = worker.RunSync(message["content"].get<std::string>(), nullptr);
-
-            nlohmann::json response;
-            response["message"] = output;
-            response["done"] = true;
-
-            res.status = 200;
-            res.set_content(response.dump(), "application/json");
-
-            return;
-        }
-    }
-
-    res.status = 400;
-    res.set_content("{\"error\": \"Invalid message format\"}", "application/json");
+    res.status = 200;
+    res.set_content("{\"status\": \"ok\"}", "application/json");
     return;
 }
 
@@ -541,11 +767,19 @@ int main(int argc, char *argv[])
     worker.gllm_init = true;
 
     worker.Run();
-    svr.Get("/api/stop", handle_stop);
-    svr.Post("/api/reset", handle_reset);
-    svr.Post("/api/generate", handle_generate);
-    svr.Get("/api/generate_provider", content_provider);
-    svr.Post("/api/chat", handle_chat);
+    svr.Get("/v1/stop", handle_stop);
+    svr.Post("/v1/chat/completions", handle_generate);
+    // svr.Get("/v1/generate_provider", content_provider);
+    // svr.Post("/v1/chat", handle_chat);
+    // svr.Post("/v1/upload", handle_upload);
+
+    svr.Post("/v1/reset", handle_reset);
+
+    // 列表
+    svr.Get("/v1/models", handle_models_list);
+
+    // 单个
+    svr.Get(R"(/v1/models/(.+))", handle_model_get);
 
     svr.set_pre_routing_handler([](const httplib::Request &req, httplib::Response &res) -> httplib::Server::HandlerResponse
                                 {
@@ -557,6 +791,7 @@ int main(int argc, char *argv[])
                                         res.status = 200;
                                         return httplib::Server::HandlerResponse::Handled; // 表示已处理，不再继续
                                     }
+                                    printf("req.method:%s req.path:%s \n", req.method.c_str(), req.path.c_str());
                                     return httplib::Server::HandlerResponse::Unhandled; // 继续处理请求
                                 });
 
@@ -564,6 +799,7 @@ int main(int argc, char *argv[])
     svr.listen("0.0.0.0", PORT);
     worker.Stop();
     worker.gllm.Deinit();
+
 #if IS_AXCL
     axclFinalize();
 #else
