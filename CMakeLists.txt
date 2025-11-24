@@ -62,5 +62,6 @@ endfunction()
 
 build_exec(main src/main.cpp)
 build_exec(main_api src/main_api.cpp)
+build_exec(main_prof src/main_prof.cpp)
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)

@@ -6,8 +6,6 @@ class ax_runner_ax650 : public ax_runner_base
 protected:
     struct ax_joint_runner_ax650_handle_t *m_handle = nullptr;
 
-    bool _parepare_io = false;
-
     int sub_init();
 
 public:

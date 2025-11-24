@@ -229,6 +229,11 @@ public:
         return &postprocess;
     }
 
+    LLaMaEmbedSelector *getEmbedSelector()
+    {
+        return &embed_selector;
+    }
+
     void Deinit()
     {
         for (int i = 0; i < _attr.axmodel_num; i++)
@@ -413,74 +418,7 @@ public:
 
         return 0;
     }
-
-    int GenerateKVCache(std::vector<int> &_token_ids)
-    {
-        // clear kv cache
-        for (size_t i = 0; i < _attr.axmodel_num; i++)
-        {
-            memset((void *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize);
-            memset((void *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize);
-        }
-
-        bfloat16 bf16 = -65536.f;
-        std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
-        mask[_attr.kv_cache_num] = 0;
-        std::vector<unsigned short> embed;
-
-        int next_token = _token_ids[0];
-
-        t_cqdm cqdm = create_cqdm(_token_ids.size(), 32);
-
-        for (unsigned int indices = 0; indices < _token_ids.size(); indices++)
-        {
-            // ALOGI("out %d %d", indices, next_token);
-            embed_selector.getByIndex(next_token, embed);
-
-            for (int m = 0; m < _attr.axmodel_num; m++)
-            {
-                if (b_stop)
-                {
-                    break;
-                }
-
-                auto &layer = llama_layers[m];
-
-                auto &input_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
-                unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
-                auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
-                unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
-
-                auto &input_indices = layer.layer.get_input(decode_grpid, "indices");
-                memcpy(input_indices.pVirAddr, &indices, sizeof(indices));
-
-                auto &input_mask = layer.layer.get_input(decode_grpid, "mask");
-                memcpy(input_mask.pVirAddr, mask.data(), mask.size() * sizeof(unsigned short));
-
-                auto &input_input = layer.layer.get_input(decode_grpid, "input");
-                memcpy(input_input.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
-
-                layer.layer.inference(decode_grpid);
-
-                auto &output_k_cache = layer.layer.get_output(decode_grpid, "K_cache_out");
-                memcpy(input_k_cache_ptr + indices * _attr.kv_cache_size, output_k_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
-
-                auto &output_v_cache = layer.layer.get_output(decode_grpid, "V_cache_out");
-                memcpy(input_v_cache_ptr + indices * _attr.kv_cache_size, output_v_cache.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
-
-                auto &output = layer.layer.get_output(decode_grpid, "output");
-                memcpy(embed.data(), output.pVirAddr, embed.size() * sizeof(unsigned short));
-
-                // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
-            }
-            mask[indices] = 0;
-            next_token = _token_ids[indices + 1];
-            update_cqdm(&cqdm, indices, "token", "");
-            // ALOGI("");
-        }
-        return 0;
-    }
-
+    
     int GetKVCache(std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int &precompute_len)
     {
         bfloat16 bf16 = -65536.f;
@@ -640,7 +578,7 @@ public:
         return 0;
     }
 
-    std::string Run(std::vector<unsigned short> test_embed)
+    std::string Run(std::vector<unsigned short> test_embed, int output_max_token = -1)
     {
         b_stop = false;
         std::string final_out;
@@ -905,6 +843,11 @@ public:
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
+                }
+                if (output_max_token > 0 && token_ids.size() >= output_max_token)
+                {
+                    b_hit_eos = true;
+                    break;
                 }
             }
 

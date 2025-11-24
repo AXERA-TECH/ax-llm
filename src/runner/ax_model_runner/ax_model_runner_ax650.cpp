@@ -123,6 +123,12 @@ void free_io_index(AX_ENGINE_IO_BUFFER_T *io_buf, int index)
     }
 }
 
+void free_io_nofree(AX_ENGINE_IO_T *io)
+{
+    delete[] io->pInputs;
+    delete[] io->pOutputs;
+}
+
 void free_io(AX_ENGINE_IO_T *io)
 {
     for (size_t j = 0; j < io->nInputSize; ++j)
@@ -198,6 +204,32 @@ static inline int prepare_io(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data,
     return 0;
 }
 
+static inline int prepare_io_no_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data)
+{
+    memset(io_data, 0, sizeof(*io_data));
+    io_data->pInputs = new AX_ENGINE_IO_BUFFER_T[info->nInputSize];
+    io_data->nInputSize = info->nInputSize;
+
+    auto ret = 0;
+    for (uint i = 0; i < info->nInputSize; ++i)
+    {
+        auto meta = info->pInputs[i];
+        auto buffer = &io_data->pInputs[i];
+        buffer->nSize = meta.nSize;
+    }
+
+    io_data->pOutputs = new AX_ENGINE_IO_BUFFER_T[info->nOutputSize];
+    io_data->nOutputSize = info->nOutputSize;
+    for (uint i = 0; i < info->nOutputSize; ++i)
+    {
+        auto meta = info->pOutputs[i];
+        auto buffer = &io_data->pOutputs[i];
+        buffer->nSize = meta.nSize;
+    }
+
+    return 0;
+}
+
 struct ax_joint_runner_ax650_handle_t
 {
     AX_ENGINE_HANDLE handle;
@@ -244,20 +276,22 @@ int ax_runner_ax650::sub_init()
     // fprintf(stdout, "Engine get io info is done. \n");
 
     // 6. alloc io
-    if (!_parepare_io)
-    {
-        for (size_t grpid = 0; grpid < io_count; grpid++)
-        {
-            AX_ENGINE_IO_INFO_T *io_info = nullptr;
-            ret = AX_ENGINE_GetGroupIOInfo(m_handle->handle, grpid, &io_info);
-            if (0 != ret)
-            {
-                ALOGE("AX_ENGINE_GetIOInfo");
-                return ret;
-            }
-            // print_io_info(io_info);
 
-            m_handle->io_info[grpid] = io_info;
+    for (size_t grpid = 0; grpid < io_count; grpid++)
+    {
+        AX_ENGINE_IO_INFO_T *io_info = nullptr;
+        ret = AX_ENGINE_GetGroupIOInfo(m_handle->handle, grpid, &io_info);
+        if (0 != ret)
+        {
+            ALOGE("AX_ENGINE_GetIOInfo");
+            return ret;
+        }
+        // print_io_info(io_info);
+
+        m_handle->io_info[grpid] = io_info;
+
+        if (grpid == 0 || grpid == io_count - 1)
+        {
 
             ret = prepare_io(m_handle->io_info[grpid], &m_handle->io_data[grpid], std::make_pair(AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED));
             if (0 != ret)
@@ -266,50 +300,70 @@ int ax_runner_ax650::sub_init()
                 return ret;
             }
         }
-
-        for (size_t grpid = 0; grpid < io_count; grpid++)
+        else
         {
-            auto &io_info = m_handle->io_info[grpid];
-            auto &io_data = m_handle->io_data[grpid];
-            for (size_t i = 0; i < io_info->nOutputSize; i++)
+            ret = prepare_io_no_alloc(m_handle->io_info[grpid], &m_handle->io_data[grpid]);
+            if (0 != ret)
             {
-                ax_runner_tensor_t tensor;
-                tensor.nIdx = i;
-                tensor.sName = std::string(io_info->pOutputs[i].pName);
-                tensor.nSize = io_info->pOutputs[i].nSize;
-                for (size_t j = 0; j < io_info->pOutputs[i].nShapeSize; j++)
-                {
-                    tensor.vShape.push_back(io_info->pOutputs[i].pShape[j]);
-                }
-                tensor.phyAddr = io_data.pOutputs[i].phyAddr;
-                tensor.pVirAddr = io_data.pOutputs[i].pVirAddr;
-                mgroup_output_tensors[grpid].push_back(tensor);
-            }
-
-            for (size_t i = 0; i < io_info->nInputSize; i++)
-            {
-                ax_runner_tensor_t tensor;
-                tensor.nIdx = i;
-                tensor.sName = std::string(io_info->pInputs[i].pName);
-                tensor.nSize = io_info->pInputs[i].nSize;
-                for (size_t j = 0; j < io_info->pInputs[i].nShapeSize; j++)
-                {
-                    tensor.vShape.push_back(io_info->pInputs[i].pShape[j]);
-                }
-                tensor.phyAddr = io_data.pInputs[i].phyAddr;
-                tensor.pVirAddr = io_data.pInputs[i].pVirAddr;
-                mgroup_input_tensors[grpid].push_back(tensor);
+                ALOGE("prepare_io_no_alloc grpid=%d", grpid);
+                return ret;
             }
         }
-
-        moutput_tensors = mgroup_output_tensors[0];
-        minput_tensors = mgroup_input_tensors[0];
-
-        _parepare_io = true;
     }
-    else
+
+    auto &last_io_data = m_handle->io_data[io_count - 1];
+
+    for (size_t grpid = 1; grpid < io_count - 1; grpid++)
     {
+        auto &io_info = m_handle->io_info[grpid];
+        auto &io_data = m_handle->io_data[grpid];
+        for (size_t i = 0; i < io_info->nInputSize; i++)
+        {
+            io_data.pInputs[i].phyAddr = last_io_data.pInputs[i].phyAddr;
+            io_data.pInputs[i].pVirAddr = last_io_data.pInputs[i].pVirAddr;
+
+            io_data.pOutputs[i].phyAddr = last_io_data.pOutputs[i].phyAddr;
+            io_data.pOutputs[i].pVirAddr = last_io_data.pOutputs[i].pVirAddr;
+        }
     }
+
+    for (size_t grpid = 0; grpid < io_count; grpid++)
+    {
+        auto &io_info = m_handle->io_info[grpid];
+        auto &io_data = m_handle->io_data[grpid];
+        for (size_t i = 0; i < io_info->nOutputSize; i++)
+        {
+            ax_runner_tensor_t tensor;
+            tensor.nIdx = i;
+            tensor.sName = std::string(io_info->pOutputs[i].pName);
+            tensor.nSize = io_info->pOutputs[i].nSize;
+            for (size_t j = 0; j < io_info->pOutputs[i].nShapeSize; j++)
+            {
+                tensor.vShape.push_back(io_info->pOutputs[i].pShape[j]);
+            }
+            tensor.phyAddr = io_data.pOutputs[i].phyAddr;
+            tensor.pVirAddr = io_data.pOutputs[i].pVirAddr;
+            mgroup_output_tensors[grpid].push_back(tensor);
+        }
+
+        for (size_t i = 0; i < io_info->nInputSize; i++)
+        {
+            ax_runner_tensor_t tensor;
+            tensor.nIdx = i;
+            tensor.sName = std::string(io_info->pInputs[i].pName);
+            tensor.nSize = io_info->pInputs[i].nSize;
+            for (size_t j = 0; j < io_info->pInputs[i].nShapeSize; j++)
+            {
+                tensor.vShape.push_back(io_info->pInputs[i].pShape[j]);
+            }
+            tensor.phyAddr = io_data.pInputs[i].phyAddr;
+            tensor.pVirAddr = io_data.pInputs[i].pVirAddr;
+            mgroup_input_tensors[grpid].push_back(tensor);
+        }
+    }
+
+    moutput_tensors = mgroup_output_tensors[0];
+    minput_tensors = mgroup_input_tensors[0];
 
     return ret;
 }
@@ -367,11 +421,35 @@ void ax_runner_ax650::release()
 {
     if (m_handle && m_handle->handle)
     {
-        for (size_t i = 0; i < m_handle->io_data.size(); i++)
+        // 这里有内存泄漏，但是不知道问题在哪 TODO
+
+        for (size_t j = 0; j < m_handle->io_data[0].nInputSize; ++j)
         {
-            /* code */
-            free_io(&m_handle->io_data[i]);
+            AX_ENGINE_IO_BUFFER_T *pBuf = m_handle->io_data[0].pInputs + j;
+            AX_SYS_MemFree(pBuf->phyAddr, pBuf->pVirAddr);
         }
+        for (size_t j = 0; j < m_handle->io_data[0].nOutputSize; ++j)
+        {
+            AX_ENGINE_IO_BUFFER_T *pBuf = m_handle->io_data[0].pOutputs + j;
+            AX_SYS_MemFree(pBuf->phyAddr, pBuf->pVirAddr);
+        }
+
+        delete[] m_handle->io_data[0].pInputs;
+        delete[] m_handle->io_data[0].pOutputs;
+
+        for (size_t j = 0; j < m_handle->io_data[m_handle->io_data.size() - 1].nInputSize; ++j)
+        {
+            AX_ENGINE_IO_BUFFER_T *pBuf = m_handle->io_data[m_handle->io_data.size() - 1].pInputs + j;
+            AX_SYS_MemFree(pBuf->phyAddr, pBuf->pVirAddr);
+        }
+        for (size_t j = 0; j < m_handle->io_data[m_handle->io_data.size() - 1].nOutputSize; ++j)
+        {
+            AX_ENGINE_IO_BUFFER_T *pBuf = m_handle->io_data[m_handle->io_data.size() - 1].pOutputs + j;
+            AX_SYS_MemFree(pBuf->phyAddr, pBuf->pVirAddr);
+        }
+
+        // delete[] m_handle->io_data[m_handle->io_data.size() - 1].pInputs;
+        // delete[] m_handle->io_data[m_handle->io_data.size() - 1].pOutputs;
 
         AX_ENGINE_DestroyHandle(m_handle->handle);
         m_handle->handle = nullptr;
