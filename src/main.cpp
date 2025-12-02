@@ -4,8 +4,14 @@
 
 #include "cmdline.hpp"
 
+#define IS_AXCL 0
+
+#if IS_AXCL
+#include <axcl.h>
+#else
 #include <ax_sys_api.h>
 #include <ax_engine_api.h>
+#endif
 
 static LLM lLaMa;
 
@@ -19,22 +25,6 @@ void llm_running_callback(int *p_token, int n_token, const char *p_str, float to
 {
     fprintf(stdout, "%s", p_str);
     fflush(stdout);
-}
-
-std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
-{
-    std::ostringstream oss_prompt;
-    switch (tokenizer_type)
-    {
-    case TKT_HTTP:
-        oss_prompt << prompt;
-        break;
-    default:
-        ALOGE("tokenizer type %d not support", tokenizer_type);
-        break;
-    }
-
-    return oss_prompt.str();
 }
 
 bool save_kvcache(std::string target_path, std::string system_prompt, int precompute_len, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches)
@@ -146,7 +136,9 @@ int main(int argc, char *argv[])
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
-
+#if IS_AXCL
+    cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
+#endif
     cmd.parse_check(argc, argv);
 
     attr.system_prompt = cmd.get<std::string>("system_prompt");
@@ -172,6 +164,24 @@ int main(int argc, char *argv[])
     }
 
     // 1. init engine
+#if IS_AXCL
+    auto devices_str = cmd.get<std::string>("devices");
+    std::vector<int> devices;
+    std::stringstream ss(devices_str);
+    std::string item;
+    while (std::getline(ss, item, ','))
+    {
+        devices.push_back(std::stoi(item));
+    }
+
+    attr.dev_ids = devices;
+
+    auto ret = axclInit(nullptr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#else
     AX_ENGINE_NPU_ATTR_T npu_attr;
     memset(&npu_attr, 0, sizeof(npu_attr));
     npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
@@ -181,12 +191,17 @@ int main(int argc, char *argv[])
     {
         return ret;
     }
+#endif
 
     if (!lLaMa.Init(attr))
     {
         ALOGE("lLaMa.Init failed");
+#if IS_AXCL
+        axclFinalize();
+#else
         AX_ENGINE_Deinit();
         AX_SYS_Deinit();
+#endif
         return -1;
     }
 
@@ -196,37 +211,8 @@ int main(int argc, char *argv[])
         printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
         // lLaMa.Reset();
     }
-    std::vector<unsigned short> prompt_data;
-    std::string last_reply;
-    std::vector<std::vector<unsigned short>> k_caches, v_caches;
-    int precompute_len = 0;
 
-    std::vector<int> _token_ids;
-    lLaMa.SetSystemPrompt(attr.system_prompt, _token_ids);
-
-    if (!kvcache_path.empty() && kvcache_path != "")
-    {
-        if (load_kvcache(kvcache_path, attr.axmodel_num, k_caches, v_caches, attr.system_prompt, precompute_len))
-        {
-            ALOGI("load kvcache from path: %s success,precompute_len: %d", kvcache_path.c_str(), precompute_len);
-        }
-        else
-        {
-            ALOGW("load kvcache from path: %s failed,generate kvcache", kvcache_path.c_str());
-            lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
-            if (!save_kvcache(kvcache_path, attr.system_prompt, precompute_len, k_caches, v_caches))
-            {
-                ALOGE("save kvcache failed");
-            }
-            ALOGI("generate kvcache to path: %s", kvcache_path.c_str());
-        }
-    }
-    else
-    {
-        lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
-    }
-    ALOGI("precompute_len: %d", precompute_len);
-    ALOGI("system_prompt: %s", attr.system_prompt.c_str());
+    std::vector<Content> history = {{SYSTEM, TEXT, attr.system_prompt}};
 
     while (b_continue)
     {
@@ -244,27 +230,25 @@ int main(int argc, char *argv[])
         if (prompt == "reset")
         {
             ALOGI("reset kvcache");
-            lLaMa.SetSystemPrompt(attr.system_prompt, _token_ids);
-            lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
+            lLaMa.ResetKVCache();
+            history = {{SYSTEM, TEXT, attr.system_prompt}};
             continue;
         }
-        std::vector<int> tokens_ids, tokens_diff;
-        lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type), last_reply, tokens_ids, tokens_diff);
-        if (auto ret = lLaMa.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
-        {
-            ALOGE("SetKVCache failed: %d,the context may be full,input \"reset\" to reset context", ret);
-            continue;
-        }
-        last_reply = lLaMa.Run(prompt_data);
-        lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
+ 
+        history.push_back({USER, TEXT, prompt});
+        history = lLaMa.Run(history);
 
         if (!b_live_print)
-            printf("%s\n", last_reply.c_str());
+            printf("%s\n", history.back().data.c_str());
     }
 
     lLaMa.Deinit();
-    
+
+#if IS_AXCL
+    axclFinalize();
+#else
     AX_ENGINE_Deinit();
     AX_SYS_Deinit();
+#endif
     return 0;
 }

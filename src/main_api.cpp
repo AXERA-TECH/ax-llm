@@ -28,40 +28,6 @@
 #include <ax_engine_api.h>
 #endif
 
-std::vector<std::string> glob(const std::string &pattern)
-{
-    std::vector<std::string> results;
-
-#ifdef _WIN32
-    WIN32_FIND_DATAA findFileData;
-    HANDLE hFind = FindFirstFileA(pattern.c_str(), &findFileData);
-
-    if (hFind != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-            {
-                results.push_back(findFileData.cFileName);
-            }
-        } while (FindNextFileA(hFind, &findFileData) != 0);
-        FindClose(hFind);
-    }
-#else
-    glob_t glob_result;
-    if (glob(pattern.c_str(), GLOB_TILDE, nullptr, &glob_result) == 0)
-    {
-        for (size_t i = 0; i < glob_result.gl_pathc; ++i)
-        {
-            results.emplace_back(glob_result.gl_pathv[i]);
-        }
-        globfree(&glob_result);
-    }
-#endif
-
-    return results;
-}
-
 static const char *kModelName = "AXERA-TECH/Qwen3-1.7B"; // 保持和聊天里返回的 model 一致
 
 httplib::Server svr;
@@ -77,22 +43,95 @@ void __sigExit(int iSigNo)
     return;
 }
 
+// 放在函数外部，或者作为类的成员变量
+// 用于缓存上一次回调遗留下来的“半个字符”
+static std::string g_utf8_buffer = ""; 
+// 保护 buffer 的锁（如果 callback 是单线程调用的，这个锁可以去掉，但保留更安全）
+static std::mutex g_buffer_mutex; 
+
+// 辅助函数：计算字符串中“有效完整 UTF-8”部分的长度
+// 返回值是“可以安全发送的字节数”
+size_t get_valid_utf8_len(const std::string &str) {
+    size_t len = str.length();
+    if (len == 0) return 0;
+
+    // 从字符串末尾开始回溯，检查最后一个字符是否完整
+    // UTF-8 最大长度为 4 字节，所以最多回溯 4 步
+    for (int i = 0; i < 4; ++i) {
+        if (len <= i) break; // 已经回溯到头了
+
+        unsigned char byte = static_cast<unsigned char>(str[len - 1 - i]);
+
+        // 1. 如果是 ASCII (0xxxxxxx)，那就是完整的，结束在它后面
+        if ((byte & 0x80) == 0) {
+            // 如果回溯了 (i > 0)，说明后面跟着的字节是不合法的孤立后缀，
+            // 但在流式场景下，我们通常假设数据流是合法的，只是还没发完。
+            // 这里为了简单：如果最后一位是 ASCII，那它就是完整的边界。
+            if (i == 0) return len; 
+            // 如果 i > 0，说明后面有 i 个 continuation byte 找不到头，这属于流还没到齐
+            // 继续找头
+        }
+
+        // 2. 检查是否是 Header Byte (11xxxxxx)
+        if ((byte & 0xC0) == 0xC0) {
+            int needed_extra = 0;
+            if ((byte & 0xE0) == 0xC0) needed_extra = 1;      // 2-byte char
+            else if ((byte & 0xF0) == 0xE0) needed_extra = 2; // 3-byte char
+            else if ((byte & 0xF8) == 0xF0) needed_extra = 3; // 4-byte char
+            
+            // i 是当前 Header 后面实际跟的字节数
+            if (i >= needed_extra) {
+                return len; // 完整了
+            } else {
+                // 不完整，这个 Header 以及后面的 i 个字节都要留给下一次
+                return len - 1 - i;
+            }
+        }
+        
+        // 3. 如果是 Continuation Byte (10xxxxxx)，继续回溯找 Header
+    }
+    
+    // 如果回溯 4 步都没找到 Header 或 ASCII，说明数据可能有问题
+    // 为了防止死锁，我们假设全部发送（让 JSON 库去处理或报错，或者丢弃）
+    // 但在流式拼接中，通常返回 0 等待更多数据
+    return 0; 
+}
+
 void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
 {
-    fprintf(stdout, "%s", p_str);
-    fflush(stdout);
+    // 1. 打印日志 (可选)
+    // fprintf(stdout, "%s", p_str);
+    // fflush(stdout);
 
-    const size_t CHUNK = 256;
-    std::string s = p_str ? std::string(p_str) : "";
-    for (size_t i = 0; i < s.size(); i += CHUNK)
-    {
-        std::string part = s.substr(i, CHUNK);
+    if (!p_str || *p_str == '\0') return;
+
+    std::lock_guard<std::mutex> buffer_lock(g_buffer_mutex);
+
+    // 2. 将新数据拼接到缓存中
+    g_utf8_buffer += p_str;
+
+    // 3. 计算缓存中有多长的数据是“UTF-8 安全”的
+    size_t send_len = get_valid_utf8_len(g_utf8_buffer);
+
+    if (send_len > 0) {
+        // 4. 切割出完整部分
+        std::string part_to_send = g_utf8_buffer.substr(0, send_len);
+        
+        // 5. 将完整部分推入消息队列
         {
-            std::lock_guard<std::mutex> lk(g_msg_locker);
-            g_msg_queue.push(std::move(part));
+            std::lock_guard<std::mutex> queue_lk(g_msg_locker);
+            g_msg_queue.push(std::move(part_to_send));
         }
         g_msg_cv.notify_one();
+
+        // 6. 保留剩下的残缺部分（如果有）到下一次
+        if (send_len < g_utf8_buffer.size()) {
+            g_utf8_buffer = g_utf8_buffer.substr(send_len);
+        } else {
+            g_utf8_buffer.clear();
+        }
     }
+    // 如果 send_len == 0，说明当前 buffer 里只有半个汉字，什么都不做，等下一次回调
 }
 
 template <typename T>
@@ -113,10 +152,7 @@ public:
     bool gllm_init = false;
     bool gllm_initing = false;
 
-    std::vector<unsigned short> prompt_data;
-    std::string last_reply;
-    std::vector<std::vector<unsigned short>> k_caches, v_caches;
-    int precompute_len = 0;
+    std::vector<Content> history;
 
 private:
     using Task = std::function<void()>;
@@ -128,7 +164,7 @@ private:
 
     void reset()
     {
-        std::vector<unsigned short>().swap(prompt_data);
+        // std::vector<unsigned short>().swap(prompt_data);
     }
 
     void run()
@@ -211,9 +247,9 @@ public:
             return;
         }
         gllm_runing = true;
-        std::vector<int> _token_ids;
-        gllm.SetSystemPrompt(system_prompt, _token_ids);
-        gllm.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
+
+        gllm.ResetKVCache();
+        history = {{SYSTEM, TEXT, system_prompt}};
         gllm_runing = false;
     }
 
@@ -235,23 +271,14 @@ public:
         gllm_runing = true;
         gllm.getAttr()->runing_callback = cb;
 
-        // std::string output;
-
-        std::vector<int> tokens_ids, tokens_diff;
-        gllm.Encode(prompt_data, prompt, last_reply, tokens_ids, tokens_diff);
-        if (auto ret = gllm.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
-        {
-            ALOGE("SetKVCache failed: %d,the context may be full,input \"reset\" to reset context", ret);
-            return "";
-        }
-        last_reply = gllm.Run(prompt_data);
-        gllm.GetKVCache(k_caches, v_caches, precompute_len);
+        history.push_back({USER, TEXT, prompt});
+        history = gllm.Run(history);
 
         gllm_runing = false;
         g_msg_cv.notify_all(); // 唤醒 content_provider_stream 的等待
-        std::cout << "Chat result: " << last_reply << std::endl;
+        std::cout << "Chat result: " << history.back().data << std::endl;
         reset();
-        return last_reply;
+        return history.back().data;
     }
 };
 
@@ -767,6 +794,11 @@ int main(int argc, char *argv[])
     worker.gllm_init = true;
 
     worker.Run();
+
+    svr.set_read_timeout(300);
+    svr.set_write_timeout(300);
+    svr.set_keep_alive_timeout(300);
+
     svr.Get("/v1/stop", handle_stop);
     svr.Post("/v1/chat/completions", handle_generate);
     // svr.Get("/v1/generate_provider", content_provider);

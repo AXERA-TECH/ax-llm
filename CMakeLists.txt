@@ -18,6 +18,8 @@ add_compile_options(-std=c++17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_subdirectory(third_party/tokenizer.axera)
+include_directories(third_party/tokenizer.axera/include)
 
 # bsp
 if(NOT BSP_MSP_DIR)
@@ -56,7 +58,7 @@ function(build_exec name main_source)
                     src/runner/Tokenizer/Tokenizer.cpp
                     )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys pthread)
+    target_link_libraries(${name} ax_engine ax_interpreter ax_sys pthread tokenizer)
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 

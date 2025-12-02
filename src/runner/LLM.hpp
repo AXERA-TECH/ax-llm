@@ -4,7 +4,8 @@
 #include <cmath>
 #include <numeric>
 #include "bfloat16.hpp"
-#include "Tokenizer/Tokenizer.hpp"
+// #include "Tokenizer/Tokenizer.hpp"
+#include "base_tokenizer.hpp"
 #include "LLMEmbedSelector.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
 #include "ax_cmm_utils.hpp"
@@ -35,7 +36,6 @@ struct LLMAttrType
     // int vpm_width = 280;
     // int vpm_height = 280;
 
-    TokenizerType tokenizer_type = TKT_HTTP;
     std::string url_tokenizer_model = "http://127.0.0.1:12345";
     bool b_bos = true, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
@@ -47,7 +47,7 @@ struct LLMAttrType
     int kv_cache_num = 1024; // auto calc
     int kv_cache_size = 256; // auto calc
 
-    int precompute_len = 1202;
+    // int precompute_len = 1202;
     std::vector<int> prefill_max_kv_cache_num_grp;
 
     int prefill_grpid = -1;
@@ -66,8 +66,12 @@ struct LLMAttrType
 class LLM
 {
 private:
-    std::shared_ptr<BaseTokenizer> tokenizer;
+    std::shared_ptr<base_tokenizer> tokenizer;
     LLaMaEmbedSelector embed_selector;
+
+    std::vector<int> last_tokens_ids;
+    std::vector<std::vector<unsigned short>> k_caches, v_caches;
+    int precompute_len = 0;
 
     LLMAttrType _attr;
 
@@ -104,20 +108,42 @@ private:
         return postprocess.apply(logits, history);
     }
 
+    // ids1: {1,2,3}
+    // ids2: {1,2,3,4,5}
+    // diff_ids: {4,5}
+    // 这是用来比较两个 token id 序列的差异的函数，当新一轮对话用户输入prompt的时候，编码出来的token id 序列与上一轮的差异，
+    // 得到新增的token id 序列，这样历史对话的token id 序列就不需要重复计算kvcached了
+    std::vector<int> diff_token_ids(std::vector<int> ids1, std::vector<int> ids2)
+    {
+        if (ids1.size() >= ids2.size())
+        {
+            return {};
+        }
+        for (int i = 0; i < ids1.size(); i++)
+        {
+            if (ids1[i] != ids2[i])
+            {
+                return {};
+            }
+        }
+        std::vector<int> diff_ids(ids2.begin() + ids1.size(), ids2.end());
+        return diff_ids;
+    }
+
 public:
     bool Init(LLMAttrType attr)
     {
         ALOGI("LLM init start");
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
-        tokenizer = CreateTokenizer(attr.tokenizer_type);
-        if (!tokenizer->Init(attr.url_tokenizer_model))
+        tokenizer = create_tokenizer(Qwen3);
+        if (!tokenizer->load(attr.url_tokenizer_model))
         {
-            ALOGE("tokenizer.Init(%s) failed", attr.url_tokenizer_model.c_str());
+            ALOGE("tokenizer.load(%s) failed", attr.url_tokenizer_model.c_str());
             return false;
         }
-        std::vector<int> _token_ids;
-        tokenizer->Reset(attr.system_prompt, _token_ids);
+        tokenizer->set_think_in_prompt(true);
+
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
         // test code
         // {
@@ -238,9 +264,9 @@ public:
     {
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
-            llama_layers[i].layer.release();
+            llama_layers[i].layer.deinit();
         }
-        llama_post.release();
+        llama_post.deinit();
         embed_selector.Deinit();
     }
 
@@ -249,14 +275,7 @@ public:
         b_stop = true;
     }
 
-    int SetSystemPrompt(std::string system_prompt, std::vector<int> &_token_ids)
-    {
-        tokenizer->Reset(system_prompt, _token_ids);
-        _attr.system_prompt = system_prompt;
-        _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_max_kv_cache_num_grp.size() - 1];
-        return 0;
-    }
-
+    // for test only
     int GenerateKVCachePrefill(std::vector<int> &_token_ids, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int &precompute_len)
     {
         bfloat16 bf16 = -65536.f;
@@ -418,7 +437,7 @@ public:
 
         return 0;
     }
-    
+
     int GetKVCache(std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int &precompute_len)
     {
         bfloat16 bf16 = -65536.f;
@@ -452,12 +471,20 @@ public:
         return 0;
     }
 
-    int SetKVCache(std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int precompute_len, int input_num_token)
+    int SetKVCache(std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int input_num_token)
     {
-        _attr.precompute_len = precompute_len;
+        int precompute_len = 0;
+        if (k_caches.size() == 0)
+        {
+            precompute_len = 0;
+        }
+        else
+        {
+            precompute_len = k_caches[0].size() / _attr.kv_cache_size;
+        }
         for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
         {
-            if (_attr.precompute_len + input_num_token <= _attr.prefill_max_kv_cache_num_grp[i])
+            if (precompute_len + input_num_token <= _attr.prefill_max_kv_cache_num_grp[i])
             {
                 _attr.prefill_grpid = i + 1;
                 break;
@@ -466,7 +493,7 @@ public:
         int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_grpid - 1];
         ALOGI("prefill_grpid:%d kv_cache_num:%d precompute_len:%d input_num_token:%d", _attr.prefill_grpid, kv_cache_num, precompute_len, input_num_token);
 
-        _attr.prefill_max_token_num = ALIGN_DOWN(_attr.prefill_max_token_num - _attr.precompute_len, _attr.prefill_token_num);
+        _attr.prefill_max_token_num = ALIGN_DOWN(_attr.prefill_max_token_num - precompute_len, _attr.prefill_token_num);
         ALOGI("current prefill_max_token_num:%d", _attr.prefill_max_token_num);
 
         if (precompute_len == 0)
@@ -518,14 +545,14 @@ public:
             auto &k_cache = k_caches[m];
             auto &v_cache = v_caches[m];
 
-            if (k_cache.size() != _attr.precompute_len * _attr.kv_cache_size)
+            if (k_cache.size() != precompute_len * _attr.kv_cache_size)
             {
-                ALOGE("k_cache.size(%d) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), _attr.precompute_len, _attr.kv_cache_size);
+                ALOGE("k_cache.size(%d) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), precompute_len, _attr.kv_cache_size);
                 return -1;
             }
-            if (v_cache.size() < _attr.precompute_len * _attr.kv_cache_size)
+            if (v_cache.size() < precompute_len * _attr.kv_cache_size)
             {
-                ALOGE("v_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), _attr.precompute_len, _attr.kv_cache_size);
+                ALOGE("v_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), precompute_len, _attr.kv_cache_size);
                 return -1;
             }
 
@@ -536,8 +563,8 @@ public:
                 auto &input_v_cache = layer.layer.get_input(_attr.prefill_grpid, "V_cache");
                 unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
 
-                memcpy(input_k_cache_ptr, k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                memcpy(input_v_cache_ptr, v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy(input_k_cache_ptr, k_cache.data(), precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy(input_v_cache_ptr, v_cache.data(), precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
                 // axcl_Memcpy((void *)input_k_cache_ptr, (void *)k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
                 // axcl_Memcpy((void *)input_v_cache_ptr, (void *)v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
             }
@@ -548,8 +575,8 @@ public:
                 auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
                 unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
 
-                memcpy(input_k_cache_ptr, k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                memcpy(input_v_cache_ptr, v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy(input_k_cache_ptr, k_cache.data(), precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy(input_v_cache_ptr, v_cache.data(), precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
                 // axcl_Memcpy((void *)input_k_cache_ptr, (void *)k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
                 // axcl_Memcpy((void *)input_v_cache_ptr, (void *)v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
             }
@@ -558,24 +585,38 @@ public:
         return 0;
     }
 
-    int Encode(std::vector<unsigned short> &out_embed, std::string prompt, std::string last_reply, std::vector<int> &tokens_ids, std::vector<int> &tokens_diff)
+    void ResetKVCache()
     {
-        if (!tokenizer->Encode(prompt, last_reply, tokens_ids, tokens_diff))
+        last_tokens_ids.clear();
+        k_caches.clear();
+        v_caches.clear();
+        precompute_len = 0;
+    }
+    std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1)
+    {
+        std::vector<int> tokens_diff;
+        if (last_tokens_ids.size() == 0)
         {
-            ALOGE("encode failed");
-            return -1;
+            tokens_diff = tokenizer->encode(history);
         }
-
-        out_embed.resize(tokens_diff.size() * _attr.tokens_embed_size);
+        else
+        {
+            tokens_diff = diff_token_ids(last_tokens_ids, tokenizer->encode(history));
+        }
+        SetKVCache(k_caches, v_caches, tokens_diff.size());
+        std::vector<unsigned short> out_embed(tokens_diff.size() * _attr.tokens_embed_size);
 
         for (size_t i = 0; i < tokens_diff.size(); i++)
         {
             embed_selector.getByIndex(tokens_diff[i], out_embed.data() + i * _attr.tokens_embed_size);
         }
+        auto reply = Run(out_embed, output_max_token);
 
-        // memcpy(out_embed.data() + 5 * _attr.tokens_embed_size, vpm_resampler.get_output("output").pVirAddr, vpm_resampler.get_output("output").nSize);
+        GetKVCache(k_caches, v_caches, precompute_len);
 
-        return 0;
+        history.push_back({ASSISTANT, TEXT, reply});
+        last_tokens_ids = tokenizer->encode(history);
+        return history;
     }
 
     std::string Run(std::vector<unsigned short> test_embed, int output_max_token = -1)
@@ -596,7 +637,7 @@ public:
         ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
 
         mask[_attr.kv_cache_num] = 0;
-        for (size_t i = 0; i < _attr.precompute_len + input_embed_num; i++)
+        for (size_t i = 0; i < precompute_len + input_embed_num; i++)
         {
             mask[i] = 0;
         }
@@ -627,7 +668,7 @@ public:
                     int mask_current_start = kv_cache_num;
                     auto mask_ptr = mask_tmp.data() + i * (kv_cache_num + _attr.prefill_token_num);
 
-                    for (int j = 0; j < _attr.precompute_len + p * _attr.prefill_token_num; j++)
+                    for (int j = 0; j < precompute_len + p * _attr.prefill_token_num; j++)
                     {
                         mask_ptr[j] = 0;
                     }
@@ -663,7 +704,7 @@ public:
                 unsigned int *input_indices_ptr = (unsigned int *)input_indices.pVirAddr;
                 memset(input_indices_ptr, 0, input_indices.nSize);
                 int idx = 0;
-                for (unsigned int i = _attr.precompute_len + p * _attr.prefill_token_num; i < _attr.precompute_len + (p + 1) * _attr.prefill_token_num; i++)
+                for (unsigned int i = precompute_len + p * _attr.prefill_token_num; i < precompute_len + (p + 1) * _attr.prefill_token_num; i++)
                 {
                     input_indices_ptr[idx] = i;
                     idx++;
@@ -689,7 +730,7 @@ public:
                 auto &output_k_cache = layer.layer.get_output(_attr.prefill_grpid, "K_cache_out");
                 auto &output_v_cache = layer.layer.get_output(_attr.prefill_grpid, "V_cache_out");
 
-                int kv_offset = (_attr.precompute_len + p * _attr.prefill_token_num) * _attr.kv_cache_size;
+                int kv_offset = (precompute_len + p * _attr.prefill_token_num) * _attr.kv_cache_size;
 
                 memcpy((unsigned short *)input_decoder_k_cache.pVirAddr + kv_offset,
                        (void *)output_k_cache.pVirAddr,
@@ -747,7 +788,7 @@ public:
         t_cost.start();
 
         bool b_hit_eos = false;
-        for (unsigned int indices = _attr.precompute_len + input_embed_num; indices < _attr.max_token_len; indices++)
+        for (unsigned int indices = precompute_len + input_embed_num; indices < _attr.max_token_len; indices++)
         {
             if (b_stop)
             {
@@ -817,13 +858,13 @@ public:
 
                 next_token = max_index;
 
-                if (tokenizer->isEnd(max_index))
+                if (tokenizer->is_stop(max_index))
                 {
                     if (cached_token.size() && _attr.runing_callback)
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        auto tmp_out = tokenizer->Decode(cached_token);
+                        auto tmp_out = tokenizer->decode(cached_token);
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
@@ -839,7 +880,7 @@ public:
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        auto tmp_out = tokenizer->Decode(cached_token);
+                        auto tmp_out = tokenizer->decode(cached_token);
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
@@ -866,7 +907,7 @@ public:
         // 去掉 len_of_input 那部分
         // token_ids.erase(token_ids.begin(), token_ids.begin() + len_of_input);
 
-        final_out = tokenizer->Decode(token_ids);
+        final_out = tokenizer->decode(token_ids);
 
         return final_out;
     }

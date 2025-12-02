@@ -23,22 +23,6 @@ void llm_running_callback(int *p_token, int n_token, const char *p_str, float to
     fflush(stdout);
 }
 
-std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
-{
-    std::ostringstream oss_prompt;
-    switch (tokenizer_type)
-    {
-    case TKT_HTTP:
-        oss_prompt << prompt;
-        break;
-    default:
-        ALOGE("tokenizer type %d not support", tokenizer_type);
-        break;
-    }
-
-    return oss_prompt.str();
-}
-
 bool save_kvcache(std::string target_path, std::string system_prompt, int precompute_len, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches)
 {
     for (size_t i = 0; i < k_caches.size(); i++)
@@ -260,7 +244,7 @@ int main(int argc, char *argv[])
                 lLaMa.getEmbedSelector()->getByIndex(tokens_diff[i], prompt_data.data() + i * lLaMa.getAttr()->tokens_embed_size);
             }
 
-            if (auto ret = lLaMa.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
+            if (auto ret = lLaMa.SetKVCache(k_caches, v_caches, tokens_diff.size()); ret != 0)
             {
                 ALOGE("SetKVCache failed: %d,the context may be full,input \"reset\" to reset context", ret);
                 continue;
