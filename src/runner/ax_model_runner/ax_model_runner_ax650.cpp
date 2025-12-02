@@ -65,6 +65,7 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
             ALOGE("Alloc input[%d] failed", i);
             return ret; // 注意：此处在实际工程中应跳转到 cleanup，为简化展示直接返回
         }
+        memset(buffer.pVirAddr, 0, buffer.nSize);
     }
 
     // Alloc Outputs
@@ -79,6 +80,7 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
             ALOGE("Alloc output[%d] failed", i);
             return ret;
         }
+        memset(buffer.pVirAddr, 0, buffer.nSize);
     }
     return 0;
 }
