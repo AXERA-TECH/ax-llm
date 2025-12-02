@@ -208,7 +208,7 @@ int main(int argc, char *argv[])
     //
     if (b_continue)
     {
-        printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
+        printf("Type \"q\" to exit\nCtrl+c to stop current running\n\"reset\" to reset kvcache\n\"dd\" to remove last conversation.\n");
         // lLaMa.Reset();
     }
 
@@ -234,7 +234,18 @@ int main(int argc, char *argv[])
             history = {{SYSTEM, TEXT, attr.system_prompt}};
             continue;
         }
- 
+        if (prompt == "dd")
+        {
+            ALOGI("remove last conversation");
+            if (history.size() >= 3) // system, user, assistant, user, assistant, ...
+            {
+                history.pop_back();
+                history.pop_back();
+            }
+
+            continue;
+        }
+
         history.push_back({USER, TEXT, prompt});
         history = lLaMa.Run(history);
 

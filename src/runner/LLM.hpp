@@ -130,6 +130,40 @@ private:
         return diff_ids;
     }
 
+    // ids1: {1,2,3,4,5}
+    // ids2: {1,2,3,6,7}
+    // diff_ids: {6,7}
+    std::vector<int> diff_token_ids(const std::vector<int> &ids1, const std::vector<int> &ids2, int &offset)
+    {
+        int min_len = std::min(ids1.size(), ids2.size());
+        offset = 0;
+
+        // 1. 找到公共前缀的长度
+        for (int i = 0; i < min_len; i++)
+        {
+            if (ids1[i] == ids2[i])
+            {
+                offset++;
+            }
+            else
+            {
+                // 2. 一旦发现不匹配，立即停止！
+                break;
+            }
+        }
+
+        // 3. 安全检查：如果 offset 已经等于 ids2 的长度，说明 ids2 完全被包含在 ids1 里（没有新内容）
+        if (offset >= ids2.size())
+        {
+            return {}; // 返回空 vector
+        }
+
+        // 4. 截取 ids2 中 offset 之后的部分
+        // 此时 offset 肯定 <= ids2.size()，所以是安全的
+        std::vector<int> diff_ids(ids2.begin() + offset, ids2.end());
+        return diff_ids;
+    }
+
 public:
     bool Init(LLMAttrType attr)
     {
@@ -473,38 +507,39 @@ public:
 
     int SetKVCache(std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int input_num_token)
     {
-        int precompute_len = 0;
+        // int precompute_len = 0;
+        int _precompute_len = 0;
         if (k_caches.size() == 0)
         {
-            precompute_len = 0;
+            _precompute_len = 0;
         }
         else
         {
-            precompute_len = k_caches[0].size() / _attr.kv_cache_size;
+            _precompute_len = k_caches[0].size() / _attr.kv_cache_size;
         }
         for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
         {
-            if (precompute_len + input_num_token <= _attr.prefill_max_kv_cache_num_grp[i])
+            if (_precompute_len + input_num_token <= _attr.prefill_max_kv_cache_num_grp[i])
             {
                 _attr.prefill_grpid = i + 1;
                 break;
             }
         }
         int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_grpid - 1];
-        ALOGI("prefill_grpid:%d kv_cache_num:%d precompute_len:%d input_num_token:%d", _attr.prefill_grpid, kv_cache_num, precompute_len, input_num_token);
+        ALOGI("prefill_grpid:%d kv_cache_num:%d precompute_len:%d input_num_token:%d", _attr.prefill_grpid, kv_cache_num, _precompute_len, input_num_token);
 
-        _attr.prefill_max_token_num = ALIGN_DOWN(_attr.prefill_max_token_num - precompute_len, _attr.prefill_token_num);
+        _attr.prefill_max_token_num = ALIGN_DOWN(_attr.prefill_max_token_num - _precompute_len, _attr.prefill_token_num);
         ALOGI("current prefill_max_token_num:%d", _attr.prefill_max_token_num);
 
-        if (precompute_len == 0)
+        if (_precompute_len == 0)
         {
             ALOGI("first run");
             return 0;
         }
 
-        if (precompute_len + input_num_token > kv_cache_num)
+        if (_precompute_len + input_num_token > kv_cache_num)
         {
-            ALOGE("precompute_len(%d) + input_num_token(%d) > _attr.prefill_max_kv_cache_num_grp[%d]", precompute_len, input_num_token, _attr.prefill_grpid - 1);
+            ALOGE("precompute_len(%d) + input_num_token(%d) > _attr.prefill_max_kv_cache_num_grp[%d]", _precompute_len, input_num_token, _attr.prefill_grpid - 1);
             return -1;
         }
 
@@ -545,14 +580,14 @@ public:
             auto &k_cache = k_caches[m];
             auto &v_cache = v_caches[m];
 
-            if (k_cache.size() != precompute_len * _attr.kv_cache_size)
+            if (k_cache.size() != _precompute_len * _attr.kv_cache_size)
             {
-                ALOGE("k_cache.size(%d) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), precompute_len, _attr.kv_cache_size);
+                ALOGE("k_cache.size(%d) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), _precompute_len, _attr.kv_cache_size);
                 return -1;
             }
-            if (v_cache.size() < precompute_len * _attr.kv_cache_size)
+            if (v_cache.size() < _precompute_len * _attr.kv_cache_size)
             {
-                ALOGE("v_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), precompute_len, _attr.kv_cache_size);
+                ALOGE("v_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), _precompute_len, _attr.kv_cache_size);
                 return -1;
             }
 
@@ -563,8 +598,8 @@ public:
                 auto &input_v_cache = layer.layer.get_input(_attr.prefill_grpid, "V_cache");
                 unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
 
-                memcpy(input_k_cache_ptr, k_cache.data(), precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                memcpy(input_v_cache_ptr, v_cache.data(), precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy(input_k_cache_ptr, k_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy(input_v_cache_ptr, v_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
                 // axcl_Memcpy((void *)input_k_cache_ptr, (void *)k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
                 // axcl_Memcpy((void *)input_v_cache_ptr, (void *)v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
             }
@@ -575,8 +610,8 @@ public:
                 auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
                 unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
 
-                memcpy(input_k_cache_ptr, k_cache.data(), precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                memcpy(input_v_cache_ptr, v_cache.data(), precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy(input_k_cache_ptr, k_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy(input_v_cache_ptr, v_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
                 // axcl_Memcpy((void *)input_k_cache_ptr, (void *)k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
                 // axcl_Memcpy((void *)input_v_cache_ptr, (void *)v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
             }
@@ -595,14 +630,27 @@ public:
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1)
     {
         std::vector<int> tokens_diff;
-        if (last_tokens_ids.size() == 0)
+        int offset = 0;
+        tokens_diff = diff_token_ids(last_tokens_ids, tokenizer->encode(history), offset);
+        ALOGI("tokens_diff size : %d, offset : %d", tokens_diff.size(), offset);
+
+        // if (offset > 0 &&
+        //     k_caches.size() == _attr.axmodel_num &&
+        //     v_caches.size() == _attr.axmodel_num &&
+        //     k_caches[0].size() >= offset * _attr.kv_cache_size &&
+        //     v_caches[0].size() >= offset * _attr.kv_cache_size)
+        if (offset != precompute_len)
         {
-            tokens_diff = tokenizer->encode(history);
+            for (size_t i = 0; i < _attr.axmodel_num; i++)
+            {
+                auto &layer = llama_layers[i];
+                k_caches[i].resize(offset * _attr.kv_cache_size);
+                v_caches[i].resize(offset * _attr.kv_cache_size);
+            }
+            precompute_len = offset;
+            ALOGI("precompute_len : %d", precompute_len);
         }
-        else
-        {
-            tokens_diff = diff_token_ids(last_tokens_ids, tokenizer->encode(history));
-        }
+
         SetKVCache(k_caches, v_caches, tokens_diff.size());
         std::vector<unsigned short> out_embed(tokens_diff.size() * _attr.tokens_embed_size);
 
