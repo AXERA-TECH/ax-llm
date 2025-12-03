@@ -33,18 +33,8 @@ message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
 include_directories(${BSP_MSP_DIR}/include)
 link_directories(${BSP_MSP_DIR}/lib)
 
-# set(SPM_ENABLE_SHARED OFF)
-# add_subdirectory(third_party/sentencepiece)
-# include_directories(third_party/sentencepiece/src)
-# include_directories(third_party/sentencepiece/third_party/protobuf-lite)
-
-# set(ABSL_ENABLE_INSTALL ON)
-# set(ABSL_PROPAGATE_CXX_STD ON)
-# add_subdirectory(third_party/abseil-cpp)
-# add_subdirectory(third_party/re2)
-# include_directories(third_party/abseil-cpp)
-# include_directories(third_party/re2)
-# link_directories(${CMAKE_BINARY_DIR}/lib)
+add_subdirectory(third_party/tokenizer.axera)
+include_directories(third_party/tokenizer.axera/include)
 
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
@@ -72,7 +62,7 @@ function(build_exec name main_source)
                     src/runner/utils/mrope.cpp
                     )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
+    target_link_libraries(${name} ax_engine ax_interpreter ax_sys tokenizer)
     target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
