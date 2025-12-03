@@ -18,6 +18,9 @@ add_compile_options(-std=c++17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_subdirectory(third_party/tokenizer.axera)
+include_directories(third_party/tokenizer.axera/include)
+
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
 
@@ -54,7 +57,7 @@ function(build_exec name main_source)
 
     # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
-    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX)
+    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX tokenizer)
     target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()

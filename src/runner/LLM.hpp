@@ -12,7 +12,7 @@
 #include "timer.hpp"
 #include "axcl_manager.h"
 
-#include "Tokenizer/Tokenizer.hpp"
+#include "BaseTokenizer.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
 
 #include "LLMEmbedSelector.hpp"
@@ -57,7 +57,6 @@ struct LLMAttrType
     int precompute_len = 0;
     int prefill_grpid = -1;
 
-    TokenizerType tokenizer_type = TKT_HTTP;
     std::string filename_tokenizer_model = "http://127.0.0.1:12345";
     bool b_bos = false, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
@@ -163,12 +162,13 @@ public:
         ALOGI("LLM init start");
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
-        tokenizer = CreateTokenizer(attr.tokenizer_type);
-        if (!tokenizer->Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
+        tokenizer = create_tokenizer(Qwen3VL);
+        if (!tokenizer->load(attr.filename_tokenizer_model))
         {
-            ALOGE("tokenizer.Init(%s, %d, %d) failed", attr.filename_tokenizer_model.c_str(), attr.b_bos, attr.b_eos);
+            ALOGE("tokenizer.load(%s) failed", attr.filename_tokenizer_model.c_str());
             return false;
         }
+        tokenizer->set_think_in_prompt(true);
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
         // test code
         // {
@@ -262,10 +262,10 @@ public:
         image_encoder.set_auto_sync_after_inference(true);
         image_encoder.set_auto_sync_before_inference(true);
 
-        _attr.IMAGE_CONTEXT_TOKEN = tokenizer->GetImgContextID();
-        _attr.IMAGE_START_TOKEN = tokenizer->GetImgStartID();
+        // _attr.IMAGE_CONTEXT_TOKEN = tokenizer->GetImgContextID();
+        // _attr.IMAGE_START_TOKEN = tokenizer->GetImgStartID();
 
-        ALOGI("IMAGE_CONTEXT_TOKEN: %d, IMAGE_START_TOKEN: %d", _attr.IMAGE_CONTEXT_TOKEN, _attr.IMAGE_START_TOKEN);
+        // ALOGI("IMAGE_CONTEXT_TOKEN: %d, IMAGE_START_TOKEN: %d", _attr.IMAGE_CONTEXT_TOKEN, _attr.IMAGE_START_TOKEN);
 
         IMAGE_ENCODER_INPUT_NCHW = -1;
         for (size_t i = 1; i < image_encoder.get_input(0).vShape.size(); i++)
@@ -498,8 +498,8 @@ public:
         timer t;
         t.start();
 
-        unsigned int grid_h = cfg.vision_config.height / cfg.vision_config.patch_size;
-        unsigned int grid_w = cfg.vision_config.width / cfg.vision_config.patch_size;
+        int grid_h = cfg.vision_config.height / cfg.vision_config.patch_size;
+        int grid_w = cfg.vision_config.width / cfg.vision_config.patch_size;
        
         std::vector<std::vector<unsigned char>> pixel_values;
 
@@ -525,7 +525,7 @@ public:
             Qwen2VideoProcessor(  src, pixel_values,
                         h, w,
                         temporal_patch_size, merge_size, patch_size);
-            cfg.video_grid_thw = {{pixel_values.size(), grid_h, grid_w}};
+            cfg.video_grid_thw = {{(int)pixel_values.size(), grid_h, grid_w}};
         }
 
         ALOGI("pixel_values size %d",pixel_values.size());
@@ -589,9 +589,14 @@ public:
 
     int Encode(std::vector<unsigned short> &out_embed, std::vector<std::vector<int>> &position_ids, Config &cfg, std::string prompt = "What is in the image?")
     {
-        ImageInfo img_info;
-        img_info.img_prompt = false;
-        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
+        std::vector<Content> contents = {
+            {SYSTEM, TEXT, "You are a helpful assistant."},
+            {USER, TEXT, prompt},
+        };
+
+        // ImageInfo img_info;
+        // img_info.img_prompt = false;
+        std::vector<int> input_ids = tokenizer->encode(contents);
         if (input_ids.size() > _attr.prefill_max_token_num)
         {
             ALOGE("input_ids(%d) > prefill_max_token_num(%d)", input_ids.size(), _attr.prefill_max_token_num);
@@ -614,12 +619,17 @@ public:
             std::vector<std::vector<int>> &position_ids, std::vector<int> &visual_pos_mask, 
             Config &cfg, std::string prompt = "What is in the image?")
     {
-        ImageInfo img_info;
-        img_info.img_prompt = true;
-        img_info.video_prompt = b_video;
-        img_info.img_token_num = img_embed[0].size()/_attr.tokens_embed_size;
-        img_info.num_img = img_embed.size();
-        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
+         std::vector<Content> contents = {
+            {SYSTEM, TEXT, "You are a helpful assistant."},
+            {USER, b_video ? VIDEO : IMAGE, prompt, (int)img_embed.size(), int(img_embed[0].size() / _attr.tokens_embed_size)},
+        };
+
+        // ImageInfo img_info;
+        // img_info.img_prompt = true;
+        // img_info.video_prompt = b_video;
+        // img_info.img_token_num = img_embed[0].size() / _attr.tokens_embed_size;
+        // img_info.num_img = img_embed.size();
+        std::vector<int> input_ids = tokenizer->encode(contents);
         ALOGI("input_ids size:%d",input_ids.size());
         std::vector<int> offsets;
         int vision_start_token_id = cfg.vision_start_token_id;
@@ -1023,13 +1033,13 @@ public:
 
                 next_token = max_index;
 
-                if (tokenizer->isEnd(max_index))
+                if (tokenizer->is_stop(max_index))
                 {
                     if (cached_token.size() && _attr.runing_callback)
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        auto tmp_out = tokenizer->Decode(cached_token);
+                        auto tmp_out = tokenizer->decode(cached_token);
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
@@ -1045,7 +1055,7 @@ public:
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        auto tmp_out = tokenizer->Decode(cached_token);
+                        auto tmp_out = tokenizer->decode(cached_token);
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
@@ -1067,7 +1077,7 @@ public:
         // 去掉 len_of_input 那部分
         // token_ids.erase(token_ids.begin(), token_ids.begin() + len_of_input);
 
-        final_out = tokenizer->Decode(token_ids);
+        final_out = tokenizer->decode(token_ids);
 
         for (size_t i = 0; i < _attr.axmodel_num; i++)
         {

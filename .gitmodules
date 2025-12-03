@@ -1,0 +1,3 @@
+[submodule "third_party/tokenizer.axera"]
+	path = third_party/tokenizer.axera
+	url = https://github.com/ZHEQIUSHUI/tokenizer.axera

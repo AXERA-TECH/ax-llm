@@ -28,40 +28,7 @@
 #include <ax_sys_api.h>
 #include <ax_engine_api.h>
 #endif
-
-std::vector<std::string> glob(const std::string &pattern)
-{
-    std::vector<std::string> results;
-
-#ifdef _WIN32
-    WIN32_FIND_DATAA findFileData;
-    HANDLE hFind = FindFirstFileA(pattern.c_str(), &findFileData);
-
-    if (hFind != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-            {
-                results.push_back(findFileData.cFileName);
-            }
-        } while (FindNextFileA(hFind, &findFileData) != 0);
-        FindClose(hFind);
-    }
-#else
-    glob_t glob_result;
-    if (glob(pattern.c_str(), GLOB_TILDE, nullptr, &glob_result) == 0)
-    {
-        for (size_t i = 0; i < glob_result.gl_pathc; ++i)
-        {
-            results.emplace_back(glob_result.gl_pathv[i]);
-        }
-        globfree(&glob_result);
-    }
-#endif
-
-    return results;
-}
+#include <UTF8Filter.hpp>
 
 static const char *kModelName = "AXERA-TECH/Qwen3-VL-2B-Instruct-GPTQ-Int4"; // 保持和聊天里返回的 model 一致
 
@@ -79,19 +46,22 @@ void __sigExit(int iSigNo)
     return;
 }
 
+UTF8Filter utf8_filter;
 void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
 {
     fprintf(stdout, "%s", p_str);
     fflush(stdout);
 
-    const size_t CHUNK = 256;
-    std::string s = p_str ? std::string(p_str) : "";
-    for (size_t i = 0; i < s.size(); i += CHUNK)
+    if (!p_str || *p_str == '\0')
+        return;
+
+    auto filtered_str = utf8_filter.filter(p_str);
+
+    if (!filtered_str.empty())
     {
-        std::string part = s.substr(i, CHUNK);
         {
-            std::lock_guard<std::mutex> lk(g_msg_locker);
-            g_msg_queue.push(std::move(part));
+            std::lock_guard<std::mutex> queue_lk(g_msg_locker);
+            g_msg_queue.push(std::move(filtered_str));
         }
         g_msg_cv.notify_one();
     }
