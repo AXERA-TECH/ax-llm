@@ -10,6 +10,7 @@
 #include "runner/utils/json.hpp"
 #include "runner/utils/string_utility.hpp"
 #include "runner/LLM.hpp"
+#include "UTF8Filter.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -43,95 +44,26 @@ void __sigExit(int iSigNo)
     return;
 }
 
-// 放在函数外部，或者作为类的成员变量
-// 用于缓存上一次回调遗留下来的“半个字符”
-static std::string g_utf8_buffer = ""; 
-// 保护 buffer 的锁（如果 callback 是单线程调用的，这个锁可以去掉，但保留更安全）
-static std::mutex g_buffer_mutex; 
-
-// 辅助函数：计算字符串中“有效完整 UTF-8”部分的长度
-// 返回值是“可以安全发送的字节数”
-size_t get_valid_utf8_len(const std::string &str) {
-    size_t len = str.length();
-    if (len == 0) return 0;
-
-    // 从字符串末尾开始回溯，检查最后一个字符是否完整
-    // UTF-8 最大长度为 4 字节，所以最多回溯 4 步
-    for (int i = 0; i < 4; ++i) {
-        if (len <= i) break; // 已经回溯到头了
-
-        unsigned char byte = static_cast<unsigned char>(str[len - 1 - i]);
-
-        // 1. 如果是 ASCII (0xxxxxxx)，那就是完整的，结束在它后面
-        if ((byte & 0x80) == 0) {
-            // 如果回溯了 (i > 0)，说明后面跟着的字节是不合法的孤立后缀，
-            // 但在流式场景下，我们通常假设数据流是合法的，只是还没发完。
-            // 这里为了简单：如果最后一位是 ASCII，那它就是完整的边界。
-            if (i == 0) return len; 
-            // 如果 i > 0，说明后面有 i 个 continuation byte 找不到头，这属于流还没到齐
-            // 继续找头
-        }
-
-        // 2. 检查是否是 Header Byte (11xxxxxx)
-        if ((byte & 0xC0) == 0xC0) {
-            int needed_extra = 0;
-            if ((byte & 0xE0) == 0xC0) needed_extra = 1;      // 2-byte char
-            else if ((byte & 0xF0) == 0xE0) needed_extra = 2; // 3-byte char
-            else if ((byte & 0xF8) == 0xF0) needed_extra = 3; // 4-byte char
-            
-            // i 是当前 Header 后面实际跟的字节数
-            if (i >= needed_extra) {
-                return len; // 完整了
-            } else {
-                // 不完整，这个 Header 以及后面的 i 个字节都要留给下一次
-                return len - 1 - i;
-            }
-        }
-        
-        // 3. 如果是 Continuation Byte (10xxxxxx)，继续回溯找 Header
-    }
-    
-    // 如果回溯 4 步都没找到 Header 或 ASCII，说明数据可能有问题
-    // 为了防止死锁，我们假设全部发送（让 JSON 库去处理或报错，或者丢弃）
-    // 但在流式拼接中，通常返回 0 等待更多数据
-    return 0; 
-}
+UTF8Filter utf8_filter;
 
 void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
 {
-    // 1. 打印日志 (可选)
     // fprintf(stdout, "%s", p_str);
     // fflush(stdout);
 
-    if (!p_str || *p_str == '\0') return;
+    if (!p_str || *p_str == '\0')
+        return;
 
-    std::lock_guard<std::mutex> buffer_lock(g_buffer_mutex);
+    auto filtered_str = utf8_filter.filter(p_str);
 
-    // 2. 将新数据拼接到缓存中
-    g_utf8_buffer += p_str;
-
-    // 3. 计算缓存中有多长的数据是“UTF-8 安全”的
-    size_t send_len = get_valid_utf8_len(g_utf8_buffer);
-
-    if (send_len > 0) {
-        // 4. 切割出完整部分
-        std::string part_to_send = g_utf8_buffer.substr(0, send_len);
-        
-        // 5. 将完整部分推入消息队列
+    if (!filtered_str.empty())
+    {
         {
             std::lock_guard<std::mutex> queue_lk(g_msg_locker);
-            g_msg_queue.push(std::move(part_to_send));
+            g_msg_queue.push(std::move(filtered_str));
         }
         g_msg_cv.notify_one();
-
-        // 6. 保留剩下的残缺部分（如果有）到下一次
-        if (send_len < g_utf8_buffer.size()) {
-            g_utf8_buffer = g_utf8_buffer.substr(send_len);
-        } else {
-            g_utf8_buffer.clear();
-        }
     }
-    // 如果 send_len == 0，说明当前 buffer 里只有半个汉字，什么都不做，等下一次回调
 }
 
 template <typename T>

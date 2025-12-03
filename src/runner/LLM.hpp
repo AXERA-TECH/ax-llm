@@ -4,8 +4,7 @@
 #include <cmath>
 #include <numeric>
 #include "bfloat16.hpp"
-// #include "Tokenizer/Tokenizer.hpp"
-#include "base_tokenizer.hpp"
+#include "BaseTokenizer.hpp"
 #include "LLMEmbedSelector.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
 #include "ax_cmm_utils.hpp"
@@ -66,7 +65,7 @@ struct LLMAttrType
 class LLM
 {
 private:
-    std::shared_ptr<base_tokenizer> tokenizer;
+    std::shared_ptr<BaseTokenizer> tokenizer;
     LLaMaEmbedSelector embed_selector;
 
     std::vector<int> last_tokens_ids;
