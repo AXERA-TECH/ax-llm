@@ -28,21 +28,6 @@ void llm_running_callback(int *p_token, int n_token, const char *p_str, float to
     fflush(stdout);
 }
 
-std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
-{
-    std::ostringstream oss_prompt;
-    switch (tokenizer_type)
-    {
-    case TKT_HTTP:
-        oss_prompt << prompt;
-        break;
-    default:
-        ALOGE("tokenizer type %d not support", tokenizer_type);
-        break;
-    }
-
-    return oss_prompt.str();
-}
 int main(int argc, char *argv[])
 {
     signal(SIGPIPE, SIG_IGN);
@@ -173,7 +158,7 @@ int main(int argc, char *argv[])
         std::string output;
         if (image_prompt == "")
         {
-            lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type));
+            lLaMa.Encode(prompt_data, prompt);
             output = lLaMa.Run(prompt_data);
         }
         else
@@ -205,7 +190,7 @@ int main(int argc, char *argv[])
                     ALOGE("lLaMa.Encode failed");
                     continue;
                 }
-                if (auto ret = lLaMa.Encode(imgs_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type)); ret != 0)
+                if (auto ret = lLaMa.Encode(imgs_embed, prompt_data, prompt); ret != 0)
                 {
                     ALOGE("lLaMa.Encode failed");
                     continue;
@@ -228,7 +213,7 @@ int main(int argc, char *argv[])
                         ALOGE("lLaMa.Encode failed");
                         continue;
                     }
-                    if (auto ret = lLaMa.Encode(img_embed, prompt_data, prompt_complete(prompt, attr.tokenizer_type)); ret != 0)
+                    if (auto ret = lLaMa.Encode(img_embed, prompt_data, prompt); ret != 0)
                     {
                         ALOGE("lLaMa.Encode failed");
                         continue;
