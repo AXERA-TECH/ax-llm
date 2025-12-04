@@ -12,7 +12,7 @@
 #include "timer.hpp"
 #include "ax_cmm_utils.hpp"
 
-#include "Tokenizer/Tokenizer.hpp"
+#include "BaseTokenizer.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
 
 #include "LLMEmbedSelector.hpp"
@@ -55,7 +55,6 @@ struct LLMAttrType
     int precompute_len = 0;
     int prefill_grpid = -1;
 
-    TokenizerType tokenizer_type = TKT_HTTP;
     std::string url_tokenizer_model = "http://127.0.0.1:12345";
     bool b_bos = false, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
@@ -134,12 +133,25 @@ public:
         ALOGI("LLM init start");
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
-        tokenizer = CreateTokenizer(attr.tokenizer_type);
-        if (!tokenizer->Init(attr.url_tokenizer_model, attr.b_bos, attr.b_eos))
+        tokenizer = create_tokenizer(InternVL3);
+        if (!tokenizer->load(attr.url_tokenizer_model))
         {
-            ALOGE("tokenizer.Init(%s, %d, %d) failed", attr.url_tokenizer_model.c_str(), attr.b_bos, attr.b_eos);
+            ALOGE("tokenizer.load(%s) failed", attr.url_tokenizer_model.c_str());
             return false;
         }
+
+        if (bool ret = tokenizer->add_stop_token("<|im_end|>"); !ret)
+        {
+            ALOGE("tokenizer.add_stop_token(<|im_end|>) failed");
+            return false;
+        }
+        auto stop_tokens = tokenizer->get_stop_tokens();
+        printf("stop_tokens size: %d\n", stop_tokens.size());
+        for (auto &token : stop_tokens)
+        {
+            printf("%d\n", token);
+        }
+        tokenizer->set_think_in_prompt(true);
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
         // test code
         // {
@@ -220,10 +232,23 @@ public:
             return false;
         }
 
-        _attr.IMAGE_CONTEXT_TOKEN = tokenizer->GetImgContextID();
-        _attr.IMAGE_START_TOKEN = tokenizer->GetImgStartID();
+        auto ids = tokenizer->encode("<IMG_CONTEXT>");
+        if (ids.size() != 1)
+        {
+            ALOGE("encode <IMG_CONTEXT> failed");
+            return false;
+        }
+        _attr.IMAGE_CONTEXT_TOKEN = ids[0];
+        ids = tokenizer->encode("<img>");
+        if (ids.size() != 1)
+        {
+            ALOGE("encode <img> failed");
+            return false;
+        }
+        _attr.IMAGE_START_TOKEN = ids[0];
 
         ALOGI("IMAGE_CONTEXT_TOKEN: %d, IMAGE_START_TOKEN: %d", _attr.IMAGE_CONTEXT_TOKEN, _attr.IMAGE_START_TOKEN);
+
 
         IMAGE_ENCODER_INPUT_NCHW = -1;
         for (size_t i = 1; i < image_encoder.get_input(0).vShape.size(); i++)
@@ -434,9 +459,11 @@ public:
 
     int Encode(std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
     {
-        ImageInfo img_info;
-        img_info.img_prompt = false;
-        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
+        std::vector<Content> contents = {
+            {SYSTEM, TEXT, "You are a helpful assistant."},
+            {USER, TEXT, prompt},
+        };
+        std::vector<int> input_ids = tokenizer->encode(contents);
         if (input_ids.size() > _attr.prefill_token_num)
         {
             ALOGE("input_ids(%ld) > prefill_token_num(%d)", input_ids.size(), _attr.prefill_token_num);
@@ -456,11 +483,13 @@ public:
 
     int Encode(std::vector<std::vector<unsigned short>> &imgs_embed, std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
     {
-        ImageInfo img_info;
-        img_info.img_prompt = true;
-        img_info.num_img = imgs_embed.size();
-        img_info.imgsz = _attr.image_encoder_width;
-        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
+        ALOGI("imgs_embed.size() : %ld, media token size : %ld", imgs_embed.size(), int(imgs_embed[0].size() / _attr.tokens_embed_size));
+        std::vector<Content> contents = {
+            {SYSTEM, TEXT, "You are a helpful assistant."},
+            {USER, IMAGE, prompt, (int)imgs_embed.size(), int(imgs_embed[0].size() / _attr.tokens_embed_size)},
+        };
+
+        std::vector<int> input_ids = tokenizer->encode(contents);
 
         std::vector<int> img_start_index;
         for (size_t i = 0; i < input_ids.size(); i++)
@@ -784,13 +813,13 @@ public:
 
                 next_token = max_index;
 
-                if (tokenizer->isEnd(max_index))
+                if (tokenizer->is_stop(max_index))
                 {
                     if (cached_token.size() && _attr.runing_callback)
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        auto tmp_out = tokenizer->Decode(cached_token);
+                        auto tmp_out = tokenizer->decode(cached_token);
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
@@ -806,7 +835,7 @@ public:
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        auto tmp_out = tokenizer->Decode(cached_token);
+                        auto tmp_out = tokenizer->decode(cached_token);
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
@@ -828,7 +857,7 @@ public:
         // 去掉 len_of_input 那部分
         // token_ids.erase(token_ids.begin(), token_ids.begin() + len_of_input);
 
-        final_out = tokenizer->Decode(token_ids);
+        final_out = tokenizer->decode(token_ids);
 
         for (size_t i = 0; i < _attr.axmodel_num; i++)
         {
