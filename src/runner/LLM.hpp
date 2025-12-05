@@ -10,13 +10,14 @@
 #include "ax_cmm_utils.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
+#include "UTF8Filter.hpp"
 
 #include <ax_sys_api.h>
 #include "LLMPostprocess.hpp"
 
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 
-typedef void (*LLMRuningCallback)(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve);
+typedef void (*LLMRuningCallback)(const char *p_str, float token_per_sec, void *reserve);
 
 struct LLMAttrType
 {
@@ -65,10 +66,12 @@ struct LLMAttrType
 class LLM
 {
 private:
+    UTF8Filter utf8_filter;
     std::shared_ptr<BaseTokenizer> tokenizer;
     LLaMaEmbedSelector embed_selector;
 
     std::vector<int> last_tokens_ids;
+    bool b_os_kvcache = false;
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     int precompute_len = 0;
 
@@ -423,8 +426,8 @@ public:
 
                 layer.layer.inference(prefill_grpid);
 
-                auto &input_decoder_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
-                auto &input_decoder_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
+                // auto &input_decoder_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
+                // auto &input_decoder_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
 
                 auto &input_prefill_k_cache = layer.layer.get_input(prefill_grpid, "K_cache");
                 auto &input_prefill_v_cache = layer.layer.get_input(prefill_grpid, "V_cache");
@@ -434,13 +437,13 @@ public:
 
                 int kv_offset = (p * _attr.prefill_token_num) * _attr.kv_cache_size;
 
-                memcpy((unsigned short *)input_decoder_k_cache.pVirAddr + kv_offset,
-                       (void *)output_k_cache.pVirAddr,
-                       sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                // memcpy((unsigned short *)input_decoder_k_cache.pVirAddr + kv_offset,
+                //        (void *)output_k_cache.pVirAddr,
+                //        sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
 
-                memcpy((unsigned short *)input_decoder_v_cache.pVirAddr + kv_offset,
-                       (void *)output_v_cache.pVirAddr,
-                       sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
+                // memcpy((unsigned short *)input_decoder_v_cache.pVirAddr + kv_offset,
+                //        (void *)output_v_cache.pVirAddr,
+                //        sizeof(unsigned short) * _attr.prefill_token_num * _attr.kv_cache_size);
 
                 memcpy((unsigned short *)input_prefill_k_cache.pVirAddr + kv_offset,
                        (void *)output_k_cache.pVirAddr,
@@ -474,10 +477,11 @@ public:
     int GetKVCache(std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int &precompute_len)
     {
         bfloat16 bf16 = -65536.f;
-        std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
+        // std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
         auto &input_mask = llama_layers[0].layer.get_input(decode_grpid, "mask");
-        memcpy(mask.data(), (void *)input_mask.pVirAddr, input_mask.nSize);
-        for (size_t i = 0; i < mask.size(); i++)
+        unsigned short *mask = (unsigned short *)input_mask.pVirAddr;
+        // memcpy(mask.data(), (void *)input_mask.pVirAddr, input_mask.nSize);
+        for (size_t i = 0; i < input_mask.nSize / sizeof(unsigned short); i++)
         {
             if (mask[i] == bf16.data)
             {
@@ -486,17 +490,20 @@ public:
             }
         }
         ALOGI("precompute_len:%d, remaining:%d", precompute_len, _attr.prefill_max_kv_cache_num_grp[_attr.prefill_max_kv_cache_num_grp.size() - 1] - precompute_len);
-        k_caches.resize(_attr.axmodel_num);
-        v_caches.resize(_attr.axmodel_num);
-        for (size_t i = 0; i < _attr.axmodel_num; i++)
+        if (b_os_kvcache)
         {
-            auto &layer = llama_layers[i];
-            k_caches[i].resize(precompute_len * _attr.kv_cache_size);
-            v_caches[i].resize(precompute_len * _attr.kv_cache_size);
-            auto &input_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
-            auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
-            memcpy((void *)k_caches[i].data(), (void *)input_k_cache.pVirAddr, precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-            memcpy((void *)v_caches[i].data(), (void *)input_v_cache.pVirAddr, precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+            k_caches.resize(_attr.axmodel_num);
+            v_caches.resize(_attr.axmodel_num);
+            for (size_t i = 0; i < _attr.axmodel_num; i++)
+            {
+                auto &layer = llama_layers[i];
+                k_caches[i].resize(precompute_len * _attr.kv_cache_size);
+                v_caches[i].resize(precompute_len * _attr.kv_cache_size);
+                auto &input_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
+                auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
+                memcpy((void *)k_caches[i].data(), (void *)input_k_cache.pVirAddr, precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                memcpy((void *)v_caches[i].data(), (void *)input_v_cache.pVirAddr, precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+            }
         }
 
         _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_max_kv_cache_num_grp.size() - 1];
@@ -504,18 +511,8 @@ public:
         return 0;
     }
 
-    int SetKVCache(std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int input_num_token)
+    int SetKVCache(std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, int _precompute_len, int input_num_token)
     {
-        // int precompute_len = 0;
-        int _precompute_len = 0;
-        if (k_caches.size() == 0)
-        {
-            _precompute_len = 0;
-        }
-        else
-        {
-            _precompute_len = k_caches[0].size() / _attr.kv_cache_size;
-        }
         for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
         {
             if (_precompute_len + input_num_token <= _attr.prefill_max_kv_cache_num_grp[i])
@@ -547,72 +544,71 @@ public:
             ALOGE("input_num_token(%d) > _attr.prefill_max_token_num(%d)", input_num_token, _attr.prefill_max_token_num);
             return -1;
         }
-
-        if (k_caches.size() != v_caches.size())
+        if (b_os_kvcache)
         {
-            ALOGE("k_caches.size(%d) != v_caches.size(%d)", k_caches.size(), v_caches.size());
-            return -1;
-        }
-
-        if (k_caches.size() != _attr.axmodel_num)
-        {
-            ALOGE("k_caches.size(%d) != _attr.axmodel_num(%d)", k_caches.size(), _attr.axmodel_num);
-            return -1;
-        }
-
-        // clear kv cache
-        for (size_t i = 0; i < _attr.axmodel_num; i++)
-        {
-            memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").nSize);
-            memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").nSize);
-
-            memset((void *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize);
-            memset((void *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize);
-        }
-
-        // int prefill_grpid = llama_layers[0].layer.get_num_input_groups() - 1;
-
-        for (unsigned int m = 0; m < _attr.axmodel_num; m++)
-        {
-            auto &layer = llama_layers[m];
-
-            auto &k_cache = k_caches[m];
-            auto &v_cache = v_caches[m];
-
-            if (k_cache.size() != _precompute_len * _attr.kv_cache_size)
+            if (k_caches.size() != v_caches.size())
             {
-                ALOGE("k_cache.size(%d) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), _precompute_len, _attr.kv_cache_size);
-                return -1;
-            }
-            if (v_cache.size() < _precompute_len * _attr.kv_cache_size)
-            {
-                ALOGE("v_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), _precompute_len, _attr.kv_cache_size);
+                ALOGE("k_caches.size(%d) != v_caches.size(%d)", k_caches.size(), v_caches.size());
                 return -1;
             }
 
-            // set kv cache inputs
+            if (k_caches.size() != _attr.axmodel_num)
             {
-                auto &input_k_cache = layer.layer.get_input(_attr.prefill_grpid, "K_cache");
-                unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
-                auto &input_v_cache = layer.layer.get_input(_attr.prefill_grpid, "V_cache");
-                unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
-
-                memcpy(input_k_cache_ptr, k_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                memcpy(input_v_cache_ptr, v_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                // axcl_Memcpy((void *)input_k_cache_ptr, (void *)k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
-                // axcl_Memcpy((void *)input_v_cache_ptr, (void *)v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
+                ALOGE("k_caches.size(%d) != _attr.axmodel_num(%d)", k_caches.size(), _attr.axmodel_num);
+                return -1;
             }
 
-            {
-                auto &input_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
-                unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
-                auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
-                unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
+            // clear kv cache
 
-                memcpy(input_k_cache_ptr, k_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                memcpy(input_v_cache_ptr, v_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                // axcl_Memcpy((void *)input_k_cache_ptr, (void *)k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
-                // axcl_Memcpy((void *)input_v_cache_ptr, (void *)v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
+            for (size_t i = 0; i < _attr.axmodel_num; i++)
+            {
+                // memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").nSize);
+                // memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").nSize);
+
+                memset((void *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize);
+                memset((void *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize);
+            }
+
+            for (unsigned int m = 0; m < _attr.axmodel_num; m++)
+            {
+                auto &layer = llama_layers[m];
+
+                auto &k_cache = k_caches[m];
+                auto &v_cache = v_caches[m];
+
+                if (k_cache.size() != _precompute_len * _attr.kv_cache_size)
+                {
+                    ALOGE("k_cache.size(%d) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), _precompute_len, _attr.kv_cache_size);
+                    return -1;
+                }
+                if (v_cache.size() < _precompute_len * _attr.kv_cache_size)
+                {
+                    ALOGE("v_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), _precompute_len, _attr.kv_cache_size);
+                    return -1;
+                }
+
+                // set kv cache inputs
+                // {
+                //     auto &input_k_cache = layer.layer.get_input(_attr.prefill_grpid, "K_cache");
+                //     unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
+                //     auto &input_v_cache = layer.layer.get_input(_attr.prefill_grpid, "V_cache");
+                //     unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
+
+                //     memcpy(input_k_cache_ptr, k_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                //     memcpy(input_v_cache_ptr, v_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                //     // axcl_Memcpy((void *)input_k_cache_ptr, (void *)k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
+                //     // axcl_Memcpy((void *)input_v_cache_ptr, (void *)v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
+                // }
+
+                {
+                    auto &input_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
+                    unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
+                    auto &input_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
+                    unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
+
+                    memcpy(input_k_cache_ptr, k_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                    memcpy(input_v_cache_ptr, v_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
+                }
             }
         }
 
@@ -625,32 +621,52 @@ public:
         k_caches.clear();
         v_caches.clear();
         precompute_len = 0;
+
+        // reset kv cache
+        for (size_t i = 0; i < _attr.axmodel_num; i++)
+        {
+            // memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").nSize);
+            // memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").nSize);
+
+            memset((void *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize);
+            memset((void *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize);
+        }
     }
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1)
     {
         std::vector<int> tokens_diff;
-        int offset = 0;
-        tokens_diff = diff_token_ids(last_tokens_ids, tokenizer->encode(history), offset);
-        ALOGI("tokens_diff size : %d, offset : %d", tokens_diff.size(), offset);
+        // int offset = 0;
+        tokens_diff = diff_token_ids(last_tokens_ids, tokenizer->encode(history), precompute_len);
+        ALOGI("tokens_diff size : %d, precompute_len : %d", tokens_diff.size(), precompute_len);
 
         // if (offset > 0 &&
         //     k_caches.size() == _attr.axmodel_num &&
         //     v_caches.size() == _attr.axmodel_num &&
         //     k_caches[0].size() >= offset * _attr.kv_cache_size &&
         //     v_caches[0].size() >= offset * _attr.kv_cache_size)
-        if (offset != precompute_len)
-        {
-            for (size_t i = 0; i < _attr.axmodel_num; i++)
-            {
-                auto &layer = llama_layers[i];
-                k_caches[i].resize(offset * _attr.kv_cache_size);
-                v_caches[i].resize(offset * _attr.kv_cache_size);
-            }
-            precompute_len = offset;
-            ALOGI("precompute_len : %d", precompute_len);
-        }
+        // if (offset != precompute_len)
+        // {
+        // for (size_t i = 0; i < _attr.axmodel_num; i++)
+        // {
+        //     auto &layer = llama_layers[i];
+        //     k_caches[i].resize(offset * _attr.kv_cache_size);
+        //     v_caches[i].resize(offset * _attr.kv_cache_size);
+        // }
 
-        SetKVCache(k_caches, v_caches, tokens_diff.size());
+        // ALOGI("precompute_len : %d", precompute_len);
+
+        // for (size_t i = 0; i < _attr.axmodel_num; i++)
+        // {
+        //     memset((unsigned short *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr + precompute_len * _attr.kv_cache_size,
+        //            0,
+        //            llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize - +precompute_len * _attr.kv_cache_size);
+        //     memset((unsigned short *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr + precompute_len * _attr.kv_cache_size,
+        //            0,
+        //            llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize - +precompute_len * _attr.kv_cache_size);
+        // }
+        // }
+
+        SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size());
         std::vector<unsigned short> out_embed(tokens_diff.size() * _attr.tokens_embed_size);
 
         for (size_t i = 0; i < tokens_diff.size(); i++)
@@ -663,6 +679,8 @@ public:
 
         history.push_back({ASSISTANT, TEXT, reply});
         last_tokens_ids = tokenizer->encode(history);
+        // 删除最后两个token_ids， “<|im_start|>assistant\n”，否则会跳过计算
+        last_tokens_ids.erase(last_tokens_ids.end() - 2, last_tokens_ids.end());
         return history;
     }
 
@@ -676,7 +694,7 @@ public:
         std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
         int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_grpid - 1];
 
-        std::vector<int> cached_token;
+        // std::vector<int> cached_token;
         std::vector<int> token_ids;
 
         int input_embed_num = test_embed.size() / _attr.tokens_embed_size;
@@ -768,8 +786,8 @@ public:
 
                 layer.layer.inference(_attr.prefill_grpid);
 
-                auto &input_decoder_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
-                auto &input_decoder_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
+                // auto &input_decoder_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
+                // auto &input_decoder_v_cache = layer.layer.get_input(decode_grpid, "V_cache");
 
                 auto &input_prefill_k_cache = layer.layer.get_input(_attr.prefill_grpid, "K_cache");
                 auto &input_prefill_v_cache = layer.layer.get_input(_attr.prefill_grpid, "V_cache");
@@ -779,13 +797,13 @@ public:
 
                 int kv_offset = (precompute_len + p * _attr.prefill_token_num) * _attr.kv_cache_size;
 
-                memcpy((unsigned short *)input_decoder_k_cache.pVirAddr + kv_offset,
-                       (void *)output_k_cache.pVirAddr,
-                       sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
+                // memcpy((unsigned short *)input_decoder_k_cache.pVirAddr + kv_offset,
+                //        (void *)output_k_cache.pVirAddr,
+                //        sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
 
-                memcpy((unsigned short *)input_decoder_v_cache.pVirAddr + kv_offset,
-                       (void *)output_v_cache.pVirAddr,
-                       sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
+                // memcpy((unsigned short *)input_decoder_v_cache.pVirAddr + kv_offset,
+                //        (void *)output_v_cache.pVirAddr,
+                //        sizeof(unsigned short) * input_num_token * _attr.kv_cache_size);
 
                 memcpy((unsigned short *)input_prefill_k_cache.pVirAddr + kv_offset,
                        (void *)output_k_cache.pVirAddr,
@@ -829,8 +847,16 @@ public:
             next_token = max_index;
 
             token_ids.push_back(max_index);
-            cached_token.push_back(max_index);
+            // cached_token.push_back(max_index);
             ALOGI("ttft: %.2f ms", ttft_timer.cost());
+            if (_attr.runing_callback)
+            {
+                auto str = utf8_filter.filter(tokenizer->decode(max_index));
+                if (!str.empty())
+                {
+                    _attr.runing_callback(str.c_str(), -1, _attr.reserve);
+                }
+            }
         }
         t_cost.start();
 
@@ -907,14 +933,14 @@ public:
 
                 if (tokenizer->is_stop(max_index))
                 {
-                    if (cached_token.size() && _attr.runing_callback)
-                    {
-                        float t_cost_ms = t_cost.cost();
-                        float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        auto tmp_out = tokenizer->decode(cached_token);
-                        _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
-                        cached_token.clear();
-                    }
+                    // if (cached_token.size() && _attr.runing_callback)
+                    // {
+                    //     float t_cost_ms = t_cost.cost();
+                    //     float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
+                    //     auto tmp_out = tokenizer->decode(cached_token);
+                    //     _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
+                    //     cached_token.clear();
+                    // }
                     b_hit_eos = true;
                     break;
                 }
@@ -922,14 +948,15 @@ public:
 
                 if (_attr.runing_callback)
                 {
-                    cached_token.push_back(max_index);
-                    if (cached_token.size() >= 3)
+                    // cached_token.push_back(max_index);
+                    // if (cached_token.size() >= 3)
+                    // {
+                    float t_cost_ms = t_cost.cost();
+                    float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
+                    auto tmp_out = tokenizer->decode(max_index);
+                    if (!tmp_out.empty())
                     {
-                        float t_cost_ms = t_cost.cost();
-                        float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        auto tmp_out = tokenizer->decode(cached_token);
-                        _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
-                        cached_token.clear();
+                        _attr.runing_callback(tmp_out.c_str(), token_per_sec, _attr.reserve);
                     }
                 }
                 if (output_max_token > 0 && token_ids.size() >= output_max_token)

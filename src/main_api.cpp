@@ -44,9 +44,7 @@ void __sigExit(int iSigNo)
     return;
 }
 
-UTF8Filter utf8_filter;
-
-void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
+void llm_running_callback(const char *p_str, float token_per_sec, void *reserve)
 {
     // fprintf(stdout, "%s", p_str);
     // fflush(stdout);
@@ -54,16 +52,11 @@ void llm_running_callback(int *p_token, int n_token, const char *p_str, float to
     if (!p_str || *p_str == '\0')
         return;
 
-    auto filtered_str = utf8_filter.filter(p_str);
-
-    if (!filtered_str.empty())
     {
-        {
-            std::lock_guard<std::mutex> queue_lk(g_msg_locker);
-            g_msg_queue.push(std::move(filtered_str));
-        }
-        g_msg_cv.notify_one();
+        std::lock_guard<std::mutex> queue_lk(g_msg_locker);
+        g_msg_queue.push(std::move(p_str));
     }
+    g_msg_cv.notify_one();
 }
 
 template <typename T>

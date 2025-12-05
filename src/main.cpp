@@ -21,7 +21,7 @@ void __sigExit(int iSigNo)
     return;
 }
 
-void llm_running_callback(int *p_token, int n_token, const char *p_str, float token_per_sec, void *reserve)
+void llm_running_callback(const char *p_str, float token_per_sec, void *reserve)
 {
     fprintf(stdout, "%s", p_str);
     fflush(stdout);
@@ -208,7 +208,7 @@ int main(int argc, char *argv[])
     //
     if (b_continue)
     {
-        printf("Type \"q\" to exit\nCtrl+c to stop current running\n\"reset\" to reset kvcache\n\"dd\" to remove last conversation.\n");
+        printf("Type \"q\" to exit\nCtrl+c to stop current running\n\"reset\" to reset kvcache\n\"dd\" to remove last conversation.\n\"pp\" to print history.\n");
         // lLaMa.Reset();
     }
 
@@ -236,13 +236,32 @@ int main(int argc, char *argv[])
         }
         if (prompt == "dd")
         {
-            ALOGI("remove last conversation");
             if (history.size() >= 3) // system, user, assistant, user, assistant, ...
             {
+                ALOGI("remove last conversation \nQ:%s \nA:%s", history[history.size() - 2].data.c_str(), history[history.size() - 1].data.c_str());
                 history.pop_back();
                 history.pop_back();
             }
-
+            continue;
+        }
+        if (prompt == "pp")
+        {
+            ALOGI("history size: %d", history.size());
+            for (auto &item : history)
+            {
+                if (item.role == SYSTEM)
+                {
+                    printf("system: %s\n", item.data.c_str());
+                }
+                else if (item.role == USER)
+                {
+                    printf("user: %s\n", item.data.c_str());
+                }
+                else if (item.role == ASSISTANT)
+                {
+                    printf("assistant: %s\n", item.data.c_str());
+                }
+            }
             continue;
         }
 

@@ -244,7 +244,7 @@ int main(int argc, char *argv[])
                 lLaMa.getEmbedSelector()->getByIndex(tokens_diff[i], prompt_data.data() + i * lLaMa.getAttr()->tokens_embed_size);
             }
 
-            if (auto ret = lLaMa.SetKVCache(k_caches, v_caches, tokens_diff.size()); ret != 0)
+            if (auto ret = lLaMa.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
             {
                 ALOGE("SetKVCache failed: %d,the context may be full,input \"reset\" to reset context", ret);
                 continue;
