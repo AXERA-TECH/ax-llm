@@ -17,7 +17,7 @@ EMBED_SIZE=576
 --bos 0 --eos 0 \
 --dynamic_load_axmodel_layer 0 \
 --use_mmap_load_embed 1 \
---filename_tokenizer_model "http://127.0.0.1:8080" \
+--filename_tokenizer_model scripts/smolvlm2_tokenizer.txt \
 --filename_post_axmodel "${AXMODEL_DIR}/llama_post.axmodel" \
 --filename_tokens_embed "${AXMODEL_DIR}/model.embed_tokens.weight.bfloat16.bin" \
 --tokens_embed_num 49280 \
