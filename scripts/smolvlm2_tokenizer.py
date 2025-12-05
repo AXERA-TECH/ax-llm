@@ -206,7 +206,7 @@ class Tokenizer_Http():
         return prompt_strings
 
     def encode(self, content):
-        text = [f'<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n']
+        text = [f'<|im_start|>User: {content}<end_of_utterance>\nAssistant:']
         input_ids = self.tokenizer(text)
         return input_ids["input_ids"][0]
 
