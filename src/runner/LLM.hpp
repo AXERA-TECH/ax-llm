@@ -388,35 +388,24 @@ public:
         timer t;
         t.start();
 
-        std::vector<std::vector<unsigned char>> pixel_values_u8;
+        std::vector<std::vector<unsigned char>> pixel_values;
 
         int w = 512, h = 512;
 
         int channel = src[0].channels();
-        int hwc = h * w * channel * sizeof(float);
+        int hwc = h * w * channel ;
 
         if (!b_video)
         {
-            Smolvlm2ImageProcessor(src, pixel_values_u8);
+            Smolvlm2ImageProcessor(src, pixel_values);
         }
         else
         {
             // 只支持一个视频
-            Smolvlm2VideoProcessor(src, pixel_values_u8);
+            Smolvlm2VideoProcessor(src, pixel_values);
         }
 
-        ALOGI("pixel_values size %d", pixel_values_u8.size());
-
-        std::vector<std::vector<float>> pixel_values;
-        for(int i=0; i< pixel_values_u8.size(); i++)
-        {
-            std::vector<float> tmp;
-            for(int j=0; j<pixel_values_u8[i].size(); j++)
-            {
-                tmp.push_back( (static_cast<float>(pixel_values_u8[i][j]) -127.5)/127.5 );
-            }
-            pixel_values.push_back(tmp);
-        }
+        ALOGI("pixel_values size %d", pixel_values.size());
 
         int cnt = 0;
         if (out_embed.empty())

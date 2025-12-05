@@ -254,8 +254,8 @@ int Smolvlm2ImageProcessor(std::vector<cv::Mat>& src, std::vector<std::vector<un
         std::vector<unsigned char> imgdata;
         imgdata.resize( 512 * 512 * 3);
         memcpy(imgdata.data(), img.data, 512 * 512 * 3);
-        output.push_back(hwc_to_chw(imgdata, 512, 512, 3));
-        // output.push_back(imgdata);
+        // output.push_back(hwc_to_chw(imgdata, 512, 512, 3));
+        output.push_back(imgdata);
     }
     
     return 0;
@@ -282,8 +282,8 @@ int Smolvlm2VideoProcessor(std::vector<cv::Mat>& src, std::vector<std::vector<un
         }
 
         memcpy(imgdata.data(), img.data, 512 * 512 * 3);
-        output.push_back(hwc_to_chw(imgdata, 512, 512, 3));
-        // output.push_back(imgdata);
+        // output.push_back(hwc_to_chw(imgdata, 512, 512, 3));
+        output.push_back(imgdata);
     }
     
     return 0;

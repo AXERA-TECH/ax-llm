@@ -3,7 +3,7 @@ AXMODEL_DIR=../../../SmolVLM2-500M-Video-Instruct.axera/python/SmolVLM2-500M-Vid
 ./build/install/bin/main \
 --template_filename_axmodel "${AXMODEL_DIR}/llama_p128_l%d_together.axmodel" \
 --axmodel_num 32 \
---filename_image_encoder_axmodedl "../../../SmolVLM2-500M-Video-Instruct.axera/python/vit-models/vision_model_1x3x512x512.axmodel" \
+--filename_image_encoder_axmodedl "../../../SmolVLM2-500M-Video-Instruct.axera/python/vit-models/vision_model_1x3x512x512_NHwC_U8.axmodel" \
 --bos 0 --eos 0 \
 --dynamic_load_axmodel_layer 0 \
 --use_mmap_load_embed 1 \
@@ -14,5 +14,5 @@ AXMODEL_DIR=../../../SmolVLM2-500M-Video-Instruct.axera/python/SmolVLM2-500M-Vid
 --tokens_embed_size 960 \
 --live_print 1 \
 --continue 1 \
---video 1 \
+--video 0 \
 --post_config_path post_config1.json 
