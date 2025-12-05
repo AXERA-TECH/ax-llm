@@ -4,8 +4,8 @@
 #include <cmath>
 #include <numeric>
 #include "bfloat16.hpp"
-#include "Tokenizer/Tokenizer.hpp"
-// #include "BaseTokenizer.hpp"
+// #include "Tokenizer/Tokenizer.hpp"
+#include "BaseTokenizer.hpp"
 #include "LLMEmbedSelector.hpp"
 #include "ax_model_runner/ax_model_runner_ax650.hpp"
 #include "ax_cmm_utils.hpp"
@@ -54,7 +54,7 @@ struct LLMAttrType
     std::vector<int> prefill_max_kv_cache_num_grp;
     int prefill_grpid = -1;
 
-    TokenizerType tokenizer_type = TKT_HTTP;
+    // TokenizerType tokenizer_type = TKT_HTTP;
     std::string filename_tokenizer_model = "http://127.0.0.1:12345";
     bool b_bos = false, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
@@ -138,20 +138,21 @@ public:
 
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
-        // tokenizer = create_tokenizer(Qwen3VL);
-        // if (!tokenizer->load(attr.filename_tokenizer_model))
-        // {
-        //     ALOGE("tokenizer.load(%s) failed", attr.filename_tokenizer_model.c_str());
-        //     return false;
-        // }
-        // tokenizer->set_think_in_prompt(true);
 
-        tokenizer = CreateTokenizer(attr.tokenizer_type);
-        if (!tokenizer->Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
+        tokenizer = create_tokenizer(SmolVLM2);
+        if (!tokenizer->load(attr.filename_tokenizer_model))
         {
-            ALOGE("tokenizer.Init(%s, %d, %d) failed", attr.filename_tokenizer_model.c_str(), attr.b_bos, attr.b_eos);
+            ALOGE("tokenizer.load(%s) failed", attr.filename_tokenizer_model.c_str());
             return false;
         }
+        tokenizer->set_think_in_prompt(true);
+
+        // tokenizer = CreateTokenizer(attr.tokenizer_type);
+        // if (!tokenizer->Init(attr.filename_tokenizer_model, attr.b_bos, attr.b_eos))
+        // {
+        //     ALOGE("tokenizer.Init(%s, %d, %d) failed", attr.filename_tokenizer_model.c_str(), attr.b_bos, attr.b_eos);
+        //     return false;
+        // }
 
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
         // test code
@@ -393,7 +394,7 @@ public:
         int w = 512, h = 512;
 
         int channel = src[0].channels();
-        int hwc = h * w * channel ;
+        int hwc = h * w * channel;
 
         if (!b_video)
         {
@@ -431,7 +432,6 @@ public:
             {
                 out_embed[i][j] = bfloat16(output_data[j]).data;
             }
-
         }
 
         ALOGI("image encode time : %f ms, size : %d", t.cost(), out_embed.size());
@@ -440,8 +440,8 @@ public:
 
     int GetPositionIds(std::vector<int> &input_ids, std::vector<std::vector<int>> &position_ids)
     {
-        std::vector<int> ids(input_ids.size()); 
-        std::iota(ids.begin(), ids.end(), 0);  // 从0开始填充
+        std::vector<int> ids(input_ids.size());
+        std::iota(ids.begin(), ids.end(), 0); // 从0开始填充
 
         position_ids.clear();
         position_ids.push_back(ids);
@@ -450,15 +450,14 @@ public:
 
     int Encode(std::vector<unsigned short> &out_embed, std::vector<std::vector<int>> &position_ids, std::string prompt = "What is in the image?")
     {
-        // std::vector<Content> contents = {
-        //     {SYSTEM, TEXT, "You are a helpful assistant."},
-        //     {USER, TEXT, prompt},
-        // };
+        std::vector<Content> contents = {
+            {USER, TEXT, prompt},
+        };
+        std::vector<int> input_ids = tokenizer->encode(contents);
 
-        ImageInfo img_info;
-        img_info.img_prompt = false;
-        // std::vector<int> input_ids = tokenizer->encode(contents);
-        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
+        // ImageInfo img_info;
+        // img_info.img_prompt = false;
+        // std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
         if (input_ids.size() > _attr.prefill_max_token_num)
         {
             ALOGE("input_ids(%d) > prefill_max_token_num(%d)", input_ids.size(), _attr.prefill_max_token_num);
@@ -476,30 +475,35 @@ public:
     }
 
     int Encode(std::vector<std::vector<unsigned short>> &img_embed, bool b_video, std::vector<unsigned short> &out_embed,
-               std::vector<std::vector<int>> &position_ids, 
+               std::vector<std::vector<int>> &position_ids,
                Config &cfg, std::string prompt = "What is in the image?")
     {
-        // std::vector<Content> contents = {
-        //     {SYSTEM, TEXT, "You are a helpful assistant."},
-        //     {USER, b_video ? VIDEO : IMAGE, prompt, (int)img_embed.size(), int(img_embed[0].size() / _attr.tokens_embed_size)},
-        // };
+        std::vector<Content> contents = {
+            {USER,
+             b_video ? VIDEO : IMAGE,
+             prompt,
+             b_video ? (int)img_embed.size() : (int)img_embed.size() / 5,
+             int(img_embed[0].size() / _attr.tokens_embed_size)},
+        };
+        ALOGI("img_embed.size :%d, is video:%d, num_media_tokens:%d, real num of image:", img_embed.size(), b_video, int(img_embed[0].size() / _attr.tokens_embed_size), contents[0].num_media);
+        std::vector<int> input_ids = tokenizer->encode(contents);
 
-        ImageInfo img_info;
-        img_info.img_prompt = true;
-        img_info.video_prompt = b_video;
-        img_info.img_token_num = img_embed[0].size() / _attr.tokens_embed_size;
-        img_info.num_img = img_embed.size();
-        // std::vector<int> input_ids = tokenizer->encode(contents);
-        std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
+        // ImageInfo img_info;
+        // img_info.img_prompt = true;
+        // img_info.video_prompt = b_video;
+        // img_info.img_token_num = img_embed[0].size() / _attr.tokens_embed_size;
+        // img_info.num_img = img_embed.size();
+        // std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
+
         ALOGI("input_ids size:%d", input_ids.size());
         std::vector<int> offsets;
         int img_token_id = cfg.image_token_id;
         bool last_is_img_token = false;
-        for (size_t i = 0; i < input_ids.size() ; i++)
+        for (size_t i = 0; i < input_ids.size(); i++)
         {
             if (input_ids[i] == img_token_id)
             {
-                if(!last_is_img_token)
+                if (!last_is_img_token)
                 {
                     ALOGI("offset %d", i);
                     offsets.push_back(i);
@@ -603,7 +607,7 @@ public:
                     int mask_current_start = kv_cache_num;
                     auto mask_ptr = mask_tmp.data() + i * (kv_cache_num + _attr.prefill_token_num);
 
-                    for (int j = 0; j <  p * _attr.prefill_token_num; j++)
+                    for (int j = 0; j < p * _attr.prefill_token_num; j++)
                     {
                         mask_ptr[j] = 0;
                     }
@@ -663,7 +667,7 @@ public:
                 // ALOGI("position_ids");
                 for (unsigned int i = 0; i < position_ids.size(); i++)
                 {
-                    for (unsigned int j = p * _attr.prefill_token_num, jj = 0; j <  (p + 1) * _attr.prefill_token_num; j++, jj++)
+                    for (unsigned int j = p * _attr.prefill_token_num, jj = 0; j < (p + 1) * _attr.prefill_token_num; j++, jj++)
                     {
                         if (j < position_ids[i].size())
                         {
@@ -871,15 +875,14 @@ public:
 
                 next_token = max_index;
 
-                // if (tokenizer->is_stop(max_index))
-                if (tokenizer->isEnd(max_index))
+                if (tokenizer->is_stop(max_index))
                 {
                     if (cached_token.size() && _attr.runing_callback)
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
                         // auto tmp_out = tokenizer->decode(cached_token);
-                        auto tmp_out = tokenizer->Decode(cached_token);
+                        auto tmp_out = tokenizer->decode(cached_token);
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
@@ -895,8 +898,7 @@ public:
                     {
                         float t_cost_ms = t_cost.cost();
                         float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                        // auto tmp_out = tokenizer->decode(cached_token);
-                        auto tmp_out = tokenizer->Decode(cached_token);
+                        auto tmp_out = tokenizer->decode(cached_token);
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
@@ -918,8 +920,7 @@ public:
         // 去掉 len_of_input 那部分
         // token_ids.erase(token_ids.begin(), token_ids.begin() + len_of_input);
 
-        // final_out = tokenizer->decode(token_ids);
-        final_out = tokenizer->Decode(token_ids);
+        final_out = tokenizer->decode(token_ids);
 
         for (size_t i = 0; i < _attr.axmodel_num; i++)
         {
