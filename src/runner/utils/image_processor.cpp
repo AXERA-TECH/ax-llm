@@ -10,6 +10,7 @@ std::vector<cv::Mat> ReadImages(std::string path){
 
     if(is_file(path)){
         cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);
+        std::cout<<"read image"<<std::endl;
         src.push_back(img);
     }
     else if(is_directory(path)){
@@ -160,3 +161,130 @@ int Qwen2VideoProcessor( std::vector<cv::Mat>& src, std::vector<std::vector<unsi
 
 }
 
+std::vector<cv::Mat> splitImageSafe(cv::Mat src, int rows, int cols) {
+    std::vector<cv::Mat> subImages;
+    
+    cv::Size size(1024, 1024);
+
+    if(src.cols!=1024 || src.rows!=1024){
+        cv::Mat img_rs;
+        cv::resize(src, img_rs, size, 0, 0, cv::INTER_CUBIC);
+        src = img_rs;
+    }
+
+    int subHeight = src.rows / rows;
+    int subWidth = src.cols / cols;
+    
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            // 计算ROI，确保不越界
+            int x = j * subWidth;
+            int y = i * subHeight;
+            int width = (j == cols - 1) ? src.cols - x : subWidth;
+            int height = (i == rows - 1) ? src.rows - y : subHeight;
+            
+            cv::Rect roi(x, y, width, height);
+            
+            // 检查ROI是否有效
+            if (roi.x >= 0 && roi.y >= 0 && 
+                roi.x + roi.width <= src.cols && 
+                roi.y + roi.height <= src.rows) {
+                
+                cv::Mat subImage = src(roi).clone();
+                cv::Size size(512, 512);
+                if(subImage.cols!=512 || subImage.rows!=512){
+                    cv::resize(subImage, subImage, size, 0, 0, cv::INTER_CUBIC);
+                }
+                
+                subImages.push_back(subImage);
+            }
+        }
+    }
+    
+    return subImages;
+}
+
+std::vector<unsigned char> hwc_to_chw(const std::vector<unsigned char>& hwc_data, 
+                                         int height, int width, int channels) {
+    assert(hwc_data.size() == height * width * channels);
+    
+    std::vector<unsigned char> chw_data(height * width * channels);
+    
+    const unsigned char* hwc_ptr = hwc_data.data();
+    unsigned char* chw_ptr = chw_data.data();
+    
+    int hw_size = height * width;
+    
+    for (int c = 0; c < channels; ++c) {
+        unsigned char* channel_ptr = chw_ptr + c * hw_size;
+        
+        for (int h = 0; h < height; ++h) {
+            for (int w = 0; w < width; ++w) {
+                int hwc_index = (h * width + w) * channels + c;
+                channel_ptr[h * width + w] = hwc_ptr[hwc_index];
+            }
+        }
+    }
+    
+    return chw_data;
+}
+
+int Smolvlm2ImageProcessor(std::vector<cv::Mat>& src, std::vector<std::vector<unsigned char>>& output)
+{
+    if(src.empty()){
+        return 0;
+    }
+
+    std::vector<cv::Mat> resized;
+    cv::Size size(512, 512);
+    
+    for(auto& img: src){
+        // cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+        auto splited = splitImageSafe(img, 2, 2);
+        resized.insert(resized.end(), splited.begin(), splited.end());
+        if(img.cols!=512 || img.rows!=512){
+            cv::resize(img, img, size, 0, 0, cv::INTER_CUBIC);
+        }
+        resized.push_back(img);
+    }
+
+    output.clear();
+    for(auto& img: resized)
+    {
+        std::vector<unsigned char> imgdata;
+        imgdata.resize( 512 * 512 * 3);
+        memcpy(imgdata.data(), img.data, 512 * 512 * 3);
+        output.push_back(hwc_to_chw(imgdata, 512, 512, 3));
+        // output.push_back(imgdata);
+    }
+    
+    return 0;
+
+}
+
+int Smolvlm2VideoProcessor(std::vector<cv::Mat>& src, std::vector<std::vector<unsigned char>>& output)
+{
+    if(src.empty()){
+        return 0;
+    }
+
+    output.clear();
+    cv::Size size(512, 512);
+    for(auto& img: src)
+    {
+        // cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+
+        std::vector<unsigned char> imgdata;
+        imgdata.resize( 512 * 512 * 3);
+
+        if(img.cols!=512 || img.rows!=512){
+            cv::resize(img, img, size, 0, 0, cv::INTER_CUBIC);
+        }
+
+        memcpy(imgdata.data(), img.data, 512 * 512 * 3);
+        output.push_back(hwc_to_chw(imgdata, 512, 512, 3));
+        // output.push_back(imgdata);
+    }
+    
+    return 0;
+}

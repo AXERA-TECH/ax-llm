@@ -11,4 +11,6 @@ int Qwen2VideoProcessor( std::vector<cv::Mat>& src, std::vector<std::vector<unsi
                         int tgt_h, int tgt_w,
                         int temporal_patch_size=2, int merge_size=2, int patch_size=14);
 
+int Smolvlm2ImageProcessor(std::vector<cv::Mat>& src, std::vector<std::vector<unsigned char>>& output);
+int Smolvlm2VideoProcessor(std::vector<cv::Mat>& src, std::vector<std::vector<unsigned char>>& output);
 #endif

@@ -33,8 +33,8 @@ message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
 include_directories(${BSP_MSP_DIR}/include)
 link_directories(${BSP_MSP_DIR}/lib)
 
-add_subdirectory(third_party/tokenizer.axera)
-include_directories(third_party/tokenizer.axera/include)
+#add_subdirectory(third_party/tokenizer.axera)
+#include_directories(third_party/tokenizer.axera/include)
 
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
@@ -62,13 +62,14 @@ function(build_exec name main_source)
                     src/runner/utils/mrope.cpp
                     )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys tokenizer)
+    #target_link_libraries(${name} ax_engine ax_interpreter ax_sys tokenizer)
+    target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 
 build_exec(main src/main.cpp)
-build_exec(main_api src/main_api.cpp)
+#build_exec(main_api src/main_api.cpp)
 
 file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*.py" "${CMAKE_SOURCE_DIR}/scripts/*.sh")
 install(FILES ${RUN_SCRIPT} DESTINATION bin/)
