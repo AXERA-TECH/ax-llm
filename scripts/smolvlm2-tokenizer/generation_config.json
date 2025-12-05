@@ -1,0 +1,11 @@
+{
+  "_from_model_config": true,
+  "bos_token_id": 0,
+  "eos_token_id": 49279,
+  "pad_token_id": 2,
+  "transformers_version": "4.47.1",
+  "top_k": 20,
+  "top_p": 0.8,
+  "repetition_penalty": 1.0,
+  "temperature": 0.7
+}
