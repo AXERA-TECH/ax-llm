@@ -1,12 +1,12 @@
 # SmolVLM2-500M
-AXMODEL_DIR=../../../SmolVLM2-500M-Video-Instruct.axera/python/SmolVLM2-500M-Video-Instruct_20151203_axmodel/
-VIT=../../../SmolVLM2-500M-Video-Instruct.axera/python/vit-models/vision_model_1x3x512x512_NHwC_U8.axmodel
+AXMODEL_DIR=SmolVLM2-500M-Video-Instruct_Ax650/
+VIT=SmolVLM2-500M-Video-Instruct_Ax650/vision_model_1x3x512x512_NHwC_U8.axmodel
 LAYER_NUM=32
 EMBED_SIZE=960
 
 # SmolVLM2-256M
-AXMODEL_DIR=../../../SmolVLM2-500M-Video-Instruct.axera/python/SmolVLM2-256M-Video-Instruct_axmodel
-VIT=../../../SmolVLM2-500M-Video-Instruct.axera/python/vit-models/vision_model_1x3x512x512_256M_NHwC_U8.axmodel
+AXMODEL_DIR=SmolVLM2-256M-Video-Instruct_Ax650
+VIT=SmolVLM2-256M-Video-Instruct_Ax650/vision_model_1x3x512x512_256M_NHwC_U8.axmodel
 LAYER_NUM=30
 EMBED_SIZE=576
 
@@ -26,3 +26,7 @@ EMBED_SIZE=576
 --continue 1 \
 --video 0 \
 --post_config_path post_config1.json 
+
+# --video 0 表示图像理解； --video 1 表示适配理解  
+# 传图像路径时可以传一个图像路径（单张图像理解）或者，多张图像所在的目录（多张图像理解）
+# 视频理解要传一个视频帧所在的目录路径，只支持一个视频
