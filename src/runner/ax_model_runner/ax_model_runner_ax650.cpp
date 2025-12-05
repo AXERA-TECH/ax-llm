@@ -1,6 +1,7 @@
 #include "ax_model_runner_ax650.hpp"
 #include <cstring>
 #include <fstream>
+#include <algorithm>
 #include <memory>
 #include <unordered_set> // 用于去重释放物理内存
 #include <ax_sys_api.h>
@@ -48,7 +49,7 @@ static int prepare_io_struct_only(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_
 
 // 辅助：分配 IO 结构体数组 + 物理内存
 static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data, 
-                                 std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRATEGY_T> strategy)
+                                 std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRATEGY_T> strategy, std::vector<std::string> skip_alloc_names={})
 {
     int ret = prepare_io_struct_only(info, io_data);
     if (ret != 0) return ret;
@@ -56,6 +57,9 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
     // Alloc Inputs
     for (uint i = 0; i < info->nInputSize; ++i) {
         auto &buffer = io_data->pInputs[i];
+        if (std::find(skip_alloc_names.begin(), skip_alloc_names.end(), info->pInputs[i].pName) != skip_alloc_names.end()) {
+            continue;
+        }
         if (strategy.first == AX_ENGINE_ABST_CACHED) {
             ret = AX_SYS_MemAllocCached((AX_U64 *)(&buffer.phyAddr), &buffer.pVirAddr, buffer.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
         } else {
@@ -71,6 +75,9 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
     // Alloc Outputs
     for (uint i = 0; i < info->nOutputSize; ++i) {
         auto &buffer = io_data->pOutputs[i];
+        if (std::find(skip_alloc_names.begin(), skip_alloc_names.end(), info->pOutputs[i].pName) != skip_alloc_names.end()) {
+            continue;
+        }
         if (strategy.second == AX_ENGINE_ABST_CACHED) {
             ret = AX_SYS_MemAllocCached((AX_U64 *)(&buffer.phyAddr), &buffer.pVirAddr, buffer.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
         } else {
@@ -104,6 +111,7 @@ int ax_runner_ax650::sub_init()
     mgroup_input_tensors.resize(io_count);
     mgroup_output_tensors.resize(io_count);
 
+    std::vector<std::string> skip_alloc_names = {"K_cache", "V_cache"};
     // 1. 分配 IO 资源
     for (size_t grpid = 0; grpid < io_count; grpid++)
     {
@@ -113,8 +121,10 @@ int ax_runner_ax650::sub_init()
         m_handle->io_info[grpid] = io_info;
 
         // 原有逻辑保持不变：Group 0 和 Last Group 分配物理内存，中间 Group 不分配
-        if (grpid == 0 || grpid == io_count - 1) {
+        if (grpid == 0) {
             ret = prepare_io_with_alloc(io_info, &m_handle->io_data[grpid], {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED});
+        } else if (grpid == io_count - 1){
+            ret = prepare_io_with_alloc(io_info, &m_handle->io_data[grpid], {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED}, skip_alloc_names);
         } else {
             ret = prepare_io_struct_only(io_info, &m_handle->io_data[grpid]);
         }
@@ -123,7 +133,22 @@ int ax_runner_ax650::sub_init()
 
     // 2. 处理中间 Group 的内存共享逻辑 (原有逻辑的 Hack)
     if (io_count > 2) {
+        auto &first_io_data = m_handle->io_data[0];
+        auto &first_io_info = m_handle->io_info[0];
         auto &last_io_data = m_handle->io_data[io_count - 1];
+        auto &last_io_info = m_handle->io_info[io_count - 1];
+        for (uint i = 0; i < last_io_data.nInputSize; ++i) {
+            if (std::find(skip_alloc_names.begin(), skip_alloc_names.end(), last_io_info->pInputs[i].pName) != skip_alloc_names.end()) {
+                for (uint j = 0; j < first_io_data.nInputSize; ++j) {
+                    if (first_io_info->pInputs[j].pName == last_io_info->pInputs[i].pName)
+                    {
+                        last_io_data.pInputs[i].phyAddr = first_io_data.pInputs[j].phyAddr;
+                        last_io_data.pInputs[i].pVirAddr = first_io_data.pInputs[j].pVirAddr;
+                    }
+                } 
+            }
+        }
+
         for (size_t grpid = 1; grpid < io_count - 1; grpid++) {
             auto &io_info = m_handle->io_info[grpid];
             auto &io_data = m_handle->io_data[grpid];
