@@ -15,7 +15,6 @@
 #include "ax_sys_api.h"
 #include "LLMPostprocess.hpp"
 #include "image_processor.hpp"
-#include "mrope.hpp"
 #include "utils/utils.hpp"
 
 /**
@@ -56,7 +55,6 @@ struct LLMAttrType
 
     // TokenizerType tokenizer_type = TKT_HTTP;
     std::string filename_tokenizer_model = "http://127.0.0.1:12345";
-    bool b_bos = false, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
     int tokens_embed_num = 32000;
     int tokens_embed_size = 2048;
@@ -78,17 +76,7 @@ struct LLMAttrType
     LLMRuningCallback runing_callback = nullptr;
     void *reserve = nullptr;
 
-    /**
-     * 151667 for InternVL 2.5/3
-     * 92546 for InternVL 2.5-8B-MPO
-     */
-    int IMAGE_CONTEXT_TOKEN = 151667;
-
-    /**
-     * 151665 for InternVL 2.5/3
-     * 92544 for InternVL 2.5-8B-MPO
-     */
-    int IMAGE_START_TOKEN = 151665;
+    int IMAGE_CONTEXT_TOKEN = 49190;
 };
 
 class LLM
@@ -247,10 +235,16 @@ public:
         sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 3, "count", axmodel_path);
 
-        // _attr.IMAGE_CONTEXT_TOKEN = tokenizer->GetImgContextID();
-        // _attr.IMAGE_START_TOKEN = tokenizer->GetImgStartID();
-
-        // ALOGI("IMAGE_CONTEXT_TOKEN: %d, IMAGE_START_TOKEN: %d", _attr.IMAGE_CONTEXT_TOKEN, _attr.IMAGE_START_TOKEN);
+        auto img_token_ids = tokenizer->encode("<image>");
+        if (img_token_ids.size() == 1)
+        {
+            _attr.IMAGE_CONTEXT_TOKEN = img_token_ids[0];
+        }
+        else
+        {
+            ALOGW("image token not found, use default token id: %d", _attr.IMAGE_CONTEXT_TOKEN);
+        }
+        ALOGI("IMAGE_CONTEXT_TOKEN: %d", _attr.IMAGE_CONTEXT_TOKEN);
 
         IMAGE_ENCODER_INPUT_NCHW = -1;
         for (size_t i = 1; i < image_encoder.get_input(0).vShape.size(); i++)
@@ -382,7 +376,7 @@ public:
         b_stop = true;
     }
 
-    int EncodeImage(std::vector<cv::Mat> &src, bool b_video, Config &cfg,
+    int EncodeImage(std::vector<cv::Mat> &src, bool b_video,
                     std::vector<std::vector<unsigned short>> &out_embed)
     {
         int ret;
@@ -476,7 +470,7 @@ public:
 
     int Encode(std::vector<std::vector<unsigned short>> &img_embed, bool b_video, std::vector<unsigned short> &out_embed,
                std::vector<std::vector<int>> &position_ids,
-               Config &cfg, std::string prompt = "What is in the image?")
+               std::string prompt = "What is in the image?")
     {
         std::vector<Content> contents = {
             {USER,
@@ -487,21 +481,13 @@ public:
         };
         ALOGI("img_embed.size :%d, is video:%d, num_media_tokens:%d, real num of image:", img_embed.size(), b_video, int(img_embed[0].size() / _attr.tokens_embed_size), contents[0].num_media);
         std::vector<int> input_ids = tokenizer->encode(contents);
-
-        // ImageInfo img_info;
-        // img_info.img_prompt = true;
-        // img_info.video_prompt = b_video;
-        // img_info.img_token_num = img_embed[0].size() / _attr.tokens_embed_size;
-        // img_info.num_img = img_embed.size();
-        // std::vector<int> input_ids = tokenizer->Encode(prompt, img_info);
-
         ALOGI("input_ids size:%d", input_ids.size());
         std::vector<int> offsets;
-        int img_token_id = cfg.image_token_id;
+
         bool last_is_img_token = false;
         for (size_t i = 0; i < input_ids.size(); i++)
         {
-            if (input_ids[i] == img_token_id)
+            if (input_ids[i] == _attr.IMAGE_CONTEXT_TOKEN)
             {
                 if (!last_is_img_token)
                 {

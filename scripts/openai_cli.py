@@ -20,7 +20,7 @@ def test(openai_messages):
     client = OpenAI(api_key="not-needed", base_url=BASE_URL)
 
     stream = client.chat.completions.create(
-        model="AXERA-TECH/Qwen3-VL-2B-Instruct-GPTQ-Int4",
+        model="AXERA-TECH/SmolVLM2-500M-Video-Instruct",
         messages=openai_messages,
         stream=True,
     )
@@ -39,7 +39,7 @@ def test_image():
     openai_messages = {
         "role": "user",
         "content": [
-            {"type": "text", "text": "描述一下这张图片"},
+            {"type": "text", "text": "Describe this image"},
             {"type": "image_url", "image_url": image_data},
         ],
     }
@@ -56,11 +56,15 @@ def test_video():
     openai_messages = {
         "role": "user",
         "content": [
-            {"type": "text", "text": "描述一下这个视频"},
+            {"type": "text", "text": "Describe this video"},
             {"type": "image_url", "is_video":True, "image_url": image_data_list},
         ],
     }
     
     test(openai_messages)
-
+    
+print("Test image")
+test_image()
+    
+print("Test video")
 test_video()

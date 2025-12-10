@@ -10,8 +10,6 @@
 
 #include "runner/utils/files.hpp"
 
-#include "runner/utils/mrope.hpp"
-
 #define IS_AXCL 0
 
 #if IS_AXCL
@@ -53,10 +51,7 @@ int main(int argc, char *argv[])
 
     cmd.add<std::string>("filename_image_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodedl);
 
-    cmd.add<bool>("bos", 0, "", false, attr.b_bos);
-    cmd.add<bool>("eos", 0, "", false, attr.b_eos);
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
-    // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
 
@@ -69,7 +64,6 @@ int main(int argc, char *argv[])
     cmd.add<bool>("continue", 0, "continuous dialogue", false, b_continue);
     // cmd.add<int>("img_width", 'w', "image width", true);
     // cmd.add<int>("img_height", 'h', "image height", true);
-    cmd.add<int>("img_token_id", 0, "image token id", false, 49190);
 
     cmd.add<std::string>("post_config_path", 0, "post config path", false, attr.post_config_path);
 #if IS_AXCL
@@ -88,8 +82,6 @@ int main(int argc, char *argv[])
     // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
 
     attr.filename_image_encoder_axmodedl = cmd.get<std::string>("filename_image_encoder_axmodedl");
-    attr.b_bos = cmd.get<bool>("bos");
-    attr.b_eos = cmd.get<bool>("eos");
     // attr.b_use_topk = cmd.get<bool>("use_topk");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
@@ -152,9 +144,6 @@ int main(int argc, char *argv[])
     std::vector<std::vector<unsigned short>> img_embed;
     std::vector<std::vector<int>> position_ids;
 
-    Config config;
-
-    config.image_token_id = cmd.get<int>("img_token_id");
 
     bool b_video = cmd.get<bool>("video");
 
@@ -210,8 +199,8 @@ int main(int argc, char *argv[])
             }
             else
             {
-                lLaMa.EncodeImage(src, b_video,  config, img_embed);
-                lLaMa.Encode(img_embed, b_video, prompt_data, position_ids, config, prompt);
+                lLaMa.EncodeImage(src, b_video, img_embed);
+                lLaMa.Encode(img_embed, b_video, prompt_data, position_ids, prompt);
                 output = lLaMa.Run(prompt_data, position_ids);
             }
         }

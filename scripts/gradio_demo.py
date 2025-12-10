@@ -215,7 +215,7 @@ with gr.Blocks(css="""
             
         with gr.Column(scale=1):
             base_url = gr.Textbox(value="http://localhost:8000/v1", label="Base URL")
-            model = gr.Textbox(value="AXERA-TECH/Qwen3-VL-2B-Instruct-GPTQ-Int4", label="Model")
+            model = gr.Textbox(value="AXERA-TECH/SmolVLM2-500M-Video-Instruct", label="Model")
             api_key = gr.Textbox(value="not-needed", label="API Key", type="password")
             with gr.Row():
                 prefer_video = gr.Checkbox(True, label="如果有视频，优先使用视频抽帧")

@@ -10,7 +10,6 @@
 #include "runner/utils/json.hpp"
 #include "runner/utils/string_utility.hpp"
 #include "runner/LLM.hpp"
-#include "utils/mrope.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -31,7 +30,7 @@
 
 #include "UTF8Filter.hpp"
 
-static const char *kModelName = "AXERA-TECH/Qwen3-VL-2B-Instruct-GPTQ-Int4"; // 保持和聊天里返回的 model 一致
+static const char *kModelName = "AXERA-TECH/SmolVLM2-500M-Video-Instruct"; // 保持和聊天里返回的 model 一致
 
 httplib::Server svr;
 const int PORT = 8000;
@@ -84,15 +83,14 @@ class Worker
 {
 public:
     LLM gllm;
-    Config config;
     std::atomic<bool> gllm_runing = false;
     bool gllm_init = false;
     bool gllm_initing = false;
 
     std::vector<unsigned short> prompt_data;
     std::vector<std::vector<unsigned short>> img_embed;
-    std::vector<std::vector<float>> deepstack_features;
-    std::vector<int> visual_pos_mask;
+    // std::vector<std::vector<float>> deepstack_features;
+    // std::vector<int> visual_pos_mask;
     std::vector<std::vector<int>> position_ids;
 
 private:
@@ -112,12 +110,12 @@ private:
         }
         std::vector<std::vector<unsigned short>>().swap(img_embed);
 
-        for (auto& inner_vec : deepstack_features) {
-            std::vector<float>().swap(inner_vec); 
-        }
-        std::vector<std::vector<float>>().swap(deepstack_features);
+        // for (auto& inner_vec : deepstack_features) {
+        //     std::vector<float>().swap(inner_vec); 
+        // }
+        // std::vector<std::vector<float>>().swap(deepstack_features);
 
-        std::vector<int>().swap(visual_pos_mask);
+        // std::vector<int>().swap(visual_pos_mask);
 
         for (auto& inner_vec : position_ids) {
             std::vector<int>().swap(inner_vec); 
@@ -385,22 +383,22 @@ public:
             // }
             // output = gllm.Run(prompt_data);
 
-            gllm.Encode(prompt_data, position_ids, config, prompt);
-            output = gllm.Run(prompt_data, position_ids, deepstack_features, visual_pos_mask);
+            gllm.Encode(prompt_data, position_ids, prompt);
+            output = gllm.Run(prompt_data, position_ids);
         }
         else
         {
-            if (auto ret = gllm.EncodeImage(srcs, b_video, config, img_embed, deepstack_features); ret != 0)
+            if (auto ret = gllm.EncodeImage(srcs, b_video, img_embed); ret != 0)
             {
                 ALOGE("lLaMa.Encode failed");
                 return "";
             }
-            if (auto ret = gllm.Encode(img_embed, b_video, prompt_data, position_ids, visual_pos_mask, config, prompt); ret != 0)
+            if (auto ret = gllm.Encode(img_embed, b_video, prompt_data, position_ids, prompt); ret != 0)
             {
                 ALOGE("lLaMa.Encode failed");
                 return "";
             }
-            output = gllm.Run(prompt_data, position_ids, deepstack_features, visual_pos_mask);
+            output = gllm.Run(prompt_data, position_ids);
         }
 
         gllm_runing = false;
@@ -829,7 +827,6 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("filename_image_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodedl);
 
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
-    // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
 
@@ -837,17 +834,7 @@ int main(int argc, char *argv[])
 
     cmd.add<std::string>("post_config_path", 0, "post config path", false, attr.post_config_path);
 
-    cmd.add<int>("img_width", 'w', "image width", true);
-    cmd.add<int>("img_height", 'h', "image height", true);
-    cmd.add<int>("img_token_id", 0, "image token id", false, 151655);
-    cmd.add<int>("video_token_id", 0, "video token id", false, 151656);
-    cmd.add<int>("vision_start_token_id", 0, "vision_start_token_id", false, 151652);
-
-    cmd.add<int>("temporal_patch_size", 0, "temporal_patch_size", false, 2);
-    cmd.add<int>("tokens_per_second", 0, "tokens_per_second", false, 2);
-    cmd.add<int>("spatial_merge_size", 0, "spatial_merge_size", false, 2);
-    cmd.add<int>("patch_size", 0, "patch size", false, 14);
-    cmd.add<int>("fps", 0, "fps", false, 1);
+    cmd.add<int>("img_token_id", 0, "image token id", false, 49190);
 
 #if IS_AXCL
     cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
@@ -871,17 +858,17 @@ int main(int argc, char *argv[])
 
     attr.post_config_path = cmd.get<std::string>("post_config_path");
 
-    worker.config.vision_config.temporal_patch_size = cmd.get<int>("temporal_patch_size");
-    worker.config.vision_config.tokens_per_second = cmd.get<int>("tokens_per_second");
-    worker.config.vision_config.spatial_merge_size = cmd.get<int>("spatial_merge_size");
-    worker.config.vision_config.patch_size = cmd.get<int>("patch_size");
-    worker.config.vision_config.width = cmd.get<int>("img_width");
-    worker.config.vision_config.height = cmd.get<int>("img_height");
-    worker.config.vision_config.fps = cmd.get<int>("fps");
+    // worker.config.vision_config.temporal_patch_size = cmd.get<int>("temporal_patch_size");
+    // worker.config.vision_config.tokens_per_second = cmd.get<int>("tokens_per_second");
+    // worker.config.vision_config.spatial_merge_size = cmd.get<int>("spatial_merge_size");
+    // worker.config.vision_config.patch_size = cmd.get<int>("patch_size");
+    // worker.config.vision_config.width = cmd.get<int>("img_width");
+    // worker.config.vision_config.height = cmd.get<int>("img_height");
+    // worker.config.vision_config.fps = cmd.get<int>("fps");
 
-    worker.config.image_token_id = cmd.get<int>("img_token_id");
-    worker.config.video_token_id = cmd.get<int>("video_token_id");
-    worker.config.vision_start_token_id = cmd.get<int>("vision_start_token_id");
+    // worker.config.image_token_id = cmd.get<int>("img_token_id");
+    // worker.config.video_token_id = cmd.get<int>("video_token_id");
+    // worker.config.vision_start_token_id = cmd.get<int>("vision_start_token_id");
 
 #if IS_AXCL
     auto devices_str = cmd.get<std::string>("devices");
