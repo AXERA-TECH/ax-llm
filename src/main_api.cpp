@@ -91,8 +91,6 @@ public:
 
     std::vector<unsigned short> prompt_data;
     std::vector<std::vector<unsigned short>> img_embed;
-    std::vector<std::vector<float>> deepstack_features;
-    std::vector<int> visual_pos_mask;
     std::vector<std::vector<int>> position_ids;
 
 private:
@@ -111,13 +109,6 @@ private:
             std::vector<unsigned short>().swap(inner_vec); 
         }
         std::vector<std::vector<unsigned short>>().swap(img_embed);
-
-        for (auto& inner_vec : deepstack_features) {
-            std::vector<float>().swap(inner_vec); 
-        }
-        std::vector<std::vector<float>>().swap(deepstack_features);
-
-        std::vector<int>().swap(visual_pos_mask);
 
         for (auto& inner_vec : position_ids) {
             std::vector<int>().swap(inner_vec); 
@@ -386,21 +377,21 @@ public:
             // output = gllm.Run(prompt_data);
 
             gllm.Encode(prompt_data, position_ids, config, prompt);
-            output = gllm.Run(prompt_data, position_ids, deepstack_features, visual_pos_mask);
+            output = gllm.Run(prompt_data, position_ids);
         }
         else
         {
-            if (auto ret = gllm.EncodeImage(srcs, b_video, config, img_embed, deepstack_features); ret != 0)
+            if (auto ret = gllm.EncodeImage(srcs, b_video, config, img_embed); ret != 0)
             {
                 ALOGE("lLaMa.Encode failed");
                 return "";
             }
-            if (auto ret = gllm.Encode(img_embed, b_video, prompt_data, position_ids, visual_pos_mask, config, prompt); ret != 0)
+            if (auto ret = gllm.Encode(img_embed, b_video, prompt_data, position_ids, config, prompt); ret != 0)
             {
                 ALOGE("lLaMa.Encode failed");
                 return "";
             }
-            output = gllm.Run(prompt_data, position_ids, deepstack_features, visual_pos_mask);
+            output = gllm.Run(prompt_data, position_ids);
         }
 
         gllm_runing = false;

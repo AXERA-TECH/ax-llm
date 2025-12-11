@@ -1,9 +1,10 @@
-#ifndef MROPE_QWEN3_H
-#define MROPE_QWEN3_H
+
+
+#ifndef _MROPE_H_
+#define _MROPE_H_
 
 #include <vector>
 
-// Forward declaration of Config (assume defined in mrope.hpp or utils.hpp)
 struct Config {
     struct VisionConfig {
         int temporal_patch_size;
@@ -23,11 +24,12 @@ struct Config {
     std::vector<std::vector<int>> video_grid_thw;   // auto calc
 };
 
+
 std::vector<std::vector<int>> get_rope_index(
     const Config& config,
     const std::vector<int>& input_ids,
     const std::vector<std::vector<int>>& image_grid_thw,
-    const std::vector<std::vector<int>>& video_grid_thw
-);
+    const std::vector<std::vector<int>>& video_grid_thw,
+    const std::vector<double>& second_per_grid_ts); 
 
-#endif // MROPE_QWEN3_H
+#endif 
