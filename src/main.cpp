@@ -76,7 +76,7 @@ int main(int argc, char *argv[])
     cmd.add<int>("temporal_patch_size", 0, "temporal_patch_size", false, 2);
     cmd.add<int>("tokens_per_second", 0, "tokens_per_second", false, 2);
     cmd.add<int>("spatial_merge_size", 0, "spatial_merge_size", false, 2);
-    cmd.add<int>("patch_size", 0, "patch size", false, 14);
+    cmd.add<int>("patch_size", 0, "patch size", false, 16);
     cmd.add<int>("fps", 0, "fps", false, 1);
 
     cmd.add<std::string>("post_config_path", 0, "post config path", false, attr.post_config_path);
