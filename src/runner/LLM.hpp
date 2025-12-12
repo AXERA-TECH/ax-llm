@@ -187,7 +187,7 @@ public:
 
             if (!attr.b_dynamic_load_axmodel_layer)
             {
-                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), false);
+                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), true);
                 if (ret != 0)
                 {
                     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
