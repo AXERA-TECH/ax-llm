@@ -218,7 +218,7 @@ public:
             }
         }
 
-        int ret = llama_post.init(attr.filename_post_axmodel.c_str(), false);
+        int ret = llama_post.init(attr.filename_post_axmodel.c_str(), true);
         if (ret != 0)
         {
             ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str());
@@ -228,7 +228,7 @@ public:
         sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
 
-        ret = image_encoder.init(attr.filename_image_encoder_axmodedl.c_str(), false);
+        ret = image_encoder.init(attr.filename_image_encoder_axmodedl.c_str(), true);
         if (ret != 0)
         {
             ALOGE("init image_encoder axmodel(%s) failed", attr.filename_image_encoder_axmodedl.c_str());
