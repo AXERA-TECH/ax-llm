@@ -93,7 +93,7 @@ img_context_token: 151655
 [I][                            Init][ 374]: Left CMM:854 MB
 Type "q" to exit, Ctrl+c to stop current running
 prompt >> 描述这张图片
-image >> images/recoAll_attractions_1.jpg
+image >> assets/recoAll_attractions_1.jpg
 [I][                     EncodeImage][ 440]: pixel_values size 1
 [I][                     EncodeImage][ 441]: grid_h 24 grid_w 24
 [I][                     EncodeImage][ 489]: image encode time : 237.778000 ms, size : 1
@@ -147,7 +147,7 @@ img_context_token: 151656
 [I][                            Init][ 374]: Left CMM:4385 MB
 Type "q" to exit, Ctrl+c to stop current running
 prompt >> 描述这个视频
-video >> video
+video >> assets/video
 video/frame_0000.jpg
 video/frame_0008.jpg
 video/frame_0016.jpg
