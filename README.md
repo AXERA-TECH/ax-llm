@@ -21,15 +21,12 @@
 - Qwen3-VL-4B-Instruct
 - Qwen3-VL-8B-Instruct
 
-### 获取地址
-
-comming soon
 
 ## 源码编译
 
 -  clone 本项目  
     ```shell
-    git clone  https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b ax-qwen3-vl  https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - clone `ax650n_bsp_sdk` 代码  
