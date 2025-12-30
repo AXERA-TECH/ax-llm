@@ -65,10 +65,7 @@ endfunction()
 build_exec(main src/main.cpp)
 build_exec(main_api src/main_api.cpp)
 
-file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*.py" "${CMAKE_SOURCE_DIR}/scripts/*.sh")
+file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*.py" "${CMAKE_SOURCE_DIR}/scripts/*.sh" "${CMAKE_SOURCE_DIR}/scripts/*.txt" "${CMAKE_SOURCE_DIR}/scripts/*.json")
 install(FILES ${RUN_SCRIPT} DESTINATION bin/)
 
-file(GLOB QWEN2_TOKENIZER "${CMAKE_SOURCE_DIR}/scripts/qwen2_tokenizer/*")
-install(FILES ${QWEN2_TOKENIZER} DESTINATION bin/qwen2_tokenizer/)
 
-# add_executable(fp32_to_bf16 tools/fp32_to_bf16.cpp)
