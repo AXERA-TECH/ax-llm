@@ -36,15 +36,15 @@
   由于axcl板端opencv环境可能不一致，如果编译时遇到opencv版本冲突的问题，请将 build.sh中
   ```
   cmake -DBSP_MSP_DIR=${BSP_MSP_DIR} \
--DTOKENIZER_BUILD_TESTS=OFF \
--DHF_TOKENIZER_DIR=$PWD/$tokenizer_folder \
--DOpenCV_DIR=$PWD/$opencv_dir/lib/cmake/opencv4 ..
+  -DTOKENIZER_BUILD_TESTS=OFF \
+  -DHF_TOKENIZER_DIR=$PWD/$tokenizer_folder \
+  -DOpenCV_DIR=$PWD/$opencv_dir/lib/cmake/opencv4 ..
   ```
   改为
   ```
   cmake -DBSP_MSP_DIR=${BSP_MSP_DIR} \
--DTOKENIZER_BUILD_TESTS=OFF \
--DHF_TOKENIZER_DIR=$PWD/$tokenizer_folder ..
+  -DTOKENIZER_BUILD_TESTS=OFF \
+  -DHF_TOKENIZER_DIR=$PWD/$tokenizer_folder ..
   ```
 - 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
   ```
