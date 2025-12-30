@@ -55,7 +55,7 @@
 
 ### 1. 图像理解
 
-![demo.jpg](assets/demo.jpg)
+![recoAll_attractions_1.jpg](assets/recoAll_attractions_1.jpg)
 
 1) 将 `build/install/bin`目录下的文件和编译好的模型都拷贝到爱芯板子上  
 2) 运行 `run_image.sh`  
