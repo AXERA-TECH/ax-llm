@@ -62,7 +62,7 @@ function(build_exec name main_source)
                     src/runner/utils/mrope.cpp
                     )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys tokenizer_static hf_tokenizer_ffi)
+    target_link_libraries(${name} ax_engine ax_interpreter ax_sys tokenizer)
     target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
