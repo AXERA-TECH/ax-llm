@@ -215,7 +215,7 @@ public:
 
         std::vector<int> rets(attr.axmodel_num);
         std::atomic<int> process_idx = 2;
-#pragma omp parallel for
+#pragma omp parallel for if (_attr.dev_ids.size() > 1)
         for (int i = 0; i < attr.axmodel_num; i++)
         {
             char axmodel_path[1024];

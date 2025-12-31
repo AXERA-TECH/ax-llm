@@ -57,7 +57,7 @@ function(build_exec name main_source)
 
     # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
-    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX tokenizer_static hf_tokenizer_ffi)
+    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX tokenizer)
     target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
