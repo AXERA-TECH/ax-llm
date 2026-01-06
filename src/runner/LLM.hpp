@@ -238,9 +238,9 @@ public:
     {
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
-            llama_layers[i].layer.release();
+            llama_layers[i].layer.deinit();
         }
-        llama_post.release();
+        llama_post.deinit();
         embed_selector.Deinit();
     }
 
