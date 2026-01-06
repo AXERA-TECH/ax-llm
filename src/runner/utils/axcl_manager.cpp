@@ -43,6 +43,52 @@ int axcl_GetCMMRemain(int devid)
     return get_pcie_remaining_cmm_size(devid);
 }
 
+axclError axcl_CreateStream(axclrtStream *stream, int devid)
+{
+    if (!axcl_contains(devid))
+    {
+        ALOGE("AXCL device %d not inited\n", devid);
+        return -1;
+    }
+    return g_devices[devid]->axclCreateStream(stream);
+}
+axclError axcl_DestroyStream(axclrtStream stream, int devid)
+{
+    if (!axcl_contains(devid))
+    {
+        ALOGE("AXCL device %d not inited\n", devid);
+        return -1;
+    }
+    return g_devices[devid]->axclDestroyStream(stream);
+}
+axclError axcl_DestroyStreamForce(axclrtStream stream, int devid)
+{
+    if (!axcl_contains(devid))
+    {
+        ALOGE("AXCL device %d not inited\n", devid);
+        return -1;
+    }
+    return g_devices[devid]->axclDestroyStreamForce(stream);
+}
+axclError axcl_SynchronizeStream(axclrtStream stream, int devid)
+{
+    if (!axcl_contains(devid))
+    {
+        ALOGE("AXCL device %d not inited\n", devid);
+        return -1;
+    }
+    return g_devices[devid]->axclSynchronizeStream(stream);
+}
+axclError axcl_SynchronizeStreamWithTimeout(axclrtStream stream, int32_t timeout, int devid)
+{
+    if (!axcl_contains(devid))
+    {
+        ALOGE("AXCL device %d not inited\n", devid);
+        return -1;
+    }
+    return g_devices[devid]->axclSynchronizeStreamWithTimeout(stream, timeout);
+}
+
 axclError axcl_Malloc(void **devPtr, size_t size, axclrtMemMallocPolicy policy, int devid)
 {
     if (!axcl_contains(devid))
@@ -123,6 +169,30 @@ axclError axcl_Memcmp(const void *devPtr1, const void *devPtr2, size_t count, in
         ALOGE("AXCL device %d not inited\n", devid);
     }
     return g_devices[devid]->axclMemcmp(devPtr1, devPtr2, count);
+}
+axclError axcl_MemsetAsync(void *devPtr, uint8_t value, size_t count, axclrtStream stream, int devid)
+{
+    if (!axcl_contains(devid))
+    {
+        ALOGE("AXCL device %d not inited\n", devid);
+    }
+    return g_devices[devid]->axclMemsetAsync(devPtr, value, count, stream);
+}
+axclError axcl_MemcpyAsync(void *dstPtr, const void *srcPtr, size_t count, axclrtMemcpyKind kind, axclrtStream stream, int devid)
+{
+    if (!axcl_contains(devid))
+    {
+        ALOGE("AXCL device %d not inited\n", devid);
+    }
+    return g_devices[devid]->axclMemcpyAsync(dstPtr, srcPtr, count, kind, stream);
+}
+axclError axcl_MemcmpAsync(const void *devPtr1, const void *devPtr2, size_t count, axclrtStream stream, int devid)
+{
+    if (!axcl_contains(devid))
+    {
+        ALOGE("AXCL device %d not inited\n", devid);
+    }
+    return g_devices[devid]->axclMemcmpAsync(devPtr1, devPtr2, count, stream);
 }
 
 axclError axcl_EngineLoadFromFile(const char *modelPath, uint64_t *modelId, int devid)

@@ -106,6 +106,27 @@ private:
         return res;
     }
 
+    axclError axclrtCreateStream_func(axclrtStream *stream)
+    {
+        return axclrtCreateStream(stream);
+    }
+    axclError axclrtDestroyStream_func(axclrtStream stream)
+    {
+        return axclrtDestroyStream(stream);
+    }
+    axclError axclrtDestroyStreamForce_func(axclrtStream stream)
+    {
+        return axclrtDestroyStreamForce(stream);
+    }
+    axclError axclrtSynchronizeStream_func(axclrtStream stream)
+    {
+        return axclrtSynchronizeStream(stream);
+    }
+    axclError axclrtSynchronizeStreamWithTimeout_func(axclrtStream stream, int32_t timeout)
+    {
+        return axclrtSynchronizeStreamWithTimeout(stream, timeout);
+    }
+
     axclError axclrtMalloc_func(void **devPtr, size_t size, axclrtMemMallocPolicy policy)
     {
         return axclrtMalloc(devPtr, size, policy);
@@ -145,6 +166,18 @@ private:
     axclError axclrtMemcmp_func(const void *devPtr1, const void *devPtr2, size_t count)
     {
         return axclrtMemcmp(devPtr1, devPtr2, count);
+    }
+    axclError axclrtMemsetAsync_func(void *devPtr, uint8_t value, size_t count, axclrtStream stream)
+    {
+        return axclrtMemsetAsync(devPtr, value, count, stream);
+    }
+    axclError axclrtMemcpyAsync_func(void *dstPtr, const void *srcPtr, size_t count, axclrtMemcpyKind kind, axclrtStream stream)
+    {
+        return axclrtMemcpyAsync(dstPtr, srcPtr, count, kind, stream);
+    }
+    axclError axclrtMemcmpAsync_func(const void *devPtr1, const void *devPtr2, size_t count, axclrtStream stream)
+    {
+        return axclrtMemcmpAsync(devPtr1, devPtr2, count, stream);
     }
 
     // ────────── 以下为各 API 的内部实现（私有部分，后缀 _func） ──────────
@@ -388,6 +421,32 @@ public:
         }
     }
 
+    axclError axclCreateStream(axclrtStream *stream)
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::axclrtCreateStream_func, this, stream);
+        return future_result.get();
+    }
+    axclError axclDestroyStream(axclrtStream stream)
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::axclrtDestroyStream_func, this, stream);
+        return future_result.get();
+    }
+    axclError axclDestroyStreamForce(axclrtStream stream)
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::axclrtDestroyStreamForce_func, this, stream);
+        return future_result.get();
+    }
+    axclError axclSynchronizeStream(axclrtStream stream)
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::axclrtSynchronizeStream_func, this, stream);
+        return future_result.get();
+    }
+    axclError axclSynchronizeStreamWithTimeout(axclrtStream stream, int32_t timeout)
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::axclrtSynchronizeStreamWithTimeout_func, this, stream, timeout);
+        return future_result.get();
+    }
+
     axclError axclMalloc(void **devPtr, size_t size, axclrtMemMallocPolicy policy)
     {
         auto future_result = addTaskWithResult(&AXCLWorker::axclrtMalloc_func, this, devPtr, size, policy);
@@ -436,6 +495,21 @@ public:
     axclError axclMemcmp(const void *devPtr1, const void *devPtr2, size_t count)
     {
         auto future_result = addTaskWithResult(&AXCLWorker::axclrtMemcmp_func, this, devPtr1, devPtr2, count);
+        return future_result.get();
+    }
+    axclError axclMemsetAsync(void *devPtr, uint8_t value, size_t count, axclrtStream stream)
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::axclrtMemsetAsync_func, this, devPtr, value, count, stream);
+        return future_result.get();
+    }
+    axclError axclMemcpyAsync(void *dstPtr, const void *srcPtr, size_t count, axclrtMemcpyKind kind, axclrtStream stream)
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::axclrtMemcpyAsync_func, this, dstPtr, srcPtr, count, kind, stream);
+        return future_result.get();
+    }
+    axclError axclMemcmpAsync(const void *devPtr1, const void *devPtr2, size_t count, axclrtStream stream)
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::axclrtMemcmpAsync_func, this, devPtr1, devPtr2, count, stream);
         return future_result.get();
     }
 

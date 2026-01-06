@@ -11,6 +11,12 @@ extern "C"
 
     int axcl_GetCMMRemain(int devid);
 
+    axclError axcl_CreateStream(axclrtStream *stream, int devid);
+    axclError axcl_DestroyStream(axclrtStream stream, int devid);
+    axclError axcl_DestroyStreamForce(axclrtStream stream, int devid);
+    axclError axcl_SynchronizeStream(axclrtStream stream, int devid);
+    axclError axcl_SynchronizeStreamWithTimeout(axclrtStream stream, int32_t timeout, int devid);
+
     axclError axcl_Malloc(void **devPtr, size_t size, axclrtMemMallocPolicy policy, int devid);
     axclError axcl_MallocCached(void **devPtr, size_t size, axclrtMemMallocPolicy policy, int devid);
     axclError axcl_Free(void *devPtr, int devid);
@@ -21,11 +27,14 @@ extern "C"
     axclError axcl_Memset(void *devPtr, uint8_t value, size_t count, int devid);
     axclError axcl_Memcpy(void *dstPtr, const void *srcPtr, size_t count, axclrtMemcpyKind kind, int devid);
     axclError axcl_Memcmp(const void *devPtr1, const void *devPtr2, size_t count, int devid);
+    axclError axcl_MemsetAsync(void *devPtr, uint8_t value, size_t count, axclrtStream stream, int devid);
+    axclError axcl_MemcpyAsync(void *dstPtr, const void *srcPtr, size_t count, axclrtMemcpyKind kind, axclrtStream stream, int devid);
+    axclError axcl_MemcmpAsync(const void *devPtr1, const void *devPtr2, size_t count, axclrtStream stream, int devid);
 
     axclError axcl_EngineLoadFromFile(const char *modelPath, uint64_t *modelId, int devid);
     axclError axcl_EngineLoadFromMem(const void *model, uint64_t modelSize, uint64_t *modelId, int devid);
     axclError axcl_EngineUnload(uint64_t modelId, int devid);
-    const char* axcl_EngineGetModelCompilerVersion(uint64_t modelId, int devid);
+    const char *axcl_EngineGetModelCompilerVersion(uint64_t modelId, int devid);
     axclError axcl_EngineSetAffinity(uint64_t modelId, axclrtEngineSet set, int devid);
     axclError axcl_EngineGetAffinity(uint64_t modelId, axclrtEngineSet *set, int devid);
     axclError axcl_EngineGetUsage(const char *modelPath, int64_t *sysSize, int64_t *cmmSize, int devid);
@@ -41,8 +50,8 @@ extern "C"
     uint32_t axcl_EngineGetNumOutputs(axclrtEngineIOInfo ioInfo, int devid);
     uint64_t axcl_EngineGetInputSizeByIndex(axclrtEngineIOInfo ioInfo, uint32_t group, uint32_t index, int devid);
     uint64_t axcl_EngineGetOutputSizeByIndex(axclrtEngineIOInfo ioInfo, uint32_t group, uint32_t index, int devid);
-    const char* axcl_EngineGetInputNameByIndex(axclrtEngineIOInfo ioInfo, uint32_t index, int devid);
-    const char* axcl_EngineGetOutputNameByIndex(axclrtEngineIOInfo ioInfo, uint32_t index, int devid);
+    const char *axcl_EngineGetInputNameByIndex(axclrtEngineIOInfo ioInfo, uint32_t index, int devid);
+    const char *axcl_EngineGetOutputNameByIndex(axclrtEngineIOInfo ioInfo, uint32_t index, int devid);
     int32_t axcl_EngineGetInputIndexByName(axclrtEngineIOInfo ioInfo, const char *name, int devid);
     int32_t axcl_EngineGetOutputIndexByName(axclrtEngineIOInfo ioInfo, const char *name, int devid);
     axclError axcl_EngineGetInputDims(axclrtEngineIOInfo ioInfo, uint32_t group, uint32_t index, axclrtEngineIODims *dims, int devid);

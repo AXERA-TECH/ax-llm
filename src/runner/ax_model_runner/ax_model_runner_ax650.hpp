@@ -11,7 +11,7 @@ protected:
     int sub_init();
 
 public:
-    int init(const char *model_file, int devid) override;
+    int init(const char *model_file, int devid, bool use_mmap = false) override;
     int init(char *model_buffer, size_t model_size) override;
 
     void release();
@@ -30,4 +30,6 @@ public:
     // int inference(ax_image_t *pstFrame) override;
     int inference() override;
     int inference(int grpid) override;
+    int inference(void *stream) override;
+    int inference(int grpid, void *stream) override;
 };

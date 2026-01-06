@@ -355,19 +355,29 @@ int ax_runner_ax650::sub_init()
     return ret;
 }
 
-int ax_runner_ax650::init(const char *model_file, int devid)
+int ax_runner_ax650::init(const char *model_file, int devid, bool use_mmap)
 {
     this->dev_id = devid;
-    char *model_buffer;
-    size_t len;
-    if (!read_file(model_file, &model_buffer, &len))
+
+    if (use_mmap)
     {
-        ALOGE("read_file");
-        return -1;
+        MMap model_buffer(model_file);
+        if (!model_buffer.data())
+            return -1;
+        auto ret = init((char *)model_buffer.data(), model_buffer.size());
+        model_buffer.close_file();
+        return ret;
     }
-    auto ret = init(model_buffer, len);
-    delete[] model_buffer;
-    return ret;
+    else
+    {
+        char *model_buffer = nullptr;
+        size_t len = 0;
+        if (!read_file(model_file, &model_buffer, &len))
+            return -1;
+        auto ret = init(model_buffer, len);
+        delete[] model_buffer;
+        return ret;
+    }
 }
 
 int ax_runner_ax650::init(char *model_buffer, size_t model_size)
@@ -530,6 +540,31 @@ int ax_runner_ax650::inference(int grpid)
     if (_auto_sync_after_inference)
         for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
             axcl_Memcpy(mgroup_output_tensors[grpid][i].pVirAddr, (void *)mgroup_output_tensors[grpid][i].phyAddr, mgroup_output_tensors[grpid][i].nSize, AXCL_MEMCPY_DEVICE_TO_HOST, dev_id);
+
+    return 0;
+}
+
+int ax_runner_ax650::inference(void *stream)
+{
+    return inference(0, stream);
+}
+
+int ax_runner_ax650::inference(int grpid, void *stream)
+{
+    if (_auto_sync_before_inference)
+        for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
+            axcl_MemcpyAsync((void *)mgroup_input_tensors[grpid][i].phyAddr, mgroup_input_tensors[grpid][i].pVirAddr, mgroup_input_tensors[grpid][i].nSize, AXCL_MEMCPY_HOST_TO_DEVICE, stream, dev_id);
+
+    auto ret = axcl_EngineExecuteAsync(m_handle->handle, m_handle->context, grpid, m_handle->ios[grpid], stream, dev_id);
+    if (ret != 0)
+    {
+        ALOGE("AX_ENGINE_Execute");
+        return ret;
+    }
+
+    if (_auto_sync_after_inference)
+        for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
+            axcl_MemcpyAsync(mgroup_output_tensors[grpid][i].pVirAddr, (void *)mgroup_output_tensors[grpid][i].phyAddr, mgroup_output_tensors[grpid][i].nSize, AXCL_MEMCPY_DEVICE_TO_HOST, stream, dev_id);
 
     return 0;
 }

@@ -59,7 +59,11 @@ bool read_file(const std::string &path, char **data, size_t *len)
 
     *data = new char[*len];
 
-    fread(*data, *len, 1, fp);
+    int ret = fread(*data, *len, 1, fp);
+    if (ret != 1)
+    {
+        return false;
+    }
 
     fclose(fp);
 

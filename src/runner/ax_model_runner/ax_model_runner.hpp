@@ -59,7 +59,7 @@ public:
     int dev_id = 0;
 
 public:
-    virtual int init(const char *model_file, int devid) = 0;
+    virtual int init(const char *model_file, int devid, bool use_mmap = false) = 0;
     virtual int init(char *model_buffer, size_t model_size) = 0;
 
     virtual void deinit() = 0;
@@ -162,4 +162,6 @@ public:
 
     virtual int inference() = 0;
     virtual int inference(int grpid) = 0;
+    virtual int inference(void *stream) = 0;
+    virtual int inference(int grpid, void *stream) = 0;
 };
