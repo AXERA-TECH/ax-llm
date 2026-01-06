@@ -893,8 +893,18 @@ public:
 
                 auto &output = layer.layer.get_output(_attr.prefill_grpid, "output");
                 axcl_MemcpyAsync(embed_tmp.data(), (void *)output.phyAddr, embed_tmp.size() * sizeof(unsigned short), AXCL_MEMCPY_DEVICE_TO_HOST, stream, layer.layer.get_devid());
+                if (m < _attr.axmodel_num - 1)
+                {
+                    if (llama_layers[m + 1].layer.get_devid() != layer.layer.get_devid())
+                    {
+                        axcl_SynchronizeStream(stream, layer.layer.get_devid());
+                    }
+                }
+                else if (m == _attr.axmodel_num - 1)
+                {
+                    axcl_SynchronizeStream(stream, layer.layer.get_devid());
+                }
 
-                axcl_SynchronizeStream(stream, layer.layer.get_devid());
                 // ALOGI("%f %f %f %f %f", bfloat16(embed[0]).fp32(), bfloat16(embed[1]).fp32(), bfloat16(embed[2]).fp32(), bfloat16(embed[3]).fp32(), bfloat16(embed[4]).fp32());
             }
             if (p == (prefill_split_num - 1))
@@ -1001,7 +1011,6 @@ public:
                     {
                         axcl_MemcpyAsync((void *)llama_post.get_input("input").phyAddr,
                                          (void *)layer.layer.get_output(decode_grpid, "output").phyAddr, llama_post.get_input("input").nSize, AXCL_MEMCPY_DEVICE_TO_DEVICE, stream, llama_post.get_devid());
-                        axcl_SynchronizeStream(stream, layer.layer.get_devid());
                     }
                     else
                     {
@@ -1018,7 +1027,6 @@ public:
                     {
                         axcl_MemcpyAsync((void *)llama_layers[m + 1].layer.get_input(decode_grpid, "input").phyAddr,
                                          (void *)layer.layer.get_output(decode_grpid, "output").phyAddr, layer.layer.get_input(decode_grpid, "input").nSize, AXCL_MEMCPY_DEVICE_TO_DEVICE, stream, layer.layer.get_devid());
-                        axcl_SynchronizeStream(stream, layer.layer.get_devid());
                     }
                     else
                     {
