@@ -4,7 +4,7 @@
 class ax_runner_ax650 : public ax_runner_base
 {
 protected:
-    struct ax_runner_ax650_handle_t *m_handle = nullptr;
+    struct ax_joint_runner_ax650_handle_t *m_handle = nullptr;
     int group_count = 0;
     bool _parepare_io = false;
 
@@ -12,12 +12,9 @@ protected:
 
 public:
     int init(const char *model_file, int devid) override;
-    int init(char *model_buffer, size_t model_size) override;
+    int init(char *model_buffer, size_t model_size, int devid) override;
 
-    void release();
     void deinit() override;
-
-    void print_info(int grpid);
 
     int get_algo_width() override;
     int get_algo_height() override;
