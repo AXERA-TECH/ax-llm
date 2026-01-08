@@ -110,7 +110,7 @@ private:
     std::vector<LLMLayer> llama_layers;
     ax_runner_ax650 llama_post;
     ax_runner_ax650 image_encoder;
-    int deepstack_features_num = 3;
+    int deepstack_features_num = 0;
     // int prefill_grpid = 1;
     int decode_grpid = 0;
 
@@ -235,6 +235,10 @@ public:
             return false;
         }
 
+        int img_outputs = image_encoder.get_num_outputs();
+        deepstack_features_num = std::max(0, img_outputs - 1);
+        ALOGI("image encoder feature outputs:%d", deepstack_features_num);
+
         remain_cmm = get_remaining_cmm_size();
         sprintf(axmodel_path, "init vpm axmodel ok,remain_cmm(%d MB)", remain_cmm);
         update_cqdm(&cqdm, attr.axmodel_num + 3, "count", axmodel_path);
@@ -267,7 +271,7 @@ public:
 
         if (IMAGE_ENCODER_INPUT_NCHW == 1)
         {
-            ALOGE("Qwen2.5_VL Image Encoder just support NHWC");
+            ALOGE("InternVL3-5 Image Encoder just support NHWC");
             return false;
         }
 
@@ -406,6 +410,9 @@ public:
         int channel = src[0].channels();
         int hwc = grid_h * grid_w * temporal_patch_size * patch_size * patch_size * channel;
 
+        // 打印 temporal_patch_size 和 patch_size 以及 channel, hwc
+        ALOGI("temporal_patch_size: %d, patch_size: %d, channel: %d, hwc: %d", temporal_patch_size, patch_size, channel, hwc);
+
         if (!b_video)
         {
             for (int i = 0; i < src.size(); i++)
@@ -440,6 +447,7 @@ public:
         }
 
         deepstack_features.clear();
+        int feature_output_num = std::min(deepstack_features_num, std::max(0, image_encoder.get_num_outputs() - 1));
         for (int i = 0; i < pixel_values.size(); i++)
         {
 
@@ -459,7 +467,7 @@ public:
                 out_embed[i][j] = bfloat16(output_data[j]).data;
             }
 
-            for (int j = 0; j < deepstack_features_num; j++)
+            for (int j = 0; j < feature_output_num; j++)
             {
 
                 size_t size = image_encoder.get_output(j + 1).nSize / sizeof(float);

@@ -1,0 +1,14 @@
+{
+    "enable_temperature" : true, // 决定是否启用温度采样
+    "temperature" : 0.7, // 控制输出随机性的核心参数，值越大输出越随机，值越小越确定
+    
+    "enable_repetition_penalty" : true, // 决定是否对重复内容进行惩罚
+    "repetition_penalty" : 1.2, // 如果为 1.0 表示无惩罚，值越大惩罚越强
+    "penalty_window" : 30, // 惩罚的 “记忆” 窗口大小，单位为词数（tokens）
+
+    "enable_top_p_sampling" : false, // 决定是否启用 “核采样” 方法
+    "top_p" : 0.9, // 这种方法不是固定候选词的数量，而是动态地选择一个最小候选集合，使得这些候选词的概率加起来刚好超过 p
+
+    "enable_top_k_sampling" : true, // 决定是否启用 “Top-K采样” 方法
+    "top_k" : 10 // 这种方法固定选择概率最高的 K 个候选词进行采样
+}

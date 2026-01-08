@@ -1,13 +1,13 @@
 {
     "enable_temperature" : true,
-    "temperature" : 0.1,
-    
-    "enable_repetition_penalty" : false,
-    "repetition_penalty" : 2,
+    "temperature" : 0.7,
+
+    "enable_repetition_penalty" : true,
+    "repetition_penalty" : 1.2,
     "penalty_window" : 30,
 
     "enable_top_p_sampling" : false,
-    "top_p" : 0.8,
+    "top_p" : 0.9,
 
     "enable_top_k_sampling" : true,
     "top_k" : 10

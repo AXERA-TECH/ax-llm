@@ -186,7 +186,7 @@ int main(int argc, char *argv[])
 
     while (b_continue)
     {
-        printf("prompt >> ");
+        printf("prompt(输入q退出) >> ");
         fflush(stdout);
         std::getline(std::cin, prompt);
         if (prompt == "q")
@@ -204,7 +204,7 @@ int main(int argc, char *argv[])
         }
         else
         {
-            printf("image >> ");
+            printf("image(回车键跳过) >> ");
         }
 
         fflush(stdout);
