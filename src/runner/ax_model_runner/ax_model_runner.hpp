@@ -58,9 +58,35 @@ public:
 
     int dev_id = 0;
 
+    // 辅助函数：初始化完成后构建映射表，提高后续查找速度
+    void build_tensor_maps()
+    {
+        map_input_tensors.clear();
+        for (const auto &t : minput_tensors)
+            map_input_tensors[t.sName] = t;
+
+        map_output_tensors.clear();
+        for (const auto &t : moutput_tensors)
+            map_output_tensors[t.sName] = t;
+
+        map_group_input_tensors.clear();
+        for (const auto &grp : mgroup_input_tensors)
+        {
+            for (const auto &t : grp)
+                map_group_input_tensors[t.sName].push_back(t);
+        }
+
+        map_group_output_tensors.clear();
+        for (const auto &grp : mgroup_output_tensors)
+        {
+            for (const auto &t : grp)
+                map_group_output_tensors[t.sName].push_back(t);
+        }
+    }
+
 public:
     virtual int init(const char *model_file, int devid) = 0;
-    virtual int init(char *model_buffer, size_t model_size) = 0;
+    virtual int init(char *model_buffer, size_t model_size, int devid) = 0;
 
     virtual void deinit() = 0;
 
@@ -74,83 +100,51 @@ public:
 
     const ax_runner_tensor_t &get_input(int idx) { return minput_tensors[idx]; }
     const ax_runner_tensor_t *get_inputs_ptr() { return minput_tensors.data(); }
-    const ax_runner_tensor_t &get_input(std::string name)
-    {
-        if (map_input_tensors.size() == 0)
-        {
-            for (size_t i = 0; i < minput_tensors.size(); i++)
-            {
-                map_input_tensors[minput_tensors[i].sName] = minput_tensors[i];
-            }
-        }
-        if (map_input_tensors.find(name) == map_input_tensors.end())
-        {
-            throw std::runtime_error("input tensor not found: " + name);
-        }
 
-        return map_input_tensors[name];
+    const ax_runner_tensor_t &get_input(const std::string &name)
+    {
+        auto it = map_input_tensors.find(name);
+        if (it == map_input_tensors.end())
+            throw std::runtime_error("input tensor not found: " + name);
+        return it->second;
     }
 
     const ax_runner_tensor_t &get_input(int grpid, int idx) { return mgroup_input_tensors[grpid][idx]; }
     const ax_runner_tensor_t *get_inputs_ptr(int grpid) { return mgroup_input_tensors[grpid].data(); }
-    const ax_runner_tensor_t &get_input(int grpid, std::string name)
+
+    const ax_runner_tensor_t &get_input(int grpid, const std::string &name)
     {
-        if (map_group_input_tensors.size() == 0)
-        {
-            for (size_t i = 0; i < mgroup_input_tensors.size(); i++)
-            {
-                for (size_t j = 0; j < mgroup_input_tensors[i].size(); j++)
-                {
-                    map_group_input_tensors[mgroup_input_tensors[i][j].sName].push_back(mgroup_input_tensors[i][j]);
-                }
-            }
-        }
-        if (map_group_input_tensors.find(name) == map_group_input_tensors.end())
-        {
+        auto it = map_group_input_tensors.find(name);
+        if (it == map_group_input_tensors.end())
             throw std::runtime_error("input tensor not found: " + name);
-        }
-        return map_group_input_tensors[name][grpid];
-        // return map_input_tensors[name];
+        // 简单的越界检查
+        if (grpid < 0 || grpid >= (int)it->second.size())
+            throw std::runtime_error("group id out of range for: " + name);
+        return it->second[grpid];
     }
 
     const ax_runner_tensor_t &get_output(int idx) { return moutput_tensors[idx]; }
     const ax_runner_tensor_t *get_outputs_ptr() { return moutput_tensors.data(); }
-    const ax_runner_tensor_t &get_output(std::string name)
-    {
-        if (map_output_tensors.size() == 0)
-        {
-            for (size_t i = 0; i < moutput_tensors.size(); i++)
-            {
-                map_output_tensors[moutput_tensors[i].sName] = moutput_tensors[i];
-            }
-        }
-        if (map_output_tensors.find(name) == map_output_tensors.end())
-        {
-            throw std::runtime_error("output tensor not found: " + name);
-        }
 
-        return map_output_tensors[name];
+    const ax_runner_tensor_t &get_output(const std::string &name)
+    {
+        auto it = map_output_tensors.find(name);
+        if (it == map_output_tensors.end())
+            throw std::runtime_error("output tensor not found: " + name);
+        return it->second;
     }
 
     const ax_runner_tensor_t &get_output(int grpid, int idx) { return mgroup_output_tensors[grpid][idx]; }
     const ax_runner_tensor_t *get_outputs_ptr(int grpid) { return mgroup_output_tensors[grpid].data(); }
-    const ax_runner_tensor_t &get_output(int grpid, std::string name)
+
+    const ax_runner_tensor_t &get_output(int grpid, const std::string &name)
     {
-        if (map_group_output_tensors.size() == 0)
-        {
-            for (size_t i = 0; i < mgroup_output_tensors.size(); i++)
-            {
-                for (size_t j = 0; j < mgroup_output_tensors[i].size(); j++)
-                {
-                    map_group_output_tensors[mgroup_output_tensors[i][j].sName].push_back(mgroup_output_tensors[i][j]);
-                }
-            }
-        }
-        if (map_group_output_tensors.find(name) == map_group_output_tensors.end())
-        {
-            throw std::runtime_error("input tensor not found: " + name);
-        }
-        return map_group_output_tensors[name][grpid];
+        auto it = map_group_output_tensors.find(name);
+        if (it == map_group_output_tensors.end())
+            throw std::runtime_error("output tensor not found: " + name);
+        if (grpid < 0 || grpid >= (int)it->second.size())
+            throw std::runtime_error("group id out of range for: " + name);
+        return it->second[grpid];
     }
 
     virtual int get_algo_width() = 0;

@@ -12,9 +12,8 @@ protected:
 
 public:
     int init(const char *model_file, int devid) override;
-    int init(char *model_buffer, size_t model_size) override;
+    int init(char *model_buffer, size_t model_size, int devid) override;
 
-    void release();
     void deinit() override;
 
     int get_algo_width() override;

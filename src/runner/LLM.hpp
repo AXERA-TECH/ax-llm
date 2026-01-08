@@ -184,7 +184,7 @@ public:
 
         std::vector<int> rets(attr.axmodel_num);
         std::atomic<int> process_idx = 2;
-#pragma omp parallel for
+#pragma omp parallel for if (_attr.dev_ids.size() > 1)
         for (int i = 0; i < attr.axmodel_num; i++)
         {
             char axmodel_path[1024];
@@ -273,9 +273,9 @@ public:
     {
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
-            llama_layers[i].layer.release();
+            llama_layers[i].layer.deinit();
         }
-        llama_post.release();
+        llama_post.deinit();
 
         embed_selector.Deinit();
 
@@ -709,109 +709,6 @@ public:
 
         return 0;
     }
-
-    // int Encode(cv::Mat src, std::vector<unsigned short> &out_embed)
-    // {
-    //     std::vector<float> mean = {0.485, 0.456, 0.406};
-    //     std::vector<float> scale = {0.229, 0.224, 0.225};
-    //     timer t;
-    //     t.start();
-    //     cv::Mat dst;
-    //     cv::resize(src, dst, cv::Size(_attr.image_encoder_width, _attr.image_encoder_height));
-    //     cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
-
-    //     // std::vector<float> input_data(dst.rows * dst.cols * 3);
-
-    //     float *input_data = (float *)image_encoder.get_input(0).pVirAddr;
-
-    //     unsigned char *img_data = dst.data;
-    //     int letterbox_rows = dst.rows;
-    //     int letterbox_cols = dst.cols;
-
-    //     for (int h = 0; h < letterbox_rows; h++)
-    //     {
-    //         for (int w = 0; w < letterbox_cols; w++)
-    //         {
-    //             for (int c = 0; c < 3; c++)
-    //             {
-    //                 int in_index = h * letterbox_cols * 3 + w * 3 + c;
-    //                 int out_index = c * letterbox_rows * letterbox_cols + h * letterbox_cols + w;
-    //                 input_data[out_index] = (float(img_data[in_index]) / 255.0 - mean[c]) / scale[c];
-    //             }
-    //         }
-    //     }
-
-    //     // void *data = image_encoder.get_input("input").pVirAddr;
-    //     // memcpy(data, dst.data, dst.rows * dst.cols * 3);
-
-    //     // std::vector<char> vit_in;
-    //     // if (!read_file("/home/axera/internvl2_5-8b-mpo_ax-infer/img.bin", vit_in))
-    //     // {
-    //     //     ALOGE("read img.bin failed");
-    //     //     return -1;
-    //     // }
-    //     // memcpy(input_data, vit_in.data(), image_encoder.get_input(0).nSize);
-
-    //     image_encoder.inference();
-    //     int size = 1;
-    //     for (size_t i = 0; i < image_encoder.get_output(0).vShape.size(); i++)
-    //     {
-    //         size *= image_encoder.get_output(0).vShape[i];
-    //     }
-
-    //     out_embed.resize(size);
-
-    //     float *out_data = (float *)image_encoder.get_output(0).pVirAddr;
-
-    //     for (size_t i = 0; i < size; i++)
-    //     {
-    //         out_embed[i] = bfloat16(out_data[i]).data;
-    //     }
-
-    //     // memcpy(out_embed.data(), image_encoder.get_output(0).pVirAddr, image_encoder.get_output(0).nSize);
-    //     ALOGI("image encode time : %0.2f ms, size : %ld", t.cost(), out_embed.size());
-    //     return 0;
-    // }
-
-    // int Encode(std::vector<unsigned short> &img_embed, std::vector<unsigned short> &out_embed, std::string prompt = "What is in the image?")
-    // {
-    //     std::vector<int> input_ids = tokenizer->Encode(prompt, true);
-
-    //     // constexpr int IMG_CONTEXT = 151648;	// InternVL2
-    //     // constexpr int IMG_CONTEXT = 151667; // InternVL2.5
-    //     constexpr int IMG_CONTEXT = 92546; // InternVL2.5-8B-MPO
-    //     int offset = 0;
-
-    //     for (size_t i = 0; i < input_ids.size(); i++)
-    //     {
-    //         if (input_ids[i] == IMG_CONTEXT)
-    //         {
-    //             offset = i;
-    //             break;
-    //         }
-    //     }
-
-    //     // for (size_t i = 0; i < input_ids.size(); i++)
-    //     // {
-    //     //     printf("%d ", input_ids[i]);
-    //     // }
-    //     // printf("\n");
-
-    //     if (input_ids.size() > _attr.prefill_token_num)
-    //     {
-    //         ALOGE("input_ids(%ld) > prefill_token_num(%d)", input_ids.size(), _attr.prefill_token_num);
-    //         return -1;
-    //     }
-    //     out_embed.resize(input_ids.size() * _attr.tokens_embed_size);
-
-    //     for (size_t i = 0; i < input_ids.size(); i++)
-    //     {
-    //         embed_selector.getByIndex(input_ids[i], out_embed.data() + i * _attr.tokens_embed_size);
-    //     }
-    //     memcpy(out_embed.data() + offset * _attr.tokens_embed_size, img_embed.data(), img_embed.size() * sizeof(unsigned short));
-    //     ALOGI("offset : %d out_embed.size() : %ld", offset, out_embed.size());
-    //     return 0;
-    // }
 
     int Encode(std::vector<unsigned short> &out_embed, std::string prompt, std::string last_reply, std::vector<int> &tokens_ids, std::vector<int> &tokens_diff)
     {
