@@ -38,9 +38,13 @@ if (AXCL_DIR)
     message(STATUS "AXCL_DIR Path: ${AXCL_DIR}")
     include_directories(${AXCL_DIR}/include)
     link_directories(${AXCL_DIR}/lib)
+    include_directories(${AXCL_DIR}/include/axcl)
+    link_directories(${AXCL_DIR}/lib/axcl)
+else()
+    include_directories(/usr/include/axcl/)
+    link_directories(/usr/lib/axcl/)
 endif()
-include_directories(/usr/include/axcl/)
-link_directories(/usr/lib/axcl/)
+
 
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
@@ -57,15 +61,12 @@ function(build_exec name main_source)
 
     # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
-    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX tokenizer)
+    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_logger axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX tokenizer)
     target_link_libraries(${name} ${OpenCV_LIBS})
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 
 build_exec(main src/main.cpp)
 build_exec(main_api src/main_api.cpp)
-
-file(GLOB RUN_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/*.py" "${CMAKE_SOURCE_DIR}/scripts/*.sh" "${CMAKE_SOURCE_DIR}/scripts/*.txt" "${CMAKE_SOURCE_DIR}/scripts/*.json")
-install(FILES ${RUN_SCRIPT} DESTINATION bin/)
 
 
