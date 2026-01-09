@@ -269,9 +269,22 @@ public:
             return false;
         }
 
-        if (IMAGE_ENCODER_INPUT_NCHW == 1)
+        if (IMAGE_ENCODER_INPUT_NCHW)
         {
-            ALOGE("InternVL3-5 Image Encoder just support NHWC");
+            ALOGI("image encoder input nchw@float32");
+            _attr.image_encoder_height = image_encoder.get_input(0).vShape[2];
+            _attr.image_encoder_width = image_encoder.get_input(0).vShape[3];
+        }
+        else
+        {
+            ALOGI("image encoder input nhwc@uint8");
+            _attr.image_encoder_height = image_encoder.get_input(0).vShape[1];
+            _attr.image_encoder_width = image_encoder.get_input(0).vShape[2];
+        }
+
+        if (_attr.image_encoder_height != _attr.image_encoder_width)
+        {
+            ALOGE("image encoder height != width");
             return false;
         }
 
@@ -393,6 +406,82 @@ public:
                     std::vector<std::vector<unsigned short>> &out_embed,
                     std::vector<std::vector<float>> &deepstack_features)
     {
+        cfg.image_grid_thw.clear();
+        cfg.video_grid_thw.clear();
+
+        if (!cfg.use_mrope)
+        {
+            timer t;
+            t.start();
+            static const float mean_vals[3] = {0.485f, 0.456f, 0.406f};
+            static const float std_vals[3] = {0.229f, 0.224f, 0.225f};
+            int target_h = _attr.image_encoder_height;
+            int target_w = _attr.image_encoder_width;
+            if (out_embed.empty())
+            {
+                out_embed.resize(src.size());
+            }
+            deepstack_features.clear();
+            for (size_t i = 0; i < src.size(); ++i)
+            {
+                if (src[i].empty())
+                {
+                    ALOGE("input image %zu is empty", i);
+                    return -1;
+                }
+                cv::Mat dst;
+                cv::resize(src[i], dst, cv::Size(target_w, target_h));
+                cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
+                if (IMAGE_ENCODER_INPUT_NCHW)
+                {
+                    float *input_ptr = (float *)image_encoder.get_input(0).pVirAddr;
+                    const int rows = dst.rows;
+                    const int cols = dst.cols;
+                    for (int h = 0; h < rows; ++h)
+                    {
+                        for (int w = 0; w < cols; ++w)
+                        {
+                            cv::Vec3b pixel = dst.at<cv::Vec3b>(h, w);
+                            for (int c = 0; c < 3; ++c)
+                            {
+                                int out_index = c * rows * cols + h * cols + w;
+                                input_ptr[out_index] = ((float)pixel[c] / 255.0f - mean_vals[c]) / std_vals[c];
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    void *data = image_encoder.get_input(0).pVirAddr;
+                    memcpy(data, dst.data, dst.rows * dst.cols * dst.channels());
+                }
+
+                image_encoder.inference();
+
+                size_t size = image_encoder.get_output(0).nSize / sizeof(float);
+                if (out_embed[i].empty())
+                {
+                    out_embed[i].resize(size);
+                }
+
+                if (IMAGE_ENCODER_OUTPUT_BF16)
+                {
+                    memcpy(out_embed[i].data(), image_encoder.get_output(0).pVirAddr, image_encoder.get_output(0).nSize);
+                }
+                else
+                {
+                    float *output_data = (float *)image_encoder.get_output(0).pVirAddr;
+                    for (size_t j = 0; j < size; j++)
+                    {
+                        out_embed[i][j] = bfloat16(output_data[j]).data;
+                    }
+                }
+            }
+
+            ALOGI("image encode time : %f ms, size : %ld", t.cost(), out_embed.size());
+            return 0;
+        }
+
         int temporal_patch_size = cfg.vision_config.temporal_patch_size;
         int merge_size = cfg.vision_config.spatial_merge_size;
         int patch_size = cfg.vision_config.patch_size;
@@ -734,17 +823,21 @@ public:
                 auto &input_indices = layer.layer.get_input(_attr.prefill_grpid, "indices");
                 unsigned int *input_indices_ptr = (unsigned int *)input_indices.pVirAddr;
                 memset(input_indices_ptr, 0, input_indices.nSize);
-                // ALOGI("position_ids");
-                for (unsigned int i = 0; i < position_ids.size(); i++)
+                unsigned int indices_dims = input_indices.vShape.empty() ? position_ids.size() : input_indices.vShape[0];
+                unsigned int start_pos = _attr.precompute_len + p * _attr.prefill_token_num;
+                unsigned int end_pos = _attr.precompute_len + (p + 1) * _attr.prefill_token_num;
+                for (unsigned int dim = 0; dim < indices_dims; ++dim)
                 {
-                    for (unsigned int j = _attr.precompute_len + p * _attr.prefill_token_num, jj = 0; j < _attr.precompute_len + (p + 1) * _attr.prefill_token_num; j++, jj++)
+                    const std::vector<int> &pos_src = (dim < position_ids.size()) ? position_ids[dim] : position_ids[0];
+                    for (unsigned int j = start_pos, jj = 0; j < end_pos; j++, jj++)
                     {
-                        if (j < position_ids[i].size())
+                        unsigned int buf_idx = dim * _attr.prefill_token_num + jj;
+                        if (j < pos_src.size())
                         {
-                            input_indices_ptr[i * _attr.prefill_token_num + jj] = position_ids[i][j];
-                            if (position_ids[i][j] > max_pos_id)
+                            input_indices_ptr[buf_idx] = pos_src[j];
+                            if (pos_src[j] > max_pos_id)
                             {
-                                max_pos_id = position_ids[i][j];
+                                max_pos_id = pos_src[j];
                             }
                         }
                     }

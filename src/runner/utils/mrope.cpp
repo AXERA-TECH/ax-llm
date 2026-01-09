@@ -94,6 +94,14 @@ std::vector<std::vector<int>> get_rope_index(
     const std::vector<std::vector<int>>& image_grid_thw,
     const std::vector<std::vector<int>>& video_grid_thw
 ) {
+    if (!config.use_mrope)
+    {
+        std::vector<std::vector<int>> position_ids(1);
+        position_ids[0].resize(input_ids.size());
+        std::iota(position_ids[0].begin(), position_ids[0].end(), 0);
+        return position_ids;
+    }
+
     const int spatial_merge_size = config.vision_config.spatial_merge_size;
     const int image_token_id = config.image_token_id;
     const int video_token_id = config.video_token_id;

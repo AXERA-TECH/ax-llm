@@ -72,6 +72,7 @@ int main(int argc, char *argv[])
     cmd.add<int>("img_token_id", 0, "image token id", false, 151655);
     cmd.add<int>("video_token_id", 0, "video token id", false, 151656);
     cmd.add<int>("vision_start_token_id", 0, "vision_start_token_id", false, 151652);
+    cmd.add<bool>("use_mrope", 0, "enable multi-dimensional rope indices", false, true);
 
     cmd.add<int>("temporal_patch_size", 0, "temporal_patch_size", false, 2);
     cmd.add<int>("tokens_per_second", 0, "tokens_per_second", false, 2);
@@ -170,6 +171,7 @@ int main(int argc, char *argv[])
     config.vision_config.width = cmd.get<int>("img_width");
     config.vision_config.height = cmd.get<int>("img_height");
     config.vision_config.fps = cmd.get<int>("fps");
+    config.use_mrope = cmd.get<bool>("use_mrope");
 
     config.image_token_id = cmd.get<int>("img_token_id");
     config.video_token_id = cmd.get<int>("video_token_id");

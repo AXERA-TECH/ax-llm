@@ -21,6 +21,7 @@ struct Config {
 
     std::vector<std::vector<int>> image_grid_thw;   // auto calc
     std::vector<std::vector<int>> video_grid_thw;   // auto calc
+    bool use_mrope = true;
 };
 
 std::vector<std::vector<int>> get_rope_index(
