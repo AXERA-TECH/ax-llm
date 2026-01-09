@@ -727,6 +727,11 @@ public:
         timer ttft_timer;
         ttft_timer.start();
 
+        double profile_infer_ms = 0.0;
+        double profile_cache_copy_ms = 0.0;
+        double profile_post_ms = 0.0;
+        double profile_callback_ms = 0.0;
+
         int max_pos_id = 0;
         for (size_t p = 0; p < prefill_split_num; p++)
         {
@@ -1026,13 +1031,19 @@ public:
                 auto &input_mask = layer.layer.get_input(decode_grpid, "mask");
                 memcpy((void *)input_mask.pVirAddr, mask.data(), mask.size() * sizeof(unsigned short));
 
+                timer t_stage;
+                t_stage.start();
                 layer.layer.inference(decode_grpid);
+                profile_infer_ms += t_stage.cost();
 
+                timer t_memcpy;
+                t_memcpy.start();
                 auto &output_k_cache = layer.layer.get_output(decode_grpid, "K_cache_out");
                 memcpy((unsigned short *)input_k_cache.pVirAddr + indices * _attr.kv_cache_size, (void *)output_k_cache.pVirAddr, output_k_cache.nSize);
 
                 auto &output_v_cache = layer.layer.get_output(decode_grpid, "V_cache_out");
                 memcpy((unsigned short *)input_v_cache.pVirAddr + indices * _attr.kv_cache_size, (void *)output_v_cache.pVirAddr, output_v_cache.nSize);
+                profile_cache_copy_ms += t_memcpy.cost();
 
                 if (m == _attr.axmodel_num - 1)
                 {
@@ -1049,6 +1060,8 @@ public:
             // ALOGI("");
             mask[indices] = 0;
             {
+                timer t_post;
+                t_post.start();
                 llama_post.inference();
 
                 auto &output_post = llama_post.get_output(0);
@@ -1057,6 +1070,7 @@ public:
                 float max_val = -MAXFLOAT;
                 // max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
                 auto max_index = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
+                profile_post_ms += t_post.cost();
 
                 next_token = max_index;
 
@@ -1077,6 +1091,8 @@ public:
 
                 if (_attr.runing_callback)
                 {
+                    timer t_cb;
+                    t_cb.start();
                     cached_token.push_back(max_index);
                     if (cached_token.size() >= 3)
                     {
@@ -1086,6 +1102,7 @@ public:
                         _attr.runing_callback(cached_token.data(), cached_token.size(), tmp_out.c_str(), token_per_sec, _attr.reserve);
                         cached_token.clear();
                     }
+                    profile_callback_ms += t_cb.cost();
                 }
             }
 
@@ -1100,6 +1117,17 @@ public:
         fflush(stdout);
         float t_cost_ms = t_cost.cost();
         ALOGN("hit eos,avg %.2f token/s\n", token_ids.size() / (t_cost_ms / 1000));
+
+        if (!token_ids.empty())
+        {
+            double tokens = (double)token_ids.size();
+            ALOGI("decode profile: infer %.3f ms/token, cache_copy %.3f, post %.3f, callback %.3f, tokens %.0f",
+                  profile_infer_ms / tokens,
+                  profile_cache_copy_ms / tokens,
+                  profile_post_ms / tokens,
+                  profile_callback_ms / tokens,
+                  tokens);
+        }
 
         // 去掉 len_of_input 那部分
         // token_ids.erase(token_ids.begin(), token_ids.begin() + len_of_input);

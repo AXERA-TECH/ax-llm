@@ -17,19 +17,16 @@
 
 ### 已支持模型
 
-- Qwen3-VL-2B-Instruct
-- Qwen3-VL-4B-Instruct
-- Qwen3-VL-8B-Instruct
-
+- AXERA-TECH/InternVL3_5-1B_GPTQ_INT4
 
 ## 源码编译
 
 -  clone 本项目  
     ```shell
-    git clone -b ax-qwen3-vl  https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b ax-internvl-3_5 https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
-- clone `ax650n_bsp_sdk` 代码  
+- clone `ax650n_bsp_sdk` 仓库 (可选)  
     ```shell
     git cloen https://github.com/AXERA-TECH/ax650n_bsp_sdk
     ```
@@ -37,159 +34,105 @@
     ```shell
     ./build.sh
     ```
-- 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
+- 正确编译后，`build_650/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
   ```
   $ tree install/bin/
-    install/bin/
+    .
+    ├── gradio_demo.py
+    ├── internvl3-5-1b_tokenizer.txt
     ├── main
     ├── main_api
-    ├── gradio_demo.py
     ├── openai_cli.py
     ├── post_config.json
-    ├── run_image.sh
-    ├── run_video.sh
-    └── qwen3_tokenizer.txt
+    ├── qwen3_tokenizer.py
+    └── run_internvl_3-5_1b_448_ax650.sh
+
+    0 directories, 8 files
   ```
   
 ## 运行示例
 
 ### 1. 图像理解
 
-![recoAll_attractions_1.jpg](assets/recoAll_attractions_1.jpg)
+![panda.jpg](assets/image_1.jpg)
 
-1) 将 `build/install/bin`目录下的文件和编译好的模型都拷贝到爱芯板子上  
-2) 运行 `run_image.sh`  
-```shell
-root@ax650 ~/Qwen3-VL-2B-Instruct-GPTQ-Int4 # bash run_image.sh 
-[I][                            Init][ 156]: LLM init start
-[I][                            Init][ 158]: Total CMM:4353 MB
-[I][                            Init][  34]: connect http://127.0.0.1:8080 ok
-bos_id: -1, eos_id: 151645
-img_start_token: 151652
-img_context_token: 151655
-  3% | ██                                |   1 /  31 [0.01s<0.46s, 66.67 count/s] tokenizer init ok[I][                            Init][  26]: LLaMaEmbedSelector use mmap
-  6% | ███                               |   2 /  31 [0.02s<0.34s, 90.91 count/s] embed_selector init ok[I][                            Init][ 201]: attr.axmodel_num:28
-103% | ██████████████████████████████████ |  32 /  31 [34.03s<32.96s, 0.94 count/s] init vpm axmodel ok,remain_cmm(854 MB)[I][                            Init][ 266]: IMAGE_CONTEXT_TOKEN: 151655, IMAGE_START_TOKEN: 151652
-[I][                            Init][ 309]: image encoder output float32
+1) 将 `build_650/install/bin` 目录下的文件和编译好的模型都拷贝到爱芯板子上, 可以直接从 [AXERA-TECH/InternVL3_5-1B_GPTQ_INT4](https://huggingface.co/AXERA-TECH/InternVL3_5-1B_GPTQ_INT4) 下载.
+2) 运行 `run_internvl_3-5_1b_448_ax650.sh`  
 
-[I][                            Init][ 339]: max_token_len : 2047
-[I][                            Init][ 344]: kv_cache_size : 1024, kv_cache_num: 2047
-[I][                            Init][ 352]: prefill_token_num : 128
-[I][                            Init][ 356]: grp: 1, prefill_max_token_num : 1
-[I][                            Init][ 356]: grp: 2, prefill_max_token_num : 128
-[I][                            Init][ 356]: grp: 3, prefill_max_token_num : 256
-[I][                            Init][ 356]: grp: 4, prefill_max_token_num : 384
-[I][                            Init][ 356]: grp: 5, prefill_max_token_num : 512
-[I][                            Init][ 356]: grp: 6, prefill_max_token_num : 640
-[I][                            Init][ 356]: grp: 7, prefill_max_token_num : 768
-[I][                            Init][ 356]: grp: 8, prefill_max_token_num : 896
-[I][                            Init][ 356]: grp: 9, prefill_max_token_num : 1024
-[I][                            Init][ 356]: grp: 10, prefill_max_token_num : 1152
-[I][                            Init][ 360]: prefill_max_token_num : 1152
-[I][                            Init][ 372]: LLM init ok
-[I][                            Init][ 374]: Left CMM:854 MB
+```sh
+root@ax650 ~/yongqiang/push_hugging_face/InternVL3_5-1B_GPTQ_INT4 # ./run_internvl_3-5_1b_448_ax650.sh
+[I][                            Init][ 135]: LLM init start
+[I][                            Init][ 137]: Total CMM:7915 MB
+tokenizer_type = 3
+  3% | ██                                |   1 /  31 [0.71s<21.92s, 1.41 count/s] tokenizer init ok[I][                            Init][  26]: LLaMaEmbedSelector use mmap
+  6% | ███                               |   2 /  31 [0.71s<11.05s, 2.81 count/s] embed_selector init ok[I][                            Init][ 182]: attr.axmodel_num:28
+100% | ████████████████████████████████ |  31 /  31 [2.06s<2.06s, 15.03 count/s] init post axmodel ok,remain_cmm(6940 MB)[I][                            Init][ 240]: image encoder feature outputs:0
+103% | ██████████████████████████████████ |  32 /  31 [2.32s<2.25s, 13.79 count/s] init vpm axmodel ok,remain_cmm(6588 MB)[I][                            Init][ 280]: image encoder input nhwc@uint8
+[I][                            Init][ 305]: image encoder output float32
+
+[I][                            Init][ 335]: max_token_len : 2047
+[I][                            Init][ 340]: kv_cache_size : 1024, kv_cache_num: 2047
+[I][                            Init][ 348]: prefill_token_num : 128
+[I][                            Init][ 352]: grp: 1, prefill_max_token_num : 1
+[I][                            Init][ 352]: grp: 2, prefill_max_token_num : 128
+[I][                            Init][ 352]: grp: 3, prefill_max_token_num : 256
+[I][                            Init][ 352]: grp: 4, prefill_max_token_num : 384
+[I][                            Init][ 352]: grp: 5, prefill_max_token_num : 512
+[I][                            Init][ 352]: grp: 6, prefill_max_token_num : 640
+[I][                            Init][ 352]: grp: 7, prefill_max_token_num : 768
+[I][                            Init][ 352]: grp: 8, prefill_max_token_num : 896
+[I][                            Init][ 352]: grp: 9, prefill_max_token_num : 1024
+[I][                            Init][ 356]: prefill_max_token_num : 1024
+[I][                     load_config][ 281]: load config:
+{
+    "enable_repetition_penalty": true,
+    "enable_temperature": true,
+    "enable_top_k_sampling": true,
+    "enable_top_p_sampling": false,
+    "penalty_window": 30,
+    "repetition_penalty": 1.2,
+    "temperature": 0.7,
+    "top_k": 10,
+    "top_p": 0.9
+}
+
+[I][                            Init][ 373]: LLM init ok
+[I][                            Init][ 375]: Left CMM:6588 MB
 Type "q" to exit, Ctrl+c to stop current running
-prompt >> 描述这张图片
-image >> assets/recoAll_attractions_1.jpg
-[I][                     EncodeImage][ 440]: pixel_values size 1
-[I][                     EncodeImage][ 441]: grid_h 24 grid_w 24
-[I][                     EncodeImage][ 489]: image encode time : 237.778000 ms, size : 1
-[I][                          Encode][ 532]: input_ids size:168
-[I][                          Encode][ 540]: offset 15
-[I][                          Encode][ 569]: img_embed.size:1, 294912
-[I][                          Encode][ 583]: out_embed size:344064
-[I][                          Encode][ 584]: input_ids size 168
-[I][                          Encode][ 586]: position_ids size:168
-[I][                             Run][ 607]: input token num : 168, prefill_split_num : 2
-[I][                             Run][ 641]: input_num_token:128
-[I][                             Run][ 641]: input_num_token:40
-[I][                             Run][ 865]: ttft: 313.60 ms
-这是一张在埃及沙漠中拍摄的风景照片。画面中，三座巨大的金字塔在晴朗的天空下矗立，它们是古埃及文明的象征。这些金字塔由巨大的石块堆叠而成，表面因岁月侵蚀而显得斑驳。在金字塔的前方，有几个人影在沙地上行走，这为整个场景提供了比例感和尺度感。整个场景充满了历史的厚重感和神秘的氛围。
+prompt(输入q退出) >> 介绍一下你自己
+image(回车键跳过) >>
+[I][                             Run][ 713]: input token num : 21, prefill_split_num : 1
+[I][                             Run][ 747]: input_num_token:21
+[I][                             Run][ 976]: ttft: 83.79 ms
+我被称为"语言模型-1.0"，来自上海人工智能实验室。我的开发团队致力于为用户提供高效、准确和个性化的AI服务。作为一款先进的自然语言处理（NLP）模型，我旨在帮助用户解决各种语言相关问题，并提供有用的信息和建议。我的设计目标是能够以自然流畅的方式与人类进行交互，无论是回答问题、提供建议还是执行任务。
 
-[N][                             Run][ 992]: hit eos,avg 14.14 token/s
-```
+[N][                             Run][1102]: hit eos,avg 19.79 token/s
 
-### 2. 视频理解
+prompt(输入q退出) >> 请你详细描述下面这幅图
+image(回车键跳过) >> assets/image_1.jpg
+[I][                     EncodeImage][ 481]: image encode time : 408.467987 ms, size : 1
+[I][                          Encode][ 636]: input_ids size:284
+[I][                          Encode][ 644]: offset 15
+[I][                          Encode][ 673]: img_embed.size:1, 262144
+[I][                          Encode][ 689]: out_embed size:290816
+[I][                          Encode][ 690]: input_ids size 284
+[I][                          Encode][ 692]: position_ids size:284
+[I][                             Run][ 713]: input token num : 284, prefill_split_num : 3
+[I][                             Run][ 747]: input_num_token:128
+[I][                             Run][ 747]: input_num_token:128
+[I][                             Run][ 747]: input_num_token:28
+[I][                             Run][ 976]: ttft: 270.76 ms
+这是一幅生动的图片，展示了一只大熊猫正在自然环境中觅食的情景。画面中，大熊猫正低头在植物丛中寻找食物。它的毛发呈白色，背部和腹部有黑色斑点。周围绿意盎然，各种灌木和植物环绕着它，显得生机勃勃。背景的木质结构可能是一把竹竿或长椅，进一步暗示这可能是动物园或野生动物保护区。整个场景充满了自然的气息，让人感受到大自然的可爱与生机。
 
-1) 将 `build/install/bin`目录下的文件和编译好的模型都拷贝到爱芯板子上  
-2) 运行 `run_video.sh`   
-```shell
-root@ax650 ~/Qwen3-VL-2B-Instruct-GPTQ-Int4 # bash run_video.sh 
-[I][                            Init][ 156]: LLM init start
-[I][                            Init][ 158]: Total CMM:7884 MB
-[I][                            Init][  34]: connect http://127.0.0.1:8080 ok
-bos_id: -1, eos_id: 151645
-img_start_token: 151652
-img_context_token: 151656
-  3% | ██                                |   1 /  31 [0.01s<0.34s, 90.91 count/s] tokenizer init ok[I][                            Init][  26]: LLaMaEmbedSelector use mmap
-  6% | ███                               |   2 /  31 [0.01s<0.23s, 133.33 count/s] embed_selector init ok[I][                            Init][ 201]: attr.axmodel_num:28
-103% | ██████████████████████████████████ |  32 /  31 [32.37s<31.36s, 0.99 count/s] init vpm axmodel ok,remain_cmm(4385 MB)[I][                            Init][ 266]: IMAGE_CONTEXT_TOKEN: 151656, IMAGE_START_TOKEN: 151652
-[I][                            Init][ 309]: image encoder output float32
+[N][                             Run][1102]: hit eos,avg 19.86 token/s
 
-[I][                            Init][ 339]: max_token_len : 2047
-[I][                            Init][ 344]: kv_cache_size : 1024, kv_cache_num: 2047
-[I][                            Init][ 352]: prefill_token_num : 128
-[I][                            Init][ 356]: grp: 1, prefill_max_token_num : 1
-[I][                            Init][ 356]: grp: 2, prefill_max_token_num : 128
-[I][                            Init][ 356]: grp: 3, prefill_max_token_num : 256
-[I][                            Init][ 356]: grp: 4, prefill_max_token_num : 384
-[I][                            Init][ 356]: grp: 5, prefill_max_token_num : 512
-[I][                            Init][ 356]: grp: 6, prefill_max_token_num : 640
-[I][                            Init][ 356]: grp: 7, prefill_max_token_num : 768
-[I][                            Init][ 356]: grp: 8, prefill_max_token_num : 896
-[I][                            Init][ 356]: grp: 9, prefill_max_token_num : 1024
-[I][                            Init][ 356]: grp: 10, prefill_max_token_num : 1152
-[I][                            Init][ 360]: prefill_max_token_num : 1152
-[I][                            Init][ 372]: LLM init ok
-[I][                            Init][ 374]: Left CMM:4385 MB
-Type "q" to exit, Ctrl+c to stop current running
-prompt >> 描述这个视频
-video >> assets/video
-video/frame_0000.jpg
-video/frame_0008.jpg
-video/frame_0016.jpg
-video/frame_0024.jpg
-video/frame_0032.jpg
-video/frame_0040.jpg
-video/frame_0048.jpg
-video/frame_0056.jpg
-[I][                     EncodeImage][ 440]: pixel_values size 4
-[I][                     EncodeImage][ 441]: grid_h 24 grid_w 24
-[I][                     EncodeImage][ 489]: image encode time : 751.481018 ms, size : 4
-[I][                          Encode][ 532]: input_ids size:600
-[I][                          Encode][ 540]: offset 15
-[I][                          Encode][ 569]: img_embed.size:4, 294912
-[I][                          Encode][ 574]: offset:159
-[I][                          Encode][ 574]: offset:303
-[I][                          Encode][ 574]: offset:447
-[I][                          Encode][ 583]: out_embed size:1228800
-[I][                          Encode][ 584]: input_ids size 600
-[I][                          Encode][ 586]: position_ids size:600
-[I][                             Run][ 607]: input token num : 600, prefill_split_num : 5
-[I][                             Run][ 641]: input_num_token:128
-[I][                             Run][ 641]: input_num_token:128
-[I][                             Run][ 641]: input_num_token:128
-[I][                             Run][ 641]: input_num_token:128
-[I][                             Run][ 641]: input_num_token:88
-[I][                             Run][ 865]: ttft: 843.36 ms
-这是一段关于两只山地旱獭（也称“山地土拨鼠”）在山地环境中互动的视频。
-
-在画面中，两只山地旱獭正站在布满碎石的山坡上，背景是连绵起伏的山脉和蓝天。它们的毛色以灰、棕、黑相间，脸部和耳朵周围有明显的黑白条纹，显得非常可爱。
-
-这两只旱獭正在进行一场激烈的“拳击”或“格斗”游戏。它们的前爪高高举起，像在互相击打，但它们的姿势和动作表明它们可能是在进行一场激烈的“拳击”或“格斗”游戏。它们的嘴巴和前爪在空中挥舞，似乎在互相攻击或展示力量。
-
-整个场景充满了动感和活力，展现了这些小动物在自然环境中充满活力和趣味的一面。
-
-[N][                             Run][ 992]: hit eos,avg 14.16 token/s
+prompt(输入q退出) >>
 
 ```
-
 
 ## Reference
 
-- [Qwen/Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct)
-- [Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)
-- [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
+- [OpenGVLab/InternVL3_5-1B](https://huggingface.co/OpenGVLab/InternVL3_5-1B)
 
 ## 技术讨
 
