@@ -363,6 +363,7 @@ void ax_runner_ax650::deinit()
     if (m_handle && m_handle->handle)
     {
         std::vector<unsigned long long> free_phy_addr;
+        std::vector<void*> free_vir_addr;
         for (int grpid = 0; grpid < group_count; grpid++)
         {
             for (auto &tensor : mgroup_output_tensors[grpid])
@@ -372,6 +373,11 @@ void ax_runner_ax650::deinit()
                     axcl_Free((void *)tensor.phyAddr, dev_id);
                     free_phy_addr.push_back(tensor.phyAddr);
                 }
+                if (free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
+                {
+                    free(tensor.pVirAddr);
+                    free_vir_addr.push_back(tensor.pVirAddr);
+                }
             }
             for (auto &tensor : mgroup_input_tensors[grpid])
             {
@@ -379,6 +385,11 @@ void ax_runner_ax650::deinit()
                 {
                     axcl_Free((void *)tensor.phyAddr, dev_id);
                     free_phy_addr.push_back(tensor.phyAddr);
+                }
+                if (free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
+                {
+                    free(tensor.pVirAddr);
+                    free_vir_addr.push_back(tensor.pVirAddr);
                 }
             }
             axcl_EngineDestroyIO(m_handle->ios[grpid], dev_id);
