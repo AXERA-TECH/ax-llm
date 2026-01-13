@@ -23,7 +23,7 @@
 
 
 ## 源码编译
-编译过程需要在板端进行，不能交叉编译。  
+即可以交叉编译，也可以在开发板上编译。    
 -  clone 本项目  
     ```shell
     git clone -b axcl-qwen3-vl https://github.com/AXERA-TECH/ax-llm.git
