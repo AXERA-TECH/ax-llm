@@ -1,4 +1,4 @@
-# AX-LLM
+<img width="534" height="178" alt="image" src="https://github.com/user-attachments/assets/be06e474-3514-4cf0-af6a-d9fdb4670bd0" /># AX-LLM
 
 ![GitHub License](https://img.shields.io/github/license/AXERA-TECH/ax-llm)
 
@@ -26,7 +26,7 @@
 即可以交叉编译，也可以在开发板上编译。    
 -  clone 本项目  
     ```shell
-    git clone -b axcl-qwen3-vl https://github.com/AXERA-TECH/ax-llm.git
+    git clone --recursive -b axcl-qwen3-vl https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - 编译  
