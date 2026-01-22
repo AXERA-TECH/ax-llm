@@ -825,7 +825,12 @@ public:
                 auto &input_input = layer.layer.get_input(_attr.prefill_grpid, "input");
                 layer.layer.set_input(_attr.prefill_grpid, "input", embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short));
 
-                layer.layer.inference(_attr.prefill_grpid);
+                int ret = layer.layer.inference(_attr.prefill_grpid);
+                if (ret != 0)
+                {
+                    ALOGE("layer(%d) inference(%d) failed", m, _attr.prefill_grpid);
+                    return "";
+                }
 
                 int kv_offset = (_attr.precompute_len + p * _attr.prefill_token_num) * _attr.kv_cache_size;
 
@@ -902,7 +907,12 @@ public:
 
         {
             llama_post.set_input(0, embed.data(), embed.size());
-            llama_post.inference();
+            int ret = llama_post.inference();
+            if (ret != 0)
+            {
+                ALOGE("post inference failed");
+                return "";
+            }
 
             int max_index;
 
@@ -944,7 +954,12 @@ public:
                 layer.layer.set_input(decode_grpid, "indices", &indices, sizeof(indices));
                 layer.layer.set_input(decode_grpid, "mask", mask.data(), mask.size() * sizeof(unsigned short));
 
-                layer.layer.inference(decode_grpid);
+                int ret = layer.layer.inference(decode_grpid);
+                if (ret != 0)
+                {
+                    ALOGE("layer(%d) inference(%d) failed", m, decode_grpid);
+                    return "";
+                }
 
 #pragma omp parallel for
                 for (int rankid = 0; rankid < layer.layer.get_devids().size(); rankid++)
@@ -973,7 +988,12 @@ public:
             }
             mask[indices] = 0;
             {
-                llama_post.inference();
+                int ret = llama_post.inference();
+                if (ret != 0)
+                {
+                    ALOGE("post inference failed");
+                    return "";
+                }
                 auto &output_post = llama_post.get_output(0);
                 axcl_Memcpy(output_post.pVirAddr, (void *)output_post.phyAddr, output_post.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_HOST, llama_post.get_devid());
                 unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
