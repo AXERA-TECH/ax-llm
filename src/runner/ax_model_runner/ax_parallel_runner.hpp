@@ -6,6 +6,7 @@
 
 #include "untar.h"
 #include <memory>
+#include <future>
 
 class ax_parallel_runner
 {
@@ -139,6 +140,7 @@ public:
     int get_num_inputs() { return m_runners[0]->get_num_inputs(); }
     int get_num_outputs() { return m_runners[0]->get_num_outputs(); }
     int get_num_groups() { return m_runners[0]->get_num_groups(); }
+    int get_num_ranks() { return m_runners.size(); }
 
     const ax_runner_tensor_t &get_input(int idx) { return m_runners[0]->get_input(idx); }
     const ax_runner_tensor_t *get_inputs_ptr() { return m_runners[0]->get_inputs_ptr(); }
@@ -298,23 +300,75 @@ public:
         }
     }
 
+    //     int inference(int grpid)
+    //     {
+    //         if (b_input_mem_sync)
+    //             input_mem_sync(grpid);
+
+    //         std::vector<int> rets(m_runners.size());
+    // #pragma omp parallel for
+    //         for (int i = 0; i < m_runners.size(); i++)
+    //         {
+    //             int ret = m_runners[i]->inference(grpid);
+    //             rets[i] = ret;
+    //         }
+    //         for (int i = 0; i < m_runners.size(); i++)
+    //         {
+    //             if (rets[i] != 0)
+    //             {
+    //                 ALOGE("inference failed, ret=%d", rets[i]);
+    //                 return rets[i];
+    //             }
+    //         }
+
+    //         return 0;
+    //     }
+
     int inference(int grpid)
     {
         if (b_input_mem_sync)
             input_mem_sync(grpid);
 
-        std::vector<int> rets(m_runners.size());
-#pragma omp parallel for
-        for (int i = 0; i < m_runners.size(); i++)
+        const std::size_t n = m_runners.size();
+        if (n == 0)
+            return 0;
+
+        std::vector<std::future<int>> futs;
+        futs.reserve(n);
+
+        // 1) 同时启动所有 runner
+        for (std::size_t i = 0; i < n; ++i)
         {
-            int ret = m_runners[i]->inference(grpid);
-            rets[i] = ret;
+            futs.emplace_back(std::async(std::launch::async, [this, grpid, i]() -> int
+                                         { return m_runners[i]->inference(grpid); }));
         }
-        for (int i = 0; i < m_runners.size(); i++)
+
+        // 2) 等全部完成并收集
+        std::vector<int> rets(n, 0);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            try
+            {
+                rets[i] = futs[i].get();
+            }
+            catch (const std::exception &e)
+            {
+                ALOGE("inference exception, idx=%zu, %s", i, e.what());
+                rets[i] = -1;
+            }
+            catch (...)
+            {
+                ALOGE("inference unknown exception, idx=%zu", i);
+                rets[i] = -1;
+            }
+        }
+
+        // 3) 检查返回值（保持你原来的逻辑：发现非0就返回）
+        for (std::size_t i = 0; i < n; ++i)
         {
             if (rets[i] != 0)
             {
-                ALOGE("inference failed, ret=%d", rets[i]);
+                ALOGE("inference failed, idx=%zu, ret=%d", i, rets[i]);
                 return rets[i];
             }
         }
