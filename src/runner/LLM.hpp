@@ -4,7 +4,6 @@
 #include <cmath>
 #include <numeric>
 #include <atomic>
-#include <omp.h>
 
 #include <opencv2/opencv.hpp>
 
@@ -22,6 +21,51 @@
 #include "mrope.hpp"
 
 #include <axcl_rt_p2p.h>
+
+#define ENABLE_COST 0
+
+#if ENABLE_COST
+
+static std::unordered_map<std::string, std::vector<double>> cost_records;
+void print_cost_statistics()
+{
+    for (const auto &pair : cost_records)
+    {
+        const std::string &func_name = pair.first;
+        std::vector<double> costs = pair.second;
+
+        double sum = 0.0;
+        double max_cost = costs[0];
+        double min_cost = costs[0];
+        double mid_cost = 0.0;
+        for (double cost : costs)
+        {
+            sum += cost;
+        }
+        max_cost = *std::max_element(costs.begin(), costs.end());
+        min_cost = *std::min_element(costs.begin(), costs.end());
+        std::sort(costs.begin(), costs.end());
+        mid_cost = costs[costs.size() / 2];
+
+        double avg_cost = sum / costs.size();
+
+        printf("avg: %5.2f ms, max: %5.2f ms, min: %5.2f ms, mid: %5.2f ms %s\n",
+               avg_cost, max_cost, min_cost, mid_cost, func_name.c_str());
+    }
+}
+
+#define COST(func)                           \
+    do                                       \
+    {                                        \
+        timer _timer;                        \
+        func();                                \
+        double cost = _timer.cost();         \
+        cost_records[#func].push_back(cost); \
+    } while (0);
+#else
+void print_cost_statistics() {}
+#define COST(func) func()
+#endif
 
 /**
  * @brief 说明图像编码器输入数据的格式和预处理要求
@@ -201,7 +245,7 @@ public:
         //         printf("%d %0.22f\n", embed[i], val);
         //     }
         // }
-        omp_set_num_threads(_attr.dev_ids.size());
+
         for (auto &devid : _attr.dev_ids)
         {
             if (axcl_Init(devid) != 0)
@@ -938,9 +982,14 @@ public:
                 break;
             }
 
-            embed_selector.getByIndex(next_token, embed);
+            std::function<void()> func1 = [&]()
+            {
+                embed_selector.getByIndex(next_token, embed);
 
-            llama_layers[0].layer.set_input(decode_grpid, "input", embed.data(), llama_layers[0].layer.get_input(decode_grpid, "input").nSize);
+                llama_layers[0].layer.set_input(decode_grpid, "input", embed.data(), llama_layers[0].layer.get_input(decode_grpid, "input").nSize);
+            };
+
+            COST(func1);
 
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
@@ -950,60 +999,76 @@ public:
                 }
 
                 auto &layer = llama_layers[m];
-
-                layer.layer.set_input(decode_grpid, "indices", &indices, sizeof(indices));
-                layer.layer.set_input(decode_grpid, "mask", mask.data(), mask.size() * sizeof(unsigned short));
-
-                int ret = layer.layer.inference(decode_grpid);
-                if (ret != 0)
+                std::function<void()> func2 = [&]()
                 {
-                    ALOGE("layer(%d) inference(%d) failed", m, decode_grpid);
-                    return "";
-                }
+                    layer.layer.set_input(decode_grpid, "indices", &indices, sizeof(indices));
+                    layer.layer.set_input(decode_grpid, "mask", mask.data(), mask.size() * sizeof(unsigned short));
+                };
+                COST(func2);
 
+                std::function<void()> func3 = [&]()
+                {
+                    int ret = layer.layer.inference(decode_grpid);
+                    if (ret != 0)
+                    {
+                        ALOGE("layer(%d) inference(%d) failed", m, decode_grpid);
+                    }
+                };
+                COST(func3);
+
+                std::function<void()> func4 = [&]()
+                {
 #pragma omp parallel for
-                for (int rankid = 0; rankid < layer.layer.get_devids().size(); rankid++)
-                {
-                    auto &input_k_cache = layer.layer.get_rank_input(rankid, decode_grpid, "K_cache");
-                    auto &input_v_cache = layer.layer.get_rank_input(rankid, decode_grpid, "V_cache");
+                    for (int rankid = 0; rankid < layer.layer.get_devids().size(); rankid++)
+                    {
+                        auto &input_k_cache = layer.layer.get_rank_input(rankid, decode_grpid, "K_cache");
+                        auto &input_v_cache = layer.layer.get_rank_input(rankid, decode_grpid, "V_cache");
 
-                    auto &output_k_cache = layer.layer.get_rank_output(rankid, decode_grpid, "K_cache_out");
-                    auto &output_v_cache = layer.layer.get_rank_output(rankid, decode_grpid, "V_cache_out");
+                        auto &output_k_cache = layer.layer.get_rank_output(rankid, decode_grpid, "K_cache_out");
+                        auto &output_v_cache = layer.layer.get_rank_output(rankid, decode_grpid, "V_cache_out");
 
-                    axcl_Memcpy((unsigned short *)input_k_cache.phyAddr + indices * _attr.kv_cache_size, (void *)output_k_cache.phyAddr, output_k_cache.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid(rankid));
-                    axcl_Memcpy((unsigned short *)input_v_cache.phyAddr + indices * _attr.kv_cache_size, (void *)output_v_cache.phyAddr, output_v_cache.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid(rankid));
-                }
+                        axcl_Memcpy((unsigned short *)input_k_cache.phyAddr + indices * _attr.kv_cache_size, (void *)output_k_cache.phyAddr, output_k_cache.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid(rankid));
+                        axcl_Memcpy((unsigned short *)input_v_cache.phyAddr + indices * _attr.kv_cache_size, (void *)output_v_cache.phyAddr, output_v_cache.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_DEVICE, layer.layer.get_devid(rankid));
+                    }
+                    axcl_Memcpy((void *)layer.layer.get_output(decode_grpid, "output").pVirAddr,
+                                (void *)layer.layer.get_output(decode_grpid, "output").phyAddr, layer.layer.get_output(decode_grpid, "output").nSize, AXCL_MEMCPY_DEVICE_TO_HOST, layer.layer.get_devid());
 
-                axcl_Memcpy((void *)layer.layer.get_output(decode_grpid, "output").pVirAddr,
-                            (void *)layer.layer.get_output(decode_grpid, "output").phyAddr, layer.layer.get_output(decode_grpid, "output").nSize, AXCL_MEMCPY_DEVICE_TO_HOST, layer.layer.get_devid());
-
-                if (m == _attr.axmodel_num - 1)
-                {
-                    llama_post.set_input(0, layer.layer.get_output(decode_grpid, "output").pVirAddr, layer.layer.get_output(decode_grpid, "output").nSize);
-                }
-                else if (m < _attr.axmodel_num - 1)
-                {
-                    llama_layers[m + 1].layer.set_input(decode_grpid, "input", layer.layer.get_output(decode_grpid, "output").pVirAddr, layer.layer.get_output(decode_grpid, "output").nSize);
-                }
+                    if (m == _attr.axmodel_num - 1)
+                    {
+                        llama_post.set_input(0, layer.layer.get_output(decode_grpid, "output").pVirAddr, layer.layer.get_output(decode_grpid, "output").nSize);
+                    }
+                    else if (m < _attr.axmodel_num - 1)
+                    {
+                        llama_layers[m + 1].layer.set_input(decode_grpid, "input", layer.layer.get_output(decode_grpid, "output").pVirAddr, layer.layer.get_output(decode_grpid, "output").nSize);
+                    }
+                };
+                COST(func4);
             }
             mask[indices] = 0;
             {
-                int ret = llama_post.inference();
-                if (ret != 0)
+                std::function<void()> func5 = [&]()
                 {
-                    ALOGE("post inference failed");
-                    return "";
-                }
-                auto &output_post = llama_post.get_output(0);
-                axcl_Memcpy(output_post.pVirAddr, (void *)output_post.phyAddr, output_post.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_HOST, llama_post.get_devid());
-                unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
-                float max_val = -MAXFLOAT;
-                // max_index = FindMax(post_out, _attr.tokens_embed_num, &max_val);
-                auto max_index = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
+                    int ret = llama_post.inference();
+                    if (ret != 0)
+                    {
+                        ALOGE("post inference failed");
+                    }
+                };
+                COST(func5);
 
-                next_token = max_index;
+                std::function<void()> func6 = [&]()
+                {
+                    auto &output_post = llama_post.get_output(0);
+                    axcl_Memcpy(output_post.pVirAddr, (void *)output_post.phyAddr, output_post.nSize, axclrtMemcpyKind::AXCL_MEMCPY_DEVICE_TO_HOST, llama_post.get_devid());
+                    unsigned short *post_out = (unsigned short *)output_post.pVirAddr;
 
-                if (tokenizer->is_stop(max_index))
+                    auto max_index = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
+
+                    next_token = max_index;
+                };
+                COST(func6);
+
+                if (tokenizer->is_stop(next_token))
                 {
                     if (cached_token.size() && _attr.runing_callback)
                     {
@@ -1016,11 +1081,11 @@ public:
                     b_hit_eos = true;
                     break;
                 }
-                token_ids.push_back(max_index);
+                token_ids.push_back(next_token);
 
                 if (_attr.runing_callback)
                 {
-                    cached_token.push_back(max_index);
+                    cached_token.push_back(next_token);
                     if (cached_token.size() >= 3)
                     {
                         float t_cost_ms = t_cost.cost();
@@ -1057,6 +1122,8 @@ public:
                 }
             }
         }
+
+        print_cost_statistics();
 
         return final_out;
     }
