@@ -23,14 +23,14 @@
 
 -  clone 本项目  
     ```shell
-    git clone -b ax-internvl-3_5 https://github.com/AXERA-TECH/ax-llm.git
+    git clone -b ax-internvl3_5 git@github.com:AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - clone `ax650n_bsp_sdk` 仓库 (可选)  
     ```shell
     git cloen https://github.com/AXERA-TECH/ax650n_bsp_sdk
     ```
-- 仔细阅读 `build.sh` ，并在 `build.sh` 正确修改 `BSP_MSP_DIR` 变量后(该变量表示`ax650n_bsp_sdk`代码位置)，运行编译脚本  
+- 仔细阅读 `build.sh` (这里以 `AX650` 为编译硬件平台), 并在 `build.sh` 正确修改 `BSP_MSP_DIR` 变量后(该变量表示`ax650n_bsp_sdk`代码位置)，运行编译脚本:
     ```shell
     ./build.sh
     ```
@@ -49,6 +49,8 @@
 
     0 directories, 8 files
   ```
+
+> 注意: 如果想要编译 `AX620E` 平台, 请使用 `build_ax620e.sh`, 与 `build.sh` 区别在于 `SDK` 的路径不同.
   
 ## 运行示例
 
