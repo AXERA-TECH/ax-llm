@@ -1,0 +1,9 @@
+bsp_msp_out/msp
+msp
+weights
+.vscode
+build*
+tools/test.cpp
+!build.sh
+qtproj/LLM-Chat/CMakeLists.txt.user
+axcl
