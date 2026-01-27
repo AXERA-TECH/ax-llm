@@ -17,6 +17,8 @@ struct ImageInfo
     int imgsz = 448;
     int num_img = 1;
     bool img_prompt = false;
+    bool video_prompt = false;
+    int img_token_num = -1;
 };
 
 class BaseTokenizer
@@ -30,6 +32,7 @@ public:
     virtual int GetEosID() = 0;
     virtual int GetImgStartID() = 0;
     virtual int GetImgContextID() = 0;
+    virtual int GetVideoContextID() = 0;
 
     virtual bool isEnd(int id) { return id == GetEosID(); }
 };

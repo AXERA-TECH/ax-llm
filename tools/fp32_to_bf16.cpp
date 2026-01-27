@@ -1,6 +1,5 @@
 #include <fstream>
 #include <iostream>
-#include <algorithm>
 #include "vector"
 #include "../src/runner/utils/bfloat16.hpp"
 

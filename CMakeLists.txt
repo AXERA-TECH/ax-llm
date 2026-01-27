@@ -18,22 +18,6 @@ add_compile_options(-std=c++17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(BUILD_WITH_YOLOV5_TEST OFF)
-
-# bsp
-if(NOT BSP_MSP_DIR)
-    # 判断 /soc/lib/libax_engine.so 是否存在，以确定是否为板端编译
-    if(EXISTS /soc/lib/libax_engine.so)
-        message(STATUS "Detected board,BSP_MSP_DIR = /soc")
-        set(BSP_MSP_DIR /soc)
-    else()
-        set(BSP_MSP_DIR ${CMAKE_SOURCE_DIR}/bsp_msp_out/msp/out)
-    endif()
-endif()
-message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
-include_directories(${BSP_MSP_DIR}/include)
-link_directories(${BSP_MSP_DIR}/lib)
-
 add_subdirectory(third_party/tokenizer.axera)
 include_directories(third_party/tokenizer.axera/include)
 
@@ -50,23 +34,39 @@ include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
 
+if (AXCL_DIR)
+    message(STATUS "AXCL_DIR Path: ${AXCL_DIR}")
+    include_directories(${AXCL_DIR}/include)
+    link_directories(${AXCL_DIR}/lib)
+    include_directories(${AXCL_DIR}/include/axcl)
+    link_directories(${AXCL_DIR}/lib/axcl)
+else()
+    include_directories(/usr/include/axcl/)
+    link_directories(/usr/lib/axcl/)
+endif()
+
+
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
                     src/runner/ax_model_runner/ax_model_runner_ax650.cpp 
+                    # src/runner/ax_model_runner/ax_model_runner_ax650_host.cpp
+                    src/runner/utils/axcl_manager.cpp
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
-                    # src/runner/Tokenizer/QwenTokenizer.cpp
+                    src/runner/utils/files.cpp 
+                    src/runner/utils/image_processor.cpp 
+                    src/runner/utils/mrope.cpp
                     )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys tokenizer)
+    # target_link_libraries(${name} ax_engine ax_interpreter ax_sys)
     
-    # target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX)
+    target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_logger axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX tokenizer)
     target_link_libraries(${name} ${OpenCV_LIBS})
-
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 
 build_exec(main src/main.cpp)
 build_exec(main_api src/main_api.cpp)
+
 

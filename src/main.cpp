@@ -5,7 +5,7 @@
 #include "cmdline.hpp"
 #include "string_utility.hpp"
 
-#define IS_AXCL 0
+#define IS_AXCL 1
 
 #if IS_AXCL
 #include <axcl.h>
@@ -37,20 +37,19 @@ int main(int argc, char *argv[])
     bool b_continue = true;
 
     cmdline::parser cmd;
-
+    // cmd.add<std::string>("prompt", 'p', "prompt", true, prompt);
+    // cmd.add<std::string>("image", 'i', "single image file or .txt file for images list", true);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<std::string>("filename_tokenizer_txt", 0, "tokenizer txt path", false, attr.filename_tokenizer_txt);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
-    cmd.add<std::string>("filename_image_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodedl);
+    cmd.add<std::string>("filename_image_encoder_axmodel", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodel);
 
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
     // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
-    cmd.add<int>("img_width", 0, "image width", false, attr.image_encoder_width);
-    cmd.add<int>("img_height", 0, "image height", false, attr.image_encoder_height);
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
 
@@ -62,6 +61,20 @@ int main(int argc, char *argv[])
 #endif
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
+    cmd.add<int>("img_width", 'w', "image width", true);
+    cmd.add<int>("img_height", 'h', "image height", true);
+
+    // cmd.add<int>("img_token_id", 0, "image token id", false, 151655); 
+    // cmd.add<int>("video_token_id", 0, "video token id", false, 151656);
+    // cmd.add<int>("vision_start_token_id", 0, "vision_start_token_id", false, 151652);
+    
+    // cmd.add<int>("temporal_patch_size", 0, "temporal_patch_size", false, 2);
+    // cmd.add<int>("tokens_per_second", 0, "tokens_per_second", false, 2);
+    // cmd.add<int>("spatial_merge_size", 0, "spatial_merge_size", false, 2);
+    // cmd.add<int>("patch_size", 0, "patch size", false, 16);
+    // cmd.add<int>("fps", 0, "fps", false, 1);
+
+    cmd.add<std::string>("post_config_path", 0, "post config path", false, attr.post_config_path);
 
     cmd.parse_check(argc, argv);
 
@@ -74,7 +87,7 @@ int main(int argc, char *argv[])
     // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
     // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
 
-    attr.filename_image_encoder_axmodedl = cmd.get<std::string>("filename_image_encoder_axmodedl");
+    attr.filename_image_encoder_axmodel = cmd.get<std::string>("filename_image_encoder_axmodel");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
@@ -132,7 +145,14 @@ int main(int argc, char *argv[])
     }
 
     std::vector<unsigned short> prompt_data;
+    
+    std::vector<std::vector<unsigned short>> img_embed;
+    std::vector<int> visual_pos_mask;
 
+    Config config;
+    config.vision_config.width = cmd.get<int>("img_width");
+    config.vision_config.height = cmd.get<int>("img_height");
+    //
     if (b_continue)
     {
         printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
@@ -152,7 +172,10 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        printf("image >> ");
+        {
+            printf("image >> ");
+        }
+        
         fflush(stdout);
         std::string image_prompt;
         std::getline(std::cin, image_prompt);
@@ -226,6 +249,15 @@ int main(int argc, char *argv[])
 
         if (!b_live_print)
             printf("%s\n", output.c_str());
+
+        std::vector<unsigned short>().swap(prompt_data);
+
+        for (auto& inner_vec : img_embed) {
+            std::vector<unsigned short>().swap(inner_vec); 
+        }
+        std::vector<std::vector<unsigned short>>().swap(img_embed);
+
+        std::vector<int>().swap(visual_pos_mask);
     }
 
     lLaMa.Deinit();

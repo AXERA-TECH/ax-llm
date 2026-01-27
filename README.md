@@ -4,7 +4,7 @@
 
 | Platform | Build Status |
 | -------- | ------------ |
-| AX650    | ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/AXERA-TECH/ax-llm/build_650.yml)|
+| AX650    | ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/AXERA-TECH/ax-llm/build_650.yml?internvl2)|
 
 ## 简介
 
@@ -14,8 +14,6 @@
 
 - AX650A/AX650N
   - SDK ≥ v3.6.2
-- AX630C
-  - SDK ≥ v3.0.0
 
 ### 已支持模型
 
@@ -23,56 +21,64 @@
 - FastVLM-1.5B
 - FastVLM-1.5B-GPTQ-Int4
 
-### 获取地址
-
-- [Huggingface](https://huggingface.co/AXERA-TECH)
-  - [FastVLM-0.5B](https://huggingface.co/AXERA-TECH/FastVLM-0.5B) 
-  - [FastVLM-1.5B](https://huggingface.co/AXERA-TECH/FastVLM-1.5B)
-  - [FastVLM-1.5B-GPTQ-Int4](https://huggingface.co/AXERA-TECH/FastVLM-1.5B-GPTQ-Int4)
 
 ## 源码编译
-
-- 在 Host 上下载 axcl llm 对应分支
+即可以交叉编译，也可以在开发板上编译。    
+-  clone 本项目  
     ```shell
-    git clone --recurse-submodules --shallow-submodules --depth 1 -b ax-fastvlm https://github.com/Nnow2024/ax-llm.git
+    git clone --recurse-submodules --shallow-submodules --depth 1 -b axcl-fastvlm https://github.com/Nnow2024/ax-llm.git
     cd ax-llm
     ```
-- 本地编译
-    ```shell
-    sudo apt install libopencv-dev build-essential 
-    ./build.sh
-    ```
-- 正确编译后，`build/install/bin` 目录
+- 编译  
+  ```
+  ./build.sh
+  ```
+- 正确编译后，`build/install/bin` 目录，应有以下文件（百度网盘中有预编译的可执行程序）
   ```
   $ tree install/bin/
     install/bin/
     ├── main
     ├── main_api
   ```
-  其中 `main` 就是 Huggingface 仓库中对应的 `main_ax650`
-  
+
 ## 运行示例
+### 1. 设置环境变量
+设置 LD_LIBRARY_PATH={path to build/install/lib}:$LD_LIBRARY_PATH
 
-### FastVLM-1.5B-GPTQ-Int4
+### 2. 图像理解
 
+1) 将 `build/install/bin`目录下的文件和编译好的模型都拷贝到爱芯板子上，下载[AXERA-TECH/FastVLM-0.5B](https://huggingface.co/AXERA-TECH/FastVLM-0.5B)仓库。
+2) 仓库下载完成后，运行 `run_axcl_x86.sh`
 ```shell
-root@ax650:~/FastVLM-1.5B-GPTQ-Int4# ./run_ax650_1024.sh
-[I][                            Init][ 134]: LLM init start
+chmod +x main* run*
+./run_axcl_x86.sh
+```
+output:
+```
+[I][                            Init][ 162]: LLM init start
 tokenizer_type = 3
-  6% | ███                               |   2 /  31 [1.09s<16.97s, 1.83 count/s] embed_selector init ok
-100% | ████████████████████████████████ |  31 /  31 [3.39s<3.39s, 9.14 count/s] init post axmodel ok,remain_cmm(8619 MB)[I][                            Init][ 284]: image encoder input nhwc@uint8
-[I][                            Init][ 308]: image encoder output float32
+stop_tokens size: 2
+151645
+151645
+  7% | ███                               |   2 /  27 [0.18s<2.48s, 10.87 count/s] embed_selector init ok
+[I][                             run][  30]: AXCLWorker start with devid 0
+100% | ████████████████████████████████ |  27 /  27 [20.66s<20.66s, 1.31 count/s] init post axmodel ok,remain_cmm(6394 MB)[I][                            Init][ 313]: image encoder input nhwc@uint8
+[I][                            Init][ 338]: image encoder output float32
 
-[I][                            Init][ 318]: image_encoder_height : 1024, image_encoder_width: 1024
-[I][                            Init][ 320]: max_token_len : 1024
-[I][                            Init][ 323]: kv_cache_size : 256, kv_cache_num: 1024
-[I][                            Init][ 331]: prefill_token_num : 128
-[I][                            Init][ 335]: grp: 1, prefill_max_token_num : 1
-[I][                            Init][ 335]: grp: 2, prefill_max_token_num : 128
-[I][                            Init][ 335]: grp: 3, prefill_max_token_num : 256
-[I][                            Init][ 335]: grp: 4, prefill_max_token_num : 512
-[I][                            Init][ 335]: grp: 5, prefill_max_token_num : 640
-[I][                            Init][ 339]: prefill_max_token_num : 640
+[I][                            Init][ 350]: max_token_len : 1024
+[I][                            Init][ 353]: kv_cache_size : 128, kv_cache_num: 1024
+[I][                            Init][ 361]: prefill_token_num : 128
+[I][                            Init][ 365]: grp: 1, prefill_max_token_num : 1
+[I][                            Init][ 365]: grp: 2, prefill_max_token_num : 128
+[I][                            Init][ 365]: grp: 3, prefill_max_token_num : 256
+[I][                            Init][ 365]: grp: 4, prefill_max_token_num : 512
+[I][                            Init][ 365]: grp: 5, prefill_max_token_num : 640
+[I][                            Init][ 369]: prefill_max_token_num : 640
+________________________
+|    ID| remain cmm(MB)|
+========================
+|     0|           6228|
+¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯
 [I][                     load_config][ 282]: load config:
 {
     "enable_repetition_penalty": false,
@@ -86,43 +92,41 @@ tokenizer_type = 3
     "top_p": 0.8
 }
 
-[I][                            Init][ 348]: LLM init ok
+[I][                            Init][ 466]: LLM init ok
 Type "q" to exit, Ctrl+c to stop current running
 prompt >> who are you
 image >>
-[I][                          Encode][ 470]: input_ids size: 22
-[I][                             Run][ 604]: input token num : 22, prefill_split_num : 1
-[I][                             Run][ 619]: prefill grpid 2
-[I][                             Run][ 646]: input_num_token:22
-[I][                             Run][ 770]: ttft: 128.29 ms
-I am an AI language model, I am here to help answer any questions you may have. How can I assist you today?
+[I][                             Run][ 718]: input token num : 27, prefill_split_num : 1
+[I][                             Run][ 733]: prefill grpid 2
+[I][                             Run][ 760]: input_num_token:27
+[I][                             Run][ 889]: ttft: 153.21 ms
+I'm an AI language model and I don't have personal identity or a physical body. I exist solely as a digital entity created by Apple Inc. and I am designed to assist and provide information to users.
 
-[N][                             Run][ 879]: hit eos,avg 19.84 token/s
+[N][                             Run][1041]: hit eos,avg 17.21 token/s
 
-prompt >> describe the image
-image >> ./images/ssd_horse.jpg
-[I][                          Encode][ 442]: image encode time : 232.04 ms, size : 393216
-[I][                          Encode][ 496]: imgs_embed.size() : 1, media token size : 256
-[I][                             Run][ 604]: input token num : 280, prefill_split_num : 3
-[I][                             Run][ 619]: prefill grpid 4
-[I][                             Run][ 646]: input_num_token:128
-[I][                             Run][ 646]: input_num_token:128
-[I][                             Run][ 646]: input_num_token:24
-[I][                             Run][ 770]: ttft: 417.89 ms
-In the image, a young man is riding a brown horse in a fenced area. The horse is standing still, and the rider is holding the reins. The horse has a white blaze on its face and is wearing a bridle. The rider is wearing a blue hoodie and jeans. In front of the horse, there is a brown dog standing on the ground, looking up at the horse. In the background, there is a silver pickup truck parked near a fence. There are also some trees and other people visible in the background. The ground is covered with dirt.
+prompt >> describe the image.
+image >> ./images/image_1.jpg
+[I][                          Encode][ 563]: image encode time : 49.20 ms, size : 57344
+[I][                          Encode][ 610]: imgs_embed.size() : 1, media token size : 64
+[I][                             Run][ 718]: input token num : 94, prefill_split_num : 1
+[I][                             Run][ 733]: prefill grpid 2
+[I][                             Run][ 760]: input_num_token:94
+[I][                             Run][ 889]: ttft: 149.93 ms
+The image depicts a panda bear in a naturalistic setting, surrounded by greenery and a wooden structure. The panda appears to be resting or hiding among the plants, with its head turned towards the camera. The panda's distinctive black and white fur is clearly visible, with its black ears, eyes, and nose contrasting against its white face and body. The background features a mix of green leaves, bamboo shoots, and other vegetation, as well as a wooden structure that resembles a tree trunk or a small fence. The overall scene suggests a peaceful and natural environment, possibly a zoo or wildlife sanctuary.
 
-[N][                             Run][ 879]: hit eos,avg 19.85 token/s
+[N][                             Run][1041]: hit eos,avg 17.11 token/s
 
 prompt >> q
+[I][                             run][  80]: AXCLWorker exit with devid 0
 ```
 
 ## Reference
 
-- [FastVLM-0.5B](https://huggingface.co/apple/FastVLM-0.5B)
-- [FastVLM-1.5B](https://huggingface.co/apple/FastVLM-1.5B)
+- [AXERA-TECH/FastVLM-0.5B](https://huggingface.co/AXERA-TECH/FastVLM-0.5B)
+- [AXERA-TECH/FastVLM-1.5B](https://huggingface.co/AXERA-TECH/FastVLM-1.5B)
+- [AXERA-TECH/FastVLM-1.5B-GPTQ-Int4](https://huggingface.co/AXERA-TECH/FastVLM-1.5B-GPTQ-Int4)
 
-## 技术讨论
+## 技术讨
 
 - Github issues
 - QQ 群: 139953715
-

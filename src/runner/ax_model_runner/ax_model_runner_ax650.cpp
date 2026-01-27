@@ -1,94 +1,40 @@
 #include "ax_model_runner_ax650.hpp"
-#include "string.h"
-#include "fstream"
-#include "memory"
-// #include "utilities/file.hpp"
-#include <ax_sys_api.h>
-#include <ax_ivps_api.h>
-#include <ax_engine_api.h>
+#include <string.h>
+#include <fstream>
+#include <memory>
 #include <fcntl.h>
+#include <algorithm>
 #include "memory_utils.hpp"
 #include "sample_log.h"
+#include "axcl_manager.h"
 
 #define AX_CMM_ALIGN_SIZE 128
 
-const char *AX_CMM_SESSION_NAME = "npu";
+static const char *AX_CMM_SESSION_NAME = "npu";
 
-typedef enum
+static void print_io_info(std::vector<ax_runner_tensor_t> &input, std::vector<ax_runner_tensor_t> &output)
 {
-    AX_ENGINE_ABST_DEFAULT = 0,
-    AX_ENGINE_ABST_CACHED = 1,
-} AX_ENGINE_ALLOC_BUFFER_STRATEGY_T;
-
-typedef std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRATEGY_T> INPUT_OUTPUT_ALLOC_STRATEGY;
-
-static void print_io_info(AX_ENGINE_IO_INFO_T *io_info)
-{
-    static std::map<AX_ENGINE_DATA_TYPE_T, const char *> data_type = {
-        {AX_ENGINE_DT_UNKNOWN, "UNKNOWN"},
-        {AX_ENGINE_DT_UINT8, "UINT8"},
-        {AX_ENGINE_DT_UINT16, "UINT16"},
-        {AX_ENGINE_DT_FLOAT32, "FLOAT32"},
-        {AX_ENGINE_DT_SINT16, "SINT16"},
-        {AX_ENGINE_DT_SINT8, "SINT8"},
-        {AX_ENGINE_DT_SINT32, "SINT32"},
-        {AX_ENGINE_DT_UINT32, "UINT32"},
-        {AX_ENGINE_DT_FLOAT64, "FLOAT64"},
-        {AX_ENGINE_DT_UINT10_PACKED, "UINT10_PACKED"},
-        {AX_ENGINE_DT_UINT12_PACKED, "UINT12_PACKED"},
-        {AX_ENGINE_DT_UINT14_PACKED, "UINT14_PACKED"},
-        {AX_ENGINE_DT_UINT16_PACKED, "UINT16_PACKED"},
-    };
-
-    static std::map<AX_ENGINE_COLOR_SPACE_T, const char *> color_type = {
-        {AX_ENGINE_CS_FEATUREMAP, "FEATUREMAP"},
-        {AX_ENGINE_CS_RAW8, "RAW8"},
-        {AX_ENGINE_CS_RAW10, "RAW10"},
-        {AX_ENGINE_CS_RAW12, "RAW12"},
-        {AX_ENGINE_CS_RAW14, "RAW14"},
-        {AX_ENGINE_CS_RAW16, "RAW16"},
-        {AX_ENGINE_CS_NV12, "NV12"},
-        {AX_ENGINE_CS_NV21, "NV21"},
-        {AX_ENGINE_CS_RGB, "RGB"},
-        {AX_ENGINE_CS_BGR, "BGR"},
-        {AX_ENGINE_CS_RGBA, "RGBA"},
-        {AX_ENGINE_CS_GRAY, "GRAY"},
-        {AX_ENGINE_CS_YUV444, "YUV444"},
-    };
-    printf("\ninput size: %d\n", io_info->nInputSize);
-    for (uint32_t i = 0; i < io_info->nInputSize; ++i)
+    printf("\ninput size: %ld\n", input.size());
+    for (uint32_t i = 0; i < input.size(); ++i)
     {
         // print shape info,like [batchsize x channel x height x width]
-        auto &info = io_info->pInputs[i];
-        printf("    name: \e[1;32m%8s", info.pName);
+        auto &info = input[i];
+        printf("    name: \e[1;32m%8s", info.sName.c_str());
 
         std::string dt = "unknown";
-        if (data_type.find(info.eDataType) != data_type.end())
-        {
-            dt = data_type[info.eDataType];
-            printf(" \e[1;34m[%s] ", dt.c_str());
-        }
-        else
-        {
-            printf(" \e[1;31m[%s] ", dt.c_str());
-        }
+
+        printf(" \e[1;31m[%s] ", dt.c_str());
 
         std::string ct = "unknown";
-        if (info.pExtraMeta && color_type.find(info.pExtraMeta->eColorSpace) != color_type.end())
-        {
-            ct = color_type[info.pExtraMeta->eColorSpace];
-            printf("\e[1;34m[%s]", ct.c_str());
-        }
-        else
-        {
-            printf("\e[1;31m[%s]", ct.c_str());
-        }
+
+        printf("\e[1;31m[%s]", ct.c_str());
+
         printf(" \n        \e[1;31m");
 
-        for (AX_U8 s = 0; s < info.nShapeSize; s++)
+        for (int s = 0; s < info.vShape.size(); s++)
         {
-            printf("%d", info.pShape[s]);
-            if (s != info.nShapeSize - 1)
+            printf("%d", info.vShape[s]);
+            if (s != info.vShape.size() - 1)
             {
                 printf(" x ");
             }
@@ -96,16 +42,16 @@ static void print_io_info(AX_ENGINE_IO_INFO_T *io_info)
         printf("\e[0m\n\n");
     }
 
-    printf("\noutput size: %d\n", io_info->nOutputSize);
-    for (uint32_t i = 0; i < io_info->nOutputSize; ++i)
+    printf("\noutput size: %ld\n", output.size());
+    for (uint32_t i = 0; i < output.size(); ++i)
     {
         // print shape info,like [batchsize x channel x height x width]
-        auto &info = io_info->pOutputs[i];
-        printf("    name: \e[1;32m%8s \e[1;34m[%s]\e[0m\n        \e[1;31m", info.pName, data_type[info.eDataType]);
-        for (AX_U8 s = 0; s < info.nShapeSize; s++)
+        auto &info = output[i];
+        printf("    name: \e[1;32m%8s \e[0m\n        \e[1;31m", info.sName.c_str());
+        for (int s = 0; s < info.vShape.size(); s++)
         {
-            printf("%d", info.pShape[s]);
-            if (s != info.nShapeSize - 1)
+            printf("%d", info.vShape[s]);
+            if (s != info.vShape.size() - 1)
             {
                 printf(" x ");
             }
@@ -114,267 +60,343 @@ static void print_io_info(AX_ENGINE_IO_INFO_T *io_info)
     }
 }
 
-void free_io_index(AX_ENGINE_IO_BUFFER_T *io_buf, int index)
+static int prepare_io_struct_only(int grpid, axclrtEngineIOInfo io_info, axclrtEngineIO io, std::vector<ax_runner_tensor_t> &input, std::vector<ax_runner_tensor_t> &output, int _devid)
 {
-    for (int i = 0; i < index; ++i)
-    {
-        AX_ENGINE_IO_BUFFER_T *pBuf = io_buf + i;
-        AX_SYS_MemFree(pBuf->phyAddr, pBuf->pVirAddr);
-    }
-}
+    auto inputNum = axcl_EngineGetNumInputs(io_info, _devid);
+    auto outputNum = axcl_EngineGetNumOutputs(io_info, _devid);
+    input.resize(inputNum);
+    output.resize(outputNum);
 
-void free_io(AX_ENGINE_IO_T *io)
-{
-    for (size_t j = 0; j < io->nInputSize; ++j)
+    for (int32_t i = 0; i < inputNum; i++)
     {
-        AX_ENGINE_IO_BUFFER_T *pBuf = io->pInputs + j;
-        AX_SYS_MemFree(pBuf->phyAddr, pBuf->pVirAddr);
-    }
-    for (size_t j = 0; j < io->nOutputSize; ++j)
-    {
-        AX_ENGINE_IO_BUFFER_T *pBuf = io->pOutputs + j;
-        AX_SYS_MemFree(pBuf->phyAddr, pBuf->pVirAddr);
-    }
-    delete[] io->pInputs;
-    delete[] io->pOutputs;
-}
-
-static inline int prepare_io(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data, INPUT_OUTPUT_ALLOC_STRATEGY strategy)
-{
-    memset(io_data, 0, sizeof(*io_data));
-    io_data->pInputs = new AX_ENGINE_IO_BUFFER_T[info->nInputSize];
-    io_data->nInputSize = info->nInputSize;
-
-    auto ret = 0;
-    for (uint i = 0; i < info->nInputSize; ++i)
-    {
-        auto meta = info->pInputs[i];
-        auto buffer = &io_data->pInputs[i];
-        if (strategy.first == AX_ENGINE_ABST_CACHED)
-        {
-            ret = AX_SYS_MemAllocCached((AX_U64 *)(&buffer->phyAddr), &buffer->pVirAddr, meta.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
-        }
-        else
-        {
-            ret = AX_SYS_MemAlloc((AX_U64 *)(&buffer->phyAddr), &buffer->pVirAddr, meta.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
-        }
-
+        axclrtEngineIODims dims = {0};
+        int ret = axcl_EngineGetInputDims(io_info, grpid, i, &dims, _devid);
         if (ret != 0)
         {
-            free_io_index(io_data->pInputs, i);
-            fprintf(stderr, "Allocate input{%d} { phy: %p, vir: %p, size: %lu Bytes }. fail \n", i, (void *)buffer->phyAddr, buffer->pVirAddr, (long)meta.nSize);
+            printf("axcl_EngineGetInputDims failed, ret: %d\n", ret);
             return ret;
         }
-        memset(buffer->pVirAddr, 0, meta.nSize);
-        // fprintf(stderr, "Allocate input{%d} { phy: %p, vir: %p, size: %lu Bytes }. \n", i, (void*)buffer->phyAddr, buffer->pVirAddr, (long)meta.nSize);
+        input[i].sName = axcl_EngineGetInputNameByIndex(io_info, i, _devid);
+        input[i].vShape.resize(dims.dimCount);
+        for (int32_t j = 0; j < dims.dimCount; j++)
+        {
+            input[i].vShape[j] = dims.dims[j];
+        }
+        input[i].nIdx = i;
+        input[i].nSize = axcl_EngineGetInputSizeByIndex(io_info, grpid, i, _devid);
+
+        input[i].phyAddr = 0;
+        input[i].pVirAddr = 0;
     }
 
-    io_data->pOutputs = new AX_ENGINE_IO_BUFFER_T[info->nOutputSize];
-    io_data->nOutputSize = info->nOutputSize;
-    for (uint i = 0; i < info->nOutputSize; ++i)
+    for (int32_t i = 0; i < outputNum; i++)
     {
-        auto meta = info->pOutputs[i];
-        auto buffer = &io_data->pOutputs[i];
-        buffer->nSize = meta.nSize;
-        if (strategy.second == AX_ENGINE_ABST_CACHED)
-        {
-            ret = AX_SYS_MemAllocCached((AX_U64 *)(&buffer->phyAddr), &buffer->pVirAddr, meta.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
-        }
-        else
-        {
-            ret = AX_SYS_MemAlloc((AX_U64 *)(&buffer->phyAddr), &buffer->pVirAddr, meta.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
-        }
+        axclrtEngineIODims dims = {0};
+        int ret = axcl_EngineGetOutputDims(io_info, grpid, i, &dims, _devid);
         if (ret != 0)
         {
-            fprintf(stderr, "Allocate output{%d} { phy: %p, vir: %p, size: %lu Bytes }. fail \n", i, (void *)buffer->phyAddr, buffer->pVirAddr, (long)meta.nSize);
-            free_io_index(io_data->pInputs, io_data->nInputSize);
-            free_io_index(io_data->pOutputs, i);
+            printf("axcl_EngineGetOutputDims failed, ret: %d\n", ret);
             return ret;
         }
-        memset(buffer->pVirAddr, 0, meta.nSize);
-        // fprintf(stderr, "Allocate output{%d} { phy: %p, vir: %p, size: %lu Bytes }.\n", i, (void*)buffer->phyAddr, buffer->pVirAddr, (long)meta.nSize);
+        output[i].sName = axcl_EngineGetOutputNameByIndex(io_info, i, _devid);
+        output[i].vShape.resize(dims.dimCount);
+        for (int32_t j = 0; j < dims.dimCount; j++)
+        {
+            output[i].vShape[j] = dims.dims[j];
+        }
+        output[i].nIdx = i;
+        output[i].nSize = axcl_EngineGetOutputSizeByIndex(io_info, grpid, i, _devid);
+        output[i].phyAddr = 0;
+        output[i].pVirAddr = 0;
+    }
+    return 0;
+}
+
+static int prepare_io_with_alloc(int grpid, axclrtEngineIOInfo io_info, axclrtEngineIO io,
+                                 std::vector<ax_runner_tensor_t> &input, std::vector<ax_runner_tensor_t> &output,
+                                 int _devid, std::vector<std::string> skip_alloc_input_names = {}, std::vector<std::string> skip_alloc_output_names = {})
+{
+    int ret = prepare_io_struct_only(grpid, io_info, io, input, output, _devid);
+    if (ret != 0)
+    {
+        printf("prepare_io_struct_only failed, ret: %d\n", ret);
+        return ret;
     }
 
+    for (int32_t i = 0; i < input.size(); i++)
+    {
+        if (std::find(skip_alloc_input_names.begin(), skip_alloc_input_names.end(), input[i].sName) != skip_alloc_input_names.end())
+        {
+            continue;
+        }
+        void *devPtr = nullptr;
+        ret = axcl_Malloc(&devPtr, input[i].nSize, axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST, _devid);
+        if (ret != 0)
+        {
+            printf("axcl_Malloc failed, ret: %d\n", ret);
+            return ret;
+        }
+        input[i].phyAddr = (unsigned long long)devPtr;
+        input[i].pVirAddr = malloc(input[i].nSize);
+        if (input[i].pVirAddr == nullptr)
+        {
+            printf("malloc failed, ret: %d\n", ret);
+            return ret;
+        }
+        memset(input[i].pVirAddr, 0, input[i].nSize);
+        axcl_Memset(devPtr, 0, input[i].nSize, _devid);
+    }
+
+    for (int32_t i = 0; i < output.size(); i++)
+    {
+        if (std::find(skip_alloc_output_names.begin(), skip_alloc_output_names.end(), output[i].sName) != skip_alloc_output_names.end())
+        {
+            continue;
+        }
+        void *devPtr = nullptr;
+        ret = axcl_Malloc(&devPtr, output[i].nSize, axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST, _devid);
+        if (ret != 0)
+        {
+            printf("axcl_Malloc failed, ret: %d\n", ret);
+            return ret;
+        }
+        output[i].phyAddr = (unsigned long long)devPtr;
+        output[i].pVirAddr = malloc(output[i].nSize);
+        if (output[i].pVirAddr == nullptr)
+        {
+            printf("malloc failed, ret: %d\n", ret);
+            return ret;
+        }
+        memset(output[i].pVirAddr, 0, output[i].nSize);
+        axcl_Memset(devPtr, 0, output[i].nSize, _devid);
+    }
     return 0;
 }
 
 struct ax_joint_runner_ax650_handle_t
 {
-    AX_ENGINE_HANDLE handle;
-    AX_ENGINE_CONTEXT_T context;
-    std::vector<AX_ENGINE_IO_INFO_T *> io_info;
-    std::vector<AX_ENGINE_IO_T> io_data;
-
-    // int algo_width, algo_height;
-    // int algo_colorformat;
+    uint64_t handle = 0;
+    uint64_t context = 0;
+    axclrtEngineIOInfo io_info = 0;
+    std::vector<axclrtEngineIO> ios;
 };
 
 int ax_runner_ax650::sub_init()
 {
     // 4. create context
-    int ret = AX_ENGINE_CreateContext(m_handle->handle);
+    int ret = axcl_EngineCreateContext(m_handle->handle, &m_handle->context, dev_id);
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateContext");
         return ret;
     }
-    ret = AX_ENGINE_CreateContextV2(m_handle->handle, &m_handle->context);
-    if (0 != ret)
-    {
-        ALOGE("AX_ENGINE_CreateContextV2");
-        return ret;
-    }
     // fprintf(stdout, "Engine creating context is done.\n");
 
     // 5. set io
-    AX_U32 io_count = 0;
-    ret = AX_ENGINE_GetGroupIOInfoCount(m_handle->handle, &io_count);
+    ret = axcl_EngineGetIOInfo(m_handle->handle, &m_handle->io_info, dev_id);
     if (0 != ret)
     {
-        ALOGE("AX_ENGINE_GetGroupIOInfoCount");
+        ALOGE("AX_ENGINE_GetIOInfo");
         return ret;
     }
-    // ALOGI("io_count=%d", io_count);
-
-    m_handle->io_info.resize(io_count);
-    m_handle->io_data.resize(io_count);
-    mgroup_input_tensors.resize(io_count);
-    mgroup_output_tensors.resize(io_count);
-
     // fprintf(stdout, "Engine get io info is done. \n");
 
-    // 6. alloc io
-    if (!_parepare_io)
+    ret = axcl_EngineGetShapeGroupsCount(m_handle->io_info, &group_count, dev_id);
+    if (ret != 0)
     {
-        for (size_t grpid = 0; grpid < io_count; grpid++)
+        axcl_EngineUnload(m_handle->handle, dev_id);
+        return ret;
+    }
+
+    // 4. create io
+
+    // fprintf(stdout, "Engine creating io is done. \n");
+
+    // 6. alloc io
+
+    m_handle->ios.resize(group_count);
+    // m_handle->io_datas.resize(group_count);
+    mgroup_input_tensors.resize(group_count);
+    mgroup_output_tensors.resize(group_count);
+
+    // memset(&m_handle->io_datas[0], 0, sizeof(AXCL_IO_DATA_T) * group_count);
+
+    std::vector<std::string> skip_alloc_input_names = {"K_cache", "V_cache"};
+    // 1. 分配 IO 资源
+    for (size_t grpid = 0; grpid < group_count; grpid++)
+    {
+        ret = axcl_EngineCreateIO(m_handle->io_info, &m_handle->ios[grpid], dev_id);
+
+        // 原有逻辑保持不变：Group 0 和 Last Group 分配物理内存，中间 Group 不分配
+        if (grpid == 0)
         {
-            AX_ENGINE_IO_INFO_T *io_info = nullptr;
-            ret = AX_ENGINE_GetGroupIOInfo(m_handle->handle, grpid, &io_info);
-            if (0 != ret)
-            {
-                ALOGE("AX_ENGINE_GetIOInfo");
-                return ret;
-            }
-            // print_io_info(io_info);
+            ret = prepare_io_with_alloc(grpid, m_handle->io_info, m_handle->ios[grpid], mgroup_input_tensors[grpid], mgroup_output_tensors[grpid], dev_id);
+        }
+        else if (grpid == group_count - 1)
+        {
+            ret = prepare_io_with_alloc(grpid, m_handle->io_info, m_handle->ios[grpid], mgroup_input_tensors[grpid], mgroup_output_tensors[grpid], dev_id, skip_alloc_input_names);
+        }
+        else
+        {
+            ret = prepare_io_struct_only(grpid, m_handle->io_info, m_handle->ios[grpid], mgroup_input_tensors[grpid], mgroup_output_tensors[grpid], dev_id);
+        }
+        if (ret != 0)
+            return ret;
+    }
 
-            m_handle->io_info[grpid] = io_info;
-
-            ret = prepare_io(m_handle->io_info[grpid], &m_handle->io_data[grpid], std::make_pair(AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED));
-            if (0 != ret)
+    if (group_count > 2)
+    {
+        auto &first_input = mgroup_input_tensors[0];
+        auto &last_input = mgroup_input_tensors[group_count - 1];
+        auto &last_output = mgroup_output_tensors[group_count - 1];
+        for (uint i = 0; i < last_input.size(); ++i)
+        {
+            if (std::find(skip_alloc_input_names.begin(), skip_alloc_input_names.end(), last_input[i].sName) != skip_alloc_input_names.end())
             {
-                ALOGE("prepare_io grpid=%d", grpid);
-                return ret;
+                for (uint j = 0; j < first_input.size(); ++j)
+                {
+                    if (first_input[j].sName == last_input[i].sName)
+                    {
+                        last_input[i].phyAddr = first_input[j].phyAddr;
+                        last_input[i].pVirAddr = first_input[j].pVirAddr;
+                    }
+                }
             }
         }
 
-        for (size_t grpid = 0; grpid < io_count; grpid++)
+        for (size_t grpid = 1; grpid < group_count - 1; grpid++)
         {
-            auto &io_info = m_handle->io_info[grpid];
-            auto &io_data = m_handle->io_data[grpid];
-            for (size_t i = 0; i < io_info->nOutputSize; i++)
+            auto &input = mgroup_input_tensors[grpid];
+
+            // 安全检查：确保维度匹配再拷贝
+            size_t min_inputs = std::min(input.size(), last_input.size());
+            for (size_t i = 0; i < min_inputs; i++)
             {
-                ax_runner_tensor_t tensor;
-                tensor.nIdx = i;
-                tensor.sName = std::string(io_info->pOutputs[i].pName);
-                tensor.nSize = io_info->pOutputs[i].nSize;
-                for (size_t j = 0; j < io_info->pOutputs[i].nShapeSize; j++)
-                {
-                    tensor.vShape.push_back(io_info->pOutputs[i].pShape[j]);
-                }
-                tensor.phyAddr = io_data.pOutputs[i].phyAddr;
-                tensor.pVirAddr = io_data.pOutputs[i].pVirAddr;
-                mgroup_output_tensors[grpid].push_back(tensor);
+                input[i].phyAddr = last_input[i].phyAddr;
+                input[i].pVirAddr = last_input[i].pVirAddr;
             }
 
-            for (size_t i = 0; i < io_info->nInputSize; i++)
+            auto &output = mgroup_output_tensors[grpid];
+            size_t min_outputs = std::min(output.size(), last_output.size());
+            for (size_t i = 0; i < min_outputs; i++)
             {
-                ax_runner_tensor_t tensor;
-                tensor.nIdx = i;
-                tensor.sName = std::string(io_info->pInputs[i].pName);
-                tensor.nSize = io_info->pInputs[i].nSize;
-                for (size_t j = 0; j < io_info->pInputs[i].nShapeSize; j++)
-                {
-                    tensor.vShape.push_back(io_info->pInputs[i].pShape[j]);
-                }
-                tensor.phyAddr = io_data.pInputs[i].phyAddr;
-                tensor.pVirAddr = io_data.pInputs[i].pVirAddr;
-                mgroup_input_tensors[grpid].push_back(tensor);
+                output[i].phyAddr = last_output[i].phyAddr;
+                output[i].pVirAddr = last_output[i].pVirAddr;
             }
         }
+    }
 
+    for (size_t grpid = 0; grpid < mgroup_input_tensors.size(); grpid++)
+    {
+        for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
+        {
+            axcl_EngineSetInputBufferByIndex(m_handle->ios[grpid], i, (void *)mgroup_input_tensors[grpid][i].phyAddr, mgroup_input_tensors[grpid][i].nSize, dev_id);
+        }
+    }
+
+    for (size_t grpid = 0; grpid < mgroup_output_tensors.size(); grpid++)
+    {
+        for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
+        {
+            axcl_EngineSetOutputBufferByIndex(m_handle->ios[grpid], i, (void *)mgroup_output_tensors[grpid][i].phyAddr, mgroup_output_tensors[grpid][i].nSize, dev_id);
+        }
+    }
+
+    if (!mgroup_output_tensors.empty())
         moutput_tensors = mgroup_output_tensors[0];
+    if (!mgroup_input_tensors.empty())
         minput_tensors = mgroup_input_tensors[0];
 
-        _parepare_io = true;
-    }
-    else
-    {
-    }
+    // print_io_info(minput_tensors, mtensors);
+
+    build_tensor_maps();
 
     return ret;
 }
 
-int ax_runner_ax650::init(const char *model_file, bool use_mmap)
-{
-    if (use_mmap)
-    {
-        MMap model_buffer(model_file);
-        if (!model_buffer.data())
-        {
-            ALOGE("mmap");
-            return -1;
-        }
-        auto ret = init((char *)model_buffer.data(), model_buffer.size());
-        model_buffer.close_file();
-        return ret;
-    }
-    else
-    {
-        char *model_buffer;
-        size_t len;
-        if (!read_file(model_file, &model_buffer, &len))
-        {
-            ALOGE("read_file");
-            return -1;
-        }
-        auto ret = init(model_buffer, len);
-        delete[] model_buffer;
-        return ret;
-    }
-}
-
-int ax_runner_ax650::init(char *model_buffer, size_t model_size)
+int ax_runner_ax650::init(const char *model_file, int devid)
 {
     if (!m_handle)
     {
         m_handle = new ax_joint_runner_ax650_handle_t;
     }
+    memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
+    this->dev_id = devid;
 
-    // 3. create handle
-
-    int ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer, model_size);
+    this->dev_id = devid;
+    int ret = axcl_EngineLoadFromFile(model_file, &m_handle->handle, dev_id);
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateHandle");
         return ret;
     }
-    // fprintf(stdout, "Engine creating handle is done.\n");
+    return sub_init();
+}
+
+int ax_runner_ax650::init(char *model_buffer, size_t model_size, int devid)
+{
+    if (!m_handle)
+    {
+        m_handle = new ax_joint_runner_ax650_handle_t;
+    }
+    memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
+    this->dev_id = devid;
+
+    void *devMem = nullptr;
+    axcl_Malloc(&devMem, model_size, AXCL_MEM_MALLOC_NORMAL_ONLY, dev_id);
+
+    axcl_Memcpy(devMem, model_buffer, model_size, AXCL_MEMCPY_HOST_TO_DEVICE, dev_id);
+
+    int ret = axcl_EngineLoadFromMem(devMem, model_size, &m_handle->handle, dev_id);
+    if (0 != ret)
+    {
+        ALOGE("AX_ENGINE_CreateHandle");
+        return ret;
+    }
+    axcl_Free(devMem, dev_id);
 
     return sub_init();
 }
 
-void ax_runner_ax650::release()
+void ax_runner_ax650::deinit()
 {
     if (m_handle && m_handle->handle)
     {
-        for (size_t i = 0; i < m_handle->io_data.size(); i++)
+        std::vector<unsigned long long> free_phy_addr;
+        std::vector<void*> free_vir_addr;
+        for (int grpid = 0; grpid < group_count; grpid++)
         {
-            /* code */
-            free_io(&m_handle->io_data[i]);
+            for (auto &tensor : mgroup_output_tensors[grpid])
+            {
+                if (free_phy_addr.end() == std::find(free_phy_addr.begin(), free_phy_addr.end(), tensor.phyAddr))
+                {
+                    axcl_Free((void *)tensor.phyAddr, dev_id);
+                    free_phy_addr.push_back(tensor.phyAddr);
+                }
+                if (free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
+                {
+                    free(tensor.pVirAddr);
+                    free_vir_addr.push_back(tensor.pVirAddr);
+                }
+            }
+            for (auto &tensor : mgroup_input_tensors[grpid])
+            {
+                if (free_phy_addr.end() == std::find(free_phy_addr.begin(), free_phy_addr.end(), tensor.phyAddr))
+                {
+                    axcl_Free((void *)tensor.phyAddr, dev_id);
+                    free_phy_addr.push_back(tensor.phyAddr);
+                }
+                if (free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
+                {
+                    free(tensor.pVirAddr);
+                    free_vir_addr.push_back(tensor.pVirAddr);
+                }
+            }
+            axcl_EngineDestroyIO(m_handle->ios[grpid], dev_id);
         }
 
-        AX_ENGINE_DestroyHandle(m_handle->handle);
-        m_handle->handle = nullptr;
+        axcl_EngineUnload(m_handle->handle, dev_id);
+        m_handle->handle = 0;
     }
 
     if (m_handle)
@@ -383,56 +405,99 @@ void ax_runner_ax650::release()
         m_handle = nullptr;
     }
 
-    moutput_tensors.clear();
     minput_tensors.clear();
+    moutput_tensors.clear();
+
     map_input_tensors.clear();
     map_output_tensors.clear();
 
-    mgroup_output_tensors.clear();
     mgroup_input_tensors.clear();
+    mgroup_output_tensors.clear();
+
     map_group_input_tensors.clear();
     map_group_output_tensors.clear();
-
-    // AX_ENGINE_Deinit();
 }
 
-void ax_runner_ax650::deinit()
+int ax_runner_ax650::get_algo_width() { return -1; }
+int ax_runner_ax650::get_algo_height() { return -1; }
+
+int ax_runner_ax650::set_input(int grpid, int idx, unsigned long long int phy_addr, unsigned long size)
 {
-    if (m_handle && m_handle->handle)
+    if (size < get_input(grpid, idx).nSize)
     {
-        // free_io(&m_handle->io_data);
-        // mtensors.clear();
-        // minput_tensors.clear();
-        // map_input_tensors.clear();
-        // map_tensors.clear();
-        AX_ENGINE_DestroyHandle(m_handle->handle);
-        m_handle->handle = nullptr;
-        // delete m_handle;
-        // m_handle = nullptr;
+        ALOGE("set_input size %ld < %d", size, get_input(grpid, idx).nSize);
+        return -1;
     }
 
-    // AX_ENGINE_Deinit();
+    int ret = axcl_EngineSetInputBufferByIndex(m_handle->ios[grpid], idx, (void *)phy_addr, size, dev_id);
+    if (0 != ret)
+    {
+        ALOGE("axcl_EngineSetInputBufferByIndex %d", ret);
+        return ret;
+    }
+    auto &input = mgroup_input_tensors[grpid][idx];
+    input.phyAddr = phy_addr;
+    return ret;
+}
+int ax_runner_ax650::set_output(int grpid, int idx, unsigned long long int phy_addr, unsigned long size)
+{
+    if (size < get_output(grpid, idx).nSize)
+    {
+        ALOGE("set_output size %ld < %d", size, get_output(grpid, idx).nSize);
+        return -1;
+    }
+
+    return axcl_EngineSetOutputBufferByIndex(m_handle->ios[grpid], idx, (void *)phy_addr, size, dev_id);
+}
+
+int ax_runner_ax650::set_input(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size)
+{
+    if (size < get_input(grpid, name).nSize)
+    {
+        ALOGE("set_input size %ld < %d", size, mgroup_input_tensors[grpid][get_input(grpid, name).nIdx].nSize);
+        return -1;
+    }
+
+    return axcl_EngineSetInputBufferByIndex(m_handle->ios[grpid], get_input(grpid, name).nIdx, (void *)phy_addr, size, dev_id);
+}
+
+int ax_runner_ax650::set_output(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size)
+{
+    if (size < get_output(grpid, name).nSize)
+    {
+        ALOGE("set_output size %ld < %d", size, get_output(grpid, name).nSize);
+        return -1;
+    }
+
+    return axcl_EngineSetOutputBufferByIndex(m_handle->ios[grpid], get_output(grpid, name).nIdx, (void *)phy_addr, size, dev_id);
+}
+
+ax_color_space_e ax_runner_ax650::get_color_space()
+{
+    return axdl_color_space_unknown;
 }
 
 int ax_runner_ax650::inference()
 {
-    int ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[0]);
-    for (size_t i = 0; i < get_num_outputs(); i++)
-    {
-        auto &tensor = get_output(i);
-        AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
-    }
-    return ret;
+    return inference(0);
 }
 
 int ax_runner_ax650::inference(int grpid)
 {
-    int ret = AX_ENGINE_RunGroupIOSync(m_handle->handle, m_handle->context, grpid, &m_handle->io_data[grpid]);
+    if (_auto_sync_before_inference)
+        for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
+            axcl_Memcpy((void *)mgroup_input_tensors[grpid][i].phyAddr, mgroup_input_tensors[grpid][i].pVirAddr, mgroup_input_tensors[grpid][i].nSize, AXCL_MEMCPY_HOST_TO_DEVICE, dev_id);
 
-    for (size_t i = 0; i < get_num_outputs(); i++)
+    auto ret = axcl_EngineExecute(m_handle->handle, m_handle->context, grpid, m_handle->ios[grpid], dev_id);
+    if (ret != 0)
     {
-        auto &tensor = get_output(grpid, i);
-        AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+        ALOGE("AX_ENGINE_Execute");
+        return ret;
     }
-    return ret;
+
+    if (_auto_sync_after_inference)
+        for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
+            axcl_Memcpy(mgroup_output_tensors[grpid][i].pVirAddr, (void *)mgroup_output_tensors[grpid][i].phyAddr, mgroup_output_tensors[grpid][i].nSize, AXCL_MEMCPY_DEVICE_TO_HOST, dev_id);
+
+    return 0;
 }

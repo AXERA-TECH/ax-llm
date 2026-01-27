@@ -16,7 +16,7 @@ class Tokenizer_Http : public BaseTokenizer
     std::string base_url;
 
     int bos_id, eos_id;
-    int img_start_token, img_context_token;
+    int img_start_token, img_context_token, video_context_token;
 
 private:
     /* data */
@@ -90,6 +90,19 @@ public:
                 img_context_token = j["img_context_token"];
             }
             printf("img_context_token: %d\n", img_context_token);
+
+            {
+                auto ret = cli->Get("/video_context_token");
+                auto rep = ret.value();
+                if (rep.status != 200)
+                {
+                    ALOGE("get video_context_token failed, status: %d", rep.status);
+                    return false;
+                }
+                nlohmann::json j = nlohmann::json::parse(rep.body);
+                video_context_token = j["video_context_token"];
+            }
+            printf("video_context_token: %d\n", video_context_token);
         }
         catch (const std::exception &e)
         {
@@ -108,7 +121,9 @@ public:
         j["text"] = input;
         j["img_prompt"] = img_info.img_prompt;
         j["imgsz"] = img_info.imgsz;
+        j["video_prompt"] = img_info.video_prompt;
         j["num_img"] = img_info.num_img;
+        j["img_token_num"] = img_info.img_token_num;
         auto ret = cli->Post("/encode", j.dump(), "application/json");
         auto rep = ret.value();
         if (rep.status != 200)
@@ -202,6 +217,10 @@ public:
     int GetImgContextID() override
     {
         return img_context_token;
+    }
+    int GetVideoContextID() override
+    {
+        return video_context_token;
     }
 };
 

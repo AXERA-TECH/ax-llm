@@ -1,31 +1,122 @@
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers.tokenization_utils_base import AddedToken
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import argparse
 
+def _prompt_split_image(
+    image_seq_len,
+    image_rows,
+    image_cols,
+    fake_token_around_image,
+    image_token,
+    global_img_token,
+):
+    """Prompt with expanded image tokens for when the image is split into patches."""
+    text_split_images = ""
+    for n_h in range(image_rows):
+        for n_w in range(image_cols):
+            text_split_images += (
+                f"{fake_token_around_image}"
+                + f"<row_{n_h + 1}_col_{n_w + 1}>"
+                + f"{image_token}" * image_seq_len
+            )
+        text_split_images += "\n"
+
+    text_split_images += (
+        f"\n{fake_token_around_image}"
+        + f"{global_img_token}"
+        + f"{image_token}" * image_seq_len
+        + f"{fake_token_around_image}"
+    )
+    return text_split_images
+
+
+def _prompt_single_image(
+    image_seq_len, fake_token_around_image, image_token, global_img_token
+):
+    """Prompt with expanded image tokens for a single image."""
+    return (
+        f"{fake_token_around_image}"
+        + f"{global_img_token}"
+        + f"{image_token}" * image_seq_len
+        + f"{fake_token_around_image}"
+    )
+
+
+def get_image_prompt_string(
+    image_rows,
+    image_cols,
+    image_seq_len,
+    fake_token_around_image,
+    image_token,
+    global_img_token,
+):
+    if image_rows == 0 and image_cols == 0:
+        return _prompt_single_image(
+            image_seq_len,
+            fake_token_around_image=fake_token_around_image,
+            image_token=image_token,
+            global_img_token=global_img_token,
+        )
+    return _prompt_split_image(
+        image_seq_len,
+        image_rows,
+        image_cols,
+        fake_token_around_image,
+        image_token,
+        global_img_token,
+    )
 
 class Tokenizer_Http():
 
     def __init__(self):
-
-        path = 'internvl2.5_tokenizer'
+        self.token_ids_cache = []
+        path = 'qwen3-vl-tokenizer'
         self.tokenizer = AutoTokenizer.from_pretrained(path,
                                                        trust_remote_code=True,
                                                        use_fast=False)
 
+        self.system_prompt = open('eval_system_prompt.md', 'r').read()
+        print(self.system_prompt)
+        
     def encode(self, content):
-        prompt = f"<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|im_end|><|im_start|>user\n{content}<|im_end|><|im_start|>assistant\n"
-        input_ids = self.tokenizer.encode(prompt)
-        return input_ids
+        text = [f'<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n']
+        # text = [f'<|im_start|>system\n{self.system_prompt}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n']
+        
+        input_ids = self.tokenizer(text)
+        return input_ids["input_ids"][0]
 
-    def encode_vpm(self, content="Please describe the image shortly."):
-        prompt = f"<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|im_end|><|im_start|>user\n<img>" + "<IMG_CONTEXT>" * 256 + f"</img>\n{content}<|im_end|><|im_start|>assistant\n"
-        input_ids = self.tokenizer.encode(prompt)
-        return input_ids
+    def encode_vpm(self, content="Describe this image.", num_img=1, img_token_num=256, video_prompt=False):
+
+        # official implementation 
+        if video_prompt:
+            pad_token = '<|video_pad|>'
+        else:
+            pad_token = '<|image_pad|>'
+        imgs_token = '<|vision_start|>' +  pad_token*img_token_num*num_img + '<|vision_end|>'
+        
+        # text = f'<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{imgs_token}{content}<|im_end|>\n<|im_start|>assistant\n'
+        text = f'<|im_start|>system\n{self.system_prompt}<|im_end|>\n<|im_start|>user\n{imgs_token}{content}<|im_end|>\n<|im_start|>assistant\n'
+        
+        output_kwargs = {'text_kwargs': {'padding': True, 'return_tensors': 'pt'}, 'images_kwargs': {'return_tensors': 'pt'}, 'audio_kwargs': {'padding': True, 'return_tensors': 'pt'}, 'videos_kwargs': {'fps': 2.0, 'return_tensors': 'pt'}, 'common_kwargs': {'return_tensors': 'pt'}}
+        
+        text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
+        return text_inputs["input_ids"].tolist()[0]
 
     def decode(self, token_ids):
-        return self.tokenizer.decode(token_ids,
-                                     clean_up_tokenization_spaces=False)
+        self.token_ids_cache += token_ids
+        text = self.tokenizer.decode(self.token_ids_cache)
+        if "\ufffd" in text and len(self.token_ids_cache) < 9:
+            print("text 中包含非法字符")
+            return ""
+        else:
+            self.token_ids_cache.clear()
+            return text.replace("\ufffd","")
+    
+    # def decode(self, token_ids):
+    #     return self.tokenizer.decode(token_ids,
+    #                                  clean_up_tokenization_spaces=False)
 
     @property
     def bos_id(self):
@@ -45,11 +136,15 @@ class Tokenizer_Http():
 
     @property
     def img_start_token(self):
-        return self.tokenizer.encode("<img>")[0]
+        return self.tokenizer.encode("<|vision_start|>")[0]
 
     @property
     def img_context_token(self):
-        return self.tokenizer.encode("<IMG_CONTEXT>")[0]
+        return self.tokenizer.encode("<|image_pad|>")[0]
+    
+    @property
+    def video_context_token(self):
+        return self.tokenizer.encode("<|video_pad|>")[0]
 
 tokenizer = Tokenizer_Http()
 
@@ -109,6 +204,12 @@ class Request(BaseHTTPRequestHandler):
                 msg = json.dumps({'img_context_token': -1})
             else:
                 msg = json.dumps({'img_context_token': img_context_token})
+        elif self.path == '/video_context_token':
+            video_context_token = tokenizer.video_context_token
+            if video_context_token is None:
+                msg = json.dumps({'video_context_token': -1})
+            else:
+                msg = json.dumps({'video_context_token': video_context_token})
         else:
             msg = 'error'
 
@@ -135,9 +236,10 @@ class Request(BaseHTTPRequestHandler):
             if 'img_prompt' in req:
                 b_img_prompt = req['img_prompt']
             if b_img_prompt:
-                token_ids = tokenizer.encode_vpm(prompt)
+                token_ids = tokenizer.encode_vpm(prompt, req["num_img"], req["img_token_num"], req["video_prompt"])
             else:
                 token_ids = tokenizer.encode(prompt)
+            
             if token_ids is None:
                 msg = json.dumps({'token_ids': -1})
             else:
@@ -162,8 +264,8 @@ class Request(BaseHTTPRequestHandler):
 if __name__ == "__main__":
 
     args = argparse.ArgumentParser()
-    args.add_argument('--host', type=str, default='0.0.0.0')
-    args.add_argument('--port', type=int, default=12345)
+    args.add_argument('--host', type=str, default='localhost')
+    args.add_argument('--port', type=int, default=8080)
     args = args.parse_args()
 
     host = (args.host, args.port)  #设定地址与端口号，'localhost'等价于'127.0.0.1'
