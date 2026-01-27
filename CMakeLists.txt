@@ -18,6 +18,7 @@ add_compile_options(-std=c++17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(BUILD_WITH_YOLOV5_TEST OFF)
 
 # bsp
 if(NOT BSP_MSP_DIR)
@@ -33,20 +34,21 @@ message(STATUS "BSP_MSP_DIR = ${BSP_MSP_DIR}")
 include_directories(${BSP_MSP_DIR}/include)
 link_directories(${BSP_MSP_DIR}/lib)
 
+add_subdirectory(third_party/tokenizer.axera)
+include_directories(third_party/tokenizer.axera/include)
+
 # 添加 FLAGS 检查代码是否有明显 bug
 include(overlook.cmake)
+
+message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
+find_package(OpenCV REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
+
+find_package(OpenMP REQUIRED)
 
 include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
-
-# if(NOT OpenCV_DIR)
-#     set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/third_party/libopencv-4.6-aarch64-none/lib/cmake/opencv4)
-# endif()
-
-# message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
-# find_package(OpenCV REQUIRED)
-# include_directories(${OpenCV_INCLUDE_DIRS})
 
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
@@ -54,14 +56,17 @@ function(build_exec name main_source)
                     src/runner/utils/memory_utils.cpp 
                     src/runner/utils/cqdm.cpp
                     src/runner/Tokenizer/Tokenizer.cpp
+                    # src/runner/Tokenizer/QwenTokenizer.cpp
                     )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys pthread)
+    target_link_libraries(${name} ax_engine ax_interpreter ax_sys tokenizer)
+    
+    # target_link_libraries(${name} spdlog axcl_pcie_dma axcl_pcie_msg axcl_token axcl_comm axcl_pkg axcl_rt pthread OpenMP::OpenMP_CXX)
+    target_link_libraries(${name} ${OpenCV_LIBS})
+
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 
 build_exec(main src/main.cpp)
 build_exec(main_api src/main_api.cpp)
-build_exec(main_prof src/main_prof.cpp)
 
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)

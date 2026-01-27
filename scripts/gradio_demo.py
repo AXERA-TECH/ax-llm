@@ -1,167 +1,127 @@
-import subprocess
-import time
+import mimetypes
+import os
 import gradio as gr
-from openai import OpenAI
 import requests
-import json
-import re
+import json, time
 
-# Base URL of your API server; adjust host and port as needed
-API_URL = "http://0.0.0.0:8000/v1"
-MODEL = "AXERA-TECH/Qwen3-1.7B"
+base_url = "http://10.126.33.235:8000"
 
-def get_all_local_ips():
-    result = subprocess.run(['ip', 'a'], capture_output=True, text=True)
-    output = result.stdout
+def upload_image(file_path):
+    if file_path is None:
+        return None
+    # Gradio File component returns a tempfile-like object
+    # file_path = image.name
+    filename = os.path.basename(file_path)
+    # Guess MIME type
+    mime_type, _ = mimetypes.guess_type(filename)
+    mime_type = mime_type or 'application/octet-stream'
+    # Open file in binary mode for upload
+    with open(file_path, 'rb') as f:
+        file_bytes = f.read()
+    # Prepare multipart form data
+    files = {
+        'image': (filename, file_bytes, mime_type)
+    }
+    # Send to upload endpoint
+    resp = requests.post(
+        f'{base_url}/api/upload',
+        files=files
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get('file_path')
 
-    # 匹配所有IPv4
-    ips = re.findall(r'inet (\d+\.\d+\.\d+\.\d+)', output)
-
-    # 过滤掉回环地址
-    real_ips = [ip for ip in ips if not ip.startswith('127.')]
-
-    return real_ips
-
-
-def reset_chat(system_prompt):
-    """
-    Calls the /api/reset endpoint (POST) to initialize a new conversation.
-    If system_prompt is provided, include it in the request body.
-    Returns empty history and clears input. On error, shows error in chat.
-    """
-    payload = {}
-    if system_prompt:
-        payload["system_prompt"] = system_prompt
+def stop_generation():
     try:
-        response = requests.post(f"{API_URL}/reset", json=payload)
-        response.raise_for_status()
-    except Exception as e:
-        # Return error in chat if reset fails
-        return [("Error resetting chat:", str(e))], ""
-    # On successful reset, clear chat history and input
-    return [], ""
+        requests.get(f'{base_url}/api/stop')
+    except:
+        pass
 
-
-def build_messages(prompt: str):
-    content = []
-    if prompt and prompt.strip():
-        content.append({"type": "text", "text": prompt.strip()})
-
-    return {"role": "user", "content": content if content else [{"type": "text", "text": prompt or ""}]}
-
-# ---------- Gradio callback (single-turn, stream) ----------
-def run_single_turn(prompt, chatbot_state):
-    try:
-        # 清空历史（单轮），构造用户气泡
-        # chatbot_state = []
-
-        # 构造 messages 和预览
-        messages = build_messages(
-            prompt=prompt or "",
-        )
-
-        user_md = (prompt or "").strip()
-
-        chatbot_state.append((user_md or "(空提示)", ""))  # assistant 先空字符串，等待流式填充
-        yield chatbot_state, chatbot_state  # 先把用户气泡渲染出来
-
-        # 调后端（流式）
-        client = OpenAI(api_key="not-needed", base_url=API_URL.strip())
-        stream = client.chat.completions.create(
-            model=MODEL.strip(),
-            messages=messages,
-            stream=True,
-        )
-
-        bot_chunks = []
-        # 先补一个空 assistant 气泡
-        # if len(chatbot_state) == 1:
-        chatbot_state[-1] = (chatbot_state[-1][0], "")
-        yield chatbot_state, chatbot_state 
-
-        # 逐 chunk 更新 assistant 气泡（Markdown）
-        for ev in stream:
-            delta = getattr(ev.choices[0], "delta", None)
-            if delta and getattr(delta, "content", None):
-                ctx = delta.content
-                if "<think>" in delta.content:
-                    ctx = delta.content.replace("<think>", "【思考中】")
-                
-                if "</think>" in delta.content:
-                    ctx = delta.content.replace("</think>", "【思考结束】")
-                
-                bot_chunks.append(ctx)
-                chatbot_state[-1] = (chatbot_state[-1][0], "".join(bot_chunks))
-                yield chatbot_state, chatbot_state 
-
-        # 结束再确保收尾
-        chatbot_state[-1] = (chatbot_state[-1][0], "".join(bot_chunks) if bot_chunks else "(empty response)")
-        yield chatbot_state, chatbot_state 
-
-    except Exception as e:
-        chatbot_state.append((
-            chatbot_state[-1][0] if chatbot_state else "(request)",
-            f"**Error:** {e}"
-        ))
-        yield chatbot_state, chatbot_state 
-
-
-
-def stop_generate():
-    try:
-        requests.get(f"{API_URL}/stop")
-    except Exception as e:
-        print(e)
-    
-
-# Build the Gradio interface优化布局
-with gr.Blocks(theme=gr.themes.Soft(font="Consolas"), fill_width=True) as demo:
-    gr.Markdown("<h2 style='text-align:center;'>🚀 Chatbot Demo with Axare API Backend</h2>")
-    
-    # 使用Row包裹左右两个主要区域
-    with gr.Row():
-        # 左侧聊天主区域（占3/4宽度）
-        with gr.Column(scale=3):
-            system_prompt = gr.Textbox(label="System Prompt", placeholder="Optional system prompt", lines=2, value="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.")
-            reset_button = gr.Button("🔄 Reset Chat")
-            chatbot = gr.Chatbot(elem_id="chatbox", label="Axera Chat",height=500)
-            user_input = gr.Textbox(label="Your Message", placeholder="Type your message here...", lines=2)
-            with gr.Row():
-                send_button = gr.Button("➡️ Send", variant="primary")
-                stop_button = gr.Button("🛑 Stop", variant="stop")
-
-        # 右侧参数设置区域（占1/4宽度）
-        with gr.Column(scale=1):
-            temperature = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.7, label="Temperature")
-            repetition_penalty = gr.Slider(minimum=1.0, maximum=2.0, step=0.01, value=1.0, label="Repetition Penalty")
-            top_p = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.9, label="Top-p Sampling")
-            top_k = gr.Slider(minimum=0, maximum=100, step=1, value=40, label="Top-k Sampling")
-    
-    
-    chat_state = gr.State([])
+def respond(prompt, image:gr.Image, temp, rep_penalty, tp, tk, history=None):
+    if history is None:
+        history = []
+    if not prompt.strip():
+        return history
+    # append empty response to history
+    if  image is None:
+        file_path = None
+    else:
+        file_path = upload_image(image)
+        history.append((f'![]({file_path})', None))
+        relative_path = os.path.relpath(file_path)
+        # html = f"<img src='{relative_path}' style='max-width:300px;'/>"
+        # history.append((html, None))
+        # print(relative_path)
         
-    reset_button.click(
-        fn=reset_chat,
-        inputs=system_prompt,
-        outputs=[chatbot, user_input],  
-    ).then(
-        lambda: [],
-        inputs=None,
-        outputs=chat_state
-    )
     
-    send_button.click(
-        fn=run_single_turn,
-        inputs=[user_input, chat_state],  
-        outputs=[chatbot, chat_state],      
-        show_progress=True,
-        queue=True,
-    )
+    history.append((prompt, ""))
+    yield history
+    # stream updates
     
-    stop_button.click(
-        fn=stop_generate
-    )
     
+    payload = {
+        "prompt": prompt,
+        "temperature": temp,
+        "repetition_penalty": rep_penalty,
+        "top-p": tp,
+        "top-k": tk
+    }
+    if file_path:
+        payload["file_path"] = file_path
+
+    response = requests.post(
+        f'{base_url}/api/generate',
+        json=payload
+    )
+    response.raise_for_status()
+    
+
+    while True:
+        time.sleep(0.01)
+        response = requests.get(
+                f'{base_url}/api/generate_provider'
+            )
+        data = response.json()
+        chunk:str = data.get("response", "") 
+        done = data.get("done", False)
+        if done:
+            break
+        if chunk.strip() == "":
+            continue
+        history[-1] = (prompt, history[-1][1] + chunk)
+        yield history
+       
+    print("end")
+    
+     
+
+
+def chat_interface():
+    with gr.Blocks(theme=gr.themes.Soft(font="Consolas"), fill_width=True) as demo:
+        gr.Markdown("## Chat with LLM\nUpload an image and chat with the model!")
+        with gr.Row():
+            image = gr.Image(label="Upload Image", type="filepath")
+            with gr.Column(scale=3):
+                chatbot = gr.Chatbot(height=600)
+                prompt = gr.Textbox(placeholder="Type your message...", label="Prompt", value="描述一下这张图片")
+                with gr.Row():
+                    btn_chat = gr.Button("Chat", variant="primary")
+                    btn_stop = gr.Button("Stop", variant="stop")
+
+            with gr.Column(scale=1):
+                temperature = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.7, label="Temperature")
+                repetition_penalty = gr.Slider(minimum=1.0, maximum=2.0, step=0.01, value=1.0, label="Repetition Penalty")
+                top_p = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.9, label="Top-p Sampling")
+                top_k = gr.Slider(minimum=0, maximum=100, step=1, value=40, label="Top-k Sampling")
+
+            btn_stop.click(fn=stop_generation, inputs=None, outputs=None)
+            btn_chat.click(
+                fn=respond,
+                inputs=[prompt, image, temperature, repetition_penalty, top_p, top_k, chatbot],
+                outputs=chatbot
+            )
+
+        demo.launch(server_name="0.0.0.0", server_port=7860)
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)  # adjust as needed
+    chat_interface()

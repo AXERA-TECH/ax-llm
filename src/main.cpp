@@ -1,11 +1,18 @@
-#include "signal.h"
+#include <signal.h>
+#include <opencv2/opencv.hpp>
 
 #include "runner/LLM.hpp"
-
 #include "cmdline.hpp"
+#include "string_utility.hpp"
 
+#define IS_AXCL 0
+
+#if IS_AXCL
+#include <axcl.h>
+#else
 #include <ax_sys_api.h>
 #include <ax_engine_api.h>
+#endif
 
 static LLM lLaMa;
 
@@ -21,106 +28,6 @@ void llm_running_callback(int *p_token, int n_token, const char *p_str, float to
     fflush(stdout);
 }
 
-std::string prompt_complete(std::string prompt, TokenizerType tokenizer_type)
-{
-    std::ostringstream oss_prompt;
-    switch (tokenizer_type)
-    {
-    case TKT_HTTP:
-        oss_prompt << prompt;
-        break;
-    default:
-        ALOGE("tokenizer type %d not support", tokenizer_type);
-        break;
-    }
-
-    return oss_prompt.str();
-}
-
-bool save_kvcache(std::string target_path, std::string system_prompt, int precompute_len, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches)
-{
-    for (size_t i = 0; i < k_caches.size(); i++)
-    {
-        std::string k_cache_path = target_path + "/k_cache_" + std::to_string(i) + ".bin";
-        std::string v_cache_path = target_path + "/v_cache_" + std::to_string(i) + ".bin";
-        std::ofstream k_cache_file(k_cache_path);
-        std::ofstream v_cache_file(v_cache_path);
-        if (!k_cache_file.is_open() || !v_cache_file.is_open())
-        {
-            ALOGE("save kvcache failed");
-            return false;
-        }
-        k_cache_file.write((char *)k_caches[i].data(), k_caches[i].size() * sizeof(unsigned short));
-        v_cache_file.write((char *)v_caches[i].data(), v_caches[i].size() * sizeof(unsigned short));
-        k_cache_file.close();
-        v_cache_file.close();
-    }
-    nlohmann::json j;
-    j["system_prompt"] = system_prompt;
-    j["precompute_len"] = precompute_len;
-    std::string config_path = target_path + "/config.json";
-    std::ofstream config_file(config_path);
-    config_file << j.dump();
-    config_file.close();
-    return true;
-}
-
-bool load_kvcache(std::string target_path, int axmodel_num, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, std::string &system_prompt, int &precompute_len)
-{
-    k_caches.resize(axmodel_num);
-    v_caches.resize(axmodel_num);
-    for (size_t i = 0; i < k_caches.size(); i++)
-    {
-        std::string k_cache_path = target_path + "/k_cache_" + std::to_string(i) + ".bin";
-        std::string v_cache_path = target_path + "/v_cache_" + std::to_string(i) + ".bin";
-        if (file_exist(k_cache_path) && file_exist(v_cache_path))
-        {
-            std::vector<unsigned short> k_cache;
-            std::vector<unsigned short> v_cache;
-            std::ifstream k_cache_file(k_cache_path);
-            std::ifstream v_cache_file(v_cache_path);
-
-            k_cache_file.seekg(0, std::ios::end);
-            k_cache.resize(k_cache_file.tellg() / sizeof(unsigned short));
-            k_cache_file.seekg(0, std::ios::beg);
-
-            v_cache_file.seekg(0, std::ios::end);
-            v_cache.resize(v_cache_file.tellg() / sizeof(unsigned short));
-            v_cache_file.seekg(0, std::ios::beg);
-
-            k_cache_file.read((char *)k_cache.data(), k_cache.size() * sizeof(unsigned short));
-            v_cache_file.read((char *)v_cache.data(), v_cache.size() * sizeof(unsigned short));
-
-            k_cache_file.close();
-            v_cache_file.close();
-            k_caches[i] = k_cache;
-            v_caches[i] = v_cache;
-        }
-        else
-        {
-            ALOGE("k_cache %s or v_cache %s not exist", k_cache_path.c_str(), v_cache_path.c_str());
-            return false;
-        }
-    }
-
-    std::string config_path = target_path + "/config.json";
-    if (file_exist(config_path))
-    {
-        std::ifstream config_file(config_path);
-        nlohmann::json j;
-        config_file >> j;
-        system_prompt = j["system_prompt"].get<std::string>();
-        precompute_len = j["precompute_len"].get<int>();
-        config_file.close();
-    }
-    else
-    {
-        ALOGE("config %s not exist", config_path.c_str());
-        return false;
-    }
-    return true;
-}
-
 int main(int argc, char *argv[])
 {
     signal(SIGPIPE, SIG_IGN);
@@ -128,50 +35,72 @@ int main(int argc, char *argv[])
     LLMAttrType attr;
     std::string prompt = "Hi";
     bool b_continue = true;
-    std::string kvcache_path;
 
     cmdline::parser cmd;
-    cmd.add<std::string>("system_prompt", 0, "system prompt", false, attr.system_prompt);
-    cmd.add<std::string>("kvcache_path", 0, "kvcache path", false, kvcache_path);
+
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
-    cmd.add<std::string>("url_tokenizer_model", 0, "tokenizer model path", false, attr.url_tokenizer_model);
+    cmd.add<std::string>("filename_tokenizer_txt", 0, "tokenizer txt path", false, attr.filename_tokenizer_txt);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
+
+    cmd.add<std::string>("filename_image_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodedl);
 
     cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
     // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
     cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
     cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
+    cmd.add<int>("img_width", 0, "image width", false, attr.image_encoder_width);
+    cmd.add<int>("img_height", 0, "image height", false, attr.image_encoder_height);
 
     cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
+
+    // cmd.add<int>("image_context", 0, "image context, 151667 for InternVL 2.5/3, 92546 for InternVL 2.5-8B-MPO", false, attr.IMAGE_CONTEXT);
+    // cmd.add<int>("image_start_context", 0, "image start context, 151665 for InternVL 2.5/3, 92544 for InternVL 2.5-8B-MPO", false, attr.IMAGE_START_CONTEXT);
+
+#if IS_AXCL
+    cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
+#endif
 
     cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
 
     cmd.parse_check(argc, argv);
 
-    attr.system_prompt = cmd.get<std::string>("system_prompt");
-    kvcache_path = cmd.get<std::string>("kvcache_path");
-    attr.url_tokenizer_model = cmd.get<std::string>("url_tokenizer_model");
+    // prompt = cmd.get<std::string>("prompt");
+    // auto image_prompt = cmd.get<std::string>("image");
+    attr.filename_tokenizer_txt = cmd.get<std::string>("filename_tokenizer_txt");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
     // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
     // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
 
+    attr.filename_image_encoder_axmodedl = cmd.get<std::string>("filename_image_encoder_axmodedl");
     attr.axmodel_num = cmd.get<int>("axmodel_num");
     attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
     attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
+    // attr.IMAGE_CONTEXT = cmd.get<int>("image_context");
+    // attr.IMAGE_START_CONTEXT = cmd.get<int>("image_start_context");
 
     attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
 
-    bool b_live_print = cmd.get<bool>("live_print");
-    if (b_live_print)
+#if IS_AXCL
+    auto devices_str = cmd.get<std::string>("devices");
+    std::vector<int> devices;
+    std::stringstream ss(devices_str);
+    std::string item;
+    while (std::getline(ss, item, ','))
     {
-        attr.runing_callback = llm_running_callback;
-        attr.reserve = 0;
+        devices.push_back(std::stoi(item));
     }
 
-    // 1. init engine
+    attr.dev_ids = devices;
+
+    auto ret = axclInit(nullptr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#else
     AX_ENGINE_NPU_ATTR_T npu_attr;
     memset(&npu_attr, 0, sizeof(npu_attr));
     npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
@@ -181,52 +110,33 @@ int main(int argc, char *argv[])
     {
         return ret;
     }
+#endif
+
+    bool b_live_print = cmd.get<bool>("live_print");
+    if (b_live_print)
+    {
+        attr.runing_callback = llm_running_callback;
+        attr.reserve = 0;
+    }
 
     if (!lLaMa.Init(attr))
     {
         ALOGE("lLaMa.Init failed");
+#if IS_AXCL
+        axclFinalize();
+#else
         AX_ENGINE_Deinit();
         AX_SYS_Deinit();
+#endif
         return -1;
     }
 
-    //
+    std::vector<unsigned short> prompt_data;
+
     if (b_continue)
     {
         printf("Type \"q\" to exit, Ctrl+c to stop current running\n");
-        // lLaMa.Reset();
     }
-    std::vector<unsigned short> prompt_data;
-    std::string last_reply;
-    std::vector<std::vector<unsigned short>> k_caches, v_caches;
-    int precompute_len = 0;
-
-    std::vector<int> _token_ids;
-    lLaMa.SetSystemPrompt(attr.system_prompt, _token_ids);
-
-    if (!kvcache_path.empty() && kvcache_path != "")
-    {
-        if (load_kvcache(kvcache_path, attr.axmodel_num, k_caches, v_caches, attr.system_prompt, precompute_len))
-        {
-            ALOGI("load kvcache from path: %s success,precompute_len: %d", kvcache_path.c_str(), precompute_len);
-        }
-        else
-        {
-            ALOGW("load kvcache from path: %s failed,generate kvcache", kvcache_path.c_str());
-            lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
-            if (!save_kvcache(kvcache_path, attr.system_prompt, precompute_len, k_caches, v_caches))
-            {
-                ALOGE("save kvcache failed");
-            }
-            ALOGI("generate kvcache to path: %s", kvcache_path.c_str());
-        }
-    }
-    else
-    {
-        lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
-    }
-    ALOGI("precompute_len: %d", precompute_len);
-    ALOGI("system_prompt: %s", attr.system_prompt.c_str());
 
     while (b_continue)
     {
@@ -241,30 +151,91 @@ int main(int argc, char *argv[])
         {
             continue;
         }
-        if (prompt == "reset")
+
+        printf("image >> ");
+        fflush(stdout);
+        std::string image_prompt;
+        std::getline(std::cin, image_prompt);
+        std::string output;
+        if (image_prompt == "")
         {
-            ALOGI("reset kvcache");
-            lLaMa.SetSystemPrompt(attr.system_prompt, _token_ids);
-            lLaMa.GenerateKVCachePrefill(_token_ids, k_caches, v_caches, precompute_len);
-            continue;
+            lLaMa.Encode(prompt_data, prompt);
+            output = lLaMa.Run(prompt_data);
         }
-        std::vector<int> tokens_ids, tokens_diff;
-        lLaMa.Encode(prompt_data, prompt_complete(prompt, attr.tokenizer_type), last_reply, tokens_ids, tokens_diff);
-        if (auto ret = lLaMa.SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size()); ret != 0)
+        else
         {
-            ALOGE("SetKVCache failed: %d,the context may be full,input \"reset\" to reset context", ret);
-            continue;
+            if (string_utility<std::string>::ends_with(image_prompt, ".txt"))
+            {
+                std::vector<std::string> lines;
+                std::ifstream ifs(image_prompt);
+                while (std::getline(ifs, image_prompt))
+                {
+                    lines.push_back(image_prompt);
+                }
+                ifs.close();
+
+                std::vector<cv::Mat> imgs;
+                for (auto &line : lines)
+                {
+                    cv::Mat src = cv::imread(line);
+                    if (src.empty())
+                    {
+                        ALOGE("image prompt(%s) not found", line.c_str());
+                        continue;
+                    }
+                    imgs.push_back(src);
+                }
+                std::vector<std::vector<unsigned short>> imgs_embed;
+                if (auto ret = lLaMa.Encode(imgs, imgs_embed); ret != 0)
+                {
+                    ALOGE("lLaMa.Encode failed");
+                    continue;
+                }
+                if (auto ret = lLaMa.Encode(imgs_embed, prompt_data, prompt); ret != 0)
+                {
+                    ALOGE("lLaMa.Encode failed");
+                    continue;
+                }
+                output = lLaMa.Run(prompt_data);
+            }
+            else
+            {
+                cv::Mat src = cv::imread(image_prompt);
+                if (src.empty())
+                {
+                    ALOGE("image prompt(%s) not found", image_prompt.c_str());
+                    continue;
+                }
+                else
+                {
+                    std::vector<unsigned short> img_embed;
+                    if (auto ret = lLaMa.Encode(src, img_embed); ret != 0)
+                    {
+                        ALOGE("lLaMa.Encode failed");
+                        continue;
+                    }
+                    if (auto ret = lLaMa.Encode(img_embed, prompt_data, prompt); ret != 0)
+                    {
+                        ALOGE("lLaMa.Encode failed");
+                        continue;
+                    }
+                    output = lLaMa.Run(prompt_data);
+                }
+            }
         }
-        last_reply = lLaMa.Run(prompt_data);
-        lLaMa.GetKVCache(k_caches, v_caches, precompute_len);
 
         if (!b_live_print)
-            printf("%s\n", last_reply.c_str());
+            printf("%s\n", output.c_str());
     }
 
     lLaMa.Deinit();
-    
+
+#if IS_AXCL
+    axclFinalize();
+#else
     AX_ENGINE_Deinit();
     AX_SYS_Deinit();
+#endif
+
     return 0;
 }

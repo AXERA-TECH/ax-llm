@@ -23,6 +23,25 @@ public:
         _use_mmap = use_mmap;
         if (use_mmap)
         {
+             std::ifstream fin(embed_path);
+            if (!fin.is_open())
+            {
+                ALOGE("embed file(%s) open failed", embed_path.c_str());
+                return false;
+            }
+
+            // get file size
+            fin.seekg(0, std::ios::end);
+            int file_size = fin.tellg();
+            fin.seekg(0, std::ios::beg);
+            if (file_size != token_num * embed_size * 2)
+            {
+                ALOGE("embed file(%s) size(%d) not equal token_num(%d) * embed_size(%d) * 2", embed_path.c_str(), file_size, token_num, embed_size);
+                return false;
+            }
+            fin.close();
+
+
             ALOGI("LLaMaEmbedSelector use mmap");
             if (!_embed_map.open_file(embed_path.c_str()))
             {
@@ -82,6 +101,24 @@ public:
         }
     }
 
+    unsigned short *getPtrByIndex(unsigned int index)
+    {
+        if (index >= _token_num)
+        {
+            ALOGE("index(%d) > token_num(%d)", index, _token_num);
+            return nullptr;
+        }
+        if (_use_mmap)
+        {
+            unsigned short *ptr = (unsigned short *)_embed_map.data();
+            return ptr + index * _embed_size;
+        }
+        else
+        {
+            return _embeds.data() + index * _embed_size;
+        }
+    }
+
     void getByIndex(unsigned int index, unsigned short *embed)
     {
         if (index >= _token_num)
@@ -89,7 +126,7 @@ public:
             ALOGE("index(%d) > token_num(%d)", index, _token_num);
             return;
         }
-        
+
         if (_use_mmap)
         {
             unsigned short *ptr = (unsigned short *)_embed_map.data();

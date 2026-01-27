@@ -10,17 +10,6 @@
 
 **AX-LLM** 由 **[爱芯元智](https://www.axera-tech.com/)** 主导开发。该项目用于探索业界常用 **LLM(Large Language Model)** 在已有芯片平台上落地的可行性和相关能力边界，**方便**社区开发者进行**快速评估**和**二次开发**自己的 **LLM 应用**。
 
-### 分支说明
-
-- [ax-context(default)](https://github.com/AXERA-TECH/ax-llm/tree/ax-context)
-  - AX650A/AX650N/AX8850/AX630C Host 运行 LLM 使用
-- [ax-internvl](https://github.com/AXERA-TECH/ax-llm/tree/ax-internvl)
-  - AX650A/AX650N/AX8850/AX630C Host 运行 InternVL 系列使用
-- [axcl-context](https://github.com/AXERA-TECH/ax-llm/tree/axcl-context)
-  - AX650N/AX8850 EP 的主控运行 LLM 系列使用
-- [axcl-internvl](https://github.com/AXERA-TECH/ax-llm/tree/axcl-internvl)
-  - AX650N/AX8850 EP 的主控运行 InternVL 系列使用
-
 ### 已支持芯片
 
 - AX650A/AX650N
@@ -30,176 +19,107 @@
 
 ### 已支持模型
 
-- Qwen2.5
-- Qwen3
-- MiniCPM
-- SmolLM2
-- Llama3
+- FastVLM-0.5B
+- FastVLM-1.5B
+- FastVLM-1.5B-GPTQ-Int4
 
 ### 获取地址
 
-我们的 ModelZoo 已迁移到 [Huggingface](https://huggingface.co/AXERA-TECH), 例如：
-
-- [Qwen2.5-7B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-7B-Instruct)
-- [Qwen2.5-1.5B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-1.5B-Instruct)
+- [Huggingface](https://huggingface.co/AXERA-TECH)
+  - [FastVLM-0.5B](https://huggingface.co/AXERA-TECH/FastVLM-0.5B) 
+  - [FastVLM-1.5B](https://huggingface.co/AXERA-TECH/FastVLM-1.5B)
+  - [FastVLM-1.5B-GPTQ-Int4](https://huggingface.co/AXERA-TECH/FastVLM-1.5B-GPTQ-Int4)
 
 ## 源码编译
 
-- clone 本项目
+- 在 Host 上下载 axcl llm 对应分支
     ```shell
-    git clone --recursive https://github.com/AXERA-TECH/ax-llm.git
+    git clone --recurse-submodules --shallow-submodules --depth 1 -b ax-fastvlm https://github.com/Nnow2024/ax-llm.git
     cd ax-llm
     ```
-- 仔细阅读 `build.sh` ，并在 `build.sh` 正确修改 `BSP_MSP_DIR` 变量后，运行编译脚本
+- 本地编译
     ```shell
+    sudo apt install libopencv-dev build-essential 
     ./build.sh
     ```
-- 正确编译后，`build/install/` 目录
+- 正确编译后，`build/install/bin` 目录
   ```
-  $ tree install
-    install
-    └── bin
-        ├── gradio_demo.py
-        ├── main
-        ├── main_api
-        └── qwen2.5_tokenizer_uid.py
+  $ tree install/bin/
+    install/bin/
+    ├── main
+    ├── main_api
   ```
-
   其中 `main` 就是 Huggingface 仓库中对应的 `main_ax650`
   
 ## 运行示例
 
-### Qwen2.5-1.5B-Instruct
-
-#### 运行支持上下文的 tokenizer 服务器
+### FastVLM-1.5B-GPTQ-Int4
 
 ```shell
-python qwen2.5_tokenizer_uid.py 
-Server running at http://127.0.0.1:12345
-```
+root@ax650:~/FastVLM-1.5B-GPTQ-Int4# ./run_ax650_1024.sh
+[I][                            Init][ 134]: LLM init start
+tokenizer_type = 3
+  6% | ███                               |   2 /  31 [1.09s<16.97s, 1.83 count/s] embed_selector init ok
+100% | ████████████████████████████████ |  31 /  31 [3.39s<3.39s, 9.14 count/s] init post axmodel ok,remain_cmm(8619 MB)[I][                            Init][ 284]: image encoder input nhwc@uint8
+[I][                            Init][ 308]: image encoder output float32
 
-#### 运行命令行 llm
-```shell
-./run_qwen2.5_1.5b_ctx_ax650.sh 
-[I][                            Init][ 110]: LLM init start
-[I][                            Init][  34]: connect http://127.0.0.1:12345 ok
-[I][                            Init][  57]: uid: 4bba0928-fada-4329-903e-3b6e52d68791
-bos_id: -1, eos_id: 151645
-100% | ████████████████████████████████ |  31 /  31 [18.94s<18.94s, 1.64 count/s] init post axmodel ok,remain_cmm(1464 MB)
-[I][                            Init][ 188]: max_token_len : 2559
-[I][                            Init][ 193]: kv_cache_size : 256, kv_cache_num: 2559
-[I][                            Init][ 201]: prefill_token_num : 128
-[I][                            Init][ 205]: grp: 1, prefill_max_token_num : 1
-[I][                            Init][ 205]: grp: 2, prefill_max_token_num : 512
-[I][                            Init][ 205]: grp: 3, prefill_max_token_num : 1024
-[I][                            Init][ 205]: grp: 4, prefill_max_token_num : 1536
-[I][                            Init][ 205]: grp: 5, prefill_max_token_num : 2048
-[I][                            Init][ 209]: prefill_max_token_num : 2048
-[I][                     load_config][ 282]: load config: 
+[I][                            Init][ 318]: image_encoder_height : 1024, image_encoder_width: 1024
+[I][                            Init][ 320]: max_token_len : 1024
+[I][                            Init][ 323]: kv_cache_size : 256, kv_cache_num: 1024
+[I][                            Init][ 331]: prefill_token_num : 128
+[I][                            Init][ 335]: grp: 1, prefill_max_token_num : 1
+[I][                            Init][ 335]: grp: 2, prefill_max_token_num : 128
+[I][                            Init][ 335]: grp: 3, prefill_max_token_num : 256
+[I][                            Init][ 335]: grp: 4, prefill_max_token_num : 512
+[I][                            Init][ 335]: grp: 5, prefill_max_token_num : 640
+[I][                            Init][ 339]: prefill_max_token_num : 640
+[I][                     load_config][ 282]: load config:
 {
     "enable_repetition_penalty": false,
     "enable_temperature": true,
     "enable_top_k_sampling": true,
     "enable_top_p_sampling": false,
-    "penalty_window": 20,
-    "repetition_penalty": 1.2,
-    "temperature": 0.9,
+    "penalty_window": 30,
+    "repetition_penalty": 2,
+    "temperature": 0.1,
     "top_k": 10,
     "top_p": 0.8
 }
 
-[I][                            Init][ 218]: LLM init ok
+[I][                            Init][ 348]: LLM init ok
 Type "q" to exit, Ctrl+c to stop current running
-[I][          GenerateKVCachePrefill][ 271]: input token num : 21, prefill_split_num : 1 prefill_grpid : 2
-[I][          GenerateKVCachePrefill][ 308]: input_num_token:21
-[I][                            main][ 230]: precompute_len: 21
-[I][                            main][ 231]: system_prompt: You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
-prompt >> hello,my name is allen,who are you
-[I][                      SetKVCache][ 531]: prefill_grpid:2 kv_cache_num:512 precompute_len:21 input_num_token:18
-[I][                      SetKVCache][ 534]: current prefill_max_token_num:1920
-[I][                             Run][ 660]: input token num : 18, prefill_split_num : 1
-[I][                             Run][ 686]: input_num_token:18
-[I][                             Run][ 829]: ttft: 539.49 ms
-Hello Allen! I'm sorry, but I'm an AI language model and I don't have a name. I'm just here to help you with any questions or information you need. How can I assist you today?
+prompt >> who are you
+image >>
+[I][                          Encode][ 470]: input_ids size: 22
+[I][                             Run][ 604]: input token num : 22, prefill_split_num : 1
+[I][                             Run][ 619]: prefill grpid 2
+[I][                             Run][ 646]: input_num_token:22
+[I][                             Run][ 770]: ttft: 128.29 ms
+I am an AI language model, I am here to help answer any questions you may have. How can I assist you today?
 
-[N][                             Run][ 943]: hit eos,avg 10.80 token/s
+[N][                             Run][ 879]: hit eos,avg 19.84 token/s
 
-[I][                      GetKVCache][ 500]: precompute_len:83, remaining:1965
-prompt >> 我叫什么名字
-[I][                      SetKVCache][ 531]: prefill_grpid:2 kv_cache_num:512 precompute_len:83 input_num_token:12
-[I][                      SetKVCache][ 534]: current prefill_max_token_num:1920
-[I][                             Run][ 660]: input token num : 12, prefill_split_num : 1
-[I][                             Run][ 686]: input_num_token:12
-[I][                             Run][ 829]: ttft: 538.67 ms
-你的名字是Allen。
+prompt >> describe the image
+image >> ./images/ssd_horse.jpg
+[I][                          Encode][ 442]: image encode time : 232.04 ms, size : 393216
+[I][                          Encode][ 496]: imgs_embed.size() : 1, media token size : 256
+[I][                             Run][ 604]: input token num : 280, prefill_split_num : 3
+[I][                             Run][ 619]: prefill grpid 4
+[I][                             Run][ 646]: input_num_token:128
+[I][                             Run][ 646]: input_num_token:128
+[I][                             Run][ 646]: input_num_token:24
+[I][                             Run][ 770]: ttft: 417.89 ms
+In the image, a young man is riding a brown horse in a fenced area. The horse is standing still, and the rider is holding the reins. The horse has a white blaze on its face and is wearing a bridle. The rider is wearing a blue hoodie and jeans. In front of the horse, there is a brown dog standing on the ground, looking up at the horse. In the background, there is a silver pickup truck parked near a fence. There are also some trees and other people visible in the background. The ground is covered with dirt.
 
-[N][                             Run][ 943]: hit eos,avg 10.57 token/s
+[N][                             Run][ 879]: hit eos,avg 19.85 token/s
 
-[I][                      GetKVCache][ 500]: precompute_len:100, remaining:1948
-
+prompt >> q
 ```
-
-#### 运行api以及gradio demo
-##### 启动服务器
-```shell
-./run_qwen2.5_1.5b_ctx_ax650_api.sh 
-[I][                            Init][ 110]: LLM init start
-[I][                            Init][  34]: connect http://10.126.33.124:12345 ok
-[I][                            Init][  57]: uid: 13c64c2a-9b4e-4875-91f4-fa9f426e3726
-bos_id: -1, eos_id: 151645
-  3% | ██                                |   1 /  31 [0.15s<4.77s, 6.49 count/s] tokenizer init ok[I][                            Init][  26]: LLaMaEmbedSelector use mmap
-100% | ████████████████████████████████ |  31 /  31 [2.97s<2.97s, 10.44 count/s] init post axmodel ok,remain_cmm(1464 MB)[I][                            Init][ 188]: max_token_len : 2559
-[I][                            Init][ 193]: kv_cache_size : 256, kv_cache_num: 2559
-[I][                            Init][ 201]: prefill_token_num : 128
-[I][                            Init][ 205]: grp: 1, prefill_max_token_num : 1
-[I][                            Init][ 205]: grp: 2, prefill_max_token_num : 512
-[I][                            Init][ 205]: grp: 3, prefill_max_token_num : 1024
-[I][                            Init][ 205]: grp: 4, prefill_max_token_num : 1536
-[I][                            Init][ 205]: grp: 5, prefill_max_token_num : 2048
-[I][                            Init][ 209]: prefill_max_token_num : 2048
-[I][                     load_config][ 282]: load config: 
-{
-    "enable_repetition_penalty": false,
-    "enable_temperature": true,
-    "enable_top_k_sampling": true,
-    "enable_top_p_sampling": false,
-    "penalty_window": 20,
-    "repetition_penalty": 1.2,
-    "temperature": 0.9,
-    "top_k": 10,
-    "top_p": 0.8
-}
-
-[I][                            Init][ 218]: LLM init ok
-Server running on port 8000...
-```
-获取板端 ip，并修改 gradio 代码中的 ip 地址
-```
-import time
-import gradio as gr
-import requests
-import json
-
-# Base URL of your API server; adjust host and port as needed
-API_URL = "http://x.x.x.x:8000"
-...
-
-```
-运行 gradio_demo.py
-```
-python gradio_demo.py 
-/home/axera/ax-llm/scripts/gradio_demo.py:102: UserWarning: You have not specified a value for the `type` parameter. Defaulting to the 'tuples' format for chatbot messages, but this is deprecated and will be removed in a future version of Gradio. Please set type='messages' instead, which uses openai-style dictionaries with 'role' and 'content' keys.
-  chatbot = gr.Chatbot(elem_id="chatbox", label="Axera Chat",height=500)
-* Running on local URL:  http://0.0.0.0:7860
-
-To create a public link, set `share=True` in `launch()`.
-```
-
-![](scripts/gradio_demo.png)
 
 ## Reference
 
-- [Qwen](https://huggingface.co/Qwen)
+- [FastVLM-0.5B](https://huggingface.co/apple/FastVLM-0.5B)
+- [FastVLM-1.5B](https://huggingface.co/apple/FastVLM-1.5B)
 
 ## 技术讨论
 
