@@ -32,9 +32,9 @@
 
 ## 源码编译
 
-- 在 Host 上下载 ax llm 对应分支
+- 在 Host 上下载 axcl llm 对应分支
     ```shell
-    git clone --recurse-submodules --shallow-submodules --depth 1 -b ax-fastvlm https://github.com/AXERA-TECH/ax-llm.git
+    git clone --recurse-submodules --shallow-submodules --depth 1 -b ax-fastvlm https://github.com/Nnow2024/ax-llm.git
     cd ax-llm
     ```
 - 本地编译
