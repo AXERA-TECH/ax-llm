@@ -26,7 +26,7 @@
 即可以交叉编译，也可以在开发板上编译。    
 -  clone 本项目  
     ```shell
-    git clone --recurse-submodules --shallow-submodules --depth 1 -b axcl-fastvlm https://github.com/Nnow2024/ax-llm.git
+    git clone --recurse-submodules --shallow-submodules --depth 1 -b axcl-fastvlm https://github.com/AXERA-TECH/ax-llm.git
     cd ax-llm
     ```
 - 编译  
@@ -40,6 +40,7 @@
     ├── main
     ├── main_api
   ```
+这里的main就是huggingface预编译仓库中的main_axcl_x86。
 
 ## 运行示例
 ### 1. 设置环境变量
