@@ -77,8 +77,6 @@ public:
     bool gllm_init = false;
     bool gllm_initing = false;
 
-    std::vector<Content> history;
-
 private:
     using Task = std::function<void()>;
     std::thread worker_thread;
@@ -86,11 +84,6 @@ private:
     std::mutex queue_mutex;
     std::condition_variable condition;
     std::atomic<bool> stop_flag;
-
-    void reset()
-    {
-        // std::vector<unsigned short>().swap(prompt_data);
-    }
 
     void run()
     {
@@ -165,44 +158,24 @@ public:
         }
     }
 
-    void ResetSync(std::string system_prompt)
-    {
-        if (gllm_runing)
-        {
-            return;
-        }
-        gllm_runing = true;
-
-        gllm.ResetKVCache();
-        history = {{SYSTEM, TEXT, system_prompt}};
-        gllm_runing = false;
-    }
-
-    void ResetASync(std::string system_prompt)
-    {
-        addTask([this, system_prompt]()
-                { ResetSync(system_prompt); });
-    }
-
     // **支持带参数的任务**
-    void RunAsync(std::string prompt)
+    void RunAsync(std::vector<Content> history)
     {
-        addTask([this, prompt]()
-                { RunSync(prompt, llm_running_callback); });
+        addTask([this, history]()
+                { RunSync(history, llm_running_callback); });
     }
 
-    std::string RunSync(std::string prompt, LLMRuningCallback cb)
+    std::string RunSync(std::vector<Content> history, LLMRuningCallback cb)
     {
         gllm_runing = true;
         gllm.getAttr()->runing_callback = cb;
 
-        history.push_back({USER, TEXT, prompt});
         history = gllm.Run(history);
+        gllm.ResetKVCache();
 
         gllm_runing = false;
         g_msg_cv.notify_all(); // 唤醒 content_provider_stream 的等待
         std::cout << "Chat result: " << history.back().data << std::endl;
-        reset();
         return history.back().data;
     }
 };
@@ -343,38 +316,16 @@ void set_llm_config(nlohmann::json &body)
     }
 }
 
-void content_provider(const httplib::Request &req, httplib::Response &res)
-{
-    std::lock_guard<std::mutex> tmp_locker(g_msg_locker);
-    std::string bot_response;
-
-    while (!g_msg_queue.empty())
-    {
-        auto str = g_msg_queue.front(); // 用 front 取出
-        g_msg_queue.pop();
-
-        bot_response += str;
-    }
-
-    // 最后发送 done=true
-    nlohmann::json chunk;
-    chunk["response"] = bot_response; // 最后不再补发内容，避免重复
-    if (worker.gllm_runing)
-        chunk["done"] = false;
-    else
-        chunk["done"] = true;
-
-    res.status = 200;
-    res.set_content(chunk.dump(), "application/json");
-}
-
 bool content_provider_stream(size_t /*offset*/, httplib::DataSink &sink)
 {
     auto send_sse = [&](const std::string &json_str)
     {
-        sink.write("data: ", 6);
-        sink.write(json_str.data(), json_str.size());
-        sink.write("\n\n", 2);
+        if (sink.is_writable())
+        {
+            sink.write("data: ", 6);
+            sink.write(json_str.data(), json_str.size());
+            sink.write("\n\n", 2);
+        }
     };
 
     const std::string id = "cmpl-" + std::to_string(std::time(nullptr));
@@ -457,7 +408,7 @@ bool content_provider_stream(size_t /*offset*/, httplib::DataSink &sink)
     return true;
 }
 
-bool handle_body(const nlohmann::json &body, std::string &prompt, std::vector<std::string> &image_paths, bool &b_video, bool &stream)
+bool handle_body(const nlohmann::json &body, std::vector<Content> &history, bool &stream)
 {
     if (body.contains("stream") && body["stream"].is_boolean())
     {
@@ -468,53 +419,68 @@ bool handle_body(const nlohmann::json &body, std::string &prompt, std::vector<st
 
     nlohmann::json messages = body["messages"];
 
-    if (messages.contains("role") &&
-        messages["role"] == "user" &&
-        messages.contains("content"))
+    for (auto &item : messages)
     {
-        if (messages["content"].is_array())
+        Content content;
+        content.type = TEXT;
+        if (item.contains("role") && item["role"] == "system")
         {
-            for (auto &item : messages["content"])
-            {
-                if (item.contains("type") && item["type"] == "text")
-                {
-                    prompt = item["text"];
-                }
-                else if (item.contains("type") && item["type"] == "image_url")
-                {
-                    if (item["image_url"].is_array())
-                    {
-                        if (item.contains("is_video") && item["is_video"].is_boolean())
-                        {
-                            b_video = item["is_video"];
-                        }
-                        for (auto &img : item["image_url"])
-                        {
-                            image_paths.push_back(img);
-                        }
-                    }
-                    else
-                    {
-                        image_paths.push_back(item["image_url"]);
-                    }
-                }
-            }
+            content.role = SYSTEM;
         }
-        else if (messages["content"].is_string())
+        else if (item.contains("role") && item["role"] == "user")
         {
-            prompt = messages["content"];
+            content.role = USER;
+        }
+        else if (item.contains("role") && item["role"] == "assistant")
+        {
+            content.role = ASSISTANT;
         }
         else
         {
             ALOGE("content type not support");
             return false;
         }
+
+        if (item.contains("content") && item["content"].is_string())
+        {
+            content.data = item["content"];
+        }
+        else if (item.contains("content") && item["content"].is_array())
+        {
+            for (auto &item : item["content"])
+            {
+                if (item.contains("type") && item["type"] == "text")
+                {
+                    content.data += item["text"];
+                }
+            }
+        }
+        else
+        {
+            ALOGE("content type not support");
+            return false;
+        }
+        history.push_back(content);
     }
-    else
+
+    for (auto &content : history)
     {
-        ALOGE("content type not support");
-        return false;
+        switch (content.role)
+        {
+        case SYSTEM:
+            printf("\33[33msystem:%s\33[0m\n", content.data.c_str());
+            break;
+        case USER:
+            printf("\33[32muser:%s\33[0m\n", content.data.c_str());
+            break;
+        case ASSISTANT:
+            printf("\33[34massistant:%s\33[0m\n", content.data.c_str());
+            break;
+        default:
+            break;
+        }
     }
+
     return true;
 }
 
@@ -545,23 +511,21 @@ void handle_generate(const httplib::Request &req, httplib::Response &res)
 
     set_llm_config(body);
 
-    std::string prompt;
-    std::vector<std::string> image_paths;
-    bool b_video = false;
+    printf("body:\n%s\n", body.dump(4).c_str());
+
+    std::vector<Content> history;
     bool stream = false;
-    if (!handle_body(body, prompt, image_paths, b_video, stream))
+    if (!handle_body(body, history, stream))
     {
         res.status = 400;
         res.set_content("{\"error\": \"Invalid request format\"}", "application/json");
         return;
     }
 
-    ALOGI("prompt:%s  stream:%d", prompt.c_str(), stream);
-
     if (stream)
     {
         worker.gllm_runing = true;
-        worker.RunAsync(prompt);
+        worker.RunAsync(history);
 
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
@@ -573,7 +537,7 @@ void handle_generate(const httplib::Request &req, httplib::Response &res)
     }
     else
     {
-        auto output = worker.RunSync(prompt, nullptr);
+        auto output = worker.RunSync(history, nullptr);
 
         nlohmann::json response;
         response["id"] = "cmpl-" + std::to_string(std::time(nullptr));
@@ -589,44 +553,15 @@ void handle_generate(const httplib::Request &req, httplib::Response &res)
         choice["finish_reason"] = "stop";
 
         response["choices"] = nlohmann::json::array({choice});
-        // 可选：统计用
-        response["usage"] = {
-            {"prompt_tokens", prompt.size()},
-            {"completion_tokens", output.size()},
-            {"total_tokens", prompt.size() + output.size()}};
+        // // 可选：统计用
+        // response["usage"] = {
+        //     {"prompt_tokens", prompt.size()},
+        //     {"completion_tokens", output.size()},
+        //     {"total_tokens", prompt.size() + output.size()}};
 
         res.status = 200;
         res.set_content(response.dump(), "application/json");
     }
-}
-
-void handle_reset(const httplib::Request &req, httplib::Response &res)
-{
-    auto body = nlohmann::json::parse(req.body, nullptr, false);
-    if (body.is_discarded())
-    {
-        ALOGE("Invalid request format, body is discarded %s", req.body.c_str());
-        res.status = 400;
-        res.set_content("{\"error\": \"Invalid request format\"}", "application/json");
-        return;
-    }
-    std::string system_prompt;
-    if (body.contains("system_prompt"))
-    {
-        system_prompt = body["system_prompt"];
-    }
-
-    if (!check_model_available(req, res))
-    {
-        ALOGE("model not available");
-        return;
-    }
-
-    worker.ResetASync(system_prompt);
-
-    res.status = 200;
-    res.set_content("{\"status\": \"ok\"}", "application/json");
-    return;
 }
 
 void handle_stop(const httplib::Request &req, httplib::Response &res)
@@ -645,7 +580,6 @@ int main(int argc, char *argv[])
 
     LLMAttrType attr;
     cmdline::parser cmd;
-    cmd.add<std::string>("system_prompt", 0, "system prompt", false, attr.system_prompt);
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<std::string>("url_tokenizer_model", 0, "tokenizer model path", false, attr.url_tokenizer_model);
@@ -663,7 +597,6 @@ int main(int argc, char *argv[])
 #endif
     cmd.parse_check(argc, argv);
 
-    attr.system_prompt = cmd.get<std::string>("system_prompt");
     attr.url_tokenizer_model = cmd.get<std::string>("url_tokenizer_model");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
@@ -729,8 +662,6 @@ int main(int argc, char *argv[])
     // svr.Get("/v1/generate_provider", content_provider);
     // svr.Post("/v1/chat", handle_chat);
     // svr.Post("/v1/upload", handle_upload);
-
-    svr.Post("/v1/reset", handle_reset);
 
     // 列表
     svr.Get("/v1/models", handle_models_list);
