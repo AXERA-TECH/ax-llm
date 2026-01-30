@@ -171,7 +171,6 @@ public:
         gllm.getAttr()->runing_callback = cb;
 
         history = gllm.Run(history);
-        gllm.ResetKVCache();
 
         gllm_runing = false;
         g_msg_cv.notify_all(); // 唤醒 content_provider_stream 的等待

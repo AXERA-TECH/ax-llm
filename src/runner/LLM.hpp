@@ -562,9 +562,6 @@ public:
 
             for (size_t i = 0; i < _attr.axmodel_num; i++)
             {
-                // memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").nSize);
-                // memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").nSize);
-
                 memset((void *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize);
                 memset((void *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize);
             }
@@ -576,9 +573,9 @@ public:
                 auto &k_cache = k_caches[m];
                 auto &v_cache = v_caches[m];
 
-                if (k_cache.size() != _precompute_len * _attr.kv_cache_size)
+                if (k_cache.size() < _precompute_len * _attr.kv_cache_size)
                 {
-                    ALOGE("k_cache.size(%d) != precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), _precompute_len, _attr.kv_cache_size);
+                    ALOGE("k_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", k_cache.size(), _precompute_len, _attr.kv_cache_size);
                     return -1;
                 }
                 if (v_cache.size() < _precompute_len * _attr.kv_cache_size)
@@ -586,19 +583,6 @@ public:
                     ALOGE("v_cache.size(%d) < precompute_len(%d) * _attr.kv_cache_size(%d)", v_cache.size(), _precompute_len, _attr.kv_cache_size);
                     return -1;
                 }
-
-                // set kv cache inputs
-                // {
-                //     auto &input_k_cache = layer.layer.get_input(_attr.prefill_grpid, "K_cache");
-                //     unsigned short *input_k_cache_ptr = (unsigned short *)input_k_cache.pVirAddr;
-                //     auto &input_v_cache = layer.layer.get_input(_attr.prefill_grpid, "V_cache");
-                //     unsigned short *input_v_cache_ptr = (unsigned short *)input_v_cache.pVirAddr;
-
-                //     memcpy(input_k_cache_ptr, k_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                //     memcpy(input_v_cache_ptr, v_cache.data(), _precompute_len * _attr.kv_cache_size * sizeof(unsigned short));
-                //     // axcl_Memcpy((void *)input_k_cache_ptr, (void *)k_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
-                //     // axcl_Memcpy((void *)input_v_cache_ptr, (void *)v_cache.data(), _attr.precompute_len * _attr.kv_cache_size * sizeof(unsigned short), axclrtMemcpyKind::AXCL_MEMCPY_HOST_TO_DEVICE, layer.layer.get_devid());
-                // }
 
                 {
                     auto &input_k_cache = layer.layer.get_input(decode_grpid, "K_cache");
@@ -611,7 +595,6 @@ public:
                 }
             }
         }
-
         return 0;
     }
 
@@ -625,46 +608,49 @@ public:
         // reset kv cache
         for (size_t i = 0; i < _attr.axmodel_num; i++)
         {
-            // memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "K_cache").nSize);
-            // memset((void *)llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(_attr.prefill_grpid, "V_cache").nSize);
-
             memset((void *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize);
             memset((void *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr, 0, llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize);
         }
     }
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1)
     {
-        std::vector<int> tokens_diff;
-        // int offset = 0;
-        tokens_diff = diff_token_ids(last_tokens_ids, tokenizer->encode(history), precompute_len);
-        ALOGI("tokens_diff size : %d, precompute_len : %d", tokens_diff.size(), precompute_len);
+        auto new_tokens = tokenizer->encode(history);
 
-        // if (offset > 0 &&
-        //     k_caches.size() == _attr.axmodel_num &&
-        //     v_caches.size() == _attr.axmodel_num &&
-        //     k_caches[0].size() >= offset * _attr.kv_cache_size &&
-        //     v_caches[0].size() >= offset * _attr.kv_cache_size)
-        // if (offset != precompute_len)
-        // {
-        // for (size_t i = 0; i < _attr.axmodel_num; i++)
-        // {
-        //     auto &layer = llama_layers[i];
-        //     k_caches[i].resize(offset * _attr.kv_cache_size);
-        //     v_caches[i].resize(offset * _attr.kv_cache_size);
-        // }
+        int offset = 0;
+        auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
 
-        // ALOGI("precompute_len : %d", precompute_len);
+        bool not_append = !(offset == (int)last_tokens_ids.size() && new_tokens.size() >= last_tokens_ids.size());
 
-        // for (size_t i = 0; i < _attr.axmodel_num; i++)
-        // {
-        //     memset((unsigned short *)llama_layers[i].layer.get_input(decode_grpid, "K_cache").pVirAddr + precompute_len * _attr.kv_cache_size,
-        //            0,
-        //            llama_layers[i].layer.get_input(decode_grpid, "K_cache").nSize - +precompute_len * _attr.kv_cache_size);
-        //     memset((unsigned short *)llama_layers[i].layer.get_input(decode_grpid, "V_cache").pVirAddr + precompute_len * _attr.kv_cache_size,
-        //            0,
-        //            llama_layers[i].layer.get_input(decode_grpid, "V_cache").nSize - +precompute_len * _attr.kv_cache_size);
-        // }
-        // }
+        if (not_append)
+        {
+            ALOGW("history not append (rollback/modify). force ResetKVCache and recompute.");
+            ResetKVCache();
+            last_tokens_ids.clear();
+            k_caches.clear();
+            v_caches.clear();
+            precompute_len = 0;
+
+            // 重算 diff（此时 old 为空 => diff = 全量 tokens）
+            tokens_diff = new_tokens;
+            offset = 0;
+        }
+
+        if (tokens_diff.empty())
+        {
+            if (!new_tokens.empty())
+            {
+                // 重新跑最后一个 token，以获得正确的 embed
+                precompute_len = (int)new_tokens.size() - 1;
+                tokens_diff = {new_tokens.back()};
+            }
+            else
+            {
+                // 只有 system 之类的极端情况
+                ResetKVCache();
+                tokens_diff.clear();
+                precompute_len = 0;
+            }
+        }
 
         SetKVCache(k_caches, v_caches, precompute_len, tokens_diff.size());
         std::vector<unsigned short> out_embed(tokens_diff.size() * _attr.tokens_embed_size);
@@ -684,7 +670,7 @@ public:
         return history;
     }
 
-    std::string Run(std::vector<unsigned short> test_embed, int output_max_token = -1)
+    std::string Run(std::vector<unsigned short> &test_embed, int output_max_token = -1)
     {
         b_stop = false;
         std::string final_out;
