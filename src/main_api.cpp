@@ -38,6 +38,8 @@ static std::queue<std::string> g_msg_queue;
 static std::condition_variable g_msg_cv;
 static std::mutex g_msg_locker;
 
+static UTF8Filter g_utf8_filter;
+
 void __sigExit(int iSigNo)
 {
     svr.stop();
@@ -54,7 +56,7 @@ void llm_running_callback(const char *p_str, float token_per_sec, void *reserve)
 
     {
         std::lock_guard<std::mutex> queue_lk(g_msg_locker);
-        g_msg_queue.push(std::move(p_str));
+        g_msg_queue.push(g_utf8_filter.filter(p_str));
     }
     g_msg_cv.notify_one();
 }
