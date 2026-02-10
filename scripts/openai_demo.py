@@ -27,14 +27,13 @@ stream = client.chat.completions.create(
     messages=messages,
     stream=True,
 )
-print("")
-print("assistant:", end="")
+
+print("assistant:", end="\n")
 # 逐 chunk 更新 assistant 气泡（Markdown）
 for ev in stream:
     delta = getattr(ev.choices[0], "delta", None)
     if delta and getattr(delta, "content", None):
         ctx = delta.content
         print(ctx, end="", flush=True)
-
-
+print("\n")
 

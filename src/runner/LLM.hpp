@@ -59,7 +59,6 @@ struct LLMAttrType
 
     bool b_use_mmap_load_layer = true;
 
-    // bool b_live_print = true;
     LLMRuningCallback runing_callback = nullptr;
     void *reserve = nullptr;
 };

@@ -1,8 +1,16 @@
-#include "signal.h"
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <fstream>
+#include <queue>
+#include <signal.h>
+#include <filesystem>
+#include <sstream>
+#include <termios.h>
+#include <unistd.h>
 
 #include "runner/LLM.hpp"
-
-#include "cmdline.hpp"
+#include "openai_api/server.hpp"
 
 #define IS_AXCL 0
 
@@ -13,169 +21,261 @@
 #include <ax_engine_api.h>
 #endif
 
-static LLM lLaMa;
+// Global variables
+static LLM g_llm;
+static openai_api::Server g_server;
+static bool g_running = true;
+
+// Terminal settings for handling UTF-8 backspace
+struct termios g_orig_termios;
+static bool g_terminal_modified = false;
+
+void save_terminal_settings()
+{
+    tcgetattr(STDIN_FILENO, &g_orig_termios);
+}
+
+void restore_terminal_settings()
+{
+    if (g_terminal_modified) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
+        g_terminal_modified = false;
+    }
+}
+
+void setup_terminal_for_utf8()
+{
+    struct termios new_termios;
+    tcgetattr(STDIN_FILENO, &new_termios);
+    // Disable canonical mode and echo for custom input handling
+    new_termios.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+    g_terminal_modified = true;
+}
 
 void __sigExit(int iSigNo)
 {
-    lLaMa.Stop();
+    g_running = false;
+    g_llm.Stop();
+    g_server.stop();
+    restore_terminal_settings();
     return;
 }
 
-void llm_running_callback(const char *p_str, float token_per_sec, void *reserve)
+void llm_running_callback(std::string str, float token_per_sec, void *reserve)
 {
-    fprintf(stdout, "%s", p_str);
+    fprintf(stdout, "%s", str.c_str());
     fflush(stdout);
 }
 
-bool save_kvcache(std::string target_path, std::string system_prompt, int precompute_len, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches)
+// Config structure for JSON configuration
+struct ModelConfig
 {
-    for (size_t i = 0; i < k_caches.size(); i++)
+    // Model paths
+    std::string model_name = "AXERA-TECH/Qwen3-1.7B";
+    LLMAttrType attr;
+    int port = 8000;
+
+    bool load_from_json(const std::string &config_path)
     {
-        std::string k_cache_path = target_path + "/k_cache_" + std::to_string(i) + ".bin";
-        std::string v_cache_path = target_path + "/v_cache_" + std::to_string(i) + ".bin";
-        std::ofstream k_cache_file(k_cache_path);
-        std::ofstream v_cache_file(v_cache_path);
-        if (!k_cache_file.is_open() || !v_cache_file.is_open())
+        if (!file_exist(config_path))
         {
-            ALOGE("save kvcache failed");
+            ALOGE("Config file not found: %s", config_path.c_str());
             return false;
         }
-        k_cache_file.write((char *)k_caches[i].data(), k_caches[i].size() * sizeof(unsigned short));
-        v_cache_file.write((char *)v_caches[i].data(), v_caches[i].size() * sizeof(unsigned short));
-        k_cache_file.close();
-        v_cache_file.close();
+
+        try
+        {
+            std::ifstream f(config_path);
+            nlohmann::json j;
+            f >> j;
+#define check_key(key)                   \
+    if (!j.contains(key))                \
+    {                                    \
+        ALOGE("Key not found: %s", key); \
+        return false;                    \
     }
-    nlohmann::json j;
-    j["system_prompt"] = system_prompt;
-    j["precompute_len"] = precompute_len;
-    std::string config_path = target_path + "/config.json";
-    std::ofstream config_file(config_path);
-    config_file << j.dump();
-    config_file.close();
-    return true;
+
+            check_key("template_filename_axmodel");
+            attr.template_filename_axmodel = j["template_filename_axmodel"].get<std::string>();
+
+            check_key("filename_post_axmodel");
+            attr.filename_post_axmodel = j["filename_post_axmodel"].get<std::string>();
+
+            check_key("url_tokenizer_model");
+            attr.url_tokenizer_model = j["url_tokenizer_model"].get<std::string>();
+
+            check_key("filename_tokens_embed");
+            attr.filename_tokens_embed = j["filename_tokens_embed"].get<std::string>();
+
+            check_key("post_config_path");
+            attr.post_config_path = j["post_config_path"].get<std::string>();
+
+            check_key("axmodel_num");
+            attr.axmodel_num = j["axmodel_num"].get<int>();
+
+            check_key("tokens_embed_num");
+            attr.tokens_embed_num = j["tokens_embed_num"].get<int>();
+
+            check_key("tokens_embed_size");
+            attr.tokens_embed_size = j["tokens_embed_size"].get<int>();
+
+            // Load options
+            if (j.contains("b_use_mmap_load_embed"))
+            {
+                attr.b_use_mmap_load_embed = j["use_mmap_load_embed"].get<bool>();
+            }
+            if (j.contains("b_use_mmap_load_layer"))
+            {
+                attr.b_use_mmap_load_layer = j["use_mmap_load_layer"].get<bool>();
+            }
+
+#if IS_AXCL
+            check_key("devices");
+            attr.dev_ids = j["devices"].get<std::vector<int>>();
+
+#endif
+            // Load prompt
+            if (j.contains("system_prompt"))
+            {
+                attr.system_prompt = j["system_prompt"].get<std::string>();
+            }
+
+            // Load server settings
+            check_key("model_name");
+            model_name = j["model_name"].get<std::string>();
+
+            if (j.contains("port"))
+            {
+                port = j["port"].get<int>();
+            }
+
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            ALOGE("Failed to parse config file: %s", e.what());
+            return false;
+        }
+    }
+};
+
+// Helper function to resolve relative paths
+std::string resolve_path(const std::string &base_path, const std::string &relative_path)
+{
+    if (relative_path.empty())
+        return relative_path;
+    if (relative_path[0] == '/' || relative_path.substr(0, 2) == "./")
+    {
+        return relative_path; // Already absolute or explicit relative
+    }
+    return base_path + "/" + relative_path;
 }
 
-bool load_kvcache(std::string target_path, int axmodel_num, std::vector<std::vector<unsigned short>> &k_caches, std::vector<std::vector<unsigned short>> &v_caches, std::string &system_prompt, int &precompute_len)
+// Helper function to make paths absolute in config
+void resolve_config_paths(ModelConfig &config, const std::string &model_path)
 {
-    k_caches.resize(axmodel_num);
-    v_caches.resize(axmodel_num);
-    for (size_t i = 0; i < k_caches.size(); i++)
+    config.attr.template_filename_axmodel = resolve_path(model_path, config.attr.template_filename_axmodel);
+    config.attr.filename_post_axmodel = resolve_path(model_path, config.attr.filename_post_axmodel);
+    config.attr.url_tokenizer_model = resolve_path(model_path, config.attr.url_tokenizer_model);
+    config.attr.filename_tokens_embed = resolve_path(model_path, config.attr.filename_tokens_embed);
+    config.attr.post_config_path = resolve_path(model_path, config.attr.post_config_path);
+}
+
+// Read UTF-8 character length
+size_t utf8_char_len(unsigned char c)
+{
+    if (c < 0x80)
+        return 1;
+    if ((c & 0xE0) == 0xC0)
+        return 2;
+    if ((c & 0xF0) == 0xE0)
+        return 3;
+    if ((c & 0xF8) == 0xF0)
+        return 4;
+    return 1; // Invalid UTF-8, treat as single byte
+}
+
+// Custom input handling for proper UTF-8 backspace support
+std::string read_line_with_utf8_support()
+{
+    std::string line;
+    char c;
+
+    while (read(STDIN_FILENO, &c, 1) == 1)
     {
-        std::string k_cache_path = target_path + "/k_cache_" + std::to_string(i) + ".bin";
-        std::string v_cache_path = target_path + "/v_cache_" + std::to_string(i) + ".bin";
-        if (file_exist(k_cache_path) && file_exist(v_cache_path))
+        if (c == '\n' || c == '\r')
         {
-            std::vector<unsigned short> k_cache;
-            std::vector<unsigned short> v_cache;
-            std::ifstream k_cache_file(k_cache_path);
-            std::ifstream v_cache_file(v_cache_path);
+            printf("\n");
+            fflush(stdout);
+            break;
+        }
+        else if (c == 0x7F || c == '\b')
+        { // Backspace or DEL
+            if (!line.empty())
+            {
+                // Calculate how many bytes to remove for the last UTF-8 character
+                size_t remove_len = 0;
+                size_t pos = line.length();
 
-            k_cache_file.seekg(0, std::ios::end);
-            k_cache.resize(k_cache_file.tellg() / sizeof(unsigned short));
-            k_cache_file.seekg(0, std::ios::beg);
+                // Find the start of the last UTF-8 character
+                while (pos > 0 && ((unsigned char)line[pos - 1] & 0x80) && !((unsigned char)line[pos - 1] & 0x40))
+                {
+                    pos--;
+                }
+                if (pos > 0)
+                {
+                    remove_len = line.length() - pos;
+                    if (remove_len == 0)
+                        remove_len = 1;
 
-            v_cache_file.seekg(0, std::ios::end);
-            v_cache.resize(v_cache_file.tellg() / sizeof(unsigned short));
-            v_cache_file.seekg(0, std::ios::beg);
+                    // Erase the last character
+                    line.erase(line.length() - remove_len);
 
-            k_cache_file.read((char *)k_cache.data(), k_cache.size() * sizeof(unsigned short));
-            v_cache_file.read((char *)v_cache.data(), v_cache.size() * sizeof(unsigned short));
-
-            k_cache_file.close();
-            v_cache_file.close();
-            k_caches[i] = k_cache;
-            v_caches[i] = v_cache;
+                    // Move cursor back and clear to end of line
+                    for (size_t i = 0; i < remove_len; i++)
+                    {
+                        printf("\b \b");
+                    }
+                    fflush(stdout);
+                }
+            }
+        }
+        else if (c == 0x03)
+        { // Ctrl+C
+            printf("\n");
+            fflush(stdout);
+            raise(SIGINT);
+            return "";
+        }
+        else if (c == 0x04)
+        { // Ctrl+D
+            if (line.empty())
+            {
+                printf("\n");
+                fflush(stdout);
+                return "q"; // Exit on Ctrl+D at empty line
+            }
         }
         else
         {
-            ALOGE("k_cache %s or v_cache %s not exist", k_cache_path.c_str(), v_cache_path.c_str());
-            return false;
+            line.push_back(c);
+            printf("%c", c);
+            fflush(stdout);
         }
     }
 
-    std::string config_path = target_path + "/config.json";
-    if (file_exist(config_path))
-    {
-        std::ifstream config_file(config_path);
-        nlohmann::json j;
-        config_file >> j;
-        system_prompt = j["system_prompt"].get<std::string>();
-        precompute_len = j["precompute_len"].get<int>();
-        config_file.close();
-    }
-    else
-    {
-        ALOGE("config %s not exist", config_path.c_str());
-        return false;
-    }
-    return true;
+    return line;
 }
 
-int main(int argc, char *argv[])
+// Run interactive mode
+int run_interactive_mode(ModelConfig &config)
 {
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, __sigExit);
-    LLMAttrType attr;
-    std::string prompt = "Hi";
-    bool b_continue = true;
-    std::string kvcache_path;
+    config.attr.runing_callback = llm_running_callback;
+    config.attr.reserve = nullptr;
 
-    cmdline::parser cmd;
-    cmd.add<std::string>("system_prompt", 0, "system prompt", false, attr.system_prompt);
-    cmd.add<std::string>("kvcache_path", 0, "kvcache path", false, kvcache_path);
-    cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
-    cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
-    cmd.add<std::string>("url_tokenizer_model", 0, "tokenizer model path", false, attr.url_tokenizer_model);
-    cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
-
-    cmd.add<int>("axmodel_num", 0, "num of axmodel(for template)", false, attr.axmodel_num);
-    // cmd.add<int>("prefill_axmodel_num", 0, "num of axmodel(for template)", true, attr.prefill_axmodel_num);
-    cmd.add<int>("tokens_embed_num", 0, "tokens embed num", false, attr.tokens_embed_num);
-    cmd.add<int>("tokens_embed_size", 0, "tokens embed size", false, attr.tokens_embed_size);
-
-    cmd.add<bool>("use_mmap_load_embed", 0, "it can save os memory", false, attr.b_use_mmap_load_embed);
-
-    cmd.add<bool>("live_print", 0, "print in live if set true, else print in end", false);
+    // Initialize engine
 #if IS_AXCL
-    cmd.add<std::string>("devices", 0, "devices id,for example: \"0,1,2,3\" ", true, "0,1,2,3");
-#endif
-    cmd.parse_check(argc, argv);
-
-    attr.system_prompt = cmd.get<std::string>("system_prompt");
-    kvcache_path = cmd.get<std::string>("kvcache_path");
-    attr.url_tokenizer_model = cmd.get<std::string>("url_tokenizer_model");
-    attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
-    attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
-    attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
-    // attr.template_prefill_filename_axmodel = cmd.get<std::string>("template_prefill_filename_axmodel");
-    // attr.prefill_axmodel_num = cmd.get<int>("prefill_axmodel_num");
-
-    attr.axmodel_num = cmd.get<int>("axmodel_num");
-    attr.tokens_embed_num = cmd.get<int>("tokens_embed_num");
-    attr.tokens_embed_size = cmd.get<int>("tokens_embed_size");
-
-    attr.b_use_mmap_load_embed = cmd.get<bool>("use_mmap_load_embed");
-
-    bool b_live_print = cmd.get<bool>("live_print");
-    if (b_live_print)
-    {
-        attr.runing_callback = llm_running_callback;
-        attr.reserve = 0;
-    }
-
-    // 1. init engine
-#if IS_AXCL
-    auto devices_str = cmd.get<std::string>("devices");
-    std::vector<int> devices;
-    std::stringstream ss(devices_str);
-    std::string item;
-    while (std::getline(ss, item, ','))
-    {
-        devices.push_back(std::stoi(item));
-    }
-
-    attr.dev_ids = devices;
-
     auto ret = axclInit(nullptr);
     if (0 != ret)
     {
@@ -193,9 +293,9 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    if (!lLaMa.Init(attr))
+    if (!g_llm.Init(config.attr))
     {
-        ALOGE("lLaMa.Init failed");
+        ALOGE("LLM.Init failed");
 #if IS_AXCL
         axclFinalize();
 #else
@@ -205,40 +305,48 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    //
-    if (b_continue)
-    {
-        printf("Type \"q\" to exit\nCtrl+c to stop current running\n\"reset\" to reset kvcache\n\"dd\" to remove last conversation.\n\"pp\" to print history.\n");
-        // lLaMa.Reset();
-    }
+    printf("Type \"q\" to exit\n");
+    printf("Ctrl+c to stop current running\n");
+    printf("\"reset\" to reset kvcache\n");
+    printf("\"dd\" to remove last conversation.\n");
+    printf("\"pp\" to print history.\n");
+    printf("----------------------------------------\n");
 
-    std::vector<Content> history = {{SYSTEM, TEXT, attr.system_prompt}};
+    std::vector<Content> history = {{SYSTEM, TEXT, config.attr.system_prompt}};
 
-    while (b_continue)
+    // Setup terminal for UTF-8 input handling
+    save_terminal_settings();
+    setup_terminal_for_utf8();
+
+    while (g_running)
     {
         printf("prompt >> ");
         fflush(stdout);
-        std::getline(std::cin, prompt);
+
+        std::string prompt = read_line_with_utf8_support();
+
         if (prompt == "q")
         {
             break;
         }
-        if (prompt == "")
+        if (prompt.empty())
         {
             continue;
         }
         if (prompt == "reset")
         {
             ALOGI("reset kvcache");
-            lLaMa.ResetKVCache();
-            history = {{SYSTEM, TEXT, attr.system_prompt}};
+            g_llm.ResetKVCache();
+            history = {{SYSTEM, TEXT, config.attr.system_prompt}};
             continue;
         }
         if (prompt == "dd")
         {
-            if (history.size() >= 3) // system, user, assistant, user, assistant, ...
+            if (history.size() >= 3)
             {
-                ALOGI("remove last conversation \nQ:%s \nA:%s", history[history.size() - 2].data.c_str(), history[history.size() - 1].data.c_str());
+                ALOGI("remove last conversation \nQ:%s \nA:%s",
+                      history[history.size() - 2].data.c_str(),
+                      history[history.size() - 1].data.c_str());
                 history.pop_back();
                 history.pop_back();
             }
@@ -246,33 +354,33 @@ int main(int argc, char *argv[])
         }
         if (prompt == "pp")
         {
-            ALOGI("history size: %d", history.size());
+            ALOGI("history size: %zu", history.size());
             for (auto &item : history)
             {
-                if (item.role == SYSTEM)
+                switch (item.role)
                 {
+                case SYSTEM:
                     printf("system: %s\n", item.data.c_str());
-                }
-                else if (item.role == USER)
-                {
+                    break;
+                case USER:
                     printf("user: %s\n", item.data.c_str());
-                }
-                else if (item.role == ASSISTANT)
-                {
+                    break;
+                case ASSISTANT:
                     printf("assistant: %s\n", item.data.c_str());
+                    break;
+                default:
+                    break;
                 }
             }
             continue;
         }
 
         history.push_back({USER, TEXT, prompt});
-        history = lLaMa.Run(history);
-
-        if (!b_live_print)
-            printf("%s\n", history.back().data.c_str());
+        history = g_llm.Run(history);
     }
 
-    lLaMa.Deinit();
+    restore_terminal_settings();
+    g_llm.Deinit();
 
 #if IS_AXCL
     axclFinalize();
@@ -280,5 +388,259 @@ int main(int argc, char *argv[])
     AX_ENGINE_Deinit();
     AX_SYS_Deinit();
 #endif
+
+    return 0;
+}
+
+// Handle HTTP API messages
+bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history)
+{
+    for (auto &item : messages)
+    {
+        Content content;
+        content.type = TEXT;
+
+        if (item.contains("role") && item["role"] == "system")
+        {
+            content.role = SYSTEM;
+        }
+        else if (item.contains("role") && item["role"] == "user")
+        {
+            content.role = USER;
+        }
+        else if (item.contains("role") && item["role"] == "assistant")
+        {
+            content.role = ASSISTANT;
+        }
+        else
+        {
+            ALOGE("content type not support");
+            return false;
+        }
+
+        if (item.contains("content") && item["content"].is_string())
+        {
+            content.data = item["content"];
+        }
+        else if (item.contains("content") && item["content"].is_array())
+        {
+            for (auto &c : item["content"])
+            {
+                if (c.contains("type") && c["type"] == "text")
+                {
+                    content.data += c["text"];
+                }
+            }
+        }
+        else
+        {
+            ALOGE("content type not support");
+            return false;
+        }
+        history.push_back(content);
+    }
+
+    for (auto &content : history)
+    {
+        switch (content.role)
+        {
+        case SYSTEM:
+            printf("\33[33msystem:%s\33[0m\n", content.data.c_str());
+            break;
+        case USER:
+            printf("\33[32muser:%s\33[0m\n", content.data.c_str());
+            break;
+        case ASSISTANT:
+            printf("\33[34massistant:%s\33[0m\n", content.data.c_str());
+            break;
+        default:
+            break;
+        }
+    }
+
+    return true;
+}
+
+// Run server mode
+int run_server_mode(const ModelConfig &config, int port)
+{
+
+    LLM llm;
+
+    // Initialize engine
+#if IS_AXCL
+    auto ret = axclInit(nullptr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#else
+    AX_ENGINE_NPU_ATTR_T npu_attr;
+    memset(&npu_attr, 0, sizeof(npu_attr));
+    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    AX_SYS_Init();
+    auto ret = AX_ENGINE_Init(&npu_attr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#endif
+
+    if (!llm.Init(config.attr))
+    {
+        ALOGE("LLM.Init failed");
+#if IS_AXCL
+        axclFinalize();
+#else
+        AX_ENGINE_Deinit();
+        AX_SYS_Deinit();
+#endif
+        return -1;
+    }
+
+    g_server.setMaxConcurrency(1);
+
+    std::string model_name = config.model_name;
+
+    g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
+                                             std::shared_ptr<openai_api::BaseDataProvider> provider)
+                          {
+        if (!provider->is_writable()) {
+            ALOGE("provider not writable");
+            return;
+        }
+        
+        std::vector<Content> history;
+        if (!handle_api_messages(req.messages, history)) {
+            ALOGE("handle_body failed");
+            provider->end();
+            return;
+        }
+        
+        auto callback = [provider](std::string str, float token_per_sec, void *reserve) {
+            if (!provider->is_writable()) {
+                ALOGE("provider not writable");
+                return;
+            }
+            openai_api::OutputChunk chunk;
+            chunk.type = openai_api::OutputChunkType::TextDelta;
+            chunk.text = str;
+            provider->push(chunk);
+        };
+        
+        llm.getAttr()->runing_callback = callback;
+        llm.Run(history, req.max_tokens);
+        provider->end(); });
+
+    printf("Starting server on port %d with model '%s'...\n", port, model_name.c_str());
+    g_server.run(port);
+
+    llm.Deinit();
+
+#if IS_AXCL
+    axclFinalize();
+#else
+    AX_ENGINE_Deinit();
+    AX_SYS_Deinit();
+#endif
+
+    return 0;
+}
+
+// Print usage
+void print_usage(const char *program_name)
+{
+    printf("Usage:\n");
+    printf("  %s run <model_path> [options]    Run interactive chat mode\n", program_name);
+    printf("  %s serve <model_path> [options]  Run HTTP API server mode\n", program_name);
+    printf("\n");
+    printf("Arguments:\n");
+    printf("  model_path    Path to model directory containing config.json and model files\n");
+    printf("\n");
+    printf("Serve options:\n");
+    printf("  --port <port> Server port (default: 8080)\n");
+    printf("\n");
+    printf("Model directory structure:\n");
+    printf("  model_path/\n");
+    printf("    ├── config.json          # Model configuration\n");
+    printf("    ├── tokenizer.txt        # Tokenizer model\n");
+    printf("    ├── *.axmodel            # AXera model files\n");
+    printf("    └── post_config.json     # Post-processing config (optional)\n");
+}
+
+int main(int argc, char *argv[])
+{
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, __sigExit);
+
+    if (argc < 3)
+    {
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    std::string mode = argv[1];
+    std::string model_path = argv[2];
+
+    // Check if model path exists
+    if (!std::filesystem::exists(model_path))
+    {
+        ALOGE("Model path does not exist: %s", model_path.c_str());
+        return -1;
+    }
+
+    // Load config from model directory
+    std::string config_path = model_path + "/config.json";
+    ModelConfig config;
+
+    if (!config.load_from_json(config_path))
+    {
+        ALOGE("Failed to load config from: %s", config_path.c_str());
+        // Try to use default config and resolve paths
+        ALOGE("Using default configuration");
+    }
+
+    // Resolve relative paths to absolute paths based on model_path
+    resolve_config_paths(config, model_path);
+
+    if (mode == "run")
+    {
+        for (int i = 3; i < argc; i++)
+        {
+            std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h")
+            {
+                print_usage(argv[0]);
+                return 0;
+            }
+        }
+        return run_interactive_mode(config);
+    }
+    else if (mode == "serve")
+    {
+        // Parse serve mode options
+        int port = config.port;
+        for (int i = 3; i < argc; i++)
+        {
+            std::string arg = argv[i];
+            if (arg == "--port" && i + 1 < argc)
+            {
+                port = std::stoi(argv[++i]);
+            }
+            else if (arg == "--help" || arg == "-h")
+            {
+                print_usage(argv[0]);
+                return 0;
+            }
+        }
+        return run_server_mode(config, port);
+    }
+    else
+    {
+        ALOGE("Unknown mode: %s", mode.c_str());
+        print_usage(argv[0]);
+        return -1;
+    }
+
     return 0;
 }

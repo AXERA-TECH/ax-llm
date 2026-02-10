@@ -65,8 +65,6 @@ function(build_exec name main_source)
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 
-build_exec(main src/main.cpp)
-build_exec(main_api src/main_api.cpp)
-build_exec(main_prof src/main_prof.cpp)
+build_exec(axllm src/main.cpp)
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)
