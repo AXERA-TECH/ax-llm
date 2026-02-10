@@ -1,4 +1,4 @@
-<img width="534" height="178" alt="image" src="https://github.com/user-attachments/assets/be06e474-3514-4cf0-af6a-d9fdb4670bd0" /># AX-LLM
+# AX-LLM
 
 ![GitHub License](https://img.shields.io/github/license/AXERA-TECH/ax-llm)
 
