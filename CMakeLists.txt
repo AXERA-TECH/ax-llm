@@ -49,6 +49,9 @@ include_directories(src/runner/utils)
 # message(STATUS "OPENCV_DIR Path: ${OpenCV_DIR}")
 # find_package(OpenCV REQUIRED)
 # include_directories(${OpenCV_INCLUDE_DIRS})
+set(OPENAI_API_BUILD_EXAMPLES OFF)
+set(OPENAI_API_BUILD_TESTS OFF)
+add_subdirectory(third_party/openai-api.cpp)
 
 function(build_exec name main_source)
     add_executable(${name} ${main_source}
@@ -58,7 +61,7 @@ function(build_exec name main_source)
                     src/runner/Tokenizer/Tokenizer.cpp
                     )
 
-    target_link_libraries(${name} ax_engine ax_interpreter ax_sys pthread tokenizer)
+    target_link_libraries(${name} ax_engine ax_interpreter ax_sys pthread tokenizer openai_api::server)
     install(TARGETS ${name} DESTINATION bin)
 endfunction()
 

@@ -17,7 +17,8 @@
 
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 
-typedef void (*LLMRuningCallback)(const char *p_str, float token_per_sec, void *reserve);
+// typedef void (*LLMRuningCallback)(const char *p_str, float token_per_sec, void *reserve);
+using LLMRuningCallback = std::function<void(const char *p_str, float token_per_sec, void *reserve)>;
 
 struct LLMAttrType
 {
@@ -939,7 +940,7 @@ public:
                     // {
                     float t_cost_ms = t_cost.cost();
                     float token_per_sec = token_ids.size() / (t_cost_ms / 1000);
-                    auto tmp_out = tokenizer->decode(max_index);
+                    auto tmp_out = utf8_filter.filter(tokenizer->decode(max_index));
                     if (!tmp_out.empty())
                     {
                         _attr.runing_callback(tmp_out.c_str(), token_per_sec, _attr.reserve);
