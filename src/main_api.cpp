@@ -195,14 +195,18 @@ int main(int argc, char *argv[])
                         return;
                     }
 
+                    
+
                 std::vector<Content> history;
                 if (!handle_body(req.messages, history))
                 {
                     ALOGE("handle_body failed");
-                } 
+                    provider->end();
+                    return;
+                }
 
                 //void llm_running_callback(const char *p_str, float token_per_sec, void *reserve)
-                auto callback = [provider](const char *p_str, float token_per_sec, void *reserve)
+                auto callback = [provider](std::string str, float token_per_sec, void *reserve)
                 {
                     if (!provider->is_writable())
                     {
@@ -211,7 +215,7 @@ int main(int argc, char *argv[])
                     }
                     openai_api::OutputChunk chunk;
                     chunk.type = openai_api::OutputChunkType::TextDelta;
-                    chunk.text = p_str;
+                    chunk.text = str;
                     provider->push(chunk);
                 };
                 llm.getAttr()->runing_callback = callback;

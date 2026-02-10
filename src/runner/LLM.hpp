@@ -18,7 +18,7 @@
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 
 // typedef void (*LLMRuningCallback)(const char *p_str, float token_per_sec, void *reserve);
-using LLMRuningCallback = std::function<void(const char *p_str, float token_per_sec, void *reserve)>;
+using LLMRuningCallback = std::function<void(std::string str, float token_per_sec, void *reserve)>;
 
 struct LLMAttrType
 {
@@ -841,7 +841,7 @@ public:
                 auto str = utf8_filter.filter(tokenizer->decode(max_index));
                 if (!str.empty())
                 {
-                    _attr.runing_callback(str.c_str(), -1, _attr.reserve);
+                    _attr.runing_callback(str, -1, _attr.reserve);
                 }
             }
         }
@@ -943,7 +943,7 @@ public:
                     auto tmp_out = utf8_filter.filter(tokenizer->decode(max_index));
                     if (!tmp_out.empty())
                     {
-                        _attr.runing_callback(tmp_out.c_str(), token_per_sec, _attr.reserve);
+                        _attr.runing_callback(tmp_out, token_per_sec, _attr.reserve);
                     }
                 }
                 if (output_max_token > 0 && token_ids.size() >= output_max_token)
