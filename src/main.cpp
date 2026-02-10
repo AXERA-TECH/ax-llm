@@ -105,6 +105,9 @@ struct ModelConfig
             check_key("url_tokenizer_model");
             attr.url_tokenizer_model = j["url_tokenizer_model"].get<std::string>();
 
+            check_key("tokenizer_type");
+            attr.tokenizer_type = j["tokenizer_type"].get<std::string>();
+
             check_key("filename_tokens_embed");
             attr.filename_tokens_embed = j["filename_tokens_embed"].get<std::string>();
 

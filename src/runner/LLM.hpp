@@ -36,7 +36,7 @@ struct LLMAttrType
     // std::string filename_vpm_resampler_axmodedl = "minicpmv/vpm_resampler_version0_fp16.axmodel";
     // int vpm_width = 280;
     // int vpm_height = 280;
-
+    std::string tokenizer_type;
     std::string url_tokenizer_model = "http://127.0.0.1:12345";
     bool b_bos = true, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
@@ -172,13 +172,20 @@ public:
         ALOGI("LLM init start");
         t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
-        tokenizer = create_tokenizer(Qwen3);
+        tokenizer = create_tokenizer(this->_attr.tokenizer_type);
+        if (!tokenizer)
+        {
+            ALOGE("create_tokenizer(%s) failed", this->_attr.tokenizer_type.c_str());
+            return false;
+        }
+        
         if (!tokenizer->load(attr.url_tokenizer_model))
         {
             ALOGE("tokenizer.load(%s) failed", attr.url_tokenizer_model.c_str());
             return false;
         }
         tokenizer->set_think_in_prompt(true);
+        ALOGI("tokenizer type: %s, url_tokenizer_model: %s", this->_attr.tokenizer_type.c_str(), this->_attr.url_tokenizer_model.c_str());
 
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
         // test code
