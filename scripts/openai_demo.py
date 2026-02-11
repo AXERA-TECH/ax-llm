@@ -9,8 +9,8 @@ import argparse
 if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description='OpenAI Demo')
-    parser.add_argument('--model', type=str, default=MODEL, help='Model name')
-    parser.add_argument('--api_url', type=str, default=API_URL, help='API URL', default="http://10.126.33.252:8000/v1")
+    parser.add_argument('--model', type=str, help='Model name')
+    parser.add_argument('--api_url', type=str, help='API URL', default="http://10.126.33.252:8000/v1")
     args = parser.parse_args()
 
     # Base URL of your API server; adjust host and port as needed
