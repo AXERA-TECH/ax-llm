@@ -6,7 +6,7 @@
 # build_dir 修改为自己想要的编译目录名称
 build_dir=build_aarch64
 echo "build dir: ${build_dir}"
-mkdir ${build_dir}
+mkdir -p ${build_dir}
 cd ${build_dir}
 
 axcl_url="https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/axcl_3.6.2_aarch64.zip"
@@ -24,8 +24,7 @@ axcl_dir=${PWD}/axcl_3.6.2
 URL="https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz"
 FOLDER="gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu"
 
-aarch64-none-linux-gnu-gcc -v
-if [ $? -ne 0 ]; then
+if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
     # Check if the file exists
     if [ ! -f "$FOLDER.tar.xz" ]; then
         # Download the file
@@ -41,8 +40,7 @@ if [ $? -ne 0 ]; then
     fi
 
     export PATH=$PATH:$PWD/$FOLDER/bin/
-    aarch64-none-linux-gnu-gcc -v
-    if [ $? -ne 0 ]; then
+    if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
         echo "Error: aarch64-none-linux-gnu-gcc not found"
         exit 1
     fi

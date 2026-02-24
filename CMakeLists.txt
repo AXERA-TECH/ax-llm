@@ -91,6 +91,7 @@ add_subdirectory(third_party/openai-api.cpp)
 set(COMMON_SOURCES
     src/runner/utils/memory_utils.cpp
     src/runner/utils/cqdm.cpp
+    src/runner/LLM.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -101,7 +102,12 @@ if(BUILD_AX650)
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_ax650.cpp
     )
+    add_executable(llm_smoke tools/llm_smoke.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+    )
     target_include_directories(axllm PRIVATE ${BSP_MSP_DIR}/include)
+    target_include_directories(llm_smoke PRIVATE ${BSP_MSP_DIR}/include)
     # link_directories 是全局的，用 target 属性更干净；CMake < 3.13 没有
     # target_link_directories，改用 set_target_properties 设置 LINK_FLAGS 或
     # 直接传绝对路径库目录给 target_link_libraries 的 -L 形式：
@@ -110,7 +116,13 @@ if(BUILD_AX650)
         ax_engine ax_interpreter ax_sys
         pthread tokenizer openai_api::server
     )
+    target_link_libraries(llm_smoke
+        -L${BSP_MSP_DIR}/lib
+        ax_engine ax_interpreter ax_sys
+        pthread tokenizer openai_api::server
+    )
     install(TARGETS axllm DESTINATION bin)
+    install(TARGETS llm_smoke DESTINATION bin)
 endif()
 
 # ---------------------------------------------------------------------------

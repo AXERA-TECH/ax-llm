@@ -11,6 +11,8 @@
 
 #include "runner/LLM.hpp"
 #include "openai_api/server.hpp"
+#include "runner/utils/memory_utils.hpp"
+#include "runner/utils/sample_log.h"
 
 #ifdef USE_AXCL
 #include <axcl.h>
