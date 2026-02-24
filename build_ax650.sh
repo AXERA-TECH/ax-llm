@@ -60,6 +60,10 @@ if [ $? -ne 0 ]; then
 fi
 
 # 开始编译
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=./install -DBSP_MSP_DIR=${BSP_MSP_DIR} -DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-none-linux-gnu.toolchain.cmake ..
+cmake -DCMAKE_BUILD_TYPE=Release \
+-DCMAKE_INSTALL_PREFIX=./install \
+-DBSP_MSP_DIR=${BSP_MSP_DIR} \
+-DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-none-linux-gnu.toolchain.cmake \
+-DBUILD_AX650=ON ..
 make -j16
 make install

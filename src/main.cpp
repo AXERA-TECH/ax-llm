@@ -12,9 +12,7 @@
 #include "runner/LLM.hpp"
 #include "openai_api/server.hpp"
 
-#define IS_AXCL 0
-
-#if IS_AXCL
+#ifdef USE_AXCL
 #include <axcl.h>
 #else
 #include <ax_sys_api.h>
@@ -37,7 +35,8 @@ void save_terminal_settings()
 
 void restore_terminal_settings()
 {
-    if (g_terminal_modified) {
+    if (g_terminal_modified)
+    {
         tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
         g_terminal_modified = false;
     }
@@ -126,14 +125,14 @@ struct ModelConfig
             // Load options
             if (j.contains("b_use_mmap_load_embed"))
             {
+                attr.b_use_mmap_load_embed = j["b_use_mmap_load_embed"].get<bool>();
+            }
+            else if (j.contains("use_mmap_load_embed"))
+            {
                 attr.b_use_mmap_load_embed = j["use_mmap_load_embed"].get<bool>();
             }
-            if (j.contains("b_use_mmap_load_layer"))
-            {
-                attr.b_use_mmap_load_layer = j["use_mmap_load_layer"].get<bool>();
-            }
 
-#if IS_AXCL
+#if USE_AXCL
             check_key("devices");
             attr.dev_ids = j["devices"].get<std::vector<int>>();
 
@@ -176,11 +175,18 @@ std::string resolve_path(const std::string &base_path, const std::string &relati
 }
 
 // Helper function to make paths absolute in config
+static inline bool is_url(const std::string &p)
+{
+    auto pos = p.find("://");
+    return pos != std::string::npos;
+}
+
 void resolve_config_paths(ModelConfig &config, const std::string &model_path)
 {
     config.attr.template_filename_axmodel = resolve_path(model_path, config.attr.template_filename_axmodel);
     config.attr.filename_post_axmodel = resolve_path(model_path, config.attr.filename_post_axmodel);
-    config.attr.url_tokenizer_model = resolve_path(model_path, config.attr.url_tokenizer_model);
+    if (!is_url(config.attr.url_tokenizer_model))
+        config.attr.url_tokenizer_model = resolve_path(model_path, config.attr.url_tokenizer_model);
     config.attr.filename_tokens_embed = resolve_path(model_path, config.attr.filename_tokens_embed);
     config.attr.post_config_path = resolve_path(model_path, config.attr.post_config_path);
 }
@@ -278,7 +284,7 @@ int run_interactive_mode(ModelConfig &config)
     config.attr.reserve = nullptr;
 
     // Initialize engine
-#if IS_AXCL
+#if USE_AXCL
     auto ret = axclInit(nullptr);
     if (0 != ret)
     {
@@ -299,7 +305,7 @@ int run_interactive_mode(ModelConfig &config)
     if (!g_llm.Init(config.attr))
     {
         ALOGE("LLM.Init failed");
-#if IS_AXCL
+#if USE_AXCL
         axclFinalize();
 #else
         AX_ENGINE_Deinit();
@@ -385,7 +391,7 @@ int run_interactive_mode(ModelConfig &config)
     restore_terminal_settings();
     g_llm.Deinit();
 
-#if IS_AXCL
+#if USE_AXCL
     axclFinalize();
 #else
     AX_ENGINE_Deinit();
@@ -471,7 +477,7 @@ int run_server_mode(const ModelConfig &config, int port)
     LLM llm;
 
     // Initialize engine
-#if IS_AXCL
+#if USE_AXCL
     auto ret = axclInit(nullptr);
     if (0 != ret)
     {
@@ -492,7 +498,7 @@ int run_server_mode(const ModelConfig &config, int port)
     if (!llm.Init(config.attr))
     {
         ALOGE("LLM.Init failed");
-#if IS_AXCL
+#if USE_AXCL
         axclFinalize();
 #else
         AX_ENGINE_Deinit();
@@ -540,7 +546,7 @@ int run_server_mode(const ModelConfig &config, int port)
 
     llm.Deinit();
 
-#if IS_AXCL
+#if USE_AXCL
     axclFinalize();
 #else
     AX_ENGINE_Deinit();
