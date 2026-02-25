@@ -43,29 +43,80 @@
 - [Qwen2.5-7B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-7B-Instruct)
 - [Qwen2.5-1.5B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-1.5B-Instruct)
 
+## 当前分支（axllm）
+
+本分支统一输出可执行文件名为 `axllm`，根据运行环境自动选择 AX650 片上后端或 AXCL PCIe 后端。
+
+### 安装方式（推荐）
+
+使用根目录的安装脚本：
+
+```shell
+./install.sh
+```
+
+或使用一行命令下载并执行（默认分支 `axllm`）：
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/AXERA-TECH/ax-llm/axllm/install.sh | bash
+```
+
+脚本逻辑：
+
+- **AX650 片上后端**
+  - 条件：`/proc/ax_proc/board_id` 包含 `AX650` 且本机有 `gcc`
+  - 行为：自动下载 BSP（msp_3.6.2）和交叉工具链，编译并安装到 `/usr/bin/axllm`
+- **AXCL PCIe 后端**
+  - 条件：可运行 `axcl-smi` 且存在 `/usr/include/axcl/` 与 `/usr/lib/axcl/`
+  - 行为：使用系统 AXCL 头文件与库编译后端并安装到 `/usr/bin/axllm`
+
+默认从当前仓库 `origin` 拉取 **axllm 分支**（可通过环境变量覆盖）：
+
+```shell
+REPO_URL=git@github.com:AXERA-TECH/ax-llm.git BRANCH=axllm ./install.sh
+```
+
+卸载：
+
+```shell
+./uninstall.sh
+```
+
+### 编译方式（手动）
+
+如果需要手动编译，请按后端选择对应脚本：
+
+```shell
+# AX650 片上后端
+./build_ax650.sh
+
+# AXCL PCIe 后端（x86）
+./build_axcl_x86.sh
+
+# AXCL PCIe 后端（aarch64 交叉编译）
+./build_axcl_aarch64.sh
+```
+
+编译完成后，`build*/install/bin/` 目录下会生成 `axllm`（本分支已统一命名）。
+
 ## 源码编译
 
-- clone 本项目
-    ```shell
-    git clone --recursive https://github.com/AXERA-TECH/ax-llm.git
-    cd ax-llm
-    ```
-- 仔细阅读 `build.sh` ，并在 `build.sh` 正确修改 `BSP_MSP_DIR` 变量后，运行编译脚本
-    ```shell
-    ./build.sh
-    ```
-- 正确编译后，`build/install/` 目录
+- clone 本项目（带子模块）
+  ```shell
+  git clone --recursive https://github.com/AXERA-TECH/ax-llm.git
+  cd ax-llm
   ```
-  $ tree install
-    install
-    └── bin
-        ├── gradio_demo.py
-        ├── main
-        ├── main_api
-        └── qwen2.5_tokenizer_uid.py
-  ```
+- 使用本分支推荐的安装脚本或对应后端脚本编译
 
-  其中 `main` 就是 Huggingface 仓库中对应的 `main_ax650`
+## 使用方式
+
+编译/安装后运行：
+
+```shell
+axllm
+```
+
+如需 API/Gradio 示例，可继续使用 `scripts/` 下的脚本（与分支功能一致）。
   
 ## 运行示例
 
@@ -205,4 +256,3 @@ To create a public link, set `share=True` in `launch()`.
 
 - Github issues
 - QQ 群: 139953715
-
