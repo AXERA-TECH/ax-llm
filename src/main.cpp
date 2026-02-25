@@ -520,27 +520,41 @@ int run_server_mode(const ModelConfig &config, int port)
             ALOGE("provider not writable");
             return;
         }
-        
+
         std::vector<Content> history;
         if (!handle_api_messages(req.messages, history)) {
             ALOGE("handle_body failed");
             provider->end();
             return;
         }
-        
-        auto callback = [provider](std::string str, float token_per_sec, void *reserve) {
-            if (!provider->is_writable()) {
-                ALOGE("provider not writable");
-                return;
+
+        if (req.stream) {
+            auto callback = [provider, model_id = req.model](std::string str, float token_per_sec, void *reserve) {
+                if (!provider->is_writable()) {
+                    ALOGE("provider not writable");
+                    return;
+                }
+                auto chunk = openai_api::OutputChunk::TextDelta(str, model_id);
+                provider->push(chunk);
+                fprintf(stdout, "%s", str.c_str());
+                fflush(stdout);
+            };
+
+            llm.getAttr()->runing_callback = callback;
+            llm.Run(history, req.max_tokens);
+        } else {
+            llm.getAttr()->runing_callback = nullptr;
+            auto out_history = llm.Run(history, req.max_tokens);
+            std::string final_text;
+            if (!out_history.empty() && out_history.back().role == ASSISTANT) {
+                final_text = out_history.back().data;
             }
-            openai_api::OutputChunk chunk;
-            chunk.type = openai_api::OutputChunkType::TextDelta;
-            chunk.text = str;
+            auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
+            fprintf(stdout, "%s", final_text.c_str());
+            fflush(stdout);
             provider->push(chunk);
-        };
-        
-        llm.getAttr()->runing_callback = callback;
-        llm.Run(history, req.max_tokens);
+        }
+
         provider->end(); });
 
     printf("Starting server on port %d with model '%s'...\n", port, model_name.c_str());
