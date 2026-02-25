@@ -283,16 +283,29 @@ public:
 
         enable_temperature = config["enable_temperature"];
         temperature = config["temperature"];
+        if (temperature <= 0.0f) temperature = 1.0f;
 
         enable_repetition_penalty = config["enable_repetition_penalty"];
         repetition_penalty = config["repetition_penalty"];
         penalty_window = config["penalty_window"];
+        if (penalty_window < 0) penalty_window = 0;
+        if (repetition_penalty < 0.0f) repetition_penalty = 1.0f;
 
         enable_top_p_sampling = config["enable_top_p_sampling"];
         top_p = config["top_p"];
+        if (top_p <= 0.0f) top_p = 0.9f; // reasonable default
+        if (top_p > 1.0f) top_p = 1.0f;
 
         enable_top_k_sampling = config["enable_top_k_sampling"];
         top_k = config["top_k"];
+        if (top_k < 1) top_k = 1;
+
+        // 互斥处理：若同时开启 top_p 与 top_k，则优先 top_p
+        if (enable_top_p_sampling && enable_top_k_sampling)
+        {
+            ALOGW("Both top_p and top_k enabled; prefer top_p and disable top_k");
+            enable_top_k_sampling = false;
+        }
         return true;
     }
 

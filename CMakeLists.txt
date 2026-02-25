@@ -145,7 +145,20 @@ if(BUILD_AXCL)
         -L${AXCL_DIR}/lib
         ${AXCL_LINK_LIBS}
     )
+    # AXCL smoke test
+    add_executable(llm_smoke_axcl tools/llm_smoke.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_axcl.cpp
+        src/runner/utils/axcl_manager.cpp
+    )
+    target_include_directories(llm_smoke_axcl PRIVATE ${AXCL_DIR}/include)
+    target_compile_definitions(llm_smoke_axcl PRIVATE USE_AXCL)
+    target_link_libraries(llm_smoke_axcl
+        -L${AXCL_DIR}/lib
+        ${AXCL_LINK_LIBS}
+    )
     install(TARGETS axllm_axcl DESTINATION bin)
+    install(TARGETS llm_smoke_axcl DESTINATION bin)
 endif()
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)

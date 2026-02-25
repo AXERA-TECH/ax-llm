@@ -5,6 +5,12 @@
 #include <filesystem>
 #include "runner/LLM.hpp"
 #include "utils/json.hpp"
+#ifdef USE_AXCL
+#include <axcl.h>
+#else
+#include <ax_sys_api.h>
+#include <ax_engine_api.h>
+#endif
 
 static std::string resolve_path(const std::string &base, const std::string &p) {
     if (p.empty()) return p;
@@ -38,8 +44,33 @@ int main(int argc, char** argv) {
     attr.tokens_embed_size         = j["tokens_embed_size"].get<int>();
     if (j.contains("b_use_mmap_load_embed")) attr.b_use_mmap_load_embed = j["b_use_mmap_load_embed"].get<bool>();
 
+    // ---- system init (参考 main) ----
+#ifdef USE_AXCL
+    {
+        auto ret = axclInit(nullptr);
+        if (0 != ret) { std::cerr << "axclInit failed: " << ret << "\n"; return ret; }
+    }
+#else
+    AX_ENGINE_NPU_ATTR_T npu_attr; memset(&npu_attr, 0, sizeof(npu_attr));
+    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    AX_SYS_Init();
+    {
+        auto ret = AX_ENGINE_Init(&npu_attr);
+        if (0 != ret) { std::cerr << "AX_ENGINE_Init failed: " << ret << "\n"; return ret; }
+    }
+#endif
+
     LLM llm;
-    if (!llm.Init(attr)) { std::cerr << "LLM.Init failed\n"; return 3; }
+    if (!llm.Init(attr)) {
+        std::cerr << "LLM.Init failed\n";
+#ifdef USE_AXCL
+        axclFinalize();
+#else
+        AX_ENGINE_Deinit();
+        AX_SYS_Deinit();
+#endif
+        return 3;
+    }
 
     std::vector<Content> history;
     history.push_back({SYSTEM, TEXT, std::string("You are a helpful assistant.")});
@@ -50,5 +81,13 @@ int main(int argc, char** argv) {
     llm.Run(history, max_tokens);
     std::cout << "\n[SMOKE OK]\n";
     llm.Deinit();
+
+    // ---- system deinit ----
+#ifdef USE_AXCL
+    axclFinalize();
+#else
+    AX_ENGINE_Deinit();
+    AX_SYS_Deinit();
+#endif
     return 0;
 }

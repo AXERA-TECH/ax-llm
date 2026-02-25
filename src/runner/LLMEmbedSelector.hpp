@@ -1,5 +1,6 @@
 #pragma once
 #include <string.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -32,7 +33,7 @@ public:
         }
         else
         {
-            std::ifstream fin(embed_path);
+            std::ifstream fin(embed_path, std::ios::binary);
             if (!fin.is_open())
             {
                 ALOGE("embed file(%s) open failed", embed_path.c_str());
@@ -41,16 +42,18 @@ public:
 
             // get file size
             fin.seekg(0, std::ios::end);
-            int file_size = fin.tellg();
+            std::uint64_t file_size = (std::uint64_t)fin.tellg();
             fin.seekg(0, std::ios::beg);
-            if (file_size != token_num * embed_size * 2)
+            std::uint64_t expect_size = (std::uint64_t)token_num * (std::uint64_t)embed_size * 2ULL;
+            if (file_size != expect_size)
             {
-                ALOGE("embed file(%s) size(%d) not equal token_num(%d) * embed_size(%d) * 2", embed_path.c_str(), file_size, token_num, embed_size);
+                ALOGE("embed file(%s) size(%llu) not equal token_num(%u) * embed_size(%u) * 2 = %llu",
+                    embed_path.c_str(), (unsigned long long)file_size, token_num, embed_size, (unsigned long long)expect_size);
                 return false;
             }
 
             _embeds.resize(token_num * embed_size);
-            fin.read((char *)_embeds.data(), file_size);
+            fin.read((char *)_embeds.data(), (std::streamsize)expect_size);
             fin.close();
         }
 
