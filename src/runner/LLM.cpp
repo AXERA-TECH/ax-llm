@@ -139,7 +139,7 @@ struct LLM::Impl {
         llama_layers.resize(attr.axmodel_num);
         auto dev_assign = distributeModels((int)_attr.dev_ids.size(), attr.axmodel_num);
         std::vector<int> rets(attr.axmodel_num, 0);
-        std::atomic<int> process_idx(2);
+        std::atomic<int> process_idx(1);
 #pragma omp parallel for if (_attr.dev_ids.size() > 1)
         for (int i = 0; i < attr.axmodel_num; i++)
         {
@@ -159,7 +159,7 @@ struct LLM::Impl {
             if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
             char path[1024];
             sprintf(path, "init post axmodel ok,remain_cmm(%d MB)", axcl_GetCMMRemain(post_devid));
-            update_cqdm(&cqdm, attr.axmodel_num + 2, "count", path);
+            update_cqdm(&cqdm, attr.axmodel_num + 1, "count", path);
         }
 #else
         llama_layers.resize(attr.axmodel_num);
@@ -172,17 +172,17 @@ struct LLM::Impl {
             if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
             int remain_cmm = get_remaining_cmm_size();
             sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
-            update_cqdm(&cqdm, i + 2, "count", axmodel_path);
+            update_cqdm(&cqdm, i + 1, "count", axmodel_path);
         }
         {
             int ret = llama_post.init(attr.filename_post_axmodel.c_str(), -1);
             if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
             int remain_cmm = get_remaining_cmm_size();
             sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
-            update_cqdm(&cqdm, attr.axmodel_num + 2, "count", axmodel_path);
+            update_cqdm(&cqdm, attr.axmodel_num + 1, "count", axmodel_path);
         }
 #endif
-
+        printf("\n");
         {
             _attr.max_token_len = llama_layers[0].layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
             ALOGI("max_token_len : %d", _attr.max_token_len);
@@ -217,9 +217,9 @@ struct LLM::Impl {
                 ALOGE("embed_selector.Init(%s, %d, %d) failed", _attr.filename_tokens_embed.c_str(), _attr.tokens_embed_num, _attr.tokens_embed_size);
                 return false;
             }
-            update_cqdm(&cqdm, 1, "count", "embed_selector init ok");
+            update_cqdm(&cqdm, attr.axmodel_num + 2, "count", "embed_selector init ok");
         }
-
+        printf("\n");
         if (!postprocess.load_config(attr.post_config_path)) { ALOGW("load postprocess config(%s) failed", attr.post_config_path.c_str()); }
         ALOGI("LLM init ok");
         return true;
