@@ -254,7 +254,12 @@ int ax_runner_ax650::sub_init()
 
 int ax_runner_ax650::init(const char *model_file, int /*devid*/)
 {
-    MMap model_buffer(model_file);
+    MMap model_buffer;
+    if (!model_buffer.open_file(model_file))
+    {
+        ALOGE("model file(%s) open failed", model_file);
+        return -1;
+    }
     auto ret = init((char *)model_buffer.data(), model_buffer.size(), -1);
     return ret;
 }

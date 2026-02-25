@@ -20,7 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 后端选项（可组合）
 #
 #   BUILD_AX650  ON   → 编译 AX650 片上后端，产出可执行文件 axllm
-#   BUILD_AXCL   ON   → 编译 AXCL PCIe 后端，产出可执行文件 axllm_axcl
+#   BUILD_AXCL   ON   → 编译 AXCL PCIe 后端，产出可执行文件 axllm
 #
 # 三种典型配置：
 #   build_650          : -DBUILD_AX650=ON  -DBUILD_AXCL=OFF
@@ -28,7 +28,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #   build_axcl_aarch64 : -DBUILD_AX650=ON  -DBUILD_AXCL=ON
 # ---------------------------------------------------------------------------
 option(BUILD_AX650 "Build AX650 on-chip backend  (produces: axllm)"       ON)
-option(BUILD_AXCL  "Build AXCL PCIe backend       (produces: axllm_axcl)" OFF)
+option(BUILD_AXCL  "Build AXCL PCIe backend       (produces: axllm)" OFF)
 
 message(STATUS "BUILD_AX650 = ${BUILD_AX650}")
 message(STATUS "BUILD_AXCL  = ${BUILD_AXCL}")
@@ -126,39 +126,52 @@ if(BUILD_AX650)
 endif()
 
 # ---------------------------------------------------------------------------
-# AXCL PCIe 后端  →  axllm_axcl
+# AXCL PCIe 后端  →  axllm
 # ---------------------------------------------------------------------------
 if(BUILD_AXCL)
     set(AXCL_LINK_LIBS axcl_rt pthread tokenizer openai_api::server)
+
+# Prefer real versioned axcl_rt .so to avoid linker script extra deps
+file(GLOB AXCL_RT_CAND "${AXCL_DIR}/lib/libaxcl_rt.so.*" "${AXCL_DIR}/lib/axcl/libaxcl_rt.so.*")
+if(AXCL_RT_CAND)
+    list(SORT AXCL_RT_CAND COMPARE NATURAL ORDER DESCENDING)
+    list(GET AXCL_RT_CAND 0 AXCL_RT_REAL)
+    add_library(axcl_rt_real SHARED IMPORTED)
+    set_target_properties(axcl_rt_real PROPERTIES IMPORTED_LOCATION "${AXCL_RT_REAL}")
+    set(AXCL_LINK_LIBS axcl_rt_real pthread tokenizer openai_api::server)
+endif()
+
     if(OpenMP_CXX_FOUND)
         list(APPEND AXCL_LINK_LIBS OpenMP::OpenMP_CXX)
     endif()
 
-    add_executable(axllm_axcl src/main.cpp
+    add_executable(axllm src/main.cpp
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_axcl.cpp
         src/runner/utils/axcl_manager.cpp
     )
-    target_include_directories(axllm_axcl PRIVATE ${AXCL_DIR}/include)
-    target_compile_definitions(axllm_axcl PRIVATE USE_AXCL)
-    target_link_libraries(axllm_axcl
+    target_include_directories(axllm PRIVATE ${AXCL_DIR}/include)
+    target_compile_definitions(axllm PRIVATE USE_AXCL)
+    target_link_libraries(axllm
         -L${AXCL_DIR}/lib
         ${AXCL_LINK_LIBS}
     )
     # AXCL smoke test
-    add_executable(llm_smoke_axcl tools/llm_smoke.cpp
+    add_executable(llm_smoke tools/llm_smoke.cpp
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_axcl.cpp
         src/runner/utils/axcl_manager.cpp
     )
-    target_include_directories(llm_smoke_axcl PRIVATE ${AXCL_DIR}/include)
-    target_compile_definitions(llm_smoke_axcl PRIVATE USE_AXCL)
-    target_link_libraries(llm_smoke_axcl
+    target_include_directories(llm_smoke PRIVATE ${AXCL_DIR}/include)
+    target_compile_definitions(llm_smoke PRIVATE USE_AXCL)
+    target_link_libraries(llm_smoke
         -L${AXCL_DIR}/lib
         ${AXCL_LINK_LIBS}
     )
-    install(TARGETS axllm_axcl DESTINATION bin)
-    install(TARGETS llm_smoke_axcl DESTINATION bin)
+    set_target_properties(axllm PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
+install(TARGETS axllm DESTINATION bin)
+    set_target_properties(llm_smoke PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
+install(TARGETS llm_smoke DESTINATION bin)
 endif()
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)
