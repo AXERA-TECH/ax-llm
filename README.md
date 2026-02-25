@@ -2,24 +2,10 @@
 
 ![GitHub License](https://img.shields.io/github/license/AXERA-TECH/ax-llm)
 
-| Platform | Build Status |
-| -------- | ------------ |
-| AX650    | ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/AXERA-TECH/ax-llm/build_650.yml)|
-
 ## 简介
 
 **AX-LLM** 由 **[爱芯元智](https://www.axera-tech.com/)** 主导开发。该项目用于探索业界常用 **LLM(Large Language Model)** 在已有芯片平台上落地的可行性和相关能力边界，**方便**社区开发者进行**快速评估**和**二次开发**自己的 **LLM 应用**。
 
-### 分支说明
-
-- [ax-context(default)](https://github.com/AXERA-TECH/ax-llm/tree/ax-context)
-  - AX650A/AX650N/AX8850/AX630C Host 运行 LLM 使用
-- [ax-internvl](https://github.com/AXERA-TECH/ax-llm/tree/ax-internvl)
-  - AX650A/AX650N/AX8850/AX630C Host 运行 InternVL 系列使用
-- [axcl-context](https://github.com/AXERA-TECH/ax-llm/tree/axcl-context)
-  - AX650N/AX8850 EP 的主控运行 LLM 系列使用
-- [axcl-internvl](https://github.com/AXERA-TECH/ax-llm/tree/axcl-internvl)
-  - AX650N/AX8850 EP 的主控运行 InternVL 系列使用
 
 ### 已支持芯片
 
@@ -35,13 +21,11 @@
 - MiniCPM
 - SmolLM2
 - Llama3
+- ...
 
 ### 获取地址
 
-我们的 ModelZoo 已迁移到 [Huggingface](https://huggingface.co/AXERA-TECH), 例如：
-
-- [Qwen2.5-7B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-7B-Instruct)
-- [Qwen2.5-1.5B-Instruct](https://huggingface.co/AXERA-TECH/Qwen2.5-1.5B-Instruct)
+我们的 ModelZoo 已迁移到 [Huggingface](https://huggingface.co/AXERA-TECH)
 
 ## 当前分支（axllm）
 
@@ -65,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/AXERA-TECH/ax-llm/axllm/install.sh 
 
 - **AX650 片上后端**
   - 条件：`/proc/ax_proc/board_id` 包含 `AX650` 且本机有 `gcc`
-  - 行为：自动下载 BSP（msp_3.6.2）和交叉工具链，编译并安装到 `/usr/bin/axllm`
+  - 行为：自动下载 BSP（msp_3.6.2），编译并安装到 `/usr/bin/axllm`
 - **AXCL PCIe 后端**
   - 条件：可运行 `axcl-smi` 且存在 `/usr/include/axcl/` 与 `/usr/lib/axcl/`
   - 行为：使用系统 AXCL 头文件与库编译后端并安装到 `/usr/bin/axllm`
@@ -98,15 +82,6 @@ REPO_URL=git@github.com:AXERA-TECH/ax-llm.git BRANCH=axllm ./install.sh
 ```
 
 编译完成后，`build*/install/bin/` 目录下会生成 `axllm`（本分支已统一命名）。
-
-## 源码编译
-
-- clone 本项目（带子模块）
-  ```shell
-  git clone --recursive https://github.com/AXERA-TECH/ax-llm.git
-  cd ax-llm
-  ```
-- 使用本分支推荐的安装脚本或对应后端脚本编译
 
 ## 使用方式
 
@@ -219,10 +194,6 @@ Models: AXERA-TECH/SmolLM2-360M-Instruct
 ```shell
 python scripts/openai_demo.py --model AXERA-TECH/SmolLM2-360M-Instruct --api_url http://127.0.0.1:8000/v1
 ```
-
-## Reference
-
-- [Qwen](https://huggingface.co/Qwen)
 
 ## 技术讨论
 
