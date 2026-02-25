@@ -88,7 +88,11 @@ clone_current_branch() {
 }
 
 fetch_ax650_bsp_and_toolchain() {
-  # 参考 build_ax650.sh 的 BSP 与工具链下载逻辑
+  # 参考 build_ax650.sh 的 BSP 下载逻辑（本分支不下载工具链）
+  if ! command -v gcc >/dev/null 2>&1; then
+    echo "Error: gcc not found; AX650 build requires local gcc." >&2
+    exit 1
+  fi
   local build_dir=buiLd_ax650_auto
   mkdir -p "$build_dir" && cd "$build_dir"
 
@@ -102,17 +106,6 @@ fetch_ax650_bsp_and_toolchain() {
   fi
   BSP_MSP_DIR="$PWD/msp_3.6.2/out"
 
-  # 工具链
-  local URL="https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz"
-  local FOLDER="gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu"
-  if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
-    need_cmd wget
-    [ -f "$FOLDER.tar.xz" ] || { echo "Downloading toolchain"; wget -q --show-progress "$URL" -O "$FOLDER.tar.xz"; }
-    [ -d "$FOLDER" ] || { echo "Extracting toolchain"; tar -xf "$FOLDER.tar.xz"; }
-    export PATH="$PATH:$PWD/$FOLDER/bin"
-    command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1 || { echo "Error: aarch64-none-linux-gnu-gcc not found" >&2; exit 1; }
-  fi
-
   AX650_BUILD_DIR="$PWD"
 }
 
@@ -125,7 +118,6 @@ build_ax650() {
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=./install \
     -DBSP_MSP_DIR="${BSP_MSP_DIR}" \
-    -DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-none-linux-gnu.toolchain.cmake \
     -DBUILD_AX650=ON \
     -DBUILD_AXCL=OFF
   make -j"${JOBS}"
