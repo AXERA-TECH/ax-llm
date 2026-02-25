@@ -43,6 +43,10 @@ get_repo_and_branch() {
   here=$(cd -- "$(dirname -- "$0")" && pwd -P)
 
   : "${REPO_URL:=$(git -C "$here" config --get remote.origin.url 2>/dev/null || true)}"
+  if [ -z "${REPO_URL}" ] && [ ! -f "${here}/CMakeLists.txt" ]; then
+    # fallback for curl | bash usage
+    REPO_URL="https://github.com/AXERA-TECH/ax-llm.git"
+  fi
   # 强制默认分支为 axllm，允许通过环境变量 BRANCH 覆盖
   : "${BRANCH:=axllm}"
 }
@@ -67,6 +71,10 @@ clone_current_branch() {
     # 没有可用的远端，直接在当前仓库内构建
     echo "No REPO_URL detected; building in-place."
     SRC_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
+    if [ ! -f "${SRC_DIR}/CMakeLists.txt" ]; then
+      echo "Error: no repository found and CMakeLists.txt missing (curl | bash requires REPO_URL)." >&2
+      exit 1
+    fi
     workdir="$SRC_DIR"  # for trap cleanup logic
   fi
 
@@ -97,15 +105,24 @@ fetch_ax650_bsp_and_toolchain() {
   mkdir -p "$build_dir" && cd "$build_dir"
 
   local bsp_url="https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/msp_3.6.2.zip"
-  if [ ! -d "msp_3.6.2" ]; then
+  local bsp_cache_dir="/tmp/ax-llm-bsp"
+  local bsp_zip="${bsp_cache_dir}/msp_3.6.2.zip"
+  local bsp_root="${bsp_cache_dir}/msp_3.6.2"
+  local bsp_out="${bsp_root}/out"
+
+  mkdir -p "${bsp_cache_dir}"
+  if [ -d "${bsp_out}" ] && [ -f "${bsp_out}/lib/libax_sys.so" ]; then
+    echo "Using cached BSP at ${bsp_out}"
+  else
     echo "Downloading BSP from ${bsp_url}"
     need_cmd wget
     need_cmd unzip
-    [ -f msp_3.6.2.zip ] || wget -q --show-progress "$bsp_url" -O msp_3.6.2.zip
-    unzip -q msp_3.6.2.zip
+    [ -f "${bsp_zip}" ] || wget -q --show-progress "$bsp_url" -O "${bsp_zip}"
+    rm -rf "${bsp_root}"
+    unzip -q "${bsp_zip}" -d "${bsp_cache_dir}"
   fi
-  BSP_MSP_DIR="$PWD/msp_3.6.2/out"
 
+  BSP_MSP_DIR="${bsp_out}"
   AX650_BUILD_DIR="$PWD"
 }
 
