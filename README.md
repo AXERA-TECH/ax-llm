@@ -117,40 +117,34 @@ axllm
 ```
 
 如需 API/Gradio 示例，可继续使用 `scripts/` 下的脚本（与分支功能一致）。
-  
+
 ## 运行示例
-
-### Qwen2.5-1.5B-Instruct
-
-#### 运行支持上下文的 tokenizer 服务器
-
+### 命令行对话
 ```shell
-python qwen2.5_tokenizer_uid.py 
-Server running at http://127.0.0.1:12345
-```
-
-#### 运行命令行 llm
-```shell
-./run_qwen2.5_1.5b_ctx_ax650.sh 
-[I][                            Init][ 110]: LLM init start
-[I][                            Init][  34]: connect http://127.0.0.1:12345 ok
-[I][                            Init][  57]: uid: 4bba0928-fada-4329-903e-3b6e52d68791
-bos_id: -1, eos_id: 151645
-100% | ████████████████████████████████ |  31 /  31 [18.94s<18.94s, 1.64 count/s] init post axmodel ok,remain_cmm(1464 MB)
-[I][                            Init][ 188]: max_token_len : 2559
-[I][                            Init][ 193]: kv_cache_size : 256, kv_cache_num: 2559
-[I][                            Init][ 201]: prefill_token_num : 128
-[I][                            Init][ 205]: grp: 1, prefill_max_token_num : 1
-[I][                            Init][ 205]: grp: 2, prefill_max_token_num : 512
-[I][                            Init][ 205]: grp: 3, prefill_max_token_num : 1024
-[I][                            Init][ 205]: grp: 4, prefill_max_token_num : 1536
-[I][                            Init][ 205]: grp: 5, prefill_max_token_num : 2048
-[I][                            Init][ 209]: prefill_max_token_num : 2048
+$ axllm run smollm2-360m-ax650/
+[I][                            Init][ 127]: LLM init start
+tokenizer_type = 1
+ 97% | ████████████████████████████████  |  34 /  35 [1.98s<2.03s, 17.21 count/s] init post axmodel ok,remain_cmm(11249 MB)
+[I][                            Init][ 188]: max_token_len : 2047
+[I][                            Init][ 191]: kv_cache_size : 320, kv_cache_num: 2047
+[I][                            Init][ 194]: prefill_token_num : 128
+[I][                            Init][ 198]: grp: 1, prefill_max_kv_cache_num : 1
+[I][                            Init][ 198]: grp: 2, prefill_max_kv_cache_num : 128
+[I][                            Init][ 198]: grp: 3, prefill_max_kv_cache_num : 256
+[I][                            Init][ 198]: grp: 4, prefill_max_kv_cache_num : 384
+[I][                            Init][ 198]: grp: 5, prefill_max_kv_cache_num : 512
+[I][                            Init][ 198]: grp: 6, prefill_max_kv_cache_num : 640
+[I][                            Init][ 198]: grp: 7, prefill_max_kv_cache_num : 768
+[I][                            Init][ 198]: grp: 8, prefill_max_kv_cache_num : 896
+[I][                            Init][ 198]: grp: 9, prefill_max_kv_cache_num : 1024
+[I][                            Init][ 203]: prefill_max_token_num : 1024
+[I][                            Init][  27]: LLaMaEmbedSelector use mmap
+100% | ████████████████████████████████ |  35 /  35 [1.98s<1.98s, 17.70 count/s] embed_selector init ok
 [I][                     load_config][ 282]: load config: 
 {
     "enable_repetition_penalty": false,
-    "enable_temperature": true,
-    "enable_top_k_sampling": true,
+    "enable_temperature": false,
+    "enable_top_k_sampling": false,
     "enable_top_p_sampling": false,
     "penalty_window": 20,
     "repetition_penalty": 1.2,
@@ -159,60 +153,54 @@ bos_id: -1, eos_id: 151645
     "top_p": 0.8
 }
 
-[I][                            Init][ 218]: LLM init ok
-Type "q" to exit, Ctrl+c to stop current running
-[I][          GenerateKVCachePrefill][ 271]: input token num : 21, prefill_split_num : 1 prefill_grpid : 2
-[I][          GenerateKVCachePrefill][ 308]: input_num_token:21
-[I][                            main][ 230]: precompute_len: 21
-[I][                            main][ 231]: system_prompt: You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
-prompt >> hello,my name is allen,who are you
-[I][                      SetKVCache][ 531]: prefill_grpid:2 kv_cache_num:512 precompute_len:21 input_num_token:18
-[I][                      SetKVCache][ 534]: current prefill_max_token_num:1920
-[I][                             Run][ 660]: input token num : 18, prefill_split_num : 1
-[I][                             Run][ 686]: input_num_token:18
-[I][                             Run][ 829]: ttft: 539.49 ms
-Hello Allen! I'm sorry, but I'm an AI language model and I don't have a name. I'm just here to help you with any questions or information you need. How can I assist you today?
+[I][                            Init][ 224]: LLM init ok
+Type "q" to exit
+Ctrl+c to stop current running
+"reset" to reset kvcache
+"dd" to remove last conversation.
+"pp" to print history.
+----------------------------------------
+prompt >> hello,my name is Allen
+[I][                      SetKVCache][ 357]: prefill_grpid:2 kv_cache_num:128 precompute_len:0 input_num_token:27
+[I][                      SetKVCache][ 359]: current prefill_max_token_num:1024
+[I][                      SetKVCache][ 360]: first run
+[I][                             Run][ 412]: input token num : 27, prefill_split_num : 1
+[I][                             Run][ 474]: ttft: 177.20 ms
+Hello, Allen. How can I assist you today?
 
-[N][                             Run][ 943]: hit eos,avg 10.80 token/s
+[N][                             Run][ 554]: hit eos,avg 26.19 token/s
 
-[I][                      GetKVCache][ 500]: precompute_len:83, remaining:1965
-prompt >> 我叫什么名字
-[I][                      SetKVCache][ 531]: prefill_grpid:2 kv_cache_num:512 precompute_len:83 input_num_token:12
-[I][                      SetKVCache][ 534]: current prefill_max_token_num:1920
-[I][                             Run][ 660]: input token num : 12, prefill_split_num : 1
-[I][                             Run][ 686]: input_num_token:12
-[I][                             Run][ 829]: ttft: 538.67 ms
-你的名字是Allen。
-
-[N][                             Run][ 943]: hit eos,avg 10.57 token/s
-
-[I][                      GetKVCache][ 500]: precompute_len:100, remaining:1948
-
+[I][                      GetKVCache][ 331]: precompute_len:38, remaining:986
+prompt >> 
 ```
 
-#### 运行api以及gradio demo
-##### 启动服务器
+### 服务(兼容 OpenAI API)
+
 ```shell
-./run_qwen2.5_1.5b_ctx_ax650_api.sh 
-[I][                            Init][ 110]: LLM init start
-[I][                            Init][  34]: connect http://10.126.33.124:12345 ok
-[I][                            Init][  57]: uid: 13c64c2a-9b4e-4875-91f4-fa9f426e3726
-bos_id: -1, eos_id: 151645
-  3% | ██                                |   1 /  31 [0.15s<4.77s, 6.49 count/s] tokenizer init ok[I][                            Init][  26]: LLaMaEmbedSelector use mmap
-100% | ████████████████████████████████ |  31 /  31 [2.97s<2.97s, 10.44 count/s] init post axmodel ok,remain_cmm(1464 MB)[I][                            Init][ 188]: max_token_len : 2559
-[I][                            Init][ 193]: kv_cache_size : 256, kv_cache_num: 2559
-[I][                            Init][ 201]: prefill_token_num : 128
-[I][                            Init][ 205]: grp: 1, prefill_max_token_num : 1
-[I][                            Init][ 205]: grp: 2, prefill_max_token_num : 512
-[I][                            Init][ 205]: grp: 3, prefill_max_token_num : 1024
-[I][                            Init][ 205]: grp: 4, prefill_max_token_num : 1536
-[I][                            Init][ 205]: grp: 5, prefill_max_token_num : 2048
-[I][                            Init][ 209]: prefill_max_token_num : 2048
+$ axllm serve smollm2-360m-ax650/
+[I][                            Init][ 127]: LLM init start
+tokenizer_type = 1
+ 97% | ████████████████████████████████  |  34 /  35 [1.99s<2.05s, 17.09 count/s] init post axmodel ok,remain_cmm(11249 MB)
+[I][                            Init][ 188]: max_token_len : 2047
+[I][                            Init][ 191]: kv_cache_size : 320, kv_cache_num: 2047
+[I][                            Init][ 194]: prefill_token_num : 128
+[I][                            Init][ 198]: grp: 1, prefill_max_kv_cache_num : 1
+[I][                            Init][ 198]: grp: 2, prefill_max_kv_cache_num : 128
+[I][                            Init][ 198]: grp: 3, prefill_max_kv_cache_num : 256
+[I][                            Init][ 198]: grp: 4, prefill_max_kv_cache_num : 384
+[I][                            Init][ 198]: grp: 5, prefill_max_kv_cache_num : 512
+[I][                            Init][ 198]: grp: 6, prefill_max_kv_cache_num : 640
+[I][                            Init][ 198]: grp: 7, prefill_max_kv_cache_num : 768
+[I][                            Init][ 198]: grp: 8, prefill_max_kv_cache_num : 896
+[I][                            Init][ 198]: grp: 9, prefill_max_kv_cache_num : 1024
+[I][                            Init][ 203]: prefill_max_token_num : 1024
+[I][                            Init][  27]: LLaMaEmbedSelector use mmap
+100% | ████████████████████████████████ |  35 /  35 [1.99s<1.99s, 17.58 count/s] embed_selector init ok
 [I][                     load_config][ 282]: load config: 
 {
     "enable_repetition_penalty": false,
-    "enable_temperature": true,
-    "enable_top_k_sampling": true,
+    "enable_temperature": false,
+    "enable_top_k_sampling": false,
     "enable_top_p_sampling": false,
     "penalty_window": 20,
     "repetition_penalty": 1.2,
@@ -221,32 +209,16 @@ bos_id: -1, eos_id: 151645
     "top_p": 0.8
 }
 
-[I][                            Init][ 218]: LLM init ok
-Server running on port 8000...
+[I][                            Init][ 224]: LLM init ok
+Starting server on port 8000 with model 'AXERA-TECH/SmolLM2-360M-Instruct'...
+OpenAI API Server starting on http://0.0.0.0:8000
+Max concurrency: 1
+Models: AXERA-TECH/SmolLM2-360M-Instruct
 ```
-获取板端 ip，并修改 gradio 代码中的 ip 地址
+### 测试 OpenAI API
+```shell
+python scripts/openai_demo.py --model AXERA-TECH/SmolLM2-360M-Instruct --api_url http://127.0.0.1:8000/v1
 ```
-import time
-import gradio as gr
-import requests
-import json
-
-# Base URL of your API server; adjust host and port as needed
-API_URL = "http://x.x.x.x:8000"
-...
-
-```
-运行 gradio_demo.py
-```
-python gradio_demo.py 
-/home/axera/ax-llm/scripts/gradio_demo.py:102: UserWarning: You have not specified a value for the `type` parameter. Defaulting to the 'tuples' format for chatbot messages, but this is deprecated and will be removed in a future version of Gradio. Please set type='messages' instead, which uses openai-style dictionaries with 'role' and 'content' keys.
-  chatbot = gr.Chatbot(elem_id="chatbox", label="Axera Chat",height=500)
-* Running on local URL:  http://0.0.0.0:7860
-
-To create a public link, set `share=True` in `launch()`.
-```
-
-![](scripts/gradio_demo.png)
 
 ## Reference
 
