@@ -16,11 +16,20 @@
 
 ### 已支持模型
 
+#### LLM
 - Qwen2.5
 - Qwen3
 - MiniCPM
 - SmolLM2
 - Llama3
+- HY-MT1.5-1.8B
+- ...
+
+#### VLM（多模态）
+- Qwen3-VL-2B-Instruct
+- SmolVLM2-500M-Video-Instruct
+- FastVLM-1.5B-GPTQ-Int4
+- InternVL3_5-1B-GPTQ-INT4
 - ...
 
 ### 获取地址
@@ -92,6 +101,25 @@ axllm
 ```
 
 如需 API/Gradio 示例，可继续使用 `scripts/` 下的脚本（与分支功能一致）。
+
+### VLM 使用说明
+
+- 使用 VLM 模型目录运行 `axllm run <vlm_model_path>`
+- 每轮输入 `prompt` 后，会提示 `image >>`
+  - 直接回车：本轮仅文本对话
+  - 输入图片路径：图文对话
+  - 输入 `video:<frames_dir>`：视频/多帧对话（按文件名排序读取帧）
+
+VLM 模型的 `config.json` 需包含（或等价字段）：
+
+- `vlm_type`
+- `filename_image_encoder_axmodel`
+- `vision_patch_size`
+
+可选字段（建议保留，未配置时会自动从视觉编码模型输入形状推断）：
+
+- `vision_width`
+- `vision_height`
 
 ## 运行示例
 ### 命令行对话

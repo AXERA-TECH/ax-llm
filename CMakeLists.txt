@@ -74,12 +74,35 @@ endif()
 # ---------------------------------------------------------------------------
 add_subdirectory(third_party/tokenizer.axera)
 include_directories(third_party/tokenizer.axera/include)
+include_directories(third_party/magic_enum/include)
 
 include(overlook.cmake)
 
 include_directories(src)
 include_directories(src/runner)
 include_directories(src/runner/utils)
+
+# ---------------------------------------------------------------------------
+# Vision preprocessing (OpenCV)
+# ---------------------------------------------------------------------------
+set(AXLLM_VISION_LIBS "")
+find_package(OpenCV QUIET)
+if(OpenCV_FOUND)
+    message(STATUS "OpenCV found (${OpenCV_VERSION})")
+    add_compile_definitions(AXLLM_USE_OPENCV)
+    include_directories(${OpenCV_INCLUDE_DIRS})
+    set(AXLLM_VISION_LIBS ${OpenCV_LIBS})
+else()
+    # Fallback: SimpleCV (stb-based tiny OpenCV-like lib)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/SimpleCV/CMakeLists.txt)
+        message(WARNING "OpenCV not found: using third_party/SimpleCV for image preprocessing (may have slight differences vs OpenCV)")
+        set(SIMPLECV_BUILD_TESTS OFF CACHE BOOL "Build SimpleCV tests" FORCE)
+        add_subdirectory(third_party/SimpleCV)
+        set(AXLLM_VISION_LIBS SimpleCV::simplecv)
+    else()
+        message(FATAL_ERROR "OpenCV not found and third_party/SimpleCV is missing. Install OpenCV or init submodule third_party/SimpleCV.")
+    endif()
+endif()
 
 set(OPENAI_API_BUILD_EXAMPLES OFF)
 set(OPENAI_API_BUILD_TESTS OFF)
@@ -92,6 +115,10 @@ set(COMMON_SOURCES
     src/runner/utils/memory_utils.cpp
     src/runner/utils/cqdm.cpp
     src/runner/LLM.cpp
+    src/runner/utils/files.cpp
+    src/runner/utils/image_processor.cpp
+    src/runner/utils/mrope.cpp
+    src/runner/vision/vision_module.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -115,11 +142,13 @@ if(BUILD_AX650)
         -L${BSP_MSP_DIR}/lib
         ax_engine ax_interpreter ax_sys
         pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
     )
     target_link_libraries(llm_smoke
         -L${BSP_MSP_DIR}/lib
         ax_engine ax_interpreter ax_sys
         pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
     )
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
@@ -155,6 +184,7 @@ endif()
     target_link_libraries(axllm
         -L${AXCL_DIR}/lib
         ${AXCL_LINK_LIBS}
+        ${AXLLM_VISION_LIBS}
     )
     # AXCL smoke test
     add_executable(llm_smoke tools/llm_smoke.cpp
@@ -167,6 +197,7 @@ endif()
     target_link_libraries(llm_smoke
         -L${AXCL_DIR}/lib
         ${AXCL_LINK_LIBS}
+        ${AXLLM_VISION_LIBS}
     )
     set_target_properties(axllm PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
 install(TARGETS axllm DESTINATION bin)

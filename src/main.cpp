@@ -134,6 +134,56 @@ struct ModelConfig
                 attr.b_use_mmap_load_embed = j["use_mmap_load_embed"].get<bool>();
             }
 
+            // Optional VLM switch
+            if (j.contains("vlm_type") || j.contains("VLM_TYPE"))
+            {
+                const auto &v = j.contains("vlm_type") ? j["vlm_type"] : j["VLM_TYPE"];
+                std::optional<VLMType> parsed;
+                if (v.is_number_integer())
+                {
+                    parsed = VLMTypeFromInt(v.get<int>());
+                }
+                else if (v.is_string())
+                {
+                    parsed = VLMTypeFromString(v.get<std::string>());
+                }
+                else
+                {
+                    ALOGE("vlm_type must be int or string. choices: %s", VLMTypeChoices().c_str());
+                    return false;
+                }
+
+                if (!parsed.has_value())
+                {
+                    ALOGE("invalid vlm_type value. choices: %s", VLMTypeChoices().c_str());
+                    return false;
+                }
+                attr.vlm_type = *parsed;
+            }
+
+            if (j.contains("filename_image_encoder_axmodel"))
+            {
+                attr.filename_image_encoder_axmodel = j["filename_image_encoder_axmodel"].get<std::string>();
+            }
+            else if (j.contains("filename_image_encoder_axmodedl"))
+            {
+                // Backward compatible with older branches.
+                attr.filename_image_encoder_axmodel = j["filename_image_encoder_axmodedl"].get<std::string>();
+            }
+
+            if (j.contains("vision_cache_dir"))
+            {
+                attr.vision_cache_dir = j["vision_cache_dir"].get<std::string>();
+            }
+
+            if (j.contains("vision_width")) attr.vision_width = j["vision_width"].get<int>();
+            if (j.contains("vision_height")) attr.vision_height = j["vision_height"].get<int>();
+            if (j.contains("vision_temporal_patch_size")) attr.vision_temporal_patch_size = j["vision_temporal_patch_size"].get<int>();
+            if (j.contains("vision_spatial_merge_size")) attr.vision_spatial_merge_size = j["vision_spatial_merge_size"].get<int>();
+            if (j.contains("vision_patch_size")) attr.vision_patch_size = j["vision_patch_size"].get<int>();
+            if (j.contains("vision_fps")) attr.vision_fps = j["vision_fps"].get<int>();
+            if (j.contains("vision_tokens_per_second")) attr.vision_tokens_per_second = j["vision_tokens_per_second"].get<int>();
+
 #if USE_AXCL
             check_key("devices");
             attr.dev_ids = j["devices"].get<std::vector<int>>();
@@ -191,6 +241,8 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
         config.attr.url_tokenizer_model = resolve_path(model_path, config.attr.url_tokenizer_model);
     config.attr.filename_tokens_embed = resolve_path(model_path, config.attr.filename_tokens_embed);
     config.attr.post_config_path = resolve_path(model_path, config.attr.post_config_path);
+    config.attr.filename_image_encoder_axmodel = resolve_path(model_path, config.attr.filename_image_encoder_axmodel);
+    config.attr.vision_cache_dir = resolve_path(model_path, config.attr.vision_cache_dir);
 }
 
 // Read UTF-8 character length
@@ -321,9 +373,14 @@ int run_interactive_mode(ModelConfig &config)
     printf("\"reset\" to reset kvcache\n");
     printf("\"dd\" to remove last conversation.\n");
     printf("\"pp\" to print history.\n");
+    if (config.attr.vlm_type != VLMType::None)
+    {
+        printf("VLM enabled: after each prompt, input image path (empty = text-only). Use \"video:<frames_dir>\" for video.\n");
+    }
     printf("----------------------------------------\n");
 
     std::vector<Content> history = {{SYSTEM, TEXT, config.attr.system_prompt}};
+    std::vector<MediaInputs> media_inputs; // keep for the whole session (indices refer to `history`)
 
     // Setup terminal for UTF-8 input handling
     save_terminal_settings();
@@ -349,6 +406,7 @@ int run_interactive_mode(ModelConfig &config)
             ALOGI("reset kvcache");
             g_llm.ResetKVCache();
             history = {{SYSTEM, TEXT, config.attr.system_prompt}};
+            media_inputs.clear();
             continue;
         }
         if (prompt == "dd")
@@ -360,6 +418,12 @@ int run_interactive_mode(ModelConfig &config)
                       history[history.size() - 1].data.c_str());
                 history.pop_back();
                 history.pop_back();
+
+                // Drop any media mappings that refer to removed tail entries.
+                while (!media_inputs.empty() && media_inputs.back().content_index >= history.size())
+                {
+                    media_inputs.pop_back();
+                }
             }
             continue;
         }
@@ -374,7 +438,9 @@ int run_interactive_mode(ModelConfig &config)
                     printf("system: %s\n", item.data.c_str());
                     break;
                 case USER:
-                    printf("user: %s\n", item.data.c_str());
+                    if (item.type == IMAGE) printf("user(image): %s\n", item.data.c_str());
+                    else if (item.type == VIDEO) printf("user(video): %s\n", item.data.c_str());
+                    else printf("user: %s\n", item.data.c_str());
                     break;
                 case ASSISTANT:
                     printf("assistant: %s\n", item.data.c_str());
@@ -386,8 +452,57 @@ int run_interactive_mode(ModelConfig &config)
             continue;
         }
 
-        history.push_back({USER, TEXT, prompt});
-        history = g_llm.Run(history);
+        // Optional media input (VLM interactive workflow).
+        bool has_media = false;
+        bool is_video = false;
+        std::vector<std::string> uris;
+        if (config.attr.vlm_type != VLMType::None)
+        {
+            printf("image >> ");
+            fflush(stdout);
+            std::string media_line = read_line_with_utf8_support();
+            if (!media_line.empty())
+            {
+                // Trim leading spaces.
+                size_t p0 = 0;
+                while (p0 < media_line.size() && (media_line[p0] == ' ' || media_line[p0] == '\t')) p0++;
+                media_line = media_line.substr(p0);
+
+                if (media_line.rfind("video:", 0) == 0 || media_line.rfind("VIDEO:", 0) == 0)
+                {
+                    is_video = true;
+                    media_line = media_line.substr(6);
+                    while (!media_line.empty() && (media_line[0] == ' ' || media_line[0] == '\t')) media_line.erase(media_line.begin());
+                }
+
+                // Split by whitespace for multiple image uris.
+                std::istringstream iss(media_line);
+                std::string tok;
+                while (iss >> tok) uris.push_back(tok);
+                has_media = !uris.empty();
+            }
+        }
+
+        Content user;
+        user.role = USER;
+        user.data = prompt;
+        user.type = (has_media ? (is_video ? VIDEO : IMAGE) : TEXT);
+
+        const size_t idx = history.size();
+        history.push_back(user);
+        if (has_media)
+        {
+            media_inputs.push_back({idx, uris});
+        }
+
+        if (config.attr.vlm_type != VLMType::None && !media_inputs.empty())
+        {
+            history = g_llm.Run(history, media_inputs);
+        }
+        else
+        {
+            history = g_llm.Run(history);
+        }
     }
 
     restore_terminal_settings();
@@ -404,7 +519,7 @@ int run_interactive_mode(ModelConfig &config)
 }
 
 // Handle HTTP API messages
-bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history)
+bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history, std::vector<MediaInputs> *media_inputs = nullptr)
 {
     for (auto &item : messages)
     {
@@ -429,6 +544,8 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
             return false;
         }
 
+        std::vector<std::string> image_uris;
+
         if (item.contains("content") && item["content"].is_string())
         {
             content.data = item["content"];
@@ -441,12 +558,33 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                 {
                     content.data += c["text"];
                 }
+                else if (c.contains("type") && c["type"] == "image_url")
+                {
+                    // OpenAI style: {type:"image_url", image_url:{url:"..."}}
+                    if (c.contains("image_url") && c["image_url"].is_object() && c["image_url"].contains("url"))
+                    {
+                        image_uris.push_back(c["image_url"]["url"].get<std::string>());
+                    }
+                    else if (c.contains("image_url") && c["image_url"].is_string())
+                    {
+                        image_uris.push_back(c["image_url"].get<std::string>());
+                    }
+                }
             }
         }
         else
         {
             ALOGE("content type not support");
             return false;
+        }
+
+        if (!image_uris.empty() && content.role == USER)
+        {
+            content.type = IMAGE;
+            if (media_inputs)
+            {
+                media_inputs->push_back({history.size(), image_uris});
+            }
         }
         history.push_back(content);
     }
@@ -522,7 +660,8 @@ int run_server_mode(const ModelConfig &config, int port)
         }
 
         std::vector<Content> history;
-        if (!handle_api_messages(req.messages, history)) {
+        std::vector<MediaInputs> media_inputs;
+        if (!handle_api_messages(req.messages, history, &media_inputs)) {
             ALOGE("handle_body failed");
             provider->end();
             return;
@@ -541,10 +680,11 @@ int run_server_mode(const ModelConfig &config, int port)
             };
 
             llm.getAttr()->runing_callback = callback;
-            llm.Run(history, req.max_tokens);
+            if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
+            else llm.Run(history, req.max_tokens);
         } else {
             llm.getAttr()->runing_callback = nullptr;
-            auto out_history = llm.Run(history, req.max_tokens);
+            auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, req.max_tokens) : llm.Run(history, req.max_tokens);
             std::string final_text;
             if (!out_history.empty() && out_history.back().role == ASSISTANT) {
                 final_text = out_history.back().data;
