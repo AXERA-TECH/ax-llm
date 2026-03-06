@@ -416,10 +416,8 @@ struct LLM::Impl {
             auto &lyr  = llama_layers[i]; int devid = LLM_DEVID(lyr);
             auto &dk = lyr.layer.get_input(decode_grpid, "K_cache"); auto &dv = lyr.layer.get_input(decode_grpid, "V_cache");
             llm_memset(LLM_WADDR(dk), 0, dk.nSize, devid); llm_memset(LLM_WADDR(dv), 0, dv.nSize, devid);
-#ifdef USE_AXCL
             auto &pk = lyr.layer.get_input(_attr.prefill_grpid, "K_cache"); auto &pv = lyr.layer.get_input(_attr.prefill_grpid, "V_cache");
             llm_memset(LLM_WADDR(pk), 0, pk.nSize, devid); llm_memset(LLM_WADDR(pv), 0, pv.nSize, devid);
-#endif
         }
         size_t kv_bytes = (size_t)_precompute_len * _attr.kv_cache_size * sizeof(unsigned short);
         for (int m = 0; m < _attr.axmodel_num; m++)
@@ -429,10 +427,8 @@ struct LLM::Impl {
             if ((int)kc.size() < _precompute_len * _attr.kv_cache_size || (int)vc.size() < _precompute_len * _attr.kv_cache_size) { ALOGE("kv_cache buffer too small for layer %d", m); return -1; }
             auto &dk = lyr.layer.get_input(decode_grpid, "K_cache"); auto &dv = lyr.layer.get_input(decode_grpid, "V_cache");
             llm_h2d(LLM_WADDR(dk), kc.data(), kv_bytes, devid); llm_h2d(LLM_WADDR(dv), vc.data(), kv_bytes, devid);
-#ifdef USE_AXCL
             auto &pk = lyr.layer.get_input(_attr.prefill_grpid, "K_cache"); auto &pv = lyr.layer.get_input(_attr.prefill_grpid, "V_cache");
             llm_h2d(LLM_WADDR(pk), kc.data(), kv_bytes, devid); llm_h2d(LLM_WADDR(pv), vc.data(), kv_bytes, devid);
-#endif
         }
         return 0;
     }
@@ -556,14 +552,11 @@ struct LLM::Impl {
                 auto &dec_k = lyr.layer.get_input(decode_grpid, "K_cache");
                 auto &dec_v = lyr.layer.get_input(decode_grpid, "V_cache");
                 int kv_off = history_len * _attr.kv_cache_size;
-#ifdef USE_AXCL
-                // Only the first `input_num_token` entries are valid for the last chunk.
                 size_t kv_sz = (size_t)input_num_token * _attr.kv_cache_size * sizeof(unsigned short);
+                // Sync current prefill chunk K/V into decode group on both AXCL and AX650.
+                // Missing this causes decode stage to ignore prefill history (AX650 output degrades badly).
                 llm_d2d((unsigned short *)LLM_WADDR(dec_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                 llm_d2d((unsigned short *)LLM_WADDR(dec_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
-#else
-                size_t kv_sz = (size_t)input_num_token * _attr.kv_cache_size * sizeof(unsigned short);
-#endif
                 // axcl-qwen3-vl behavior: do not write back to the current prefill group
                 // (group-1 K/V cache capacity can be much smaller than one prefill chunk).
                 // Only propagate to future prefill groups so the next chunk can reuse history.
