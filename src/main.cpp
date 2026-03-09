@@ -8,6 +8,7 @@
 #include <sstream>
 #include <termios.h>
 #include <unistd.h>
+#include <cstdlib>
 
 #include "runner/LLM.hpp"
 #include "openai_api/server.hpp"
@@ -518,8 +519,108 @@ int run_interactive_mode(ModelConfig &config)
     return 0;
 }
 
+// ============ Base64 data-URI support ============
+static const std::string g_base64_chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789+/";
+
+static std::vector<uint8_t> base64_decode_bytes(const std::string &encoded)
+{
+    std::vector<uint8_t> out;
+    out.reserve(encoded.size() * 3 / 4);
+    int val = 0, valb = -8;
+    for (unsigned char c : encoded)
+    {
+        if (c == '=') break;
+        auto pos = g_base64_chars.find(c);
+        if (pos == std::string::npos) continue; // skip whitespace / invalid
+        val = (val << 6) + (int)pos;
+        valb += 6;
+        if (valb >= 0)
+        {
+            out.push_back((uint8_t)((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+// Detect "data:image/<ext>;base64,<payload>" and return the extension + payload.
+// Uses simple string operations instead of regex to avoid stack overflow on large payloads.
+static bool parse_base64_data_uri(const std::string &uri, std::string &ext, std::string &payload)
+{
+    const std::string prefix = "data:image/";
+    if (uri.compare(0, prefix.size(), prefix) != 0) return false;
+
+    auto semi = uri.find(';', prefix.size());
+    if (semi == std::string::npos) return false;
+
+    ext = uri.substr(prefix.size(), semi - prefix.size());
+    if (ext.empty()) return false;
+
+    const std::string b64tag = "base64,";
+    if (uri.compare(semi + 1, b64tag.size(), b64tag) != 0) return false;
+
+    size_t data_start = semi + 1 + b64tag.size();
+    if (data_start >= uri.size()) return false;
+
+    payload = uri.substr(data_start);
+    return true;
+}
+
+// Decode a base64 data-URI to a temporary file and return the path.
+// Caller should eventually delete the file (or leave it in /tmp for OS cleanup).
+static std::string save_base64_to_tempfile(const std::string &ext, const std::string &payload)
+{
+    auto bytes = base64_decode_bytes(payload);
+    if (bytes.empty()) return {};
+
+    std::string tmpdir = "/tmp/axllm_images";
+    std::filesystem::create_directories(tmpdir);
+
+    // Generate a unique filename
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::string path = tmpdir + "/img_" + std::to_string(now) + "." + ext;
+
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) return {};
+    ofs.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+    ofs.close();
+    return path;
+}
+
+// Resolve an image URI: if it's a base64 data-URI, decode to a temp file.
+// Otherwise return as-is (file path / directory).
+static std::string resolve_image_uri(const std::string &uri, std::vector<std::string> &temp_files)
+{
+    std::string ext, payload;
+    if (parse_base64_data_uri(uri, ext, payload))
+    {
+        std::string path = save_base64_to_tempfile(ext, payload);
+        if (!path.empty())
+        {
+            temp_files.push_back(path);
+        }
+        return path;
+    }
+    return uri; // plain file path
+}
+
+// Clean up temporary files created from base64 decoding.
+static void cleanup_temp_files(std::vector<std::string> &files)
+{
+    for (auto &f : files)
+    {
+        std::filesystem::remove(f);
+    }
+    files.clear();
+}
+
 // Handle HTTP API messages
-bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history, std::vector<MediaInputs> *media_inputs = nullptr)
+bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history,
+                         std::vector<MediaInputs> *media_inputs = nullptr,
+                         std::vector<std::string> *temp_files = nullptr)
 {
     for (auto &item : messages)
     {
@@ -561,13 +662,28 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                 else if (c.contains("type") && c["type"] == "image_url")
                 {
                     // OpenAI style: {type:"image_url", image_url:{url:"..."}}
+                    // Supports file paths and data:image/...;base64,... URIs
+                    std::string raw_url;
                     if (c.contains("image_url") && c["image_url"].is_object() && c["image_url"].contains("url"))
                     {
-                        image_uris.push_back(c["image_url"]["url"].get<std::string>());
+                        raw_url = c["image_url"]["url"].get<std::string>();
                     }
                     else if (c.contains("image_url") && c["image_url"].is_string())
                     {
-                        image_uris.push_back(c["image_url"].get<std::string>());
+                        raw_url = c["image_url"].get<std::string>();
+                    }
+                    if (!raw_url.empty())
+                    {
+                        if (temp_files)
+                        {
+                            image_uris.push_back(resolve_image_uri(raw_url, *temp_files));
+                        }
+                        else
+                        {
+                            // No temp_files tracking — still try to resolve, but won't auto-cleanup
+                            std::vector<std::string> dummy;
+                            image_uris.push_back(resolve_image_uri(raw_url, dummy));
+                        }
                     }
                 }
             }
@@ -661,8 +777,10 @@ int run_server_mode(const ModelConfig &config, int port)
 
         std::vector<Content> history;
         std::vector<MediaInputs> media_inputs;
-        if (!handle_api_messages(req.messages, history, &media_inputs)) {
+        std::vector<std::string> temp_files;
+        if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files)) {
             ALOGE("handle_body failed");
+            cleanup_temp_files(temp_files);
             provider->end();
             return;
         }
@@ -695,6 +813,7 @@ int run_server_mode(const ModelConfig &config, int port)
             provider->push(chunk);
         }
 
+        cleanup_temp_files(temp_files);
         provider->end(); });
 
     printf("Starting server on port %d with model '%s'...\n", port, model_name.c_str());

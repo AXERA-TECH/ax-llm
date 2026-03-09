@@ -219,9 +219,31 @@ Max concurrency: 1
 Models: AXERA-TECH/SmolLM2-360M-Instruct
 ```
 ### 测试 OpenAI API
+
+纯文本对话：
 ```shell
 python scripts/openai_demo.py --model AXERA-TECH/SmolLM2-360M-Instruct --api_url http://127.0.0.1:8000/v1
 ```
+
+自定义 prompt：
+```shell
+python scripts/openai_demo.py --model AXERA-TECH/SmolLM2-360M-Instruct --prompt "请介绍一下你自己"
+```
+
+图文对话（VLM，图片会自动 base64 编码发送）：
+```shell
+python scripts/openai_demo.py --model AXERA-TECH/Qwen3-VL-2B-Instruct --image /path/to/image.jpg --prompt "描述一下这张图片"
+```
+
+> **参数说明**
+> | 参数 | 说明 | 默认值 |
+> |------|------|--------|
+> | `--model` | 模型名称（必填） | — |
+> | `--api_url` | API 地址 | `http://127.0.0.1:8000/v1` |
+> | `--prompt` | 用户 prompt 文本 | `hello` |
+> | `--image` | 图片路径（可选，VLM 模式） | — |
+>
+> 当指定 `--image` 时，脚本会将图片读取并以 `data:image/...;base64,...` 格式嵌入请求，服务端会自动解码为临时文件供视觉编码器使用。
 
 ## 技术讨论
 
