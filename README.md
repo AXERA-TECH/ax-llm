@@ -48,6 +48,12 @@
 ./install.sh
 ```
 
+Windows + AXCL + MinGW64 可使用：
+
+```bat
+install.bat
+```
+
 或使用一行命令下载并执行（默认分支 `axllm`）：
 
 ```shell
@@ -75,6 +81,12 @@ REPO_URL=git@github.com:AXERA-TECH/ax-llm.git BRANCH=axllm ./install.sh
 ./uninstall.sh
 ```
 
+Windows 本地安装可使用：
+
+```bat
+uninstall.bat
+```
+
 ### 编译方式（手动）
 
 如果需要手动编译，请按后端选择对应脚本：
@@ -91,6 +103,28 @@ REPO_URL=git@github.com:AXERA-TECH/ax-llm.git BRANCH=axllm ./install.sh
 ```
 
 编译完成后，`build*/install/bin/` 目录下会生成 `axllm`（本分支已统一命名）。
+
+Windows 下编译 AXCL 后端时，请显式关闭 `BUILD_AX650`，并传入 `AXCL_DIR`：
+
+```powershell
+# MinGW64
+cmake -S . -B build_windows_mingw -G "MinGW Makefiles" `
+  -DBUILD_AX650=OFF -DBUILD_AXCL=ON `
+  -DAXCL_DIR="C:\Program Files\AXCL\axcl\out\axcl_win_x64"
+cmake --build build_windows_mingw --parallel
+
+# MSVC
+cmake -S . -B build_windows_msvc -G "Visual Studio 17 2022" -A x64 `
+  -DBUILD_AX650=OFF -DBUILD_AXCL=ON `
+  -DAXCL_DIR="C:\Program Files\AXCL\axcl\out\axcl_win_x64"
+cmake --build build_windows_msvc --config Release --parallel
+```
+
+如需复用当前仓库的 Windows MinGW 验证流程，可运行：
+
+```shell
+/bin/bash scripts/windows_axcl_mingw_validate.sh
+```
 
 ## 使用方式
 

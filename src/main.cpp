@@ -6,9 +6,13 @@
 #include <signal.h>
 #include <filesystem>
 #include <sstream>
+#include <string>
+#include <cstdlib>
+
+#ifndef _WIN32
 #include <termios.h>
 #include <unistd.h>
-#include <cstdlib>
+#endif
 
 #include "runner/LLM.hpp"
 #include "openai_api/server.hpp"
@@ -28,31 +32,39 @@ static openai_api::Server g_server;
 static bool g_running = true;
 
 // Terminal settings for handling UTF-8 backspace
+#ifndef _WIN32
 struct termios g_orig_termios;
+#endif
 static bool g_terminal_modified = false;
 
 void save_terminal_settings()
 {
+#ifndef _WIN32
     tcgetattr(STDIN_FILENO, &g_orig_termios);
+#endif
 }
 
 void restore_terminal_settings()
 {
+#ifndef _WIN32
     if (g_terminal_modified)
     {
         tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
         g_terminal_modified = false;
     }
+#endif
 }
 
 void setup_terminal_for_utf8()
 {
+#ifndef _WIN32
     struct termios new_termios;
     tcgetattr(STDIN_FILENO, &new_termios);
     // Disable canonical mode and echo for custom input handling
     new_termios.c_lflag &= ~(ICANON | ECHO);
     tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
     g_terminal_modified = true;
+#endif
 }
 
 void __sigExit(int iSigNo)
@@ -219,12 +231,17 @@ struct ModelConfig
 std::string resolve_path(const std::string &base_path, const std::string &relative_path)
 {
     if (relative_path.empty())
-        return relative_path;
-    if (relative_path[0] == '/' || relative_path.substr(0, 2) == "./")
     {
-        return relative_path; // Already absolute or explicit relative
+        return relative_path;
     }
-    return base_path + "/" + relative_path;
+
+    const std::filesystem::path path(relative_path);
+    if (path.is_absolute() || relative_path.rfind("./", 0) == 0 || relative_path.rfind(".\\", 0) == 0)
+    {
+        return path.lexically_normal().string();
+    }
+
+    return (std::filesystem::path(base_path) / path).lexically_normal().string();
 }
 
 // Helper function to make paths absolute in config
@@ -264,6 +281,14 @@ size_t utf8_char_len(unsigned char c)
 std::string read_line_with_utf8_support()
 {
     std::string line;
+
+#ifdef _WIN32
+    if (!std::getline(std::cin, line))
+    {
+        return "q";
+    }
+    return line;
+#else
     char c;
 
     while (read(STDIN_FILENO, &c, 1) == 1)
@@ -330,6 +355,7 @@ std::string read_line_with_utf8_support()
     }
 
     return line;
+#endif
 }
 
 // Run interactive mode
@@ -576,18 +602,26 @@ static std::string save_base64_to_tempfile(const std::string &ext, const std::st
     auto bytes = base64_decode_bytes(payload);
     if (bytes.empty()) return {};
 
-    std::string tmpdir = "/tmp/axllm_images";
+    std::filesystem::path tmpdir;
+    try
+    {
+        tmpdir = std::filesystem::temp_directory_path() / "axllm_images";
+    }
+    catch (...)
+    {
+        tmpdir = std::filesystem::current_path() / "tmp" / "axllm_images";
+    }
     std::filesystem::create_directories(tmpdir);
 
     // Generate a unique filename
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    std::string path = tmpdir + "/img_" + std::to_string(now) + "." + ext;
+    const auto path = tmpdir / ("img_" + std::to_string(now) + "." + ext);
 
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) return {};
     ofs.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
     ofs.close();
-    return path;
+    return path.string();
 }
 
 // Resolve an image URI: if it's a base64 data-URI, decode to a temp file.
@@ -767,6 +801,11 @@ int run_server_mode(const ModelConfig &config, int port)
 
     std::string model_name = config.model_name;
 
+    openai_api::ChatModelOptions options;
+    options.supports_vision = config.attr.vlm_type != VLMType::None;
+    options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
+    options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+
     g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
                                              std::shared_ptr<openai_api::BaseDataProvider> provider)
                           {
@@ -854,7 +893,9 @@ void print_usage(const char *program_name)
 
 int main(int argc, char *argv[])
 {
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
     signal(SIGINT, __sigExit);
 
     if (argc < 3)

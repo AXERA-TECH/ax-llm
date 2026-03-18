@@ -2,8 +2,6 @@
 #define CQDM_H
 
 #include <stdio.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 // Structure to hold progress bar information
 typedef struct s_cqdm

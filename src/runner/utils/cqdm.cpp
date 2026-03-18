@@ -1,13 +1,12 @@
 #include "cqdm.h"
 
+#include <chrono>
+
 // Returns the current time in milliseconds
 long long get_msec_now()
 {
-    struct timeval time;
-
-    if (gettimeofday(&time, NULL) == -1)
-        return (0);
-    return (long long)time.tv_sec * 1000LL + (long long)time.tv_usec / 1000LL;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
 
 t_cqdm create_cqdm(int total, int size)

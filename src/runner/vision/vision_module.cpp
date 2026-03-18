@@ -2,12 +2,12 @@
 
 #include <cctype>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <numeric>
-#include <sys/stat.h>
 
 #include "bfloat16.hpp"
 #include "sample_log.h"
@@ -151,14 +151,16 @@ static bool get_single_token_id(const std::shared_ptr<BaseTokenizer>& tok, const
 
 static bool file_sig(const std::string& path, uint64_t& size_out, uint64_t& mtime_ns_out)
 {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) return false;
-    size_out = (uint64_t)st.st_size;
-#if defined(__APPLE__)
-    mtime_ns_out = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)st.st_mtimespec.tv_nsec;
-#else
-    mtime_ns_out = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
-#endif
+    std::error_code ec;
+    const auto file_size = std::filesystem::file_size(path, ec);
+    if (ec) return false;
+
+    const auto write_time = std::filesystem::last_write_time(path, ec);
+    if (ec) return false;
+
+    size_out = static_cast<uint64_t>(file_size);
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(write_time.time_since_epoch()).count();
+    mtime_ns_out = static_cast<uint64_t>(ns);
     return true;
 }
 

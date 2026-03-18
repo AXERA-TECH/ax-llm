@@ -249,11 +249,11 @@ int ax_runner_axcl::sub_init()
         auto &first_input = mgroup_input_tensors[0];
         auto &last_input = mgroup_input_tensors[group_count - 1];
         auto &last_output = mgroup_output_tensors[group_count - 1];
-        for (uint i = 0; i < last_input.size(); ++i)
+        for (size_t i = 0; i < last_input.size(); ++i)
         {
             if (std::find(skip_alloc_input_names.begin(), skip_alloc_input_names.end(), last_input[i].sName) != skip_alloc_input_names.end())
             {
-                for (uint j = 0; j < first_input.size(); ++j)
+                for (size_t j = 0; j < first_input.size(); ++j)
                 {
                     if (first_input[j].sName == last_input[i].sName)
                     {
