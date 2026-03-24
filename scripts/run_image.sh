@@ -7,7 +7,7 @@ AXMODEL_DIR=Qwen3.5-2B-AX650-1
 --bos 0 --eos 0 \
 --dynamic_load_axmodel_layer 0 \
 --use_mmap_load_embed 1 \
---filename_tokenizer_model "http://10.122.86.184:9000" \
+--filename_tokenizer_model "scripts/qwen3_5_tokenizer.txt" \
 --filename_post_axmodel "${AXMODEL_DIR}/qwen3_5_text_post.axmodel" \
 --use_topk 0 \
 --filename_tokens_embed "${AXMODEL_DIR}/model.embed_tokens.weight.bfloat16.bin" \
