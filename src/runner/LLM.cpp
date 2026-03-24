@@ -2,8 +2,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <numeric>
+#include <queue>
+#include <thread>
 
 #include "bfloat16.hpp"
 #include "LLMEmbedSelector.hpp"
@@ -161,17 +165,86 @@ struct LLM::Impl {
         llama_layers.resize(attr.axmodel_num);
         auto dev_assign = distributeModels((int)_attr.dev_ids.size(), attr.axmodel_num);
         std::vector<int> rets(attr.axmodel_num, 0);
+
+        // Prepare filenames first (thread-safe, no I/O).
         for (int i = 0; i < attr.axmodel_num; i++)
         {
             char path[1024];
-            sprintf(path, attr.template_filename_axmodel.c_str(), i);
+            std::snprintf(path, sizeof(path), attr.template_filename_axmodel.c_str(), i);
             llama_layers[i].filename = path;
-            int devid = _attr.dev_ids[dev_assign[i]];
-            rets[i] = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
-            int remain = axcl_GetCMMRemain(devid);
-            sprintf(path, "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, devid, remain);
-            update_cqdm(&cqdm, i + 1, "count", path);
         }
+
+        // Load models in parallel across devices (per-device sequential), while the main thread updates progress.
+        struct LoadResult {
+            int idx = -1;
+            int ret = -1;
+            int devid = -1;
+            int remain_mb = -1;
+            std::string msg;
+        };
+
+        std::vector<std::vector<int>> models_per_dev(_attr.dev_ids.size());
+        for (int i = 0; i < attr.axmodel_num; ++i)
+        {
+            const int dev_idx = (dev_assign.empty() ? 0 : dev_assign[i]);
+            if (dev_idx >= 0 && (size_t)dev_idx < models_per_dev.size()) models_per_dev[(size_t)dev_idx].push_back(i);
+        }
+
+        std::mutex q_mu;
+        std::condition_variable q_cv;
+        std::queue<LoadResult> q;
+        std::vector<std::thread> loaders;
+        loaders.reserve(_attr.dev_ids.size());
+
+        for (size_t dev_idx = 0; dev_idx < _attr.dev_ids.size(); ++dev_idx)
+        {
+            const int devid = _attr.dev_ids[dev_idx];
+            loaders.emplace_back([&, dev_idx, devid]() {
+                for (const int i : models_per_dev[dev_idx])
+                {
+                    const int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
+                    const int remain = axcl_GetCMMRemain(devid);
+
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf), "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, devid, remain);
+
+                    LoadResult r;
+                    r.idx = i;
+                    r.ret = ret;
+                    r.devid = devid;
+                    r.remain_mb = remain;
+                    r.msg = buf;
+
+                    {
+                        std::lock_guard<std::mutex> lk(q_mu);
+                        q.push(std::move(r));
+                    }
+                    q_cv.notify_one();
+                }
+            });
+        }
+
+        int progress_step = 1;
+        int finished = 0;
+        while (finished < attr.axmodel_num)
+        {
+            LoadResult r;
+            {
+                std::unique_lock<std::mutex> lk(q_mu);
+                q_cv.wait(lk, [&]() { return !q.empty(); });
+                r = std::move(q.front());
+                q.pop();
+            }
+            if (r.idx >= 0 && r.idx < attr.axmodel_num) rets[r.idx] = r.ret;
+            update_cqdm(&cqdm, progress_step++, "count", r.msg.c_str());
+            finished++;
+        }
+
+        for (auto &t : loaders)
+        {
+            if (t.joinable()) t.join();
+        }
+
         for (int i = 0; i < attr.axmodel_num; i++) { if (rets[i] != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; } }
         {
             int post_devid = llama_layers.back().layer.get_devid();
