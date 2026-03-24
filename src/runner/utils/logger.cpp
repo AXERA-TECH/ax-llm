@@ -29,6 +29,14 @@ std::atomic<int> g_stdout_sticky_color{-1};
 std::mutex g_write_mutex;
 std::once_flag g_init_once;
 
+struct InplaceLineState {
+    bool active = false;
+    size_t width = 0; // visible chars on the current line
+    FILE *stream = stdout;
+};
+
+InplaceLineState g_inplace;
+
 #ifdef _WIN32
 struct WinConsoleState {
     HANDLE stdout_handle = nullptr;
@@ -243,6 +251,34 @@ static inline void fwrite_sv(FILE *stream, std::string_view s)
     std::fwrite(s.data(), 1, s.size(), stream);
 }
 
+static inline void write_spaces(FILE *stream, size_t n)
+{
+    static const char kSpaces[] =
+        "                                                                "; // 64 spaces
+    constexpr size_t kChunk = sizeof(kSpaces) - 1;
+    while (n > 0)
+    {
+        const size_t chunk = (n < kChunk) ? n : kChunk;
+        std::fwrite(kSpaces, 1, chunk, stream);
+        n -= chunk;
+    }
+}
+
+static inline void clear_inplace_line_locked()
+{
+    if (!g_inplace.active) return;
+    FILE *stream = g_inplace.stream ? g_inplace.stream : stdout;
+    fwrite_sv(stream, "\r");
+    if (g_inplace.width > 0)
+    {
+        write_spaces(stream, g_inplace.width);
+        fwrite_sv(stream, "\r");
+    }
+    g_inplace.active = false;
+    g_inplace.width = 0;
+    g_inplace.stream = stdout;
+}
+
 static inline std::string strip_trailing_newlines(std::string_view s)
 {
     size_t end = s.size();
@@ -338,11 +374,8 @@ static inline void write_colored_piece(FILE *stream, TextColor color, std::strin
         if (h) SetConsoleTextAttribute(h, old_attr);
         return;
     }
-#else
-    (void)use_color;
 #endif
 
-#ifndef _WIN32
     if (use_color)
     {
         fwrite_sv(stream, ansi_code(color));
@@ -355,7 +388,6 @@ static inline void write_colored_piece(FILE *stream, TextColor color, std::strin
         }
         return;
     }
-#endif
     fwrite_sv(stream, text);
 }
 
@@ -432,24 +464,11 @@ void Logger::log(LogLevel lvl, const char * /*file*/, int line, const char *func
     const bool tty = is_tty(stream);
     const bool use_color = should_use_color(stream, tty);
 
-#ifdef _WIN32
-    if (use_color && !stream_is_console(stream))
-    {
-        // Even if isatty says true, if the Win32 handle isn't a console, don't color.
-        // This avoids emitting gibberish when redirected.
-        // (ColorMode::Always overrides this check.)
-        if (static_cast<ColorMode>(g_color_mode.load()) != ColorMode::Always)
-        {
-            // pretend no color
-            // (fallthrough without changing use_color)
-        }
-    }
-#endif
-
     const std::string ts = format_timestamp();
     const std::string msg = strip_trailing_newlines(message);
 
     std::lock_guard<std::mutex> lock(g_write_mutex);
+    clear_inplace_line_locked();
 
     // Print each line with its own prefix for readability.
     size_t start = 0;
@@ -495,6 +514,7 @@ void Logger::print(TextColor color, std::string_view text, bool newline, bool to
     if (newline) msg.push_back('\n');
 
     std::lock_guard<std::mutex> lock(g_write_mutex);
+    if (newline) clear_inplace_line_locked();
     write_colored_piece(stream, color, msg, use_color);
     std::fflush(stream);
 }
@@ -507,20 +527,58 @@ void Logger::print_parts(std::initializer_list<ColoredPart> parts, bool newline,
     const bool tty = is_tty(stream);
     bool use_color = should_use_color(stream, tty);
 
-#ifdef _WIN32
-    if (use_color && !stream_is_console(stream) && static_cast<ColorMode>(g_color_mode.load()) != ColorMode::Always)
-    {
-        use_color = false;
-    }
-#endif
-
     std::lock_guard<std::mutex> lock(g_write_mutex);
+    if (newline)
+    {
+        clear_inplace_line_locked();
+    }
+    else if (tty)
+    {
+        // In-place updates (progress bars): clear the previous in-place line first so other
+        // logs never get appended to it and we won't leave trailing characters.
+        clear_inplace_line_locked();
+    }
+
+    size_t visible_width = 0;
+    if (!newline && tty)
+    {
+        for (const auto &p : parts)
+        {
+            for (const char ch : p.text)
+            {
+                if (ch == '\r') continue;
+                visible_width++;
+            }
+        }
+    }
     for (const auto &p : parts)
     {
         const TextColor c = use_color ? p.color : TextColor::Default;
         write_colored_piece(stream, c, p.text, use_color);
     }
-    if (newline) fwrite_sv(stream, "\n");
+    if (newline)
+    {
+        fwrite_sv(stream, "\n");
+    }
+    else if (tty)
+    {
+        g_inplace.active = true;
+        g_inplace.width = visible_width;
+        g_inplace.stream = stream;
+    }
+    std::fflush(stream);
+}
+
+void Logger::finish_inplace_line()
+{
+    ensure_initialized();
+    std::lock_guard<std::mutex> lock(g_write_mutex);
+    if (!g_inplace.active) return;
+    FILE *stream = g_inplace.stream ? g_inplace.stream : stdout;
+    fwrite_sv(stream, "\n");
+    g_inplace.active = false;
+    g_inplace.width = 0;
+    g_inplace.stream = stdout;
     std::fflush(stream);
 }
 
@@ -535,6 +593,7 @@ void Logger::print_chat_role(std::string_view role, TextColor role_color, std::s
     const std::string msg = strip_trailing_newlines(text);
 
     std::lock_guard<std::mutex> lock(g_write_mutex);
+    clear_inplace_line_locked();
     std::string line;
     line.reserve(role.size() + 2 + msg.size() + 1);
     line.append(role);
@@ -552,13 +611,6 @@ void Logger::set_stdout_sticky_color(TextColor color)
     const bool tty = is_tty(stream);
     bool use_color = should_use_color(stream, tty);
 
-#ifdef _WIN32
-    if (use_color && !stream_is_console(stream) && static_cast<ColorMode>(g_color_mode.load()) != ColorMode::Always)
-    {
-        use_color = false;
-    }
-#endif
-
     if (!use_color)
     {
         g_stdout_sticky_color.store(-1, std::memory_order_relaxed);
@@ -568,6 +620,7 @@ void Logger::set_stdout_sticky_color(TextColor color)
     g_stdout_sticky_color.store(static_cast<int>(color), std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> lock(g_write_mutex);
+    clear_inplace_line_locked();
 #ifdef _WIN32
     if (stream_is_console(stream))
     {
@@ -580,6 +633,11 @@ void Logger::set_stdout_sticky_color(TextColor color)
             const WORD attr = win_attr_for_color(color, old_attr);
             SetConsoleTextAttribute(h, attr);
         }
+    }
+    else
+    {
+        fwrite_sv(stream, ansi_code(color));
+        std::fflush(stream);
     }
 #else
     fwrite_sv(stream, ansi_code(color));
@@ -595,11 +653,17 @@ void Logger::clear_stdout_sticky_color()
 
     FILE *stream = stdout;
     std::lock_guard<std::mutex> lock(g_write_mutex);
+    clear_inplace_line_locked();
 #ifdef _WIN32
     if (stream_is_console(stream))
     {
         const HANDLE h = stream_handle(stream);
         if (h) SetConsoleTextAttribute(h, stream_default_attr(stream));
+    }
+    else
+    {
+        fwrite_sv(stream, "\x1b[0m");
+        std::fflush(stream);
     }
 #else
     fwrite_sv(stream, "\x1b[0m");

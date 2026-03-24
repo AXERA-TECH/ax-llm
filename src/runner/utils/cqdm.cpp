@@ -47,8 +47,8 @@ void update_cqdm(t_cqdm *cqdm, int x, const char *unit, const char *log_str)
     std::snprintf(prefix, sizeof(prefix), "\r%3d%% | ", percent);
 
     std::string bar;
-    bar.reserve(static_cast<size_t>(cqdm->size) * 3U + 4U);
-    for (int i = 0; i < filled; ++i) bar += "█";
+    bar.reserve(static_cast<size_t>(cqdm->size) + 4U);
+    for (int i = 0; i < filled; ++i) bar += "#";
     for (int i = 0; i < (cqdm->size - filled); ++i) bar += " ";
 
     const double avg = (cqdm->average_time > 1e-9) ? cqdm->average_time : 1e-9;

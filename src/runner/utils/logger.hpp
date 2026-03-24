@@ -60,6 +60,9 @@ public:
         std::string_view text;
     };
     static void print_parts(std::initializer_list<ColoredPart> parts, bool newline = true, bool to_stderr = false);
+    // Finish the current in-place line (e.g. progress bar) by printing '\n'.
+    // This keeps the last rendered progress text visible on screen.
+    static void finish_inplace_line();
 
     // Keep stdout in a specific color so streaming `printf`/`fprintf` output (e.g. token callbacks)
     // remains readable. On POSIX terminals this uses ANSI; on Windows this sets console attributes.

@@ -136,9 +136,21 @@ struct LLM::Impl {
     bool Init(LLMAttrType attr)
     {
         ALOGI("LLM init start");
-        t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         this->_attr = attr;
 
+#ifdef USE_AXCL
+        // AXCL init may spawn worker threads that print logs. Do it before the progress bar starts.
+        for (auto &devid : _attr.dev_ids)
+        {
+            if (axcl_Init(devid) != 0)
+            {
+                ALOGE("axcl_Init(%d) failed", devid);
+                return false;
+            }
+        }
+#endif
+
+        t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
         tokenizer = create_tokenizer(this->_attr.tokenizer_type);
         if (!tokenizer) { ALOGE("create_tokenizer(%s) failed", this->_attr.tokenizer_type.c_str()); return false; }
         if (!tokenizer->load(attr.url_tokenizer_model)) { ALOGE("tokenizer.init(%s) failed", attr.url_tokenizer_model.c_str()); return false; }
@@ -146,12 +158,9 @@ struct LLM::Impl {
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
 
 #ifdef USE_AXCL
-        for (auto &devid : _attr.dev_ids) { if (axcl_Init(devid) != 0) { ALOGE("axcl_Init(%d) failed", devid); return false; } }
         llama_layers.resize(attr.axmodel_num);
         auto dev_assign = distributeModels((int)_attr.dev_ids.size(), attr.axmodel_num);
         std::vector<int> rets(attr.axmodel_num, 0);
-        std::atomic<int> process_idx(1);
-#pragma omp parallel for if (_attr.dev_ids.size() > 1)
         for (int i = 0; i < attr.axmodel_num; i++)
         {
             char path[1024];
@@ -161,7 +170,7 @@ struct LLM::Impl {
             rets[i] = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
             int remain = axcl_GetCMMRemain(devid);
             sprintf(path, "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, devid, remain);
-            update_cqdm(&cqdm, process_idx++, "count", path);
+            update_cqdm(&cqdm, i + 1, "count", path);
         }
         for (int i = 0; i < attr.axmodel_num; i++) { if (rets[i] != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; } }
         {
@@ -193,7 +202,7 @@ struct LLM::Impl {
             update_cqdm(&cqdm, attr.axmodel_num + 1, "count", axmodel_path);
         }
 #endif
-        printf("\n");
+        axllm::Logger::finish_inplace_line();
         {
             _attr.max_token_len = llama_layers[0].layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
             ALOGI("max_token_len : %d", _attr.max_token_len);
@@ -230,7 +239,7 @@ struct LLM::Impl {
             }
             update_cqdm(&cqdm, attr.axmodel_num + 2, "count", "embed_selector init ok");
         }
-        printf("\n");
+        axllm::Logger::finish_inplace_line();
 
         // Optional VLM vision encoder (runtime controlled by attr.vlm_type).
         has_vision_state = false;
