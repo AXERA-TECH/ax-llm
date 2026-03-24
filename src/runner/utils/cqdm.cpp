@@ -1,6 +1,10 @@
 #include "cqdm.h"
 
 #include <chrono>
+#include <cstdio>
+#include <string>
+
+#include "logger.hpp"
 
 // Returns the current time in milliseconds
 long long get_msec_now()
@@ -30,18 +34,34 @@ void update_cqdm(t_cqdm *cqdm, int x, const char *unit, const char *log_str)
     now = get_msec_now();
 
     cqdm->count++;
-    cqdm->total_time += ((now - cqdm->last_time) / 1000);
+    cqdm->total_time += ((now - cqdm->last_time) / 1000.0);
     cqdm->average_time = cqdm->total_time / cqdm->count;
     cqdm->last_time = now;
 
     temp = ((double)(x + 1) / (double)cqdm->total);
 
-    fprintf(stdout, "\033[1;30;33m\r%3d%% | ", (int)(temp * 100));
-    for (int i = 0; i < (temp * cqdm->size); i++)
-        fprintf(stdout, "█");
-    for (int i = 0; i < (cqdm->size - temp * cqdm->size); i++)
-        fprintf(stdout, " ");
-    fprintf(stdout, " | %3d / %3d [%2.2fs<%2.2fs, %2.2f %s/s] \033[1;30;32m%s\033[0m", x + 1, cqdm->total, cqdm->total_time,
-            cqdm->average_time * cqdm->total, 1 / cqdm->average_time, unit, log_str);
-    fflush(stdout);
+    const int percent = static_cast<int>(temp * 100);
+    const int filled = static_cast<int>(temp * cqdm->size);
+
+    char prefix[64];
+    std::snprintf(prefix, sizeof(prefix), "\r%3d%% | ", percent);
+
+    std::string bar;
+    bar.reserve(static_cast<size_t>(cqdm->size) * 3U + 4U);
+    for (int i = 0; i < filled; ++i) bar += "█";
+    for (int i = 0; i < (cqdm->size - filled); ++i) bar += " ";
+
+    const double avg = (cqdm->average_time > 1e-9) ? cqdm->average_time : 1e-9;
+    char stats[256];
+    std::snprintf(stats, sizeof(stats), " | %3d / %3d [%2.2fs<%2.2fs, %2.2f %s/s] ",
+                  x + 1, cqdm->total, cqdm->total_time, avg * cqdm->total, 1.0 / avg, unit ? unit : "it");
+
+    axllm::Logger::print_parts(
+        {
+            {axllm::TextColor::Yellow, prefix},
+            {axllm::TextColor::Default, bar},
+            {axllm::TextColor::Default, stats},
+            {axllm::TextColor::Green, log_str ? std::string_view(log_str) : std::string_view()},
+        },
+        /*newline=*/false);
 }

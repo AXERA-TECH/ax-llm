@@ -74,7 +74,7 @@ struct LLM::Impl {
     ax_runner_t llama_post;
 
     int decode_grpid = 0;
-    bool b_stop = false;
+    std::atomic<bool> b_stop{false};
     LLMPostprocess postprocess;
 
     // ---- small helpers ----
@@ -284,7 +284,7 @@ struct LLM::Impl {
 #endif
     }
 
-    void Stop() { b_stop = true; }
+    void Stop() { b_stop.store(true, std::memory_order_relaxed); }
 
     int GenerateKVCachePrefill(std::vector<int> &_token_ids,
                                std::vector<std::vector<unsigned short>> &k_caches,
@@ -446,7 +446,7 @@ struct LLM::Impl {
 
     std::string Run(std::vector<unsigned short> &test_embed, int output_max_token = -1)
     {
-        b_stop = false; std::string final_out;
+        b_stop.store(false, std::memory_order_relaxed); std::string final_out;
         bfloat16 bf16 = -65536.f;
         std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
         std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
@@ -476,7 +476,7 @@ struct LLM::Impl {
 
         for (int p = 0; p < prefill_split_num; p++)
         {
-            if (b_stop) break;
+            if (b_stop.load(std::memory_order_relaxed)) break;
             int input_num_token = (p == prefill_split_num - 1) ? input_embed_num - p * _attr.prefill_token_num : _attr.prefill_token_num;
             const int history_len = precompute_len + p * _attr.prefill_token_num;
 
@@ -506,7 +506,7 @@ struct LLM::Impl {
 
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
-                if (b_stop) break;
+                if (b_stop.load(std::memory_order_relaxed)) break;
                 auto &lyr   = llama_layers[m]; int devid = LLM_DEVID(lyr);
                 auto &t_idx = lyr.layer.get_input(prefill_grpid, "indices");
                 unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
@@ -637,7 +637,7 @@ struct LLM::Impl {
         if (has_vision_state && vision_state.decode_start > 0) decode_start = (unsigned int)vision_state.decode_start;
         for (unsigned int indices = decode_start; indices < (unsigned int)_attr.max_token_len; indices++)
         {
-            if (b_stop) break;
+            if (b_stop.load(std::memory_order_relaxed)) break;
             embed_selector.getByIndex(next_token, embed);
 
 #ifdef USE_AXCL
@@ -647,7 +647,7 @@ struct LLM::Impl {
             }
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
-                if (b_stop) break; auto &lyr = llama_layers[m]; int devid = lyr.layer.get_devid();
+                if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m]; int devid = lyr.layer.get_devid();
                 auto &t_idx = lyr.layer.get_input(decode_grpid, "indices"); llm_h2d(LLM_WADDR(t_idx), &indices, sizeof(indices), devid);
                 auto &t_mask= lyr.layer.get_input(decode_grpid, "mask"); llm_h2d(LLM_WADDR(t_mask), mask.data(), mask.size() * sizeof(unsigned short), devid);
                 lyr.layer.inference(decode_grpid);
@@ -677,7 +677,7 @@ struct LLM::Impl {
 #else // AX650
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
-                if (b_stop) break; auto &lyr = llama_layers[m];
+                if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m];
                 auto &in_k = lyr.layer.get_input(decode_grpid, "K_cache"); auto *in_k_ptr = (unsigned short *)in_k.pVirAddr;
                 auto &in_v = lyr.layer.get_input(decode_grpid, "V_cache"); auto *in_v_ptr = (unsigned short *)in_v.pVirAddr;
                 auto &t_idx = lyr.layer.get_input(decode_grpid, "indices"); memcpy(t_idx.pVirAddr, &indices, sizeof(indices));

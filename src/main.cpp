@@ -1,4 +1,5 @@
 #include <iostream>
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <fstream>
@@ -7,9 +8,12 @@
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <cctype>
 #include <cstdlib>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -29,7 +33,10 @@
 // Global variables
 static LLM g_llm;
 static openai_api::Server g_server;
-static bool g_running = true;
+static std::atomic<bool> g_running{true};
+// In interactive mode: SIGINT/Ctrl+C stops current generation and returns to prompt.
+// In server mode: SIGINT/Ctrl+C exits the process (by stopping server loop).
+static std::atomic<bool> g_exit_on_sigint{true};
 
 // Terminal settings for handling UTF-8 backspace
 #ifndef _WIN32
@@ -69,12 +76,35 @@ void setup_terminal_for_utf8()
 
 void __sigExit(int iSigNo)
 {
-    g_running = false;
+    (void)iSigNo;
     g_llm.Stop();
-    g_server.stop();
-    restore_terminal_settings();
+
+    if (g_exit_on_sigint.load(std::memory_order_relaxed))
+    {
+        g_running.store(false, std::memory_order_relaxed);
+        g_server.stop();
+        restore_terminal_settings();
+    }
     return;
 }
+
+#ifdef _WIN32
+static BOOL WINAPI __ConsoleCtrlHandler(DWORD ctrl_type)
+{
+    switch (ctrl_type)
+    {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        __sigExit(SIGINT);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+#endif
 
 void llm_running_callback(std::string str, float token_per_sec, void *reserve)
 {
@@ -263,6 +293,15 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
     config.attr.vision_cache_dir = resolve_path(model_path, config.attr.vision_cache_dir);
 }
 
+static std::string trim_copy(const std::string &s)
+{
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) start++;
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) end--;
+    return s.substr(start, end - start);
+}
+
 // Read UTF-8 character length
 size_t utf8_char_len(unsigned char c)
 {
@@ -285,7 +324,13 @@ std::string read_line_with_utf8_support()
 #ifdef _WIN32
     if (!std::getline(std::cin, line))
     {
-        return "q";
+        if (std::cin.eof())
+        {
+            return "/exit";
+        }
+        // Ctrl+C may interrupt console input and put `cin` into a failed state even if we handled the event.
+        std::cin.clear();
+        return "";
     }
     return line;
 #else
@@ -343,7 +388,7 @@ std::string read_line_with_utf8_support()
             {
                 printf("\n");
                 fflush(stdout);
-                return "q"; // Exit on Ctrl+D at empty line
+                return "/exit"; // Exit on Ctrl+D at empty line
             }
         }
         else
@@ -361,6 +406,7 @@ std::string read_line_with_utf8_support()
 // Run interactive mode
 int run_interactive_mode(ModelConfig &config)
 {
+    g_exit_on_sigint.store(false, std::memory_order_relaxed);
     config.attr.runing_callback = llm_running_callback;
     config.attr.reserve = nullptr;
 
@@ -395,11 +441,12 @@ int run_interactive_mode(ModelConfig &config)
         return -1;
     }
 
-    printf("Type \"q\" to exit\n");
-    printf("Ctrl+c to stop current running\n");
-    printf("\"reset\" to reset kvcache\n");
-    printf("\"dd\" to remove last conversation.\n");
-    printf("\"pp\" to print history.\n");
+    printf("Commands:\n");
+    printf("  /q, /exit  退出\n");
+    printf("  /reset     重置 kvcache\n");
+    printf("  /dd        删除一轮对话\n");
+    printf("  /pp        打印历史对话\n");
+    printf("Ctrl+C: 停止当前生成\n");
     if (config.attr.vlm_type != VLMType::None)
     {
         printf("VLM enabled: after each prompt, input image path (empty = text-only). Use \"video:<frames_dir>\" for video.\n");
@@ -413,22 +460,23 @@ int run_interactive_mode(ModelConfig &config)
     save_terminal_settings();
     setup_terminal_for_utf8();
 
-    while (g_running)
+    while (g_running.load(std::memory_order_relaxed))
     {
         printf("prompt >> ");
         fflush(stdout);
 
         std::string prompt = read_line_with_utf8_support();
+        const std::string cmd = trim_copy(prompt);
 
-        if (prompt == "q")
+        if (cmd == "/q" || cmd == "/exit")
         {
             break;
         }
-        if (prompt.empty())
+        if (cmd.empty())
         {
             continue;
         }
-        if (prompt == "reset")
+        if (cmd == "/reset")
         {
             ALOGI("reset kvcache");
             g_llm.ResetKVCache();
@@ -436,7 +484,7 @@ int run_interactive_mode(ModelConfig &config)
             media_inputs.clear();
             continue;
         }
-        if (prompt == "dd")
+        if (cmd == "/dd")
         {
             if (history.size() >= 3)
             {
@@ -454,7 +502,7 @@ int run_interactive_mode(ModelConfig &config)
             }
             continue;
         }
-        if (prompt == "pp")
+        if (cmd == "/pp")
         {
             ALOGI("history size: %zu", history.size());
             for (auto &item : history)
@@ -462,15 +510,15 @@ int run_interactive_mode(ModelConfig &config)
                 switch (item.role)
                 {
                 case SYSTEM:
-                    printf("system: %s\n", item.data.c_str());
+                    axllm::Logger::print_chat_role("system", axllm::TextColor::Yellow, item.data);
                     break;
                 case USER:
-                    if (item.type == IMAGE) printf("user(image): %s\n", item.data.c_str());
-                    else if (item.type == VIDEO) printf("user(video): %s\n", item.data.c_str());
-                    else printf("user: %s\n", item.data.c_str());
+                    if (item.type == IMAGE) axllm::Logger::print_chat_role("user(image)", axllm::TextColor::Green, item.data);
+                    else if (item.type == VIDEO) axllm::Logger::print_chat_role("user(video)", axllm::TextColor::Green, item.data);
+                    else axllm::Logger::print_chat_role("user", axllm::TextColor::Green, item.data);
                     break;
                 case ASSISTANT:
-                    printf("assistant: %s\n", item.data.c_str());
+                    axllm::Logger::print_chat_role("assistant", axllm::TextColor::Default, item.data);
                     break;
                 default:
                     break;
@@ -739,23 +787,23 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         history.push_back(content);
     }
 
-    for (auto &content : history)
-    {
-        switch (content.role)
+        for (auto &content : history)
         {
-        case SYSTEM:
-            printf("\33[33msystem:%s\33[0m\n", content.data.c_str());
-            break;
-        case USER:
-            printf("\33[32muser:%s\33[0m\n", content.data.c_str());
-            break;
-        case ASSISTANT:
-            printf("\33[34massistant:%s\33[0m\n", content.data.c_str());
-            break;
-        default:
-            break;
+            switch (content.role)
+            {
+            case SYSTEM:
+                axllm::Logger::print_chat_role("system", axllm::TextColor::Yellow, content.data);
+                break;
+            case USER:
+                axllm::Logger::print_chat_role("user", axllm::TextColor::Green, content.data);
+                break;
+            case ASSISTANT:
+                axllm::Logger::print_chat_role("assistant", axllm::TextColor::Default, content.data);
+                break;
+            default:
+                break;
+            }
         }
-    }
 
     return true;
 }
@@ -763,6 +811,7 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
 // Run server mode
 int run_server_mode(const ModelConfig &config, int port)
 {
+    g_exit_on_sigint.store(true, std::memory_order_relaxed);
 
     LLM llm;
 
@@ -897,6 +946,9 @@ int main(int argc, char *argv[])
     signal(SIGPIPE, SIG_IGN);
 #endif
     signal(SIGINT, __sigExit);
+#ifdef _WIN32
+    SetConsoleCtrlHandler(__ConsoleCtrlHandler, TRUE);
+#endif
 
     if (argc < 3)
     {
