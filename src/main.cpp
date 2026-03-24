@@ -158,8 +158,6 @@ int main(int argc, char *argv[])
 
     std::vector<unsigned short> prompt_data;
     std::vector<std::vector<unsigned short>> img_embed;
-    std::vector<std::vector<float>> deepstack_features;
-    std::vector<int> visual_pos_mask;
     std::vector<std::vector<int>> position_ids;
 
     Config config;
@@ -214,7 +212,7 @@ int main(int argc, char *argv[])
         if (image_prompt == "")
         {
             lLaMa.Encode(prompt_data, position_ids, config, prompt);
-            output = lLaMa.Run(prompt_data, position_ids, deepstack_features, visual_pos_mask);
+            output = lLaMa.Run(prompt_data, position_ids);
         }
         else
         {
@@ -225,13 +223,13 @@ int main(int argc, char *argv[])
                 ALOGE("image prompt(%s) not found", image_prompt.c_str());
                 // continue;
                 lLaMa.Encode(prompt_data, position_ids, config, prompt);
-                output = lLaMa.Run(prompt_data, position_ids, deepstack_features, visual_pos_mask);
+                output = lLaMa.Run(prompt_data, position_ids);
             }
             else
             {
-                lLaMa.EncodeImage(src, b_video, config, img_embed, deepstack_features);
-                lLaMa.Encode(img_embed, b_video, prompt_data, position_ids, visual_pos_mask, config, prompt);
-                output = lLaMa.Run(prompt_data, position_ids, deepstack_features, visual_pos_mask);
+                lLaMa.EncodeImage(src, b_video, config, img_embed);
+                lLaMa.Encode(img_embed, b_video, prompt_data, position_ids, config, prompt);
+                output = lLaMa.Run(prompt_data, position_ids);
             }
         }
 
@@ -245,14 +243,6 @@ int main(int argc, char *argv[])
             std::vector<unsigned short>().swap(inner_vec);
         }
         std::vector<std::vector<unsigned short>>().swap(img_embed);
-
-        for (auto &inner_vec : deepstack_features)
-        {
-            std::vector<float>().swap(inner_vec);
-        }
-        std::vector<std::vector<float>>().swap(deepstack_features);
-
-        std::vector<int>().swap(visual_pos_mask);
 
         for (auto &inner_vec : position_ids)
         {
