@@ -21,6 +21,7 @@
 #include "runner/LLM.hpp"
 #include "openai_api/server.hpp"
 #include "runner/utils/memory_utils.hpp"
+#include "runner/utils/net_utils.hpp"
 #include "runner/utils/sample_log.h"
 
 #ifdef USE_AXCL
@@ -119,6 +120,9 @@ struct ModelConfig
     std::string model_name = "AXERA-TECH/Qwen3-1.7B";
     LLMAttrType attr;
     int port = 8000;
+    bool is_embedding = false;
+
+    bool is_embedding_model() const { return is_embedding; }
 
     bool load_from_json(const std::string &config_path)
     {
@@ -155,8 +159,16 @@ struct ModelConfig
             check_key("filename_tokens_embed");
             attr.filename_tokens_embed = j["filename_tokens_embed"].get<std::string>();
 
-            check_key("post_config_path");
-            attr.post_config_path = j["post_config_path"].get<std::string>();
+            const bool has_post_config_path = j.contains("post_config_path");
+            if (has_post_config_path)
+            {
+                attr.post_config_path = j["post_config_path"].get<std::string>();
+            }
+            else
+            {
+                // Optional for embedding-only configs.
+                attr.post_config_path = "post_config.json";
+            }
 
             check_key("axmodel_num");
             attr.axmodel_num = j["axmodel_num"].get<int>();
@@ -175,6 +187,29 @@ struct ModelConfig
             else if (j.contains("use_mmap_load_embed"))
             {
                 attr.b_use_mmap_load_embed = j["use_mmap_load_embed"].get<bool>();
+            }
+
+            // Optional: embedding mode switch (serve mode only).
+            // Prefer a simple bool; model family is specified via `tokenizer_type`.
+            is_embedding = false;
+            if (j.contains("is_embedding"))
+            {
+                is_embedding = j["is_embedding"].get<bool>();
+            }
+            else if (j.contains("embedding"))
+            {
+                is_embedding = j["embedding"].get<bool>();
+            }
+            else if (j.contains("embedding_type") || j.contains("EMBEDDING_TYPE"))
+            {
+                // Backward compatibility for older configs; the actual embedding behavior is specialized by `tokenizer_type`.
+                is_embedding = true;
+                ALOGW("config key `embedding_type` is deprecated; please use `is_embedding`: true");
+            }
+            if (is_embedding && !has_post_config_path)
+            {
+                // Embedding models don't require postprocess config; keep logs clean by skipping load.
+                attr.post_config_path.clear();
             }
 
             // Optional VLM switch
@@ -228,8 +263,14 @@ struct ModelConfig
             if (j.contains("vision_tokens_per_second")) attr.vision_tokens_per_second = j["vision_tokens_per_second"].get<int>();
 
 #if USE_AXCL
-            check_key("devices");
-            attr.dev_ids = j["devices"].get<std::vector<int>>();
+            if (j.contains("devices"))
+            {
+                attr.dev_ids = j["devices"].get<std::vector<int>>();
+            }
+            else
+            {
+                attr.dev_ids = {0};
+            }
 
 #endif
             // Load prompt
@@ -406,6 +447,12 @@ std::string read_line_with_utf8_support()
 // Run interactive mode
 int run_interactive_mode(ModelConfig &config)
 {
+    if (config.is_embedding_model())
+    {
+        ALOGE("Embedding models do not support interactive `run` mode. Please use `serve` mode with `/v1/embeddings`.");
+        return -1;
+    }
+
     g_exit_on_sigint.store(false, std::memory_order_relaxed);
     config.attr.runing_callback = llm_running_callback;
     config.attr.reserve = nullptr;
@@ -850,14 +897,78 @@ int run_server_mode(const ModelConfig &config, int port)
 
     std::string model_name = config.model_name;
 
-    openai_api::ChatModelOptions options;
-    options.supports_vision = config.attr.vlm_type != VLMType::None;
-    options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
-    options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+    if (config.is_embedding_model())
+    {
+        g_server.registerEmbedding(model_name, [&llm](const openai_api::EmbeddingRequest &req,
+                                                           std::shared_ptr<openai_api::BaseDataProvider> provider)
+                                   {
+            if (!provider->is_writable()) {
+                ALOGE("provider not writable");
+                return;
+            }
 
-    g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
-                                             std::shared_ptr<openai_api::BaseDataProvider> provider)
-                          {
+            if (!req.encoding_format.empty() && req.encoding_format != "float") {
+                ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
+            }
+
+            std::vector<std::vector<float>> embeds;
+            if (!llm.EmbedBatch(req.inputs, embeds)) {
+                ALOGE("EmbedBatch failed");
+                provider->end();
+                return;
+            }
+
+            auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
+            provider->push(chunk);
+            provider->end(); });
+
+        printf("Starting server on port %d with embedding model '%s'...\n", port, model_name.c_str());
+        {
+            std::vector<std::string> hosts = {"127.0.0.1"};
+            for (const auto &ip : axllm::get_local_ipv4_addresses())
+            {
+                bool exists = false;
+                for (const auto &h : hosts)
+                {
+                    if (h == ip)
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) hosts.push_back(ip);
+            }
+
+            printf("API URLs:\n");
+            for (const auto &host : hosts)
+            {
+                const std::string base = "http://" + host + ":" + std::to_string(port);
+                printf("  GET  %s/health\n", base.c_str());
+                printf("  GET  %s/v1/models\n", base.c_str());
+                printf("  POST %s/v1/embeddings\n", base.c_str());
+            }
+            printf("Aliases:\n");
+            for (const auto &host : hosts)
+            {
+                const std::string base = "http://" + host + ":" + std::to_string(port);
+                printf("  GET  %s/models\n", base.c_str());
+                printf("  POST %s/embeddings\n", base.c_str());
+            }
+        }
+        g_server.run(port);
+
+        llm.Deinit();
+    }
+    else
+    {
+        openai_api::ChatModelOptions options;
+        options.supports_vision = config.attr.vlm_type != VLMType::None;
+        options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
+        options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+
+        g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
+                                                 std::shared_ptr<openai_api::BaseDataProvider> provider)
+                              {
         if (!provider->is_writable()) {
             ALOGE("provider not writable");
             return;
@@ -904,10 +1015,43 @@ int run_server_mode(const ModelConfig &config, int port)
         cleanup_temp_files(temp_files);
         provider->end(); });
 
-    printf("Starting server on port %d with model '%s'...\n", port, model_name.c_str());
-    g_server.run(port);
+        printf("Starting server on port %d with model '%s'...\n", port, model_name.c_str());
+        {
+            std::vector<std::string> hosts = {"127.0.0.1"};
+            for (const auto &ip : axllm::get_local_ipv4_addresses())
+            {
+                bool exists = false;
+                for (const auto &h : hosts)
+                {
+                    if (h == ip)
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) hosts.push_back(ip);
+            }
 
-    llm.Deinit();
+            printf("API URLs:\n");
+            for (const auto &host : hosts)
+            {
+                const std::string base = "http://" + host + ":" + std::to_string(port);
+                printf("  GET  %s/health\n", base.c_str());
+                printf("  GET  %s/v1/models\n", base.c_str());
+                printf("  POST %s/v1/chat/completions\n", base.c_str());
+            }
+            printf("Aliases:\n");
+            for (const auto &host : hosts)
+            {
+                const std::string base = "http://" + host + ":" + std::to_string(port);
+                printf("  GET  %s/models\n", base.c_str());
+                printf("  POST %s/chat/completions\n", base.c_str());
+            }
+        }
+        g_server.run(port);
+
+        llm.Deinit();
+    }
 
 #if USE_AXCL
     axclFinalize();
@@ -930,7 +1074,10 @@ void print_usage(const char *program_name)
     printf("  model_path    Path to model directory containing config.json and model files\n");
     printf("\n");
     printf("Serve options:\n");
-    printf("  --port <port> Server port (default: 8080)\n");
+    printf("  --port <port> Server port (default: 8000)\n");
+    printf("\n");
+    printf("Embedding model config:\n");
+    printf("  Set \"is_embedding\": true in config.json to enable /v1/embeddings.\n");
     printf("\n");
     printf("Model directory structure:\n");
     printf("  model_path/\n");
@@ -982,6 +1129,12 @@ int main(int argc, char *argv[])
 
     if (mode == "run")
     {
+        if (config.is_embedding_model())
+        {
+            ALOGE("Embedding models do not support interactive `run` mode. Please use `serve` mode with `/v1/embeddings`.");
+            return -1;
+        }
+
         for (int i = 3; i < argc; i++)
         {
             std::string arg = argv[i];

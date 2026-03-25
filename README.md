@@ -155,6 +155,41 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 - `vision_width`
 - `vision_height`
 
+### Embedding（/v1/embeddings）使用说明
+
+`axllm` 支持在 `serve` 模式下加载 Embedding 模型，并提供 OpenAI 兼容的 `/v1/embeddings` 接口（Embedding 模型 **不支持** `run` 交互模式）。
+
+1) 在 Embedding 模型目录的 `config.json` 中启用开关：
+
+```json
+{
+  "is_embedding": true
+}
+```
+
+2) 启动服务：
+
+```shell
+axllm serve <embedding_model_dir> --port 8000
+```
+
+启动后会在终端打印本机可访问的完整 API URL（包含 `127.0.0.1` 与本机网卡 IP）。
+
+3) 调用示例：
+
+```shell
+# 健康检查
+curl -s http://127.0.0.1:8000/health
+
+# 获取已注册模型列表
+curl -s http://127.0.0.1:8000/v1/models
+
+# 生成 embedding（input 支持 string 或 string 数组）
+curl -s http://127.0.0.1:8000/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"<model_name>","input":["hello","world"]}'
+```
+
 ## 运行示例
 ### 命令行对话
 ```shell

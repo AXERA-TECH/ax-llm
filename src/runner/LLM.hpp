@@ -94,6 +94,9 @@ public:
     LLMPostprocess *getPostprocess();
     LLaMaEmbedSelector *getEmbedSelector();
 
+    bool Embed(const std::string &text, std::vector<float> &out_embedding);
+    bool EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings);
+
     int GenerateKVCachePrefill(std::vector<int> &ids,
                                std::vector<std::vector<unsigned short>> &k,
                                std::vector<std::vector<unsigned short>> &v,

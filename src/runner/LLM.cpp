@@ -1,6 +1,7 @@
 #include "LLM.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -62,6 +63,8 @@ struct LLM::Impl {
     int precompute_len = 0;
 
     LLMAttrType _attr;
+    bool embedding_append_eos = false;
+    int embedding_eos_token_id = -1;
 
     std::unique_ptr<vision::VisionModule> vision;
     vision::RunState vision_state;
@@ -112,6 +115,47 @@ struct LLM::Impl {
         }
     }
 
+    static inline std::vector<float> l2norm(std::vector<float> embedding)
+    {
+        float norm2 = 0.0f;
+        for (const float v : embedding) norm2 += v * v;
+        const float norm = std::sqrt(norm2);
+        if (norm > 1e-12f)
+        {
+            for (float &v : embedding) v /= norm;
+        }
+        return embedding;
+    }
+
+    static inline int tolower_uc(int c) { return std::tolower((unsigned char)c); }
+
+    static inline std::string key_of(const std::string &s)
+    {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s)
+        {
+            const unsigned char uc = (unsigned char)c;
+            if (std::isalnum(uc)) out.push_back((char)tolower_uc(uc));
+        }
+        return out;
+    }
+
+    static inline void embedding_profile_for_tokenizer(const std::string &tokenizer_type, bool &append_eos, int &eos_token_id)
+    {
+        const std::string key = key_of(tokenizer_type);
+        if (key == "qwen3" || key == "qwen3vl")
+        {
+            // Align with /home/axera/libembeding.axera (Qwen3-Embedding-0.6B)
+            append_eos = true;
+            eos_token_id = 151643;
+            return;
+        }
+
+        append_eos = false;
+        eos_token_id = -1;
+    }
+
 #ifdef USE_AXCL
     std::vector<int> distributeModels(int cardCount, int modelCount)
     {
@@ -141,6 +185,7 @@ struct LLM::Impl {
     {
         ALOGI("LLM init start");
         this->_attr = attr;
+        embedding_profile_for_tokenizer(_attr.tokenizer_type, embedding_append_eos, embedding_eos_token_id);
 
 #ifdef USE_AXCL
         // AXCL init may spawn worker threads that print logs. Do it before the progress bar starts.
@@ -350,7 +395,13 @@ struct LLM::Impl {
             }
         }
 
-        if (!postprocess.load_config(attr.post_config_path)) { ALOGW("load postprocess config(%s) failed", attr.post_config_path.c_str()); }
+        if (!this->_attr.post_config_path.empty())
+        {
+            if (!postprocess.load_config(this->_attr.post_config_path))
+            {
+                ALOGW("load postprocess config(%s) failed", this->_attr.post_config_path.c_str());
+            }
+        }
         ALOGI("LLM init ok");
         return true;
     }
@@ -367,6 +418,171 @@ struct LLM::Impl {
     }
 
     void Stop() { b_stop.store(true, std::memory_order_relaxed); }
+
+    bool EmbedTokens(const std::vector<int> &token_ids, std::vector<float> &out_embedding)
+    {
+        b_stop.store(false, std::memory_order_relaxed);
+
+        if (token_ids.empty())
+        {
+            out_embedding.clear();
+            return true;
+        }
+
+        const int input_embed_num = (int)token_ids.size();
+        if (_attr.prefill_token_num <= 0 || _attr.tokens_embed_size <= 0 || _attr.kv_cache_size <= 0)
+        {
+            ALOGE("LLM embedding not initialized correctly (prefill_token_num/embed_size/kv_cache_size)");
+            return false;
+        }
+
+        const int prefill_split_num = (int)std::ceil((double)input_embed_num / (double)_attr.prefill_token_num);
+
+        int prefill_grpid = (int)_attr.prefill_max_kv_cache_num_grp.size();
+        for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
+        {
+            if (input_embed_num <= _attr.prefill_max_kv_cache_num_grp[i])
+            {
+                prefill_grpid = (int)i + 1;
+                break;
+            }
+        }
+        if (prefill_grpid <= 0)
+        {
+            ALOGE("invalid prefill_grpid=%d", prefill_grpid);
+            return false;
+        }
+
+        // Clear KV caches for this run (embedding is stateless).
+        for (int i = 0; i < _attr.axmodel_num; i++)
+        {
+            auto &lyr = llama_layers[i];
+            const int devid = LLM_DEVID(lyr);
+            const auto &k = lyr.layer.get_input(prefill_grpid, "K_cache");
+            const auto &v = lyr.layer.get_input(prefill_grpid, "V_cache");
+            llm_memset(LLM_WADDR(k), 0, (size_t)k.nSize, devid);
+            llm_memset(LLM_WADDR(v), 0, (size_t)v.nSize, devid);
+        }
+
+        const int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[prefill_grpid - 1];
+
+        std::vector<unsigned short> all_embed((size_t)input_embed_num * (size_t)_attr.tokens_embed_size);
+        for (int i = 0; i < input_embed_num; i++)
+        {
+            embed_selector.getByIndex((unsigned int)token_ids[(size_t)i], all_embed.data() + (size_t)i * (size_t)_attr.tokens_embed_size);
+        }
+
+        std::vector<unsigned short> last_hidden((size_t)_attr.tokens_embed_size, 0);
+        std::vector<unsigned short> embed_tmp((size_t)_attr.prefill_token_num * (size_t)_attr.tokens_embed_size, 0);
+        std::vector<unsigned short> mask_tmp((size_t)_attr.prefill_token_num * (size_t)(kv_cache_num + _attr.prefill_token_num), bfloat16(-65536.f).data);
+
+        for (int p = 0; p < prefill_split_num; p++)
+        {
+            if (b_stop.load(std::memory_order_relaxed)) break;
+
+            const int history_len = p * _attr.prefill_token_num;
+            const int input_num_token = (p == prefill_split_num - 1) ? (input_embed_num - p * _attr.prefill_token_num) : _attr.prefill_token_num;
+
+            build_prefill_mask(mask_tmp, kv_cache_num, _attr.prefill_token_num, history_len, input_num_token);
+
+            std::fill(embed_tmp.begin(), embed_tmp.end(), 0);
+            const size_t copy_tokens = (size_t)input_num_token;
+            std::memcpy(embed_tmp.data(),
+                        all_embed.data() + (size_t)history_len * (size_t)_attr.tokens_embed_size,
+                        copy_tokens * (size_t)_attr.tokens_embed_size * sizeof(unsigned short));
+
+            for (int m = 0; m < _attr.axmodel_num; m++)
+            {
+                if (b_stop.load(std::memory_order_relaxed)) break;
+                auto &lyr = llama_layers[m];
+                const int devid = LLM_DEVID(lyr);
+
+                // indices
+                const auto &t_idx = lyr.layer.get_input(prefill_grpid, "indices");
+                unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr;
+                std::memset(idx_ptr, 0, (size_t)t_idx.nSize);
+                fill_indices(idx_ptr, history_len, _attr.prefill_token_num);
+                llm_h2d(LLM_WADDR(t_idx), idx_ptr, (size_t)t_idx.nSize, devid);
+
+                // mask
+                const auto &t_mask = lyr.layer.get_input(prefill_grpid, "mask");
+                llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), mask_tmp.size() * sizeof(unsigned short), devid);
+
+                // input
+                const auto &t_in = lyr.layer.get_input(prefill_grpid, "input");
+                llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
+
+                // inference
+                lyr.layer.inference(prefill_grpid);
+
+                // KV cache update
+                const size_t kv_off = (size_t)history_len * (size_t)_attr.kv_cache_size;
+                const size_t kv_sz = (size_t)input_num_token * (size_t)_attr.kv_cache_size * sizeof(unsigned short);
+                const auto &out_k = lyr.layer.get_output(prefill_grpid, "K_cache_out");
+                const auto &out_v = lyr.layer.get_output(prefill_grpid, "V_cache_out");
+                const auto &in_k  = lyr.layer.get_input(prefill_grpid, "K_cache");
+                const auto &in_v  = lyr.layer.get_input(prefill_grpid, "V_cache");
+                llm_d2d((unsigned short *)LLM_WADDR(in_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
+                llm_d2d((unsigned short *)LLM_WADDR(in_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
+
+                // output -> embed_tmp for next layer
+                const auto &t_out = lyr.layer.get_output(prefill_grpid, "output");
+                llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
+            }
+
+            if (p == prefill_split_num - 1)
+            {
+                const int local_last = input_embed_num - history_len - 1;
+                if (local_last >= 0 && local_last < _attr.prefill_token_num)
+                {
+                    std::memcpy(last_hidden.data(),
+                                embed_tmp.data() + (size_t)local_last * (size_t)_attr.tokens_embed_size,
+                                (size_t)_attr.tokens_embed_size * sizeof(unsigned short));
+                }
+            }
+        }
+
+        // For now, use last hidden state directly as embeddings (common for Qwen3-Embedding).
+        out_embedding.resize((size_t)_attr.tokens_embed_size);
+        for (int i = 0; i < _attr.tokens_embed_size; i++)
+        {
+            out_embedding[(size_t)i] = bfloat16(last_hidden[(size_t)i]).fp32();
+        }
+        out_embedding = l2norm(std::move(out_embedding));
+        return true;
+    }
+
+    bool EmbedText(const std::string &text, std::vector<float> &out_embedding)
+    {
+        if (!tokenizer)
+        {
+            ALOGE("LLM not initialized");
+            return false;
+        }
+        std::vector<int> token_ids = tokenizer->encode(text);
+        if (embedding_append_eos && embedding_eos_token_id >= 0) token_ids.push_back(embedding_eos_token_id);
+
+        if (_attr.max_token_len > 0 && (int)token_ids.size() > _attr.max_token_len)
+        {
+            token_ids.resize((size_t)_attr.max_token_len);
+            if (embedding_append_eos && !token_ids.empty()) token_ids.back() = embedding_eos_token_id;
+        }
+
+        return EmbedTokens(token_ids, out_embedding);
+    }
+
+    bool EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings)
+    {
+        out_embeddings.clear();
+        out_embeddings.reserve(inputs.size());
+        for (const auto &s : inputs)
+        {
+            std::vector<float> e;
+            if (!EmbedText(s, e)) return false;
+            out_embeddings.push_back(std::move(e));
+        }
+        return true;
+    }
 
     int GenerateKVCachePrefill(std::vector<int> &_token_ids,
                                std::vector<std::vector<unsigned short>> &k_caches,
@@ -896,6 +1112,9 @@ void LLM::Stop() { impl_->Stop(); }
 LLMAttrType *LLM::getAttr() { return &impl_->_attr; }
 LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
+
+bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
+bool LLM::EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings) { return impl_->EmbedBatch(inputs, out_embeddings); }
 
 int LLM::GenerateKVCachePrefill(std::vector<int> &ids, std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int &pre_len) { return impl_->GenerateKVCachePrefill(ids, k, v, pre_len); }
 int LLM::GetKVCache(std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int &pre_len) { return impl_->GetKVCache(k, v, pre_len); }
