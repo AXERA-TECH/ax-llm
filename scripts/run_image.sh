@@ -1,4 +1,4 @@
-AXMODEL_DIR=Qwen3.5-2B-AX650-1
+AXMODEL_DIR=Qwen3.5-2B-AX650-C128-P1152-CTX2047
 
 ./build_650/install/bin/main \
 --template_filename_axmodel "${AXMODEL_DIR}/qwen3_5_text_p128_l%d_together.axmodel" \
