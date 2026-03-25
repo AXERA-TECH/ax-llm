@@ -59,6 +59,7 @@ struct LLMAttrType
 
     // TokenizerType tokenizer_type = TKT_HTTP;
     std::string filename_tokenizer_model = "http://127.0.0.1:12345";
+    std::string model_config_path = "";
     bool b_bos = false, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
     int tokens_embed_num = 32000;
@@ -112,7 +113,6 @@ private:
 
     std::vector<LLMLayer> llama_layers;
     std::vector<bool> layer_is_linear_attn;
-    bool has_layer_types_from_config = false;
     ax_runner_ax650 llama_post;
     ax_runner_ax650 image_encoder;
     // int prefill_grpid = 1;
@@ -122,65 +122,19 @@ private:
 
     LLMPostprocess postprocess;
 
-    static bool _endswith(const std::string &s, const std::string &suffix)
+    bool _load_layer_types_from_model_config()
     {
-        if (suffix.size() > s.size())
-        {
-            return false;
-        }
-        return std::equal(suffix.rbegin(), suffix.rend(), s.rbegin());
-    }
-
-    static std::string _parent_dir(const std::string &path)
-    {
-        auto pos = path.find_last_of('/');
-        if (pos == std::string::npos)
-        {
-            return ".";
-        }
-        if (pos == 0)
-        {
-            return "/";
-        }
-        return path.substr(0, pos);
-    }
-
-    static std::string _resolve_config_path(const std::string &tokenizer_model_path)
-    {
-        if (tokenizer_model_path.empty())
-        {
-            return "";
-        }
-        if (is_directory(tokenizer_model_path))
-        {
-            std::string cfg = tokenizer_model_path + "/config.json";
-            if (is_file(cfg))
-            {
-                return cfg;
-            }
-            return "";
-        }
-        if (is_file(tokenizer_model_path) && _endswith(tokenizer_model_path, ".json"))
-        {
-            return tokenizer_model_path;
-        }
-        std::string cfg = _parent_dir(tokenizer_model_path) + "/config.json";
-        if (is_file(cfg))
-        {
-            return cfg;
-        }
-        return "";
-    }
-
-    void _load_layer_types_from_model_config()
-    {
-        has_layer_types_from_config = false;
         layer_is_linear_attn.assign(_attr.axmodel_num, false);
-        std::string config_path = _resolve_config_path(_attr.filename_tokenizer_model);
+        const std::string &config_path = _attr.model_config_path;
         if (config_path.empty())
         {
-            ALOGW("cannot resolve model config from tokenizer path: %s", _attr.filename_tokenizer_model.c_str());
-            return;
+            ALOGE("model_config_path is empty, please pass huggingface config.json path");
+            return false;
+        }
+        if (!is_file(config_path))
+        {
+            ALOGE("model config not found: %s", config_path.c_str());
+            return false;
         }
 
         try
@@ -188,8 +142,8 @@ private:
             std::ifstream f(config_path);
             if (!f.is_open())
             {
-                ALOGW("open config failed: %s", config_path.c_str());
-                return;
+                ALOGE("open config failed: %s", config_path.c_str());
+                return false;
             }
             nlohmann::json j = nlohmann::json::parse(f);
             nlohmann::json text_cfg = j;
@@ -232,45 +186,34 @@ private:
                 }
             }
 
+            if (layer_types.empty())
+            {
+                ALOGE("no layer_types/full_attention_interval found in config: %s", config_path.c_str());
+                return false;
+            }
+
             int n = std::min((int)layer_types.size(), _attr.axmodel_num);
             for (int i = 0; i < n; ++i)
             {
                 layer_is_linear_attn[i] = (layer_types[i] == "linear_attention");
             }
-            has_layer_types_from_config = (n > 0);
+            if (n <= 0)
+            {
+                ALOGE("invalid layer_types in config: %s", config_path.c_str());
+                return false;
+            }
+            if (n < _attr.axmodel_num)
+            {
+                ALOGW("layer_types(%d) < axmodel_num(%d), remaining layers use full_attention", n, _attr.axmodel_num);
+            }
             ALOGI("load layer_types from %s, parsed=%d, applied=%d", config_path.c_str(), (int)layer_types.size(), n);
+            return true;
         }
         catch (const std::exception &e)
         {
-            ALOGW("parse model config failed (%s): %s", config_path.c_str(), e.what());
+            ALOGE("parse model config failed (%s): %s", config_path.c_str(), e.what());
+            return false;
         }
-    }
-
-    void _fallback_infer_layer_types_from_io()
-    {
-        if ((int)layer_is_linear_attn.size() != _attr.axmodel_num)
-        {
-            layer_is_linear_attn.assign(_attr.axmodel_num, false);
-        }
-        for (int i = 0; i < _attr.axmodel_num; ++i)
-        {
-            try
-            {
-                auto &layer = llama_layers[i].layer;
-                auto &k_in = layer.get_input(decode_grpid, "K_cache");
-                auto &k_out = layer.get_output(decode_grpid, "K_cache_out");
-                bool by_size = (k_in.nSize == k_out.nSize);
-                bool by_shape = (k_in.vShape.size() >= 2 && k_out.vShape.size() >= 2 &&
-                                 k_in.vShape[1] == 1 && k_out.vShape[1] == 1);
-                layer_is_linear_attn[i] = by_size || by_shape;
-            }
-            catch (const std::exception &e)
-            {
-                ALOGW("infer layer type by io failed at layer %d: %s", i, e.what());
-                layer_is_linear_attn[i] = false;
-            }
-        }
-        ALOGW("layer_types fallback by io done");
     }
 
     bool _is_linear_layer(int layer_idx) const
@@ -528,10 +471,9 @@ public:
             return false;
         }
 
-        _load_layer_types_from_model_config();
-        if (!has_layer_types_from_config && !attr.b_dynamic_load_axmodel_layer)
+        if (!_load_layer_types_from_model_config())
         {
-            _fallback_infer_layer_types_from_io();
+            return false;
         }
 
         int ref_full_layer_idx = _first_full_layer_idx();
@@ -559,19 +501,6 @@ public:
             {
                 ALOGE("init axmodel(%s) failed", layer.filename.c_str());
                 return false;
-            }
-            if (!has_layer_types_from_config)
-            {
-                try
-                {
-                    auto &k_in = layer.layer.get_input(decode_grpid, "K_cache");
-                    auto &k_out = layer.layer.get_output(decode_grpid, "K_cache_out");
-                    layer_is_linear_attn[ref_full_layer_idx] = (k_in.nSize == k_out.nSize);
-                }
-                catch (const std::exception &e)
-                {
-                    ALOGW("infer reference layer type failed: %s", e.what());
-                }
             }
         }
 

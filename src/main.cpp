@@ -49,6 +49,7 @@ int main(int argc, char *argv[])
     cmd.add<std::string>("template_filename_axmodel", 0, "axmodel path template", false, attr.template_filename_axmodel);
     cmd.add<std::string>("filename_post_axmodel", 0, "post axmodel path", false, attr.filename_post_axmodel);
     cmd.add<std::string>("filename_tokenizer_model", 0, "tokenizer model path", false, attr.filename_tokenizer_model);
+    cmd.add<std::string>("model_config_path", 0, "huggingface config.json path", false, attr.model_config_path);
     cmd.add<std::string>("filename_tokens_embed", 0, "tokens embed path", false, attr.filename_tokens_embed);
 
     cmd.add<std::string>("filename_image_encoder_axmodedl", 0, "vpm encoder axmodel path", false, attr.filename_image_encoder_axmodedl);
@@ -89,6 +90,7 @@ int main(int argc, char *argv[])
     // auto image_prompt = cmd.get<std::string>("image");
     // attr.tokenizer_type = (TokenizerType)cmd.get<int>("tokenizer_type");
     attr.filename_tokenizer_model = cmd.get<std::string>("filename_tokenizer_model");
+    attr.model_config_path = cmd.get<std::string>("model_config_path");
     attr.filename_tokens_embed = cmd.get<std::string>("filename_tokens_embed");
     attr.filename_post_axmodel = cmd.get<std::string>("filename_post_axmodel");
     attr.template_filename_axmodel = cmd.get<std::string>("template_filename_axmodel");
