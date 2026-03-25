@@ -120,12 +120,6 @@ cmake -S . -B build_windows_msvc -G "Visual Studio 17 2022" -A x64 `
 cmake --build build_windows_msvc --config Release --parallel
 ```
 
-如需复用当前仓库的 Windows MinGW 验证流程，可运行：
-
-```shell
-/bin/bash scripts/windows_axcl_mingw_validate.sh
-```
-
 ## 使用方式
 
 编译/安装后运行：
@@ -189,6 +183,8 @@ curl -s http://127.0.0.1:8000/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{"model":"<model_name>","input":["hello","world"]}'
 ```
+
+也可参考 Python 示例：`python3 scripts/openai_embedding_demo.py --model <model_name> --api_url http://127.0.0.1:8000/v1`（需先 `pip install openai`）。
 
 ## 运行示例
 ### 命令行对话

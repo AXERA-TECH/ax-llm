@@ -7,3 +7,4 @@ tools/test.cpp
 !build.sh
 qtproj/LLM-Chat/CMakeLists.txt.user
 axcl
+scripts/windows_axcl_mingw_validate.sh
