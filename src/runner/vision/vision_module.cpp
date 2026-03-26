@@ -441,16 +441,26 @@ bool VisionModule::Init(VLMType type,
     const auto& in0 = impl_->encoder.get_input(0);
 
     // Auto-resolve vision width/height from encoder input shape/size, so users don't need to manually set them.
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
+    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) {
         const int old_w = vision_width_;
         const int old_h = vision_height_;
+
+        // PaddleOCRVL VIT takes float32 input (not uint8 like Qwen-VL);
+        // divide nSize by sizeof(float) to get the effective element count.
+        size_t eff_nSize = (size_t)in0.nSize;
+        if (type_ == VLMType::PaddleOCRVL && (eff_nSize % sizeof(float)) == 0) {
+            eff_nSize /= sizeof(float);
+            ALOGI("PaddleOCRVL: encoder input nSize=%zu -> eff_nSize=%zu (float32 input)",
+                  (size_t)in0.nSize, eff_nSize);
+        }
+
         const size_t cfg_bytes = (size_t)std::max(0, old_h) * (size_t)std::max(0, old_w) *
                                  (size_t)std::max(1, temporal_patch_size_) * (size_t)3;
 
         int h = old_h;
         int w = old_w;
         std::string note;
-        if (try_infer_qwen_hw_from_input_bytes((size_t)in0.nSize,
+        if (try_infer_qwen_hw_from_input_bytes(eff_nSize,
                                                std::max(1, temporal_patch_size_),
                                                3,
                                                std::max(1, patch_size_),
@@ -549,7 +559,7 @@ bool VisionModule::Init(VLMType type,
 
         bool picked = false;
 
-        if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
+        if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) {
             const int grid_h = vision_height_ / std::max(1, patch_size_);
             const int grid_w = vision_width_ / std::max(1, patch_size_);
             const int llm_grid_h = grid_h / std::max(1, spatial_merge_size_);
@@ -642,6 +652,12 @@ bool VisionModule::Init(VLMType type,
         if (!get_single_token_id(tokenizer_, "<|vision_start|>", vision_start_id_, err)) return false;
         ALOGI("Qwen-VL token ids: vision_start=%d image_pad=%d video_pad=%d", vision_start_id_, image_pad_id_, video_pad_id_);
         break;
+    case VLMType::PaddleOCRVL:
+        if (!get_single_token_id(tokenizer_, "<|IMAGE_PLACEHOLDER|>", image_pad_id_, err)) return false;
+        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) return false;
+        if (!get_single_token_id(tokenizer_, "<|IMAGE_START|>", vision_start_id_, err)) return false;
+        ALOGI("PaddleOCR-VL token ids: vision_start=%d image_pad=%d video_pad=%d", vision_start_id_, image_pad_id_, video_pad_id_);
+        break;
     case VLMType::InternVL3:
         if (!get_single_token_id(tokenizer_, "<IMG_CONTEXT>", image_pad_id_, err)) return false;
         video_pad_id_ = image_pad_id_;
@@ -676,6 +692,75 @@ bool VisionModule::Init(VLMType type,
 #if !defined(AXLLM_USE_OPENCV)
     ALOGW("Vision preprocess backend: SimpleCV (OpenCV not found at build time; minor differences vs OpenCV are possible)");
 #endif
+    return true;
+}
+
+// PaddleOCRVL: convert uint8 patches to normalized float32 before feeding to the encoder.
+// Normalization: (pixel / 255.0 - mean) / std, with mean=0.5, std=0.5 => pixel / 127.5 - 1.0
+static bool encode_block_normalized_float(ax_runner_t& enc, int devid, int out_is_bf16,
+                                          const std::vector<unsigned char>& bytes,
+                                          std::vector<unsigned short>& out_bf16,
+                                          float img_mean, float img_std,
+                                          int deepstack_layers,
+                                          std::vector<std::vector<float>>* deepstack_out,
+                                          std::string& err)
+{
+    const auto& in0 = enc.get_input(0);
+    const size_t expected_float_elems = bytes.size();
+    const size_t expected_float_bytes = expected_float_elems * sizeof(float);
+    if ((size_t)in0.nSize < expected_float_bytes) {
+        err = "encoder input tensor too small for float32 conversion";
+        return false;
+    }
+
+    // Convert uint8 -> normalized float32
+    const float scale = 1.0f / (255.0f * img_std);
+    const float shift = -img_mean / img_std;
+    std::vector<float> fp32(expected_float_elems);
+    for (size_t i = 0; i < expected_float_elems; ++i) {
+        fp32[i] = (float)bytes[i] * scale + shift;
+    }
+
+    // Copy float32 data to encoder input; zero-pad tail if needed.
+    if (expected_float_bytes == (size_t)in0.nSize) {
+        if (in0.pVirAddr) {
+            std::memcpy(in0.pVirAddr, fp32.data(), expected_float_bytes);
+        } else {
+            v_h2d(V_WADDR(in0), fp32.data(), expected_float_bytes, devid);
+        }
+    } else {
+        std::vector<unsigned char> tmp((size_t)in0.nSize, 0);
+        std::memcpy(tmp.data(), fp32.data(), expected_float_bytes);
+        if (in0.pVirAddr) {
+            std::memcpy(in0.pVirAddr, tmp.data(), tmp.size());
+        } else {
+            v_h2d(V_WADDR(in0), tmp.data(), tmp.size(), devid);
+        }
+    }
+    fp32.clear();
+    fp32.shrink_to_fit();
+
+    enc.inference();
+
+    // Read output - reuse the same logic as encode_block_u8.
+    const auto& out0 = enc.get_output(0);
+    int elem_count = 0;
+    if (out_is_bf16) {
+        elem_count = (int)((size_t)out0.nSize / sizeof(unsigned short));
+    } else {
+        elem_count = (int)((size_t)out0.nSize / sizeof(float));
+    }
+    if (elem_count <= 0) { err = "vision encoder output elem_count invalid"; return false; }
+    out_bf16.resize(elem_count);
+    if (out_is_bf16) {
+        if (out0.pVirAddr) std::memcpy(out_bf16.data(), out0.pVirAddr, (size_t)elem_count * sizeof(unsigned short));
+        else v_d2h(out_bf16.data(), V_RADDR(out0), (size_t)elem_count * sizeof(unsigned short), devid);
+    } else {
+        std::vector<float> tmp(elem_count);
+        if (out0.pVirAddr) std::memcpy(tmp.data(), out0.pVirAddr, (size_t)elem_count * sizeof(float));
+        else v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
+        for (int i = 0; i < elem_count; ++i) out_bf16[i] = bfloat16(tmp[i]).data;
+    }
     return true;
 }
 
@@ -937,7 +1022,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                             (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                         }
                     }
-                    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+                    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
                     continue;
                 }
             }
@@ -959,6 +1044,25 @@ bool VisionModule::EncodeForContent(const Content& content,
                     if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb, 0, nullptr, err)) return false;
                     blocks_for_one.push_back(std::move(emb));
                 }
+            }
+            else if (type_ == VLMType::PaddleOCRVL) {
+                // PaddleOCR-VL VIT expects patches in [N, C, pH, pW] format (channel-first per patch,
+                // no spatial merge in preprocessing — merge happens inside the VIT model).
+                std::vector<unsigned char> pv;
+                PaddleOCRVLImageProcessor(img, pv, vision_height_, vision_width_, patch_size_);
+                {
+                    unsigned char mn = 255, mx = 0;
+                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
+                    ALOGI("PaddleOCRVL pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
+                          pv.size(), (unsigned)mn, (unsigned)mx,
+                          vision_width_, vision_height_, patch_size_);
+                }
+                std::vector<unsigned short> emb;
+                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                                  pv, emb, 0.5f, 0.5f,
+                                                  0, nullptr, err))
+                    return false;
+                blocks_for_one.push_back(std::move(emb));
             }
             else if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
                 std::vector<axcv::Mat> one{img};
@@ -1012,7 +1116,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                     (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                 }
             }
-            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
         }
 
         return true;
@@ -1037,6 +1141,26 @@ bool VisionModule::EncodeForContent(const Content& content,
         for (auto& pv : pixel_values) {
             std::vector<unsigned short> emb;
             if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb, 0, nullptr, err)) return false;
+            out_blocks.push_back(std::move(emb));
+        }
+        return true;
+    }
+
+    if (type_ == VLMType::PaddleOCRVL) {
+        // PaddleOCR-VL video: process each frame independently with the same VIT as images.
+        const int grid_h = vision_height_ / patch_size_;
+        const int grid_w = vision_width_ / patch_size_;
+
+        out_num_media_for_tokenizer = (int)frames.size();
+        out_video_grid_thw.push_back({(int)frames.size(), grid_h, grid_w});
+        out_blocks.reserve(frames.size());
+        for (auto& frame : frames) {
+            std::vector<unsigned char> pv;
+            PaddleOCRVLImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_);
+            std::vector<unsigned short> emb;
+            if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                               pv, emb, 0.5f, 0.5f, 0, nullptr, err))
+                return false;
             out_blocks.push_back(std::move(emb));
         }
         return true;
@@ -1173,7 +1297,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
     if (!BuildInjectionState(input_ids_out, all_blocks, all_deepstack, state_out, err)) return false;
 
     // Optional: mRoPE (Qwen-VL)
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
+    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) {
         mrope::Config cfg;
         cfg.vision_config.temporal_patch_size = temporal_patch_size_;
         cfg.vision_config.tokens_per_second = tokens_per_second_;
@@ -1186,7 +1310,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
         cfg.video_token_id = video_pad_id_;
         cfg.vision_start_token_id = vision_start_id_;
 
-        if (type_ == VLMType::Qwen2_5VL) {
+        if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::PaddleOCRVL) {
             std::vector<double> second_per_grid_ts;
             second_per_grid_ts.reserve(video_grid_thw.size());
             for (size_t i = 0; i < video_grid_thw.size(); ++i) {

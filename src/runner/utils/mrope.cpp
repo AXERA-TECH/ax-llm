@@ -168,15 +168,14 @@ static std::vector<std::vector<int>> get_rope_index_impl(
         llm_pos_ids_list.push_back({std::move(t_index), std::move(h_index), std::move(w_index)});
 
         st = ed + llm_grid_t * llm_grid_h * llm_grid_w;
+    }
 
-        // Append remaining text if any.
-        if (st < (int)filtered_ids.size()) {
-            st_idx = findMaxIn2DVector(llm_pos_ids_list.back()) + 1;
-            text_len = (int)filtered_ids.size() - st;
-            range = generateRange(text_len, st_idx);
-            llm_pos_ids_list.push_back(expandToMatrix(range, 3));
-            st = (int)filtered_ids.size();
-        }
+    // Append remaining text after all images/videos.
+    if (st < (int)filtered_ids.size()) {
+        int st_idx = findMaxIn2DVector(llm_pos_ids_list.back()) + 1;
+        int text_len = (int)filtered_ids.size() - st;
+        auto range = generateRange(text_len, st_idx);
+        llm_pos_ids_list.push_back(expandToMatrix(range, 3));
     }
 
     // Flatten to position_ids(3 x seq_len)

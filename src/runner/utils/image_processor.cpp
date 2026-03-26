@@ -128,6 +128,47 @@ int Qwen2VideoProcessor(std::vector<axcv::Mat>& src,
     return 0;
 }
 
+int PaddleOCRVLImageProcessor(axcv::Mat& src,
+                              std::vector<unsigned char>& output,
+                              int tgt_h, int tgt_w,
+                              int patch_size) {
+    // Resize to target size and convert BGR->RGB.
+    axcv::Mat img_rs;
+    if (axcv::width(src) != tgt_w || axcv::height(src) != tgt_h) {
+        axcv::resize(src, img_rs, tgt_w, tgt_h);
+    } else {
+        img_rs = src;
+    }
+    axcv::Mat rgb;
+    axcv::cvtColorBGR2RGB(img_rs, rgb);
+
+    const int grid_h = tgt_h / patch_size;
+    const int grid_w = tgt_w / patch_size;
+    const int N = grid_h * grid_w;
+    const int C = 3;
+
+    // Output layout: [N, C, pH, pW] matching PaddleOCR-VL VIT input format (1, N, C, pH, pW).
+    output.resize((size_t)N * C * patch_size * patch_size);
+
+    size_t idx = 0;
+    for (int n = 0; n < N; n++) {
+        const int gh = n / grid_w;
+        const int gw = n % grid_w;
+        for (int c = 0; c < C; c++) {
+            for (int ph = 0; ph < patch_size; ph++) {
+                const int row = gh * patch_size + ph;
+                const uint8_t* row_ptr = axcv::row_ptr(rgb, row);
+                for (int pw = 0; pw < patch_size; pw++) {
+                    const int col = gw * patch_size + pw;
+                    output[idx++] = row_ptr[col * C + c];
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 static std::vector<axcv::Mat> splitImageSafe(axcv::Mat src, int rows, int cols, int tile_w, int tile_h) {
     std::vector<axcv::Mat> subImages;
 

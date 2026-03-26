@@ -17,6 +17,14 @@ int Qwen2VideoProcessor(std::vector<axcv::Mat>& src,
                         int merge_size = 2,
                         int patch_size = 14);
 
+// PaddleOCR-VL image processor: produces patches in [N, C, pH, pW] format
+// (channel-first per patch, row-major across patches, no spatial merge).
+// This is the format expected by the PaddleOCR-VL VIT axmodel.
+int PaddleOCRVLImageProcessor(axcv::Mat& src,
+                              std::vector<unsigned char>& output,
+                              int tgt_h, int tgt_w,
+                              int patch_size = 14);
+
 // SmolVLM2 image processor:
 // For each input image, outputs 5 blocks: 2x2 tiles (4) + global resized image (1).
 int Smolvlm2ImageProcessor(std::vector<axcv::Mat>& src,
