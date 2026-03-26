@@ -27,6 +27,7 @@
 
 #### VLM（多模态）
 - Qwen3-VL-2B-Instruct
+- Qwen3.5-2B
 - SmolVLM2-500M-Video-Instruct
 - FastVLM-1.5B-GPTQ-Int4
 - InternVL3_5-1B-GPTQ-INT4
@@ -148,6 +149,7 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 
 - `vision_width`
 - `vision_height`
+- `full_attention_interval`（Qwen3.5 等混合 linear/full attention 模型需要，用于标记每 N 层为 full-attention）
 
 ### Embedding（/v1/embeddings）使用说明
 

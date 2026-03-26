@@ -173,6 +173,18 @@ struct ModelConfig
             check_key("axmodel_num");
             attr.axmodel_num = j["axmodel_num"].get<int>();
 
+            // Optional: models with mixed linear/full attention layers (e.g., Qwen3.5).
+            // Keep config minimal: only an interval is needed (layer count comes from `axmodel_num`).
+            attr.full_attention_interval = 0;
+            if (j.contains("full_attention_interval"))
+            {
+                attr.full_attention_interval = j["full_attention_interval"].get<int>();
+            }
+            else if (j.contains("text_config") && j["text_config"].contains("full_attention_interval"))
+            {
+                attr.full_attention_interval = j["text_config"]["full_attention_interval"].get<int>();
+            }
+
             check_key("tokens_embed_num");
             attr.tokens_embed_num = j["tokens_embed_num"].get<int>();
 

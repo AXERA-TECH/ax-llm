@@ -26,6 +26,11 @@ struct LLMAttrType {
     std::string template_filename_axmodel = "tinyllama-int8/tinyllama_l%d.axmodel";
     int axmodel_num = 22;
 
+    // Optional: for models with mixed attention layer types (e.g., Qwen3.5).
+    // If > 0, every Nth layer (1-indexed) is treated as full-attention and the others as linear-attention.
+    // When 0, all layers are treated as full-attention (default).
+    int full_attention_interval = 0;
+
     int prefill_token_num = 96; // auto calc
     int prefill_max_token_num = 512;
 

@@ -50,6 +50,12 @@ int main(int argc, char** argv) {
     attr.filename_tokens_embed     = resolve_path(model_dir, j["filename_tokens_embed"].get<std::string>());
     attr.post_config_path          = resolve_path(model_dir, j["post_config_path"].get<std::string>());
     attr.axmodel_num               = j["axmodel_num"].get<int>();
+    attr.full_attention_interval   = 0;
+    if (j.contains("full_attention_interval")) {
+        attr.full_attention_interval = j["full_attention_interval"].get<int>();
+    } else if (j.contains("text_config") && j["text_config"].contains("full_attention_interval")) {
+        attr.full_attention_interval = j["text_config"]["full_attention_interval"].get<int>();
+    }
     attr.tokens_embed_num          = j["tokens_embed_num"].get<int>();
     attr.tokens_embed_size         = j["tokens_embed_size"].get<int>();
     if (j.contains("b_use_mmap_load_embed")) attr.b_use_mmap_load_embed = j["b_use_mmap_load_embed"].get<bool>();
