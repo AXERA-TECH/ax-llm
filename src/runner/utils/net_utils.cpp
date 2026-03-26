@@ -11,6 +11,8 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 namespace axllm {
@@ -105,5 +107,50 @@ std::vector<std::string> get_local_ipv4_addresses()
     return ips;
 }
 
-} // namespace axllm
+bool is_port_available(int port, const char **error)
+{
+    if (port <= 0 || port > 65535)
+    {
+        *error = "invalid port (must be 1-65535)";
+        return false;
+    }
 
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+    {
+        *error = "socket failed";
+        return false;
+    }
+
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+
+    if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
+    {
+        int err = errno;
+        if (err == EADDRINUSE)
+        {
+            *error = "port is already in use";
+        }
+        else if (err == EACCES)
+        {
+            *error = "permission denied";
+        }
+        else
+        {
+            *error = "bind failed";
+        }
+        close(sock);
+        return false;
+    }
+
+    close(sock);
+    return true;
+}
+
+} // namespace axllm
