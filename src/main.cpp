@@ -872,6 +872,14 @@ int run_server_mode(const ModelConfig &config, int port)
 {
     g_exit_on_sigint.store(true, std::memory_order_relaxed);
 
+    // Check whether port is available.
+    const char *port_error = "unknown";
+    if (!axllm::is_port_available(port, &port_error))
+    {
+        ALOGE("Port %d is unavailable: %s", port, port_error);
+        return -1;
+    }
+
     LLM llm;
 
     // Initialize engine
