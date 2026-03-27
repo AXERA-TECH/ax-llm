@@ -35,6 +35,50 @@ jobs:
             build_x86/install/**
             build_x86/main_axcl* 
 
+  build-axcl-windows-mingw64:
+    name: AXCL Windows (mingw64) build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Setup MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            curl
+            unzip
+
+      - name: Build (AXCL Windows mingw64)
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+
+          build_dir=build_mingw64
+          mkdir -p "${build_dir}"
+          cd "${build_dir}"
+
+          axcl_url="https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/axcl_win_x64_3.12.0.zip"
+          axcl_zip="axcl_win_x64_3.12.0.zip"
+          axcl_root="axcl_win_x64_3.12.0"
+
+          curl -L -o "${axcl_zip}" "${axcl_url}"
+          unzip -q "${axcl_zip}" -d "${axcl_root}"
+
+          cmake -S .. -B . -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_AX650=OFF \
+            -DBUILD_AXCL=ON \
+            -DAXCL_DIR="${PWD}/${axcl_root}"
+          cmake --build . -j 2
+
   build-ax650-aarch64:
     name: AX650 aarch64 cross-build
     runs-on: ubuntu-latest
