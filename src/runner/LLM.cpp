@@ -747,9 +747,9 @@ struct LLM::Impl {
         ALOGI("prefill_grpid:%d kv_cache_num:%d precompute_len:%d input_num_token:%d", _attr.prefill_grpid, kv_cache_num, _precompute_len, input_num_token);
         _attr.prefill_max_token_num = ALIGN_DOWN(_attr.prefill_max_token_num - _precompute_len, _attr.prefill_token_num);
         ALOGI("current prefill_max_token_num:%d", _attr.prefill_max_token_num);
-        if (_precompute_len == 0) { ALOGI("first run"); return 0; }
         if (_precompute_len + input_num_token > kv_cache_num) { ALOGE("precompute_len(%d) + input_num_token(%d) > kv_cache_num(%d)", _precompute_len, input_num_token, kv_cache_num); return -1; }
         if (input_num_token > _attr.prefill_max_token_num) { ALOGE("input_num_token(%d) > prefill_max_token_num(%d)", input_num_token, _attr.prefill_max_token_num); return -1; }
+        if (_precompute_len == 0) { ALOGI("first run"); return 0; }
         if (!b_os_kvcache) return 0;
         if (kv_k.size() != kv_v.size() || (int)kv_k.size() != _attr.axmodel_num) { ALOGE("kv cache size mismatch"); return -1; }
         for (int i = 0; i < _attr.axmodel_num; i++)
@@ -1194,7 +1194,12 @@ struct LLM::Impl {
             if (!new_tokens.empty()) { precompute_len = (int)new_tokens.size() - 1; tokens_diff = {new_tokens.back()}; }
             else { ResetKVCache(); precompute_len = 0; }
         }
-        SetKVCache(k_caches, v_caches, precompute_len, (int)tokens_diff.size());
+        const int kv_ret = SetKVCache(k_caches, v_caches, precompute_len, (int)tokens_diff.size());
+        if (kv_ret != 0)
+        {
+            ALOGE("SetKVCache failed");
+            return history;
+        }
         std::vector<unsigned short> out_embed(tokens_diff.size() * _attr.tokens_embed_size);
         for (size_t i = 0; i < tokens_diff.size(); i++)
         {
