@@ -31,6 +31,7 @@
 - SmolVLM2-500M-Video-Instruct
 - FastVLM-1.5B-GPTQ-Int4
 - InternVL3_5-1B-GPTQ-INT4
+- PaddleOCR-VL-1.5
 - ...
 
 ### 获取地址
