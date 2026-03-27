@@ -654,7 +654,9 @@ bool VisionModule::Init(VLMType type,
         break;
     case VLMType::PaddleOCRVL:
         if (!get_single_token_id(tokenizer_, "<|IMAGE_PLACEHOLDER|>", image_pad_id_, err)) return false;
-        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) return false;
+        // PaddleOCRVL uses the same placeholder token for both image and video blocks.
+        // Keep `video_pad_id_` aligned with the tokenizer chat template.
+        video_pad_id_ = image_pad_id_;
         if (!get_single_token_id(tokenizer_, "<|IMAGE_START|>", vision_start_id_, err)) return false;
         ALOGI("PaddleOCR-VL token ids: vision_start=%d image_pad=%d video_pad=%d", vision_start_id_, image_pad_id_, video_pad_id_);
         break;

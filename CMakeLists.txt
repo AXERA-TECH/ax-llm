@@ -20,7 +20,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(WIN32)
-    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+    # Ensure cpp-httplib (used by openai-api.cpp) sees a modern Windows SDK target.
+    # Without this, MinGW may default to an older _WIN32_WINNT and fail compilation.
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 endif()
 
 # ---------------------------------------------------------------------------
