@@ -739,16 +739,24 @@ struct LLM::Impl {
                    std::vector<std::vector<unsigned short>> &kv_v,
                    int _precompute_len, int input_num_token)
     {
+        // Always start from the largest group by default, then pick the first group that fits.
+        _attr.prefill_grpid = (int)_attr.prefill_max_kv_cache_num_grp.size();
         for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
         {
             if (_precompute_len + input_num_token <= _attr.prefill_max_kv_cache_num_grp[i]) { _attr.prefill_grpid = (int)i + 1; break; }
         }
         int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_grpid - 1];
         ALOGI("prefill_grpid:%d kv_cache_num:%d precompute_len:%d input_num_token:%d", _attr.prefill_grpid, kv_cache_num, _precompute_len, input_num_token);
-        _attr.prefill_max_token_num = ALIGN_DOWN(_attr.prefill_max_token_num - _precompute_len, _attr.prefill_token_num);
-        ALOGI("current prefill_max_token_num:%d", _attr.prefill_max_token_num);
+        // Remaining prefill budget should be derived from the model capacity, not accumulated across calls.
+        // Otherwise, a failed prefill (e.g. context overflow) can make it negative and break `/reset`.
+        const int max_cap = _attr.prefill_max_kv_cache_num_grp.empty() ? 0 : _attr.prefill_max_kv_cache_num_grp.back();
+        int remaining = max_cap - _precompute_len;
+        if (remaining < 0) remaining = 0;
+        remaining = ALIGN_DOWN(remaining, _attr.prefill_token_num);
+        _attr.prefill_max_token_num = remaining;
+        ALOGI("current prefill_max_token_num:%d", remaining);
         if (_precompute_len + input_num_token > kv_cache_num) { ALOGE("precompute_len(%d) + input_num_token(%d) > kv_cache_num(%d)", _precompute_len, input_num_token, kv_cache_num); return -1; }
-        if (input_num_token > _attr.prefill_max_token_num) { ALOGE("input_num_token(%d) > prefill_max_token_num(%d)", input_num_token, _attr.prefill_max_token_num); return -1; }
+        if (input_num_token > remaining) { ALOGE("input_num_token(%d) > prefill_max_token_num(%d)", input_num_token, remaining); return -1; }
         if (_precompute_len == 0) { ALOGI("first run"); return 0; }
         if (!b_os_kvcache) return 0;
         if (kv_k.size() != kv_v.size() || (int)kv_k.size() != _attr.axmodel_num) { ALOGE("kv cache size mismatch"); return -1; }
@@ -777,6 +785,11 @@ struct LLM::Impl {
     void ResetKVCache()
     {
         last_tokens_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0;
+        _attr.prefill_grpid = (int)_attr.prefill_max_kv_cache_num_grp.size();
+        if (!_attr.prefill_max_kv_cache_num_grp.empty())
+        {
+            _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp.back();
+        }
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
             auto &lyr  = llama_layers[i]; int devid = LLM_DEVID(lyr);
