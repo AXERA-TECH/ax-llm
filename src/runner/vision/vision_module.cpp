@@ -235,6 +235,13 @@ static bool disk_cache_load(const std::string& cache_dir,
     std::FILE* fp = std::fopen(file.string().c_str(), "rb");
     if (!fp) return false;
 
+    // Guard against corrupted/truncated cache files (can happen if previous run crashes mid-write).
+    // Without these bounds, we might try to allocate huge vectors and crash on next run.
+    constexpr uint32_t kMaxKeyLen = 16 * 1024;
+    constexpr uint32_t kMaxBlocks = 32 * 1024;
+    // Keep this generous: allow large image directories, but prevent pathological allocations.
+    constexpr uint64_t kMaxTotalElems = 512ull * 1024ull * 1024ull; // bf16 element count
+
     uint32_t magic = 0;
     if (std::fread(&magic, sizeof(uint32_t), 1, fp) != 1) { std::fclose(fp); return false; }
     std::fseek(fp, 0, SEEK_SET);
@@ -253,6 +260,8 @@ static bool disk_cache_load(const std::string& cache_dir,
         if ((int)hdr.tokens_embed_size != tokens_embed_size) { std::fclose(fp); return false; }
         if ((int)hdr.tokens_per_block != tokens_per_block) { std::fclose(fp); return false; }
         if ((int)hdr.deepstack_layers != deepstack_layers) { std::fclose(fp); return false; }
+        if (hdr.key_len > kMaxKeyLen) { std::fclose(fp); return false; }
+        if (hdr.num_blocks > kMaxBlocks) { std::fclose(fp); return false; }
         num_blocks = hdr.num_blocks;
         key_len = hdr.key_len;
         ds_layers = hdr.deepstack_layers;
@@ -264,6 +273,8 @@ static bool disk_cache_load(const std::string& cache_dir,
         if (deepstack_layers != 0) { std::fclose(fp); return false; } // old cache has no deepstack
         if ((int)hdr.tokens_embed_size != tokens_embed_size) { std::fclose(fp); return false; }
         if ((int)hdr.tokens_per_block != tokens_per_block) { std::fclose(fp); return false; }
+        if (hdr.key_len > kMaxKeyLen) { std::fclose(fp); return false; }
+        if (hdr.num_blocks > kMaxBlocks) { std::fclose(fp); return false; }
         num_blocks = hdr.num_blocks;
         key_len = hdr.key_len;
         ds_layers = 0;
@@ -271,10 +282,15 @@ static bool disk_cache_load(const std::string& cache_dir,
     }
 
     std::string key_read;
-    key_read.resize(key_len);
-    if (key_len > 0) {
-        if (std::fread(key_read.data(), 1, key_len, fp) != key_len) { std::fclose(fp); return false; }
-        if (key_read != key) { std::fclose(fp); return false; }
+    try {
+        key_read.resize(key_len);
+        if (key_len > 0) {
+            if (std::fread(key_read.data(), 1, key_len, fp) != key_len) { std::fclose(fp); return false; }
+            if (key_read != key) { std::fclose(fp); return false; }
+        }
+    } catch (...) {
+        std::fclose(fp);
+        return false;
     }
 
     std::vector<uint32_t> elem_counts(num_blocks);
@@ -282,14 +298,25 @@ static bool disk_cache_load(const std::string& cache_dir,
         if (std::fread(elem_counts.data(), sizeof(uint32_t), num_blocks, fp) != num_blocks) { std::fclose(fp); return false; }
     }
 
+    uint64_t total_elems = 0;
+    for (uint32_t n : elem_counts) total_elems += (uint64_t)n;
+    if (total_elems > kMaxTotalElems) { std::fclose(fp); return false; }
+    if (tokens_embed_size > 0 && (total_elems % (uint64_t)tokens_embed_size) != 0) { std::fclose(fp); return false; }
+    if (ds_layers > 0 && ds_elem_count != (uint32_t)total_elems) { std::fclose(fp); return false; }
+
     blocks_out.clear();
     blocks_out.reserve(num_blocks);
     for (uint32_t i = 0; i < num_blocks; ++i) {
         uint32_t n = elem_counts[i];
         std::vector<unsigned short> b;
-        b.resize(n);
-        if (n > 0) {
-            if (std::fread(b.data(), sizeof(unsigned short), n, fp) != n) { std::fclose(fp); return false; }
+        try {
+            b.resize(n);
+            if (n > 0) {
+                if (std::fread(b.data(), sizeof(unsigned short), n, fp) != n) { std::fclose(fp); return false; }
+            }
+        } catch (...) {
+            std::fclose(fp);
+            return false;
         }
         blocks_out.push_back(std::move(b));
     }
@@ -297,11 +324,16 @@ static bool disk_cache_load(const std::string& cache_dir,
     deepstack_out.clear();
     if (ds_layers > 0) {
         if (ds_elem_count == 0) { std::fclose(fp); return false; }
-        deepstack_out.resize(ds_layers);
-        for (uint32_t li = 0; li < ds_layers; ++li) {
-            auto& v = deepstack_out[li];
-            v.resize(ds_elem_count);
-            if (std::fread(v.data(), sizeof(float), ds_elem_count, fp) != ds_elem_count) { std::fclose(fp); return false; }
+        try {
+            deepstack_out.resize(ds_layers);
+            for (uint32_t li = 0; li < ds_layers; ++li) {
+                auto& v = deepstack_out[li];
+                v.resize(ds_elem_count);
+                if (std::fread(v.data(), sizeof(float), ds_elem_count, fp) != ds_elem_count) { std::fclose(fp); return false; }
+            }
+        } catch (...) {
+            std::fclose(fp);
+            return false;
         }
     }
 
@@ -321,8 +353,11 @@ static void disk_cache_save(const std::string& cache_dir,
 
     std::filesystem::path dir(cache_dir);
     std::filesystem::path file = dir / (to_hex_u64(fnv1a64_str(key)) + ".bin");
+    // Write to a temp file then atomically replace, so a crash can't leave a corrupted cache file.
+    std::filesystem::path tmp = file;
+    tmp += ".tmp";
 
-    std::FILE* fp = std::fopen(file.string().c_str(), "wb");
+    std::FILE* fp = std::fopen(tmp.string().c_str(), "wb");
     if (!fp) return;
 
     DiskHeaderV2 hdr{};
@@ -349,7 +384,7 @@ static void disk_cache_save(const std::string& cache_dir,
     if (!deepstack.empty()) {
         // Require consistent sizes.
         for (const auto& v : deepstack) {
-            if (v.size() != ds_elem_count) { std::fclose(fp); return; }
+            if (v.size() != ds_elem_count) { std::fclose(fp); std::remove(tmp.string().c_str()); return; }
         }
         for (const auto& v : deepstack) {
             (void)std::fwrite(v.data(), sizeof(float), v.size(), fp);
@@ -357,6 +392,13 @@ static void disk_cache_save(const std::string& cache_dir,
     }
 
     std::fclose(fp);
+
+    std::error_code ec;
+    std::filesystem::rename(tmp, file, ec);
+    if (ec) {
+        // Best-effort: remove temp file; keep existing cache file unchanged.
+        std::remove(tmp.string().c_str());
+    }
 }
 
 VisionModule::VisionModule() = default;
