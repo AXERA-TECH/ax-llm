@@ -1116,6 +1116,8 @@ int main(int argc, char *argv[])
     signal(SIGINT, __sigExit);
 #ifdef _WIN32
     SetConsoleCtrlHandler(__ConsoleCtrlHandler, TRUE);
+    // Initialize logger early so Windows console uses UTF-8 (prevents Chinese/box-drawing garbling).
+    (void)axllm::Logger::level();
 #endif
 
     if (argc < 3)

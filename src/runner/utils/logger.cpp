@@ -133,6 +133,22 @@ static void init_from_env()
     ws.stdout_is_console = (ws.stdout_handle != nullptr) && GetConsoleMode(ws.stdout_handle, &mode);
     ws.stderr_is_console = (ws.stderr_handle != nullptr) && GetConsoleMode(ws.stderr_handle, &mode);
 
+    // Try to make UTF-8 work out of the box on Windows terminals, so Chinese prompts
+    // and box drawing characters render correctly (e.g. "退出", "├──").
+    // Can be disabled by setting AXLLM_WIN_UTF8=0/false/off/no.
+    const auto win_utf8 = getenv_sv("AXLLM_WIN_UTF8");
+    const bool enable_utf8 =
+        !(str_eq_nocase(win_utf8, "0") || str_eq_nocase(win_utf8, "false") || str_eq_nocase(win_utf8, "off") || str_eq_nocase(win_utf8, "no"));
+    // Don't rely on stdout/stderr being a console handle: on modern Windows terminals (ConPTY),
+    // the std handles may be pipes even though the process is attached to a console.
+    const UINT out_cp = GetConsoleOutputCP();
+    const UINT in_cp = GetConsoleCP();
+    if (enable_utf8 && (out_cp != 0 || in_cp != 0))
+    {
+        if (out_cp != 0 && out_cp != CP_UTF8) SetConsoleOutputCP(CP_UTF8);
+        if (in_cp != 0 && in_cp != CP_UTF8) SetConsoleCP(CP_UTF8);
+    }
+
     if (ws.stdout_is_console)
     {
         CONSOLE_SCREEN_BUFFER_INFO info{};
