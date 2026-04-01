@@ -1068,6 +1068,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 printf("  POST %s/chat/completions\n", base.c_str());
             }
         }
+        g_server.setTimeout(std::chrono::milliseconds(300000));  // 5 minutes timeout for long-running requests
         g_server.run(port);
 
         llm.Deinit();
