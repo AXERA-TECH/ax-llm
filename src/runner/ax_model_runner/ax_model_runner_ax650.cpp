@@ -158,6 +158,67 @@ int ax_runner_ax650::sub_init()
             return ret;
     }
 
+    // Ensure shared K_cache/V_cache buffers are large enough for the maximum group.
+    // Some models have multiple decode groups (2k/4k/8k/16k) where group 0 is not the largest.
+    // We share KV buffers across groups to save memory, so allocate KV based on max required size.
+    {
+        size_t max_k_bytes = 0;
+        size_t max_v_bytes = 0;
+        for (size_t grpid = 0; grpid < m_handle->io_info.size(); ++grpid)
+        {
+            auto *info = m_handle->io_info[grpid];
+            if (!info) continue;
+            for (size_t i = 0; i < info->nInputSize; ++i)
+            {
+                const char *name = info->pInputs[i].pName;
+                if (!name) continue;
+                if (0 == strcmp(name, "K_cache")) max_k_bytes = std::max(max_k_bytes, (size_t)info->pInputs[i].nSize);
+                else if (0 == strcmp(name, "V_cache")) max_v_bytes = std::max(max_v_bytes, (size_t)info->pInputs[i].nSize);
+            }
+        }
+
+        auto realloc_kv_if_needed = [&](const char *name, size_t want_bytes) -> int {
+            if (want_bytes == 0) return 0;
+            auto *first_info = m_handle->io_info[0];
+            auto &first_data = m_handle->io_data[0];
+            if (!first_info || !first_data.pInputs) return 0;
+
+            for (size_t i = 0; i < first_info->nInputSize && i < first_data.nInputSize; ++i)
+            {
+                const char *n = first_info->pInputs[i].pName;
+                if (!n || 0 != strcmp(n, name)) continue;
+                auto &buf = first_data.pInputs[i];
+                if ((size_t)buf.nSize >= want_bytes) return 0;
+
+                if (buf.phyAddr != 0) AX_SYS_MemFree(buf.phyAddr, buf.pVirAddr);
+
+                int ret = AX_SYS_MemAllocCached((AX_U64 *)(&buf.phyAddr),
+                                               &buf.pVirAddr,
+                                               want_bytes,
+                                               AX_CMM_ALIGN_SIZE,
+                                               (const AX_S8 *)(AX_CMM_SESSION_NAME));
+                if (ret != 0)
+                {
+                    ALOGE("AX_SYS_MemAllocCached(%s, %zu) failed, ret=0x%x", name, want_bytes, ret);
+                    buf.phyAddr = 0;
+                    buf.pVirAddr = nullptr;
+                    return ret;
+                }
+                memset(buf.pVirAddr, 0, want_bytes);
+                ALOGD("realloc %s buffer: group0_size=%d -> max_group_size=%zu", name, buf.nSize, want_bytes);
+                return 0;
+            }
+
+            ALOGW("KV tensor %s not found in group 0", name);
+            return 0;
+        };
+
+        int ret = realloc_kv_if_needed("K_cache", max_k_bytes);
+        if (ret != 0) return ret;
+        ret = realloc_kv_if_needed("V_cache", max_v_bytes);
+        if (ret != 0) return ret;
+    }
+
     // 2. 处理中间 Group 的内存共享逻辑 (原有逻辑的 Hack)
     if (io_count > 2)
     {

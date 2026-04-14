@@ -244,6 +244,69 @@ int ax_runner_axcl::sub_init()
             return ret;
     }
 
+    // Ensure K_cache/V_cache buffers are large enough for the maximum group.
+    // We share KV buffers across shape groups to save memory, but some models
+    // (e.g. multi-decode 2k/4k/8k/16k) have different KV sizes per group.
+    // Group 0 might not be the largest, so allocate KV based on max required size.
+    {
+        size_t max_k_bytes = 0;
+        size_t max_v_bytes = 0;
+        for (size_t grpid = 0; grpid < mgroup_input_tensors.size(); ++grpid)
+        {
+            for (const auto &t : mgroup_input_tensors[grpid])
+            {
+                if (t.sName == "K_cache") max_k_bytes = std::max(max_k_bytes, (size_t)t.nSize);
+                else if (t.sName == "V_cache") max_v_bytes = std::max(max_v_bytes, (size_t)t.nSize);
+            }
+        }
+
+        auto realloc_kv_if_needed = [&](const char *name, size_t want_bytes) -> int {
+            if (want_bytes == 0) return 0;
+            auto &first_input = mgroup_input_tensors[0];
+            for (auto &t : first_input)
+            {
+                if (t.sName != name) continue;
+                if ((size_t)t.nSize >= want_bytes) return 0;
+
+                // Free the original (smaller) buffers from group 0.
+                if (t.phyAddr) axcl_Free((void *)t.phyAddr, dev_id);
+                if (t.pVirAddr) free(t.pVirAddr);
+
+                void *devPtr = nullptr;
+                int ret = axcl_Malloc(&devPtr, want_bytes, axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST, dev_id);
+                if (ret != 0)
+                {
+                    ALOGE("axcl_Malloc(%s, %zu) failed, ret=%d", name, want_bytes, ret);
+                    t.phyAddr = 0;
+                    t.pVirAddr = nullptr;
+                    return ret;
+                }
+                t.phyAddr = (unsigned long long)devPtr;
+                t.pVirAddr = malloc(want_bytes);
+                if (t.pVirAddr == nullptr)
+                {
+                    ALOGE("malloc(%s, %zu) failed", name, want_bytes);
+                    axcl_Free(devPtr, dev_id);
+                    t.phyAddr = 0;
+                    return -1;
+                }
+                memset(t.pVirAddr, 0, want_bytes);
+                axcl_Memset(devPtr, 0, want_bytes, dev_id);
+                ALOGD("realloc %s buffer: group0_size=%d -> max_group_size=%zu", name, t.nSize, want_bytes);
+                return 0;
+            }
+            // No KV tensor in group 0 (should not happen).
+            ALOGW("KV tensor %s not found in group 0", name);
+            return 0;
+        };
+
+        // Realloc in group 0 if needed (others will alias to group 0 later).
+        int ret = realloc_kv_if_needed("K_cache", max_k_bytes);
+        if (ret != 0) return ret;
+        ret = realloc_kv_if_needed("V_cache", max_v_bytes);
+        if (ret != 0) return ret;
+    }
+
     if (group_count > 2)
     {
         auto &first_input = mgroup_input_tensors[0];

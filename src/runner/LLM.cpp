@@ -5,6 +5,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <numeric>
 #include <queue>
@@ -85,6 +86,9 @@ struct LLM::Impl {
     ax_runner_t llama_post;
 
     int decode_grpid = 0;
+    std::vector<int> decode_grpids_;             // sorted by decode capacity (ascending)
+    std::vector<int> decode_max_token_len_grp_;  // same length as decode_grpids_
+    std::vector<int> prefill_grpids_;            // sorted by prefill capacity (ascending), aligns with _attr.prefill_max_kv_cache_num_grp
     std::atomic<bool> b_stop{false};
     LLMPostprocess postprocess;
 
@@ -158,6 +162,309 @@ struct LLM::Impl {
 
         append_eos = false;
         eos_token_id = -1;
+    }
+
+    int group_index_by_gid(const std::vector<int> &grpids, int gid) const
+    {
+        for (size_t i = 0; i < grpids.size(); ++i)
+        {
+            if (grpids[i] == gid) return (int)i;
+        }
+        return -1;
+    }
+
+    int prefill_capacity_by_gid(int gid) const
+    {
+        const int idx = group_index_by_gid(prefill_grpids_, gid);
+        if (idx < 0 || idx >= (int)_attr.prefill_max_kv_cache_num_grp.size()) return -1;
+        return _attr.prefill_max_kv_cache_num_grp[(size_t)idx];
+    }
+
+    int decode_capacity_by_gid(int gid) const
+    {
+        const int idx = group_index_by_gid(decode_grpids_, gid);
+        if (idx < 0 || idx >= (int)decode_max_token_len_grp_.size()) return -1;
+        return decode_max_token_len_grp_[(size_t)idx];
+    }
+
+    int choose_prefill_gid(int needed_tokens) const
+    {
+        if (prefill_grpids_.empty() || _attr.prefill_max_kv_cache_num_grp.empty()) return 1;
+        for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size() && i < prefill_grpids_.size(); ++i)
+        {
+            if (needed_tokens <= _attr.prefill_max_kv_cache_num_grp[i]) return prefill_grpids_[i];
+        }
+        return prefill_grpids_.back();
+    }
+
+    int choose_decode_gid(int needed_tokens) const
+    {
+        if (decode_grpids_.empty() || decode_max_token_len_grp_.empty()) return 0;
+        for (size_t i = 0; i < decode_max_token_len_grp_.size() && i < decode_grpids_.size(); ++i)
+        {
+            if (needed_tokens <= decode_max_token_len_grp_[i]) return decode_grpids_[i];
+        }
+        return decode_grpids_.back();
+    }
+
+    bool init_groups_from_model(ax_runner_t &ref_layer)
+    {
+        const int group_count = ref_layer.get_num_input_groups();
+        if (group_count <= 0)
+        {
+            ALOGE("invalid group_count=%d", group_count);
+            return false;
+        }
+
+        std::vector<int> decode_gids;
+        std::vector<int> prefill_gids;
+        decode_gids.reserve((size_t)group_count);
+        prefill_gids.reserve((size_t)group_count);
+
+        for (int gid = 0; gid < group_count; ++gid)
+        {
+            try
+            {
+                const auto &t_idx = ref_layer.get_input(gid, "indices");
+                const int idx_elems = (int)((size_t)t_idx.nSize / sizeof(unsigned int));
+                if (idx_elems == 1) decode_gids.push_back(gid);
+                else prefill_gids.push_back(gid);
+            }
+            catch (const std::exception &)
+            {
+                // Skip groups without indices tensor.
+            }
+        }
+
+        if (decode_gids.empty())
+        {
+            ALOGE("no decode groups detected");
+            return false;
+        }
+        if (prefill_gids.empty())
+        {
+            ALOGE("no prefill groups detected");
+            return false;
+        }
+
+        // Detect prefill_token_num from the first prefill group.
+        // Prefer `indices` last-dim (most consistent across models/backends). Fall back to `mask` shape.
+        int detected_prefill_token_num = 0;
+        {
+            const int gid = prefill_gids.front();
+            try
+            {
+                const auto &t_idx = ref_layer.get_input(gid, "indices");
+                if (!t_idx.vShape.empty()) detected_prefill_token_num = (int)t_idx.vShape.back();
+            }
+            catch (const std::exception &)
+            {
+            }
+            // Guard against picking the batch dimension (often 1).
+            if (detected_prefill_token_num <= 1)
+            {
+                try
+                {
+                    const auto &t_mask = ref_layer.get_input(gid, "mask");
+                    if (!t_mask.vShape.empty())
+                    {
+                        if (t_mask.vShape.size() >= 2 && t_mask.vShape[0] == 1)
+                            detected_prefill_token_num = (int)t_mask.vShape[1];
+                        else
+                            detected_prefill_token_num = (int)t_mask.vShape[0];
+                    }
+                }
+                catch (const std::exception &)
+                {
+                }
+            }
+            if (detected_prefill_token_num <= 1) detected_prefill_token_num = _attr.prefill_token_num;
+        }
+
+        _attr.prefill_token_num = detected_prefill_token_num;
+        ALOGI("prefill_token_num : %d", _attr.prefill_token_num);
+
+        // Build decode groups: capacity from mask length (max_token_len), fallback to K_cache tokens.
+        std::vector<std::pair<int, int>> decode_pairs; // (cap, gid)
+        for (const int gid : decode_gids)
+        {
+            int cap = -1;
+            try
+            {
+                const auto &t_mask = ref_layer.get_input(gid, "mask");
+                const int elems = (int)((size_t)t_mask.nSize / sizeof(unsigned short));
+                if (elems > 0) cap = elems - 1;
+            }
+            catch (const std::exception &)
+            {
+            }
+            if (cap < 0)
+            {
+                try
+                {
+                    const auto &t_k = ref_layer.get_input(gid, "K_cache");
+                    const size_t denom = (size_t)_attr.kv_cache_size * sizeof(unsigned short);
+                    if (denom > 0) cap = (int)((size_t)t_k.nSize / denom);
+                }
+                catch (const std::exception &)
+                {
+                }
+            }
+            if (cap > 0) decode_pairs.push_back({cap, gid});
+        }
+
+        // Build prefill groups: capacity from 2D mask shape, fallback to K_cache tokens.
+        std::vector<std::pair<int, int>> prefill_pairs; // (cap, gid)
+        for (const int gid : prefill_gids)
+        {
+            int cap = -1;
+            try
+            {
+                const auto &t_mask = ref_layer.get_input(gid, "mask");
+                const int elems = (int)((size_t)t_mask.nSize / sizeof(unsigned short));
+                if (_attr.prefill_token_num > 0 && elems > 0 && (elems % _attr.prefill_token_num) == 0)
+                {
+                    const int cols = elems / _attr.prefill_token_num;
+                    const int kv_from_mask = cols - _attr.prefill_token_num;
+                    if (kv_from_mask >= 0) cap = kv_from_mask;
+                }
+            }
+            catch (const std::exception &)
+            {
+            }
+            if (cap < 0)
+            {
+                try
+                {
+                    const auto &t_k = ref_layer.get_input(gid, "K_cache");
+                    const size_t denom = (size_t)_attr.kv_cache_size * sizeof(unsigned short);
+                    if (denom > 0) cap = (int)((size_t)t_k.nSize / denom);
+                }
+                catch (const std::exception &)
+                {
+                }
+            }
+            if (cap >= 0) prefill_pairs.push_back({cap, gid});
+        }
+
+        if (decode_pairs.empty() || prefill_pairs.empty())
+        {
+            ALOGE("failed to parse groups (decode=%zu prefill=%zu)", decode_pairs.size(), prefill_pairs.size());
+            return false;
+        }
+
+        auto dedup_sorted = [](std::vector<std::pair<int, int>> &pairs) {
+            std::sort(pairs.begin(), pairs.end());
+            pairs.erase(std::unique(pairs.begin(), pairs.end(),
+                                    [](const auto &a, const auto &b) { return a.first == b.first; }),
+                        pairs.end());
+        };
+        dedup_sorted(decode_pairs);
+        dedup_sorted(prefill_pairs);
+
+        auto shape_to_str = [](const std::vector<unsigned int> &shape) -> std::string {
+            std::string s;
+            for (size_t i = 0; i < shape.size(); ++i)
+            {
+                if (i) s.push_back('x');
+                s += std::to_string(shape[i]);
+            }
+            if (s.empty()) s = "(none)";
+            return s;
+        };
+
+        // Extra debug: print per-group KV cache tensor sizing for sanity checks.
+        for (const auto &p : decode_pairs)
+        {
+            const int cap = p.first;
+            const int gid = p.second;
+            try
+            {
+                const auto &t_mask = ref_layer.get_input(gid, "mask");
+                const auto &t_k = ref_layer.get_input(gid, "K_cache");
+                const auto &t_v = ref_layer.get_input(gid, "V_cache");
+                ALOGD("decode gid=%d cap=%d mask=%s(%zuB) K_cache=%s(%zuB) V_cache=%s(%zuB)",
+                      gid,
+                      cap,
+                      shape_to_str(t_mask.vShape).c_str(),
+                      (size_t)t_mask.nSize,
+                      shape_to_str(t_k.vShape).c_str(),
+                      (size_t)t_k.nSize,
+                      shape_to_str(t_v.vShape).c_str(),
+                      (size_t)t_v.nSize);
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
+        for (const auto &p : prefill_pairs)
+        {
+            const int cap = p.first;
+            const int gid = p.second;
+            try
+            {
+                const auto &t_mask = ref_layer.get_input(gid, "mask");
+                const auto &t_k = ref_layer.get_input(gid, "K_cache");
+                const auto &t_v = ref_layer.get_input(gid, "V_cache");
+                ALOGD("prefill gid=%d cap=%d mask=%s(%zuB) K_cache=%s(%zuB) V_cache=%s(%zuB)",
+                      gid,
+                      cap,
+                      shape_to_str(t_mask.vShape).c_str(),
+                      (size_t)t_mask.nSize,
+                      shape_to_str(t_k.vShape).c_str(),
+                      (size_t)t_k.nSize,
+                      shape_to_str(t_v.vShape).c_str(),
+                      (size_t)t_v.nSize);
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
+
+        decode_grpids_.clear();
+        decode_max_token_len_grp_.clear();
+        for (const auto &p : decode_pairs)
+        {
+            decode_max_token_len_grp_.push_back(p.first);
+            decode_grpids_.push_back(p.second);
+        }
+
+        prefill_grpids_.clear();
+        _attr.prefill_max_kv_cache_num_grp.clear();
+        for (const auto &p : prefill_pairs)
+        {
+            _attr.prefill_max_kv_cache_num_grp.push_back(p.first);
+            prefill_grpids_.push_back(p.second);
+        }
+
+        // Default to the largest groups.
+        decode_grpid = decode_grpids_.back();
+        _attr.prefill_grpid = prefill_grpids_.back();
+        _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp.back();
+
+        // Canonical context capacity should follow the largest decode/prefill group.
+        // Some models provide multiple decode groups (2k/4k/8k/16k), and group 0 may
+        // not be the largest. Use discovered capacities to drive global limits.
+        const int max_decode = decode_max_token_len_grp_.back();
+        const int max_prefill = _attr.prefill_max_kv_cache_num_grp.back();
+        const int canonical_cap = std::max(max_decode, max_prefill);
+        if (canonical_cap > 0)
+        {
+            _attr.max_token_len = canonical_cap;
+            _attr.kv_cache_num = canonical_cap;
+        }
+
+        // Print group summary for debugging.
+        for (size_t i = 0; i < decode_grpids_.size(); ++i)
+        {
+            ALOGI("decode grp: %zu, gid: %d, max_token_len : %d", i, decode_grpids_[i], decode_max_token_len_grp_[i]);
+        }
+        for (size_t i = 0; i < prefill_grpids_.size(); ++i)
+        {
+            ALOGI("prefill grp: %zu, gid: %d, prefill_max_kv_cache_num : %d", i, prefill_grpids_[i], _attr.prefill_max_kv_cache_num_grp[i]);
+        }
+        ALOGI("prefill_max_token_num : %d", _attr.prefill_max_token_num);
+        return true;
     }
 
     void init_layer_types()
@@ -370,18 +677,7 @@ struct LLM::Impl {
             _attr.kv_cache_num  = ref_layer.get_input("K_cache").nSize / _attr.kv_cache_size / sizeof(unsigned short);
             ALOGI("kv_cache_size : %d, kv_cache_num: %d", _attr.kv_cache_size, _attr.kv_cache_num);
             if (_attr.max_token_len > _attr.kv_cache_num) { ALOGE("max_token_len(%d) > kv_cache_num(%d)", _attr.max_token_len, _attr.kv_cache_num); return false; }
-            _attr.prefill_token_num = ref_layer.get_input(1, "indices").vShape[1];
-            ALOGI("prefill_token_num : %d", _attr.prefill_token_num);
-            _attr.prefill_max_kv_cache_num_grp.clear();
-            for (size_t i = 0; i < ref_layer.get_num_input_groups() - 1; i++)
-            {
-                int n = ref_layer.get_input((int)i + 1, "K_cache").vShape[1];
-                ALOGI("grp: %zu, prefill_max_kv_cache_num : %d", i + 1, n);
-                _attr.prefill_max_kv_cache_num_grp.push_back(n);
-            }
-            _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp.back();
-            _attr.prefill_grpid = (int)_attr.prefill_max_kv_cache_num_grp.size();
-            ALOGI("prefill_max_token_num : %d", _attr.prefill_max_token_num);
+            if (!init_groups_from_model(ref_layer)) return false;
         }
 
         // embed file check → then init
@@ -481,16 +777,9 @@ struct LLM::Impl {
 
         const int prefill_split_num = (int)std::ceil((double)input_embed_num / (double)_attr.prefill_token_num);
 
-        int prefill_grpid = (int)_attr.prefill_max_kv_cache_num_grp.size();
-        for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
-        {
-            if (input_embed_num <= _attr.prefill_max_kv_cache_num_grp[i])
-            {
-                prefill_grpid = (int)i + 1;
-                break;
-            }
-        }
-        if (prefill_grpid <= 0)
+        const int prefill_grpid = choose_prefill_gid(input_embed_num);
+        const int kv_cache_num = prefill_capacity_by_gid(prefill_grpid);
+        if (prefill_grpid < 0 || kv_cache_num <= 0)
         {
             ALOGE("invalid prefill_grpid=%d", prefill_grpid);
             return false;
@@ -506,8 +795,6 @@ struct LLM::Impl {
             llm_memset(LLM_WADDR(k), 0, (size_t)k.nSize, devid);
             llm_memset(LLM_WADDR(v), 0, (size_t)v.nSize, devid);
         }
-
-        const int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[prefill_grpid - 1];
 
         std::vector<unsigned short> all_embed((size_t)input_embed_num * (size_t)_attr.tokens_embed_size);
         for (int i = 0; i < input_embed_num; i++)
@@ -549,11 +836,11 @@ struct LLM::Impl {
 
                 // mask
                 const auto &t_mask = lyr.layer.get_input(prefill_grpid, "mask");
-                llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), mask_tmp.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
 
                 // input
                 const auto &t_in = lyr.layer.get_input(prefill_grpid, "input");
-                llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
 
                 // inference
                 lyr.layer.inference(prefill_grpid);
@@ -570,7 +857,7 @@ struct LLM::Impl {
 
                 // output -> embed_tmp for next layer
                 const auto &t_out = lyr.layer.get_output(prefill_grpid, "output");
-                llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
+                llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), std::min((size_t)t_out.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
             }
 
             if (p == prefill_split_num - 1)
@@ -639,9 +926,14 @@ struct LLM::Impl {
         v_caches.resize(_attr.axmodel_num);
 
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
-        int prefill_grpid = (int)_attr.prefill_max_kv_cache_num_grp.size();
-        for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++) { if (input_embed_num <= _attr.prefill_max_kv_cache_num_grp[i]) { prefill_grpid = (int)i + 1; break; } }
-        ALOGI("input token num : %d, prefill_split_num : %d prefill_grpid : %d", input_embed_num, prefill_split_num, prefill_grpid);
+        const int prefill_grpid = choose_prefill_gid(input_embed_num);
+        const int kv_cache_num = prefill_capacity_by_gid(prefill_grpid);
+        ALOGI("input token num : %d, prefill_split_num : %d prefill_grpid : %d kv_cache_num:%d", input_embed_num, prefill_split_num, prefill_grpid, kv_cache_num);
+        if (prefill_grpid < 0 || kv_cache_num <= 0)
+        {
+            ALOGE("invalid prefill_grpid=%d", prefill_grpid);
+            return -1;
+        }
 
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
@@ -658,7 +950,6 @@ struct LLM::Impl {
             return 0;
         }
 
-        int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[prefill_grpid - 1];
         std::vector<unsigned short> test_embed(_token_ids.size() * _attr.tokens_embed_size);
         for (size_t i = 0; i < _token_ids.size(); i++) embed_selector.getByIndex(_token_ids[i], test_embed.data() + i * _attr.tokens_embed_size);
 
@@ -683,8 +974,8 @@ struct LLM::Impl {
                 unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
                 int idx_i = 0; for (int i = 0; i < input_num_token; ++i) idx_ptr[idx_i++] = (unsigned int)(p * _attr.prefill_token_num + i);
                 llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
-                auto &t_mask = lyr.layer.get_input(prefill_grpid, "mask"); llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), mask_tmp.size() * sizeof(unsigned short), devid);
-                auto &t_in = lyr.layer.get_input(prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
+                auto &t_mask = lyr.layer.get_input(prefill_grpid, "mask"); llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
+                auto &t_in = lyr.layer.get_input(prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
                 lyr.layer.inference(prefill_grpid);
                 auto &out_k  = lyr.layer.get_output(prefill_grpid, "K_cache_out");
                 auto &out_v  = lyr.layer.get_output(prefill_grpid, "V_cache_out");
@@ -694,7 +985,7 @@ struct LLM::Impl {
                 size_t kv_sz = (size_t)_attr.prefill_token_num * _attr.kv_cache_size * sizeof(unsigned short);
                 llm_d2d((unsigned short *)LLM_WADDR(pre_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                 llm_d2d((unsigned short *)LLM_WADDR(pre_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
-                auto &t_out = lyr.layer.get_output(prefill_grpid, "output"); llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
+                auto &t_out = lyr.layer.get_output(prefill_grpid, "output"); llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), std::min((size_t)t_out.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
             }
         }
 
@@ -739,14 +1030,21 @@ struct LLM::Impl {
                    std::vector<std::vector<unsigned short>> &kv_v,
                    int _precompute_len, int input_num_token)
     {
-        // Always start from the largest group by default, then pick the first group that fits.
-        _attr.prefill_grpid = (int)_attr.prefill_max_kv_cache_num_grp.size();
-        for (size_t i = 0; i < _attr.prefill_max_kv_cache_num_grp.size(); i++)
+        const int needed = _precompute_len + input_num_token;
+        decode_grpid = choose_decode_gid(std::max(1, needed));
+        _attr.prefill_grpid = choose_prefill_gid(needed);
+        int kv_cache_num = prefill_capacity_by_gid(_attr.prefill_grpid);
+        ALOGI("decode_grpid:%d prefill_grpid:%d kv_cache_num:%d precompute_len:%d input_num_token:%d",
+              decode_grpid,
+              _attr.prefill_grpid,
+              kv_cache_num,
+              _precompute_len,
+              input_num_token);
+        if (_attr.prefill_grpid < 0 || kv_cache_num <= 0)
         {
-            if (_precompute_len + input_num_token <= _attr.prefill_max_kv_cache_num_grp[i]) { _attr.prefill_grpid = (int)i + 1; break; }
+            ALOGE("invalid prefill_grpid=%d", _attr.prefill_grpid);
+            return -1;
         }
-        int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_grpid - 1];
-        ALOGI("prefill_grpid:%d kv_cache_num:%d precompute_len:%d input_num_token:%d", _attr.prefill_grpid, kv_cache_num, _precompute_len, input_num_token);
         // Remaining prefill budget should be derived from the model capacity, not accumulated across calls.
         // Otherwise, a failed prefill (e.g. context overflow) can make it negative and break `/reset`.
         const int max_cap = _attr.prefill_max_kv_cache_num_grp.empty() ? 0 : _attr.prefill_max_kv_cache_num_grp.back();
@@ -785,7 +1083,8 @@ struct LLM::Impl {
     void ResetKVCache()
     {
         last_tokens_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0;
-        _attr.prefill_grpid = (int)_attr.prefill_max_kv_cache_num_grp.size();
+        decode_grpid = decode_grpids_.empty() ? 0 : decode_grpids_.back();
+        _attr.prefill_grpid = prefill_grpids_.empty() ? 1 : prefill_grpids_.back();
         if (!_attr.prefill_max_kv_cache_num_grp.empty())
         {
             _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp.back();
@@ -809,28 +1108,38 @@ struct LLM::Impl {
         b_stop.store(false, std::memory_order_relaxed); std::string final_out;
         bfloat16 bf16 = -65536.f;
         bfloat16 bf16_one = 1.0f;
-        std::vector<unsigned short> mask(_attr.kv_cache_num + 1, bf16.data);
+        // Decode mask is group-dependent:
+        // - old models: single decode group (e.g. 2k)
+        // - new models: multiple decode groups (2k/4k/8k/16k ...)
+        // Use the largest decode capacity so we can switch groups at runtime, but make sure the
+        // "last" mask element of each decode group is set to 0 (some models rely on it).
+        int max_decode_cap = _attr.max_token_len;
+        if (!decode_max_token_len_grp_.empty()) max_decode_cap = std::max(max_decode_cap, decode_max_token_len_grp_.back());
+        if (max_decode_cap <= 0) max_decode_cap = _attr.kv_cache_num;
+        std::vector<unsigned short> mask((size_t)max_decode_cap + 1, bf16.data);
         std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
-        int kv_cache_num = _attr.prefill_max_kv_cache_num_grp[_attr.prefill_grpid - 1];
         std::vector<int> token_ids;
         int input_embed_num  = (int)(test_embed.size() / _attr.tokens_embed_size);
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
         ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
-        mask[_attr.kv_cache_num] = 0; for (int i = 0; i < precompute_len + input_embed_num; i++) mask[i] = 0;
+        if (!mask.empty()) mask.back() = 0;
+        for (const int cap : decode_max_token_len_grp_)
+        {
+            if (cap >= 0 && cap < (int)mask.size()) mask[(size_t)cap] = 0;
+        }
+        for (int i = 0; i < precompute_len + input_embed_num && i < (int)mask.size(); i++) mask[(size_t)i] = 0;
         timer t_cost, ttft_timer; ttft_timer.start();
 
         // Prefill
         // Pre-compute which prefill group id we will use per chunk, so we can propagate KV caches
         // to the future groups (axcl-qwen3-vl behavior).
         std::vector<int> prefill_grp_list;
-        prefill_grp_list.resize(prefill_split_num, 1);
-        int max_prefill_gid = 1;
+        const int default_prefill_gid = prefill_grpids_.empty() ? 1 : prefill_grpids_.front();
+        prefill_grp_list.resize(prefill_split_num, default_prefill_gid);
+        int max_prefill_gid = default_prefill_gid;
         for (int p = 0; p < prefill_split_num; ++p) {
             const int history_len = precompute_len + p * _attr.prefill_token_num;
-            int g = 1;
-            for (size_t gi = 0; gi < _attr.prefill_max_kv_cache_num_grp.size(); ++gi) {
-                if (history_len <= _attr.prefill_max_kv_cache_num_grp[gi]) { g = (int)gi + 1; break; }
-            }
+            int g = choose_prefill_gid(history_len);
             prefill_grp_list[p] = g;
             if (g > max_prefill_gid) max_prefill_gid = g;
         }
@@ -845,7 +1154,7 @@ struct LLM::Impl {
             // Qwen-VL models are sensitive to group/kv_cache_num mismatch.
             const int prefill_grpid = prefill_grp_list[p];
             // Derive kv_cache_num from mask tensor shape when possible (more reliable than K_cache vShape on some models).
-            int kv_cache_num_p = _attr.prefill_max_kv_cache_num_grp[prefill_grpid - 1];
+            int kv_cache_num_p = prefill_capacity_by_gid(prefill_grpid);
             {
                 const auto &mask_t = llama_layers[(size_t)cache_ref_full_layer_idx].layer.get_input(prefill_grpid, "mask");
                 const int mask_elems = (int)(mask_t.nSize / (int)sizeof(unsigned short));
@@ -1034,6 +1343,14 @@ struct LLM::Impl {
         for (unsigned int indices = decode_start; indices < (unsigned int)_attr.max_token_len; indices++)
         {
             if (b_stop.load(std::memory_order_relaxed)) break;
+            {
+                const int want_gid = choose_decode_gid((int)indices + 1);
+                if (want_gid != decode_grpid)
+                {
+                    ALOGI("switch decode_grpid: %d -> %d (ctx=%u)", decode_grpid, want_gid, indices + 1);
+                    decode_grpid = want_gid;
+                }
+            }
             embed_selector.getByIndex(next_token, embed);
 
 #ifdef USE_AXCL
@@ -1055,7 +1372,7 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    llm_h2d(LLM_WADDR(t_mask), mask.data(), mask.size() * sizeof(unsigned short), devid);
+                    llm_h2d(LLM_WADDR(t_mask), mask.data(), std::min((size_t)t_mask.nSize, mask.size() * sizeof(unsigned short)), devid);
                 }
                 lyr.layer.inference(decode_grpid);
                 auto &out_k = lyr.layer.get_output(decode_grpid, "K_cache_out"); auto &out_v = lyr.layer.get_output(decode_grpid, "V_cache_out");
@@ -1106,7 +1423,7 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    memcpy(t_mask.pVirAddr, mask.data(), mask.size() * sizeof(unsigned short));
+                    memcpy(t_mask.pVirAddr, mask.data(), std::min((size_t)t_mask.nSize, mask.size() * sizeof(unsigned short)));
                 }
                 auto &t_in  = lyr.layer.get_input(decode_grpid, "input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
                 lyr.layer.inference(decode_grpid);
@@ -1129,7 +1446,7 @@ struct LLM::Impl {
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
 #endif
 
-            mask[indices] = 0;
+            if (indices < mask.size()) mask[indices] = 0;
             if (tokenizer->is_stop(next_token)) { b_hit_eos = true; break; }
             token_ids.push_back(next_token);
             if (_attr.runing_callback)
@@ -1142,7 +1459,10 @@ struct LLM::Impl {
             if (_attr.runing_callback == nullptr) update_cqdm(&cqdm, indices, "token", "");
         }
 
-        printf("\n\n"); fflush(stdout); float t_ms = t_cost.cost(); ALOGN("hit eos,avg %.2f token/s\n", token_ids.size() / (t_ms / 1000.0f));
+        printf("\n\n"); fflush(stdout);
+        float t_ms = t_cost.cost();
+        const float avg_tps = (t_ms > 0.0f) ? ((float)token_ids.size() / (t_ms / 1000.0f)) : 0.0f;
+        ALOGN("hit eos,tokens=%zu,avg %.2f token/s\n", token_ids.size(), avg_tps);
         final_out = tokenizer->decode(token_ids); return final_out;
     }
 

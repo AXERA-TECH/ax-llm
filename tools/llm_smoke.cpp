@@ -23,7 +23,7 @@ static std::string resolve_path(const std::string &base, const std::string &p) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: llm_smoke <model_dir> [max_tokens] [--image <path>] [--video <frames_dir>] [--prompt <text>]\n";
+        std::cerr << "Usage: llm_smoke <model_dir> [max_tokens] [--image <path>] [--video <frames_dir>] [--prompt <text>] [--repeat <N>] [--quiet]\n";
         return 1;
     }
     std::string model_dir = argv[1];
@@ -31,11 +31,26 @@ int main(int argc, char** argv) {
     std::string image_path;
     std::string video_dir;
     std::string prompt = "Describe the image.";
+    int repeat = 1;
+    bool quiet = false;
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--image" && i + 1 < argc) image_path = argv[++i];
         else if (a == "--video" && i + 1 < argc) video_dir = argv[++i];
         else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
+        else if (a == "--repeat" && i + 1 < argc) repeat = std::max(1, std::atoi(argv[++i]));
+        else if (a == "--quiet") quiet = true;
+    }
+    if (repeat > 1)
+    {
+        std::string rep;
+        rep.reserve(prompt.size() * (size_t)repeat + (size_t)repeat);
+        for (int i = 0; i < repeat; ++i)
+        {
+            if (i) rep.push_back(' ');
+            rep += prompt;
+        }
+        prompt = std::move(rep);
     }
     std::string cfg = model_dir + "/config.json";
     if (!std::filesystem::exists(cfg)) { std::cerr << "config.json not found in " << model_dir << "\n"; return 2; }
@@ -133,11 +148,19 @@ int main(int argc, char** argv) {
         history.push_back({USER, IMAGE, prompt});
         media_inputs.push_back({1, {image_path}});
     } else {
-        history.push_back({USER, TEXT, std::string("hello")});
+        history.push_back({USER, TEXT, prompt});
     }
 
-    auto cb = [](std::string s, float tps, void*){ std::cout << s << std::flush; };
-    llm.getAttr()->runing_callback = cb;
+    if (quiet)
+    {
+        auto cb = [](std::string, float, void*){};
+        llm.getAttr()->runing_callback = cb;
+    }
+    else
+    {
+        auto cb = [](std::string s, float, void*){ std::cout << s << std::flush; };
+        llm.getAttr()->runing_callback = cb;
+    }
     if (!media_inputs.empty()) llm.Run(history, media_inputs, max_tokens);
     else llm.Run(history, max_tokens);
     std::cout << "\n[SMOKE OK]\n";
