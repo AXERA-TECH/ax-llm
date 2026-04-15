@@ -1170,12 +1170,40 @@ bool VisionModule::EncodeForContent(const Content& content,
     }
 
     // VIDEO
-    if (media.uris.size() != 1) {
-        err = "VIDEO currently supports exactly 1 uri (directory of frames)";
-        return false;
+    // Supports:
+    // - 1 uri: a directory of frames (recommended), or a single image file
+    // - N uris: an ordered list of image frame files (useful for base64 uploads)
+    std::vector<axcv::Mat> frames;
+    if (media.uris.size() == 1)
+    {
+        frames = ReadImages(media.uris[0]);
+        if (frames.empty()) { err = "no video frames loaded"; return false; }
     }
-    auto frames = ReadImages(media.uris[0]);
-    if (frames.empty()) { err = "no video frames loaded"; return false; }
+    else
+    {
+        frames.reserve(media.uris.size());
+        for (const auto &uri : media.uris)
+        {
+            if (is_directory(uri))
+            {
+                err = "VIDEO uri list contains a directory; use a single frames_dir uri instead";
+                return false;
+            }
+            if (!is_file(uri))
+            {
+                err = "invalid video frame uri: " + uri;
+                return false;
+            }
+            axcv::Mat img = axcv::imread(uri, axcv::IMREAD_COLOR);
+            if (axcv::empty(img))
+            {
+                err = "failed to read video frame: " + uri;
+                return false;
+            }
+            frames.push_back(img);
+        }
+        if (frames.empty()) { err = "no video frames loaded"; return false; }
+    }
 
     if (type_ == VLMType::SmolVLM2) {
         std::vector<std::vector<unsigned char>> pixel_values;

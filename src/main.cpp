@@ -721,8 +721,10 @@ static std::string save_base64_to_tempfile(const std::string &ext, const std::st
     std::filesystem::create_directories(tmpdir);
 
     // Generate a unique filename
-    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto path = tmpdir / ("img_" + std::to_string(now) + "." + ext);
+    static std::atomic<uint64_t> g_tmp_seq{0};
+    const auto now = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+    const uint64_t seq = g_tmp_seq.fetch_add(1, std::memory_order_relaxed);
+    const auto path = tmpdir / ("img_" + std::to_string(now) + "_" + std::to_string(seq) + "." + ext);
 
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) return {};
@@ -787,6 +789,8 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         }
 
         std::vector<std::string> image_uris;
+        bool has_video = false;
+        std::vector<std::string> video_uris;
 
         if (item.contains("content") && item["content"].is_string())
         {
@@ -815,7 +819,36 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                     }
                     if (!raw_url.empty())
                     {
-                        if (temp_files)
+                        // Convention: `image_url.url` can be prefixed with "video:" to indicate
+                        // this is a video represented as a directory of frames on the server.
+                        // Example: {"type":"image_url","image_url":{"url":"video:/path/to/frames"}}
+                        if (raw_url.rfind("video:", 0) == 0 || raw_url.rfind("VIDEO:", 0) == 0)
+                        {
+                            has_video = true;
+                            std::string uri = raw_url.substr(6);
+                            // Trim leading spaces after prefix.
+                            while (!uri.empty() && (uri[0] == ' ' || uri[0] == '\t'))
+                            {
+                                uri.erase(uri.begin());
+                            }
+                            if (uri.empty())
+                            {
+                                ALOGE("video uri is empty");
+                                return false;
+                            }
+
+                            // Support base64 frames: "video:data:image/...;base64,..."
+                            if (temp_files)
+                            {
+                                video_uris.push_back(resolve_image_uri(uri, *temp_files));
+                            }
+                            else
+                            {
+                                std::vector<std::string> dummy;
+                                video_uris.push_back(resolve_image_uri(uri, dummy));
+                            }
+                        }
+                        else if (temp_files)
                         {
                             image_uris.push_back(resolve_image_uri(raw_url, *temp_files));
                         }
@@ -835,7 +868,26 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
             return false;
         }
 
-        if (!image_uris.empty() && content.role == USER)
+        if (content.role == USER && has_video)
+        {
+            if (!image_uris.empty())
+            {
+                ALOGE("mixing video and images in one message is not supported");
+                return false;
+            }
+            if (video_uris.empty())
+            {
+                ALOGE("video uris is empty");
+                return false;
+            }
+
+            content.type = VIDEO;
+            if (media_inputs)
+            {
+                media_inputs->push_back({history.size(), video_uris});
+            }
+        }
+        else if (!image_uris.empty() && content.role == USER)
         {
             content.type = IMAGE;
             if (media_inputs)
