@@ -32,7 +32,8 @@ struct RunState {
 };
 
 // Media inputs aligned to `history` by index.
-// `history[content_index].type` must be IMAGE or VIDEO.
+// `history[content_index].type` can be IMAGE / VIDEO / AUDIO.
+// AUDIO is currently a reserved placeholder interface for future runtime support.
 struct MediaInputs {
     size_t content_index = 0;
     std::vector<std::string> uris;

@@ -107,12 +107,17 @@ public:
         _size = 0;
     }
 
-    size_t size()
+    size_t size() const
     {
         return _size;
     }
 
     void *data()
+    {
+        return _add;
+    }
+
+    const void *data() const
     {
         return _add;
     }

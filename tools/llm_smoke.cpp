@@ -23,13 +23,14 @@ static std::string resolve_path(const std::string &base, const std::string &p) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: llm_smoke <model_dir> [max_tokens] [--image <path>] [--video <frames_dir>] [--prompt <text>] [--repeat <N>] [--quiet]\n";
+        std::cerr << "Usage: llm_smoke <model_dir> [max_tokens] [--image <path>] [--video <frames_dir>] [--audio <path>] [--prompt <text>] [--repeat <N>] [--quiet]\n";
         return 1;
     }
     std::string model_dir = argv[1];
     int max_tokens = (argc>=3)? std::atoi(argv[2]) : 16;
     std::string image_path;
     std::string video_dir;
+    std::string audio_path;
     std::string prompt = "Describe the image.";
     int repeat = 1;
     bool quiet = false;
@@ -37,6 +38,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--image" && i + 1 < argc) image_path = argv[++i];
         else if (a == "--video" && i + 1 < argc) video_dir = argv[++i];
+        else if (a == "--audio" && i + 1 < argc) audio_path = argv[++i];
         else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
         else if (a == "--repeat" && i + 1 < argc) repeat = std::max(1, std::atoi(argv[++i]));
         else if (a == "--quiet") quiet = true;
@@ -73,6 +75,18 @@ int main(int argc, char** argv) {
     }
     attr.tokens_embed_num          = j["tokens_embed_num"].get<int>();
     attr.tokens_embed_size         = j["tokens_embed_size"].get<int>();
+    if (j.contains("pad_token_id")) attr.pad_token_id = j["pad_token_id"].get<int>();
+    if (j.contains("hidden_size_per_layer_input")) attr.hidden_size_per_layer_input = j["hidden_size_per_layer_input"].get<int>();
+    if (j.contains("rms_norm_eps")) attr.rms_norm_eps = j["rms_norm_eps"].get<float>();
+    if (j.contains("filename_tokens_embed_per_layer")) {
+        attr.filename_tokens_embed_per_layer = resolve_path(model_dir, j["filename_tokens_embed_per_layer"].get<std::string>());
+    }
+    if (j.contains("filename_per_layer_model_projection")) {
+        attr.filename_per_layer_model_projection = resolve_path(model_dir, j["filename_per_layer_model_projection"].get<std::string>());
+    }
+    if (j.contains("filename_per_layer_projection_norm")) {
+        attr.filename_per_layer_projection_norm = resolve_path(model_dir, j["filename_per_layer_projection_norm"].get<std::string>());
+    }
     if (j.contains("b_use_mmap_load_embed")) attr.b_use_mmap_load_embed = j["b_use_mmap_load_embed"].get<bool>();
 
     // Optional VLM config (match src/main.cpp behavior).
@@ -98,7 +112,7 @@ int main(int argc, char** argv) {
     if (j.contains("vision_tokens_per_second")) attr.vision_tokens_per_second = j["vision_tokens_per_second"].get<int>();
 
     // Auto-pick a smoke image if this is a VLM model and caller didn't specify one.
-    if (attr.vlm_type != VLMType::None && image_path.empty() && video_dir.empty())
+    if (attr.vlm_type != VLMType::None && image_path.empty() && video_dir.empty() && audio_path.empty())
     {
         std::string p = model_dir + "/smoke_image.png";
         if (std::filesystem::exists(p)) {
@@ -144,6 +158,9 @@ int main(int argc, char** argv) {
     if (!video_dir.empty()) {
         history.push_back({USER, VIDEO, prompt});
         media_inputs.push_back({1, {video_dir}});
+    } else if (!audio_path.empty()) {
+        history.push_back({USER, AUDIO, prompt});
+        media_inputs.push_back({1, {audio_path}});
     } else if (!image_path.empty()) {
         history.push_back({USER, IMAGE, prompt});
         media_inputs.push_back({1, {image_path}});

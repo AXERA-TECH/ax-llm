@@ -108,6 +108,36 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
     return 0;
 }
 
+static AX_ENGINE_IO_BUFFER_T *find_input_buffer_by_name(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data, const std::string &name)
+{
+    if (!info || !io_data)
+        return nullptr;
+
+    for (uint i = 0; i < info->nInputSize; ++i)
+    {
+        const char *tensor_name = info->pInputs[i].pName;
+        if (tensor_name && name == tensor_name)
+            return io_data->pInputs + i;
+    }
+
+    return nullptr;
+}
+
+static AX_ENGINE_IO_BUFFER_T *find_output_buffer_by_name(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data, const std::string &name)
+{
+    if (!info || !io_data)
+        return nullptr;
+
+    for (uint i = 0; i < info->nOutputSize; ++i)
+    {
+        const char *tensor_name = info->pOutputs[i].pName;
+        if (tensor_name && name == tensor_name)
+            return io_data->pOutputs + i;
+    }
+
+    return nullptr;
+}
+
 int ax_runner_ax650::sub_init()
 {
     if (!m_handle)
@@ -228,16 +258,30 @@ int ax_runner_ax650::sub_init()
         auto &last_io_info = m_handle->io_info[io_count - 1];
         for (uint i = 0; i < last_io_data.nInputSize; ++i)
         {
-            if (std::find(skip_alloc_names.begin(), skip_alloc_names.end(), last_io_info->pInputs[i].pName) != skip_alloc_names.end())
+            const char *tensor_name = last_io_info->pInputs[i].pName;
+            if (!tensor_name)
+                continue;
+
+            if (std::find(skip_alloc_names.begin(), skip_alloc_names.end(), tensor_name) != skip_alloc_names.end())
             {
-                for (uint j = 0; j < first_io_data.nInputSize; ++j)
+                AX_ENGINE_IO_BUFFER_T *first_buf = find_input_buffer_by_name(first_io_info, &first_io_data, tensor_name);
+                if (!first_buf)
                 {
-                    if (first_io_info->pInputs[j].pName == last_io_info->pInputs[i].pName)
-                    {
-                        last_io_data.pInputs[i].phyAddr = first_io_data.pInputs[j].phyAddr;
-                        last_io_data.pInputs[i].pVirAddr = first_io_data.pInputs[j].pVirAddr;
-                    }
+                    ALOGE("failed to find shared input buffer for %s in group0", tensor_name);
+                    return -1;
                 }
+
+                if (first_buf->nSize < last_io_data.pInputs[i].nSize)
+                {
+                    ALOGE("shared input buffer too small for %s: src=%u dst=%u",
+                          tensor_name,
+                          first_buf->nSize,
+                          last_io_data.pInputs[i].nSize);
+                    return -1;
+                }
+
+                last_io_data.pInputs[i].phyAddr = first_buf->phyAddr;
+                last_io_data.pInputs[i].pVirAddr = first_buf->pVirAddr;
             }
         }
 
@@ -246,19 +290,60 @@ int ax_runner_ax650::sub_init()
             auto &io_info = m_handle->io_info[grpid];
             auto &io_data = m_handle->io_data[grpid];
 
-            // 安全检查：确保维度匹配再拷贝
-            size_t min_inputs = std::min(io_info->nInputSize, last_io_data.nInputSize);
-            for (size_t i = 0; i < min_inputs; i++)
+            // Gemma4 prefill groups do not guarantee identical tensor ordering across groups.
+            // Reuse buffers by tensor name instead of index to avoid wrong buffer aliasing.
+            for (size_t i = 0; i < io_info->nInputSize; i++)
             {
-                io_data.pInputs[i].phyAddr = last_io_data.pInputs[i].phyAddr;
-                io_data.pInputs[i].pVirAddr = last_io_data.pInputs[i].pVirAddr;
+                const char *tensor_name = io_info->pInputs[i].pName;
+                if (!tensor_name)
+                    continue;
+
+                AX_ENGINE_IO_BUFFER_T *shared = find_input_buffer_by_name(last_io_info, &last_io_data, tensor_name);
+                if (!shared)
+                {
+                    ALOGE("failed to find shared input buffer for group %zu tensor %s", grpid, tensor_name);
+                    return -1;
+                }
+
+                if (shared->nSize < io_data.pInputs[i].nSize)
+                {
+                    ALOGE("shared input buffer too small for group %zu tensor %s: src=%u dst=%u",
+                          grpid,
+                          tensor_name,
+                          shared->nSize,
+                          io_data.pInputs[i].nSize);
+                    return -1;
+                }
+
+                io_data.pInputs[i].phyAddr = shared->phyAddr;
+                io_data.pInputs[i].pVirAddr = shared->pVirAddr;
             }
 
-            size_t min_outputs = std::min(io_info->nOutputSize, last_io_data.nOutputSize);
-            for (size_t i = 0; i < min_outputs; i++)
+            for (size_t i = 0; i < io_info->nOutputSize; i++)
             {
-                io_data.pOutputs[i].phyAddr = last_io_data.pOutputs[i].phyAddr;
-                io_data.pOutputs[i].pVirAddr = last_io_data.pOutputs[i].pVirAddr;
+                const char *tensor_name = io_info->pOutputs[i].pName;
+                if (!tensor_name)
+                    continue;
+
+                AX_ENGINE_IO_BUFFER_T *shared = find_output_buffer_by_name(last_io_info, &last_io_data, tensor_name);
+                if (!shared)
+                {
+                    ALOGE("failed to find shared output buffer for group %zu tensor %s", grpid, tensor_name);
+                    return -1;
+                }
+
+                if (shared->nSize < io_data.pOutputs[i].nSize)
+                {
+                    ALOGE("shared output buffer too small for group %zu tensor %s: src=%u dst=%u",
+                          grpid,
+                          tensor_name,
+                          shared->nSize,
+                          io_data.pOutputs[i].nSize);
+                    return -1;
+                }
+
+                io_data.pOutputs[i].phyAddr = shared->phyAddr;
+                io_data.pOutputs[i].pVirAddr = shared->pVirAddr;
             }
         }
     }

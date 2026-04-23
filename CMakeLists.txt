@@ -100,6 +100,11 @@ if(BUILD_AXCL)
     find_package(Threads REQUIRED)
 endif()
 
+# OpenMP for AX650 on-chip path (per-layer input compute uses #pragma omp parallel for)
+if(BUILD_AX650 AND NOT OpenMP_CXX_FOUND)
+    find_package(OpenMP QUIET)
+endif()
+
 # ---------------------------------------------------------------------------
 add_subdirectory(third_party/tokenizer.axera)
 include_directories(third_party/tokenizer.axera/include)
@@ -182,6 +187,10 @@ if(BUILD_AX650)
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(axllm OpenMP::OpenMP_CXX)
+        target_link_libraries(llm_smoke OpenMP::OpenMP_CXX)
+    endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
 endif()

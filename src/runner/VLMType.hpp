@@ -22,6 +22,7 @@ enum class VLMType : int {
     FastVLM = 4,
     SmolVLM2 = 5,
     PaddleOCRVL = 6,
+    Gemma4VL = 7,
 };
 
 inline constexpr std::string_view VLMTypeName(VLMType t) {

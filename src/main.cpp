@@ -113,6 +113,22 @@ void llm_running_callback(std::string str, float token_per_sec, void *reserve)
     fflush(stdout);
 }
 
+static inline std::string get_effective_system_prompt(const LLMAttrType &attr)
+{
+    return attr.system_prompt;
+}
+
+static inline std::vector<Content> make_initial_history(const LLMAttrType &attr)
+{
+    std::vector<Content> history;
+    const std::string system_prompt = get_effective_system_prompt(attr);
+    if (!system_prompt.empty())
+    {
+        history.push_back({SYSTEM, TEXT, system_prompt});
+    }
+    return history;
+}
+
 // Config structure for JSON configuration
 struct ModelConfig
 {
@@ -184,12 +200,45 @@ struct ModelConfig
             {
                 attr.full_attention_interval = j["text_config"]["full_attention_interval"].get<int>();
             }
+            attr.num_kv_shared_layers = 0;
+            if (j.contains("num_kv_shared_layers"))
+            {
+                attr.num_kv_shared_layers = j["num_kv_shared_layers"].get<int>();
+            }
+            else if (j.contains("text_config") && j["text_config"].contains("num_kv_shared_layers"))
+            {
+                attr.num_kv_shared_layers = j["text_config"]["num_kv_shared_layers"].get<int>();
+            }
+            attr.layer_types.clear();
+            if (j.contains("layer_types"))
+            {
+                attr.layer_types = j["layer_types"].get<std::vector<std::string>>();
+            }
+            else if (j.contains("text_config") && j["text_config"].contains("layer_types"))
+            {
+                attr.layer_types = j["text_config"]["layer_types"].get<std::vector<std::string>>();
+            }
 
             check_key("tokens_embed_num");
             attr.tokens_embed_num = j["tokens_embed_num"].get<int>();
 
             check_key("tokens_embed_size");
             attr.tokens_embed_size = j["tokens_embed_size"].get<int>();
+            if (j.contains("pad_token_id")) attr.pad_token_id = j["pad_token_id"].get<int>();
+            if (j.contains("hidden_size_per_layer_input")) attr.hidden_size_per_layer_input = j["hidden_size_per_layer_input"].get<int>();
+            if (j.contains("rms_norm_eps")) attr.rms_norm_eps = j["rms_norm_eps"].get<float>();
+            if (j.contains("filename_tokens_embed_per_layer"))
+            {
+                attr.filename_tokens_embed_per_layer = j["filename_tokens_embed_per_layer"].get<std::string>();
+            }
+            if (j.contains("filename_per_layer_model_projection"))
+            {
+                attr.filename_per_layer_model_projection = j["filename_per_layer_model_projection"].get<std::string>();
+            }
+            if (j.contains("filename_per_layer_projection_norm"))
+            {
+                attr.filename_per_layer_projection_norm = j["filename_per_layer_projection_norm"].get<std::string>();
+            }
 
             // Load options
             if (j.contains("b_use_mmap_load_embed"))
@@ -341,6 +390,9 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
     if (!is_url(config.attr.url_tokenizer_model))
         config.attr.url_tokenizer_model = resolve_path(model_path, config.attr.url_tokenizer_model);
     config.attr.filename_tokens_embed = resolve_path(model_path, config.attr.filename_tokens_embed);
+    config.attr.filename_tokens_embed_per_layer = resolve_path(model_path, config.attr.filename_tokens_embed_per_layer);
+    config.attr.filename_per_layer_model_projection = resolve_path(model_path, config.attr.filename_per_layer_model_projection);
+    config.attr.filename_per_layer_projection_norm = resolve_path(model_path, config.attr.filename_per_layer_projection_norm);
     config.attr.post_config_path = resolve_path(model_path, config.attr.post_config_path);
     config.attr.filename_image_encoder_axmodel = resolve_path(model_path, config.attr.filename_image_encoder_axmodel);
     config.attr.vision_cache_dir = resolve_path(model_path, config.attr.vision_cache_dir);
@@ -508,11 +560,11 @@ int run_interactive_mode(ModelConfig &config)
     printf("Ctrl+C: 停止当前生成\n");
     if (config.attr.vlm_type != VLMType::None)
     {
-        printf("VLM enabled: after each prompt, input image path (empty = text-only). Use \"video:<frames_dir>\" for video.\n");
+        printf("VLM enabled: after each prompt, input media path (empty = text-only). Use \"video:<frames_dir>\" for video, \"audio:<file>\" for reserved audio placeholder.\n");
     }
     printf("----------------------------------------\n");
 
-    std::vector<Content> history = {{SYSTEM, TEXT, config.attr.system_prompt}};
+    std::vector<Content> history = make_initial_history(config.attr);
     std::vector<MediaInputs> media_inputs; // keep for the whole session (indices refer to `history`)
 
     // Setup terminal for UTF-8 input handling
@@ -539,13 +591,15 @@ int run_interactive_mode(ModelConfig &config)
         {
             ALOGI("reset kvcache");
             g_llm.ResetKVCache();
-            history = {{SYSTEM, TEXT, config.attr.system_prompt}};
+            history = make_initial_history(config.attr);
             media_inputs.clear();
             continue;
         }
         if (cmd == "/dd")
         {
-            if (history.size() >= 3)
+            if (history.size() >= 2 &&
+                history[history.size() - 2].role == USER &&
+                history.back().role == ASSISTANT)
             {
                 ALOGI("remove last conversation \nQ:%s \nA:%s",
                       history[history.size() - 2].data.c_str(),
@@ -574,6 +628,7 @@ int run_interactive_mode(ModelConfig &config)
                 case USER:
                     if (item.type == IMAGE) axllm::Logger::print_chat_role("user(image)", axllm::TextColor::Green, item.data);
                     else if (item.type == VIDEO) axllm::Logger::print_chat_role("user(video)", axllm::TextColor::Green, item.data);
+                    else if (item.type == AUDIO) axllm::Logger::print_chat_role("user(audio)", axllm::TextColor::Green, item.data);
                     else axllm::Logger::print_chat_role("user", axllm::TextColor::Green, item.data);
                     break;
                 case ASSISTANT:
@@ -588,11 +643,11 @@ int run_interactive_mode(ModelConfig &config)
 
         // Optional media input (VLM interactive workflow).
         bool has_media = false;
-        bool is_video = false;
+        ContentType media_type = IMAGE;
         std::vector<std::string> uris;
         if (config.attr.vlm_type != VLMType::None)
         {
-            printf("image >> ");
+            printf("media >> ");
             fflush(stdout);
             std::string media_line = read_line_with_utf8_support();
             if (!media_line.empty())
@@ -604,12 +659,18 @@ int run_interactive_mode(ModelConfig &config)
 
                 if (media_line.rfind("video:", 0) == 0 || media_line.rfind("VIDEO:", 0) == 0)
                 {
-                    is_video = true;
+                    media_type = VIDEO;
+                    media_line = media_line.substr(6);
+                    while (!media_line.empty() && (media_line[0] == ' ' || media_line[0] == '\t')) media_line.erase(media_line.begin());
+                }
+                else if (media_line.rfind("audio:", 0) == 0 || media_line.rfind("AUDIO:", 0) == 0)
+                {
+                    media_type = AUDIO;
                     media_line = media_line.substr(6);
                     while (!media_line.empty() && (media_line[0] == ' ' || media_line[0] == '\t')) media_line.erase(media_line.begin());
                 }
 
-                // Split by whitespace for multiple image uris.
+                // Split by whitespace for multiple media uris.
                 std::istringstream iss(media_line);
                 std::string tok;
                 while (iss >> tok) uris.push_back(tok);
@@ -620,7 +681,7 @@ int run_interactive_mode(ModelConfig &config)
         Content user;
         user.role = USER;
         user.data = prompt;
-        user.type = (has_media ? (is_video ? VIDEO : IMAGE) : TEXT);
+        user.type = (has_media ? media_type : TEXT);
 
         const size_t idx = history.size();
         history.push_back(user);
@@ -760,6 +821,28 @@ static void cleanup_temp_files(std::vector<std::string> &files)
     files.clear();
 }
 
+static std::string extract_media_url(const nlohmann::json &item, const char *primary_key, const char *fallback_key = nullptr)
+{
+    auto extract_from_key = [&item](const char *key) -> std::string
+    {
+        if (!key || !item.contains(key)) return {};
+        const auto &field = item[key];
+        if (field.is_object() && field.contains("url"))
+        {
+            return field["url"].get<std::string>();
+        }
+        if (field.is_string())
+        {
+            return field.get<std::string>();
+        }
+        return {};
+    };
+
+    std::string raw_url = extract_from_key(primary_key);
+    if (!raw_url.empty()) return raw_url;
+    return extract_from_key(fallback_key);
+}
+
 // Handle HTTP API messages
 bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history,
                          std::vector<MediaInputs> *media_inputs = nullptr,
@@ -788,9 +871,8 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
             return false;
         }
 
-        std::vector<std::string> image_uris;
-        bool has_video = false;
-        std::vector<std::string> video_uris;
+        std::vector<std::string> media_uris;
+        ContentType media_type = TEXT;
 
         if (item.contains("content") && item["content"].is_string())
         {
@@ -804,59 +886,52 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                 {
                     content.data += c["text"];
                 }
-                else if (c.contains("type") && c["type"] == "image_url")
+                else if (c.contains("type") &&
+                         (c["type"] == "image_url" || c["type"] == "image" ||
+                          c["type"] == "video_url" || c["type"] == "video" ||
+                          c["type"] == "audio_url" || c["type"] == "audio"))
                 {
-                    // OpenAI style: {type:"image_url", image_url:{url:"..."}}
-                    // Supports file paths and data:image/...;base64,... URIs
                     std::string raw_url;
-                    if (c.contains("image_url") && c["image_url"].is_object() && c["image_url"].contains("url"))
+                    ContentType part_type = TEXT;
+                    if (c["type"] == "image_url" || c["type"] == "image")
                     {
-                        raw_url = c["image_url"]["url"].get<std::string>();
+                        part_type = IMAGE;
+                        raw_url = extract_media_url(c, "image_url", "image");
                     }
-                    else if (c.contains("image_url") && c["image_url"].is_string())
+                    else if (c["type"] == "video_url" || c["type"] == "video")
                     {
-                        raw_url = c["image_url"].get<std::string>();
+                        part_type = VIDEO;
+                        raw_url = extract_media_url(c, "video_url", "video");
+                    }
+                    else if (c["type"] == "audio_url" || c["type"] == "audio")
+                    {
+                        part_type = AUDIO;
+                        raw_url = extract_media_url(c, "audio_url", "audio");
                     }
                     if (!raw_url.empty())
                     {
-                        // Convention: `image_url.url` can be prefixed with "video:" to indicate
-                        // this is a video represented as a directory of frames on the server.
-                        // Example: {"type":"image_url","image_url":{"url":"video:/path/to/frames"}}
-                        if (raw_url.rfind("video:", 0) == 0 || raw_url.rfind("VIDEO:", 0) == 0)
+                        if (media_type != TEXT && media_type != part_type)
                         {
-                            has_video = true;
-                            std::string uri = raw_url.substr(6);
-                            // Trim leading spaces after prefix.
-                            while (!uri.empty() && (uri[0] == ' ' || uri[0] == '\t'))
-                            {
-                                uri.erase(uri.begin());
-                            }
-                            if (uri.empty())
-                            {
-                                ALOGE("video uri is empty");
-                                return false;
-                            }
+                            ALOGE("mixed media types in a single message are not supported yet");
+                            return false;
+                        }
+                        media_type = part_type;
 
-                            // Support base64 frames: "video:data:image/...;base64,..."
+                        if (part_type == IMAGE)
+                        {
                             if (temp_files)
                             {
-                                video_uris.push_back(resolve_image_uri(uri, *temp_files));
+                                media_uris.push_back(resolve_image_uri(raw_url, *temp_files));
                             }
                             else
                             {
                                 std::vector<std::string> dummy;
-                                video_uris.push_back(resolve_image_uri(uri, dummy));
+                                media_uris.push_back(resolve_image_uri(raw_url, dummy));
                             }
-                        }
-                        else if (temp_files)
-                        {
-                            image_uris.push_back(resolve_image_uri(raw_url, *temp_files));
                         }
                         else
                         {
-                            // No temp_files tracking — still try to resolve, but won't auto-cleanup
-                            std::vector<std::string> dummy;
-                            image_uris.push_back(resolve_image_uri(raw_url, dummy));
+                            media_uris.push_back(raw_url);
                         }
                     }
                 }
@@ -868,31 +943,12 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
             return false;
         }
 
-        if (content.role == USER && has_video)
+        if (!media_uris.empty() && content.role == USER)
         {
-            if (!image_uris.empty())
-            {
-                ALOGE("mixing video and images in one message is not supported");
-                return false;
-            }
-            if (video_uris.empty())
-            {
-                ALOGE("video uris is empty");
-                return false;
-            }
-
-            content.type = VIDEO;
+            content.type = media_type;
             if (media_inputs)
             {
-                media_inputs->push_back({history.size(), video_uris});
-            }
-        }
-        else if (!image_uris.empty() && content.role == USER)
-        {
-            content.type = IMAGE;
-            if (media_inputs)
-            {
-                media_inputs->push_back({history.size(), image_uris});
+                media_inputs->push_back({history.size(), media_uris});
             }
         }
         history.push_back(content);

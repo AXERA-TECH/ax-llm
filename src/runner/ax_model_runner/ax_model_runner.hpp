@@ -127,12 +127,16 @@ public:
 
     const ax_runner_tensor_t &get_input(int grpid, const std::string &name)
     {
-        auto it = map_group_input_tensors.find(name);
-        if (it == map_group_input_tensors.end())
-            throw std::runtime_error("input tensor not found: " + name);
-        if (grpid < 0 || grpid >= (int)it->second.size())
-            throw std::runtime_error("group id out of range for: " + name);
-        return it->second[grpid];
+        if (grpid < 0 || grpid >= (int)mgroup_input_tensors.size())
+            throw std::runtime_error("group id out of range for input: " + name);
+
+        for (const auto &tensor : mgroup_input_tensors[(size_t)grpid])
+        {
+            if (tensor.sName == name)
+                return tensor;
+        }
+
+        throw std::runtime_error("input tensor not found in group: " + name);
     }
 
     const ax_runner_tensor_t &get_output(int grpid, int idx) { return mgroup_output_tensors[grpid][idx]; }
@@ -140,12 +144,16 @@ public:
 
     const ax_runner_tensor_t &get_output(int grpid, const std::string &name)
     {
-        auto it = map_group_output_tensors.find(name);
-        if (it == map_group_output_tensors.end())
-            throw std::runtime_error("output tensor not found: " + name);
-        if (grpid < 0 || grpid >= (int)it->second.size())
-            throw std::runtime_error("group id out of range for: " + name);
-        return it->second[grpid];
+        if (grpid < 0 || grpid >= (int)mgroup_output_tensors.size())
+            throw std::runtime_error("group id out of range for output: " + name);
+
+        for (const auto &tensor : mgroup_output_tensors[(size_t)grpid])
+        {
+            if (tensor.sName == name)
+                return tensor;
+        }
+
+        throw std::runtime_error("output tensor not found in group: " + name);
     }
 
     virtual int inference() = 0;

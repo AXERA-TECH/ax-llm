@@ -25,6 +25,14 @@ int PaddleOCRVLImageProcessor(axcv::Mat& src,
                               int tgt_h, int tgt_w,
                               int patch_size = 14);
 
+// Gemma4 image processor:
+// Resize -> RGB -> patchify to [num_patches, patch_size * patch_size * 3] in HWC order.
+// Values remain uint8 here; callers typically convert to float32 and rescale by 1/255.
+int Gemma4ImageProcessor(axcv::Mat& src,
+                         std::vector<unsigned char>& output,
+                         int tgt_h, int tgt_w,
+                         int patch_size = 16);
+
 // SmolVLM2 image processor:
 // For each input image, outputs 5 blocks: 2x2 tiles (4) + global resized image (1).
 int Smolvlm2ImageProcessor(std::vector<axcv::Mat>& src,

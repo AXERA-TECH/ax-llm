@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <regex>
 #include <numeric>
 
 #include "bfloat16.hpp"
@@ -146,6 +147,16 @@ static bool get_single_token_id(const std::shared_ptr<BaseTokenizer>& tok, const
         return false;
     }
     out_id = ids[0];
+    return true;
+}
+
+static bool parse_gemma4_profile_from_path(const std::string& path, int& out_h, int& out_w, int& out_tokens)
+{
+    std::smatch m;
+    if (!std::regex_search(path, m, std::regex("_h(\\d+)_w(\\d+)_t(\\d+)"))) return false;
+    out_h = std::stoi(m[1].str());
+    out_w = std::stoi(m[2].str());
+    out_tokens = std::stoi(m[3].str());
     return true;
 }
 
@@ -523,6 +534,38 @@ bool VisionModule::Init(VLMType type,
                       vision_width_, vision_height_, cfg_bytes, (size_t)in0.nSize);
             }
         }
+    } else if (type_ == VLMType::Gemma4VL) {
+        const int old_w = vision_width_;
+        const int old_h = vision_height_;
+        int parsed_h = 0, parsed_w = 0, parsed_tokens = 0;
+        const bool parsed_profile = parse_gemma4_profile_from_path(encoder_axmodel, parsed_h, parsed_w, parsed_tokens);
+
+        const size_t eff_nsize = ((size_t)in0.nSize % sizeof(float) == 0) ? ((size_t)in0.nSize / sizeof(float)) : (size_t)in0.nSize;
+        const int pixel_dim = std::max(1, patch_size_) * std::max(1, patch_size_) * 3;
+        if (pixel_dim <= 0 || eff_nsize % (size_t)pixel_dim != 0) {
+            err = "failed to infer Gemma4 vision patch layout from encoder input";
+            return false;
+        }
+
+        const int patch_count = (int)(eff_nsize / (size_t)pixel_dim);
+        if (parsed_profile) {
+            vision_height_ = parsed_h;
+            vision_width_ = parsed_w;
+        } else if (vision_width_ > 0 && vision_height_ > 0) {
+            const int expected_patch_count = (vision_height_ / std::max(1, patch_size_)) * (vision_width_ / std::max(1, patch_size_));
+            if (expected_patch_count != patch_count) {
+                ALOGW("Gemma4 input patch count mismatch: cfg=%dx%d -> %d patches, model=%d patches",
+                      vision_width_, vision_height_, expected_patch_count, patch_count);
+            }
+        } else {
+            err = "failed to infer Gemma4 vision_width/vision_height from encoder filename; please set config";
+            return false;
+        }
+
+        if (old_w != vision_width_ || old_h != vision_height_) {
+            ALOGW("Gemma4 vision size override: cfg=%dx%d -> model=%dx%d",
+                  old_w, old_h, vision_width_, vision_height_);
+        }
     } else if (type_ == VLMType::InternVL3 || type_ == VLMType::FastVLM) {
         // Classic image encoder: detect NCHW/NHWC layout and image size from model input shape.
         impl_->input_is_nchw = -1;
@@ -632,6 +675,19 @@ bool VisionModule::Init(VLMType type,
                 tokens_per_block_ = tpb;
                 picked = true;
             }
+        } else if (type_ == VLMType::Gemma4VL) {
+            int expected_h = 0, expected_w = 0, expected_tokens = 0;
+            const bool parsed_profile = parse_gemma4_profile_from_path(encoder_axmodel, expected_h, expected_w, expected_tokens);
+            int out_is_bf16 = -1, tpb = 0;
+            if (try_pick_by_bytes(4, out_is_bf16, tpb) && (!parsed_profile || tpb == expected_tokens)) {
+                impl_->encoder_output_is_bf16 = out_is_bf16;
+                tokens_per_block_ = tpb;
+                picked = true;
+            } else if (try_pick_by_bytes(2, out_is_bf16, tpb) && (!parsed_profile || tpb == expected_tokens)) {
+                impl_->encoder_output_is_bf16 = out_is_bf16;
+                tokens_per_block_ = tpb;
+                picked = true;
+            }
         }
 
         if (!picked) {
@@ -719,6 +775,14 @@ bool VisionModule::Init(VLMType type,
         if (!get_single_token_id(tokenizer_, "<image>", image_pad_id_, err)) return false;
         video_pad_id_ = image_pad_id_;
         vision_start_id_ = -1;
+        break;
+    case VLMType::Gemma4VL:
+        if (!get_single_token_id(tokenizer_, "<|image|>", image_pad_id_, err)) return false;
+        if (!get_single_token_id(tokenizer_, "<|video|>", video_pad_id_, err)) {
+            video_pad_id_ = -1;
+        }
+        vision_start_id_ = -1;
+        ALOGI("Gemma4-VL token ids: image_pad=%d video_pad=%d", image_pad_id_, video_pad_id_);
         break;
     default:
         break;
@@ -1005,7 +1069,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                                     std::string& err)
 {
     if (!enabled_ || !impl_ || !impl_->encoder_inited) { err = "vision module not initialized"; return false; }
-    if (content.type != IMAGE && content.type != VIDEO) { err = "content is not image/video"; return false; }
+    if (content.type != IMAGE && content.type != VIDEO && content.type != AUDIO) { err = "content is not image/video/audio"; return false; }
     if (media.uris.empty()) { err = "media.uris empty"; return false; }
 
     out_blocks.clear();
@@ -1013,6 +1077,16 @@ bool VisionModule::EncodeForContent(const Content& content,
     out_video_grid_thw.clear();
 
     const int devid = impl_->encoder.get_devid();
+
+    if (content.type == AUDIO) {
+        if (type_ == VLMType::Gemma4VL) {
+            out_num_media_for_tokenizer = 0;
+            ALOGW("Gemma4 audio input is reserved but not implemented yet, skip %zu uri(s)", media.uris.size());
+            return true;
+        }
+        err = "AUDIO not supported for this vlm_type";
+        return false;
+    }
 
     if (content.type == IMAGE) {
         // Expand all uris into a flat image file list (directory is treated as multiple images).
@@ -1108,6 +1182,16 @@ bool VisionModule::EncodeForContent(const Content& content,
                     return false;
                 blocks_for_one.push_back(std::move(emb));
             }
+            else if (type_ == VLMType::Gemma4VL) {
+                std::vector<unsigned char> pv;
+                Gemma4ImageProcessor(img, pv, vision_height_, vision_width_, patch_size_);
+                std::vector<unsigned short> emb;
+                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                                  pv, emb, 0.0f, 1.0f,
+                                                  0, nullptr, err))
+                    return false;
+                blocks_for_one.push_back(std::move(emb));
+            }
             else if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
                 std::vector<axcv::Mat> one{img};
                 std::vector<std::vector<unsigned char>> pixel_values;
@@ -1170,6 +1254,11 @@ bool VisionModule::EncodeForContent(const Content& content,
     }
 
     // VIDEO
+    if (type_ == VLMType::Gemma4VL) {
+        out_num_media_for_tokenizer = 0;
+        ALOGW("Gemma4 video input is reserved but not implemented yet, skip %zu uri(s)", media.uris.size());
+        return true;
+    }
     // Supports:
     // - 1 uri: a directory of frames (recommended), or a single image file
     // - N uris: an ordered list of image frame files (useful for base64 uploads)
@@ -1341,7 +1430,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
 
     for (size_t i = 0; i < history_out.size(); ++i) {
         auto& c = history_out[i];
-        if (c.type != IMAGE && c.type != VIDEO) continue;
+        if (c.type != IMAGE && c.type != VIDEO && c.type != AUDIO) continue;
 
         auto it = media_map.find(i);
         if (it == media_map.end()) {

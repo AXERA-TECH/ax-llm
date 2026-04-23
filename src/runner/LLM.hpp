@@ -12,10 +12,11 @@ class LLaMaEmbedSelector;
 
 using LLMRuningCallback = std::function<void(std::string str, float token_per_sec, void *reserve)>;
 
-// Multimodal (VLM) media inputs are passed out-of-band, aligned to `history` by index.
-// `history[content_index].type` must be IMAGE or VIDEO.
+// Multimodal media inputs are passed out-of-band, aligned to `history` by index.
+// `history[content_index].type` can be IMAGE / VIDEO / AUDIO.
 // For IMAGE: each uri can be a file or a directory of images (sorted).
 // For VIDEO: uri is typically a directory of frames (sorted).
+// For AUDIO: the interface is reserved for future runtime support; some models may skip it today.
 struct MediaInputs {
     size_t content_index = 0;
     std::vector<std::string> uris;
@@ -30,6 +31,8 @@ struct LLMAttrType {
     // If > 0, every Nth layer (1-indexed) is treated as full-attention and the others as linear-attention.
     // When 0, all layers are treated as full-attention (default).
     int full_attention_interval = 0;
+    int num_kv_shared_layers = 0;
+    std::vector<std::string> layer_types;
 
     int prefill_token_num = 96; // auto calc
     int prefill_max_token_num = 512;
@@ -42,6 +45,12 @@ struct LLMAttrType {
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
     int tokens_embed_num = 32000;
     int tokens_embed_size = 2048;
+    int pad_token_id = 0;
+    int hidden_size_per_layer_input = 0;
+    float rms_norm_eps = 1e-6f;
+    std::string filename_tokens_embed_per_layer;
+    std::string filename_per_layer_model_projection;
+    std::string filename_per_layer_projection_norm;
 
     int max_token_len = 127; // auto calc
     int kv_cache_num = 1024; // auto calc
@@ -55,7 +64,7 @@ struct LLMAttrType {
     // ---- vision / VLM (optional, runtime switch by `vlm_type`) ----
     // If `vlm_type != VLMType::None`, vision encoder will be initialized and used.
     // See `VLMType` in `src/runner/VLMType.hpp`.
-    // Names/ids (via magic_enum): `None(0)`, `Qwen2_5VL(1)`, `Qwen3VL(2)`, `InternVL3(3)`, `FastVLM(4)`, `SmolVLM2(5)`, `PaddleOCRVL(6)`.
+    // Names/ids (via magic_enum): `None(0)`, `Qwen2_5VL(1)`, `Qwen3VL(2)`, `InternVL3(3)`, `FastVLM(4)`, `SmolVLM2(5)`, `PaddleOCRVL(6)`, `Gemma4VL(7)`.
     VLMType vlm_type = VLMType::None;
 
     // Vision encoder axmodel (image/video encoder). Required if `vlm_type != VLMType::None`.

@@ -169,6 +169,45 @@ int PaddleOCRVLImageProcessor(axcv::Mat& src,
     return 0;
 }
 
+int Gemma4ImageProcessor(axcv::Mat& src,
+                         std::vector<unsigned char>& output,
+                         int tgt_h, int tgt_w,
+                         int patch_size) {
+    axcv::Mat img_rs;
+    if (axcv::width(src) != tgt_w || axcv::height(src) != tgt_h) {
+        axcv::resize(src, img_rs, tgt_w, tgt_h);
+    } else {
+        img_rs = src;
+    }
+
+    axcv::Mat rgb;
+    axcv::cvtColorBGR2RGB(img_rs, rgb);
+
+    const int grid_h = tgt_h / patch_size;
+    const int grid_w = tgt_w / patch_size;
+    const int pixel_dim = patch_size * patch_size * 3;
+    output.resize((size_t)grid_h * (size_t)grid_w * (size_t)pixel_dim);
+
+    size_t idx = 0;
+    for (int gh = 0; gh < grid_h; ++gh) {
+        for (int gw = 0; gw < grid_w; ++gw) {
+            for (int ph = 0; ph < patch_size; ++ph) {
+                const int row = gh * patch_size + ph;
+                const uint8_t* row_ptr = axcv::row_ptr(rgb, row);
+                for (int pw = 0; pw < patch_size; ++pw) {
+                    const int col = gw * patch_size + pw;
+                    const uint8_t* pixel = row_ptr + col * 3;
+                    output[idx++] = pixel[0];
+                    output[idx++] = pixel[1];
+                    output[idx++] = pixel[2];
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 static std::vector<axcv::Mat> splitImageSafe(axcv::Mat src, int rows, int cols, int tile_w, int tile_h) {
     std::vector<axcv::Mat> subImages;
 

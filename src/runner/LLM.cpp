@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "bfloat16.hpp"
+#include "Gemma4PerLayerHelper.hpp"
 #include "LLMEmbedSelector.hpp"
 #include "LLMPostprocess.hpp"
 #include "UTF8Filter.hpp"
@@ -53,15 +54,168 @@ static inline void llm_d2d(void *vir_dst, const void *vir_src, size_t n, int /*d
 #define LLM_DEVID(layer_obj) (0)
 #endif
 
+namespace {
+
+template <typename RunnerT>
+const ax_runner_tensor_t *try_get_group_input_tensor(RunnerT &runner, int grpid, const std::string &name)
+{
+    try
+    {
+        return &runner.get_input(grpid, name);
+    }
+    catch (...)
+    {
+    }
+
+    if (grpid > 0)
+    {
+        try
+        {
+            return &runner.get_input(grpid, name + "_" + std::to_string(grpid));
+        }
+        catch (...)
+        {
+        }
+    }
+
+    return nullptr;
+}
+
+static inline std::string safe_decode_token(const std::shared_ptr<BaseTokenizer> &tokenizer, int token_id)
+{
+    if (!tokenizer)
+        return {};
+
+    try
+    {
+        return tokenizer->decode(token_id);
+    }
+    catch (const std::exception &e)
+    {
+        ALOGW("tokenizer decode failed for token %d: %s", token_id, e.what());
+    }
+    catch (...)
+    {
+        ALOGW("tokenizer decode failed for token %d with unknown exception", token_id);
+    }
+
+    return {};
+}
+
+static inline std::string sanitize_utf8_text(const std::string &text)
+{
+    UTF8Filter filter;
+    return filter.filter(text);
+}
+
+static inline bool tokenizer_uses_hidden_channel_markup(const std::string &tokenizer_type)
+{
+    return tokenizer_type == "Gemma4" || tokenizer_type == "Gemma4VL";
+}
+
+class ChannelSectionFilter
+{
+public:
+    void reset()
+    {
+        pending_.clear();
+        skipping_ = false;
+    }
+
+    std::string filter(const std::string &chunk)
+    {
+        // Gemma4 hidden-thought section is "<|channel>thought\n...<channel|>" per tokenizer x-regex
+        // and chat_template.jinja::strip_thinking. <|think|> is a prompt-only marker (emitted when
+        // enable_thinking=true in the template); the model does not generate it. Matching it here
+        // as a section-opener would make any model output containing the 9-byte literal "<|think|>"
+        // be silently swallowed because no paired "<channel|>" would follow.
+        static const std::string kChannelStart = "<|channel>";
+        static const std::string kChannelEnd = "<channel|>";
+        static const size_t kStartGuard = kChannelStart.size() - 1;
+        static const size_t kEndGuard = kChannelEnd.size() - 1;
+
+        pending_ += chunk;
+        std::string out;
+
+        while (true)
+        {
+            if (!skipping_)
+            {
+                size_t start = pending_.find(kChannelStart);
+
+                if (start == std::string::npos)
+                {
+                    if (pending_.size() > kStartGuard)
+                    {
+                        const size_t emit_len = pending_.size() - kStartGuard;
+                        out.append(pending_, 0, emit_len);
+                        pending_.erase(0, emit_len);
+                    }
+                    break;
+                }
+
+                out.append(pending_, 0, start);
+                pending_.erase(0, start);
+                skipping_ = true;
+            }
+
+            const size_t end = pending_.find(kChannelEnd);
+            if (end == std::string::npos)
+            {
+                if (pending_.size() > kEndGuard)
+                    pending_.erase(0, pending_.size() - kEndGuard);
+                break;
+            }
+
+            pending_.erase(0, end + kChannelEnd.size());
+            skipping_ = false;
+        }
+
+        return out;
+    }
+
+    std::string flush()
+    {
+        if (skipping_)
+        {
+            pending_.clear();
+            return {};
+        }
+
+        std::string out;
+        out.swap(pending_);
+        return out;
+    }
+
+private:
+    std::string pending_;
+    bool skipping_ = false;
+};
+
+static inline std::string strip_hidden_channel_sections(const std::string &text)
+{
+    ChannelSectionFilter filter;
+    filter.reset();
+    std::string out = filter.filter(text);
+    out += filter.flush();
+    return out;
+}
+
+} // namespace
+
 struct LLM::Impl {
     UTF8Filter utf8_filter;
     std::shared_ptr<BaseTokenizer> tokenizer;
     LLaMaEmbedSelector embed_selector;
+    Gemma4PerLayerHelper gemma4_per_layer_helper;
 
     std::vector<int> last_tokens_ids;
+    std::vector<int> run_input_token_ids;
     bool b_os_kvcache = false;
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     int precompute_len = 0;
+    std::vector<int> prefill_history_kv_cache_num_grp;
+    std::vector<int> prefill_symbolic_kv_cache_num_grp;
 
     LLMAttrType _attr;
     bool embedding_append_eos = false;
@@ -81,6 +235,8 @@ struct LLM::Impl {
     std::vector<LLMLayer> llama_layers;
     // Optional per-layer attention type (for models like Qwen3.5 that mix linear/full attention).
     std::vector<bool> layer_is_linear_attn;
+    std::vector<int> layer_kv_cache_sizes;
+    std::vector<int> shared_kv_source_layers;
     // Use a full-attention layer as reference for token-wise KV cache shapes.
     int cache_ref_full_layer_idx = 0;
     ax_runner_t llama_post;
@@ -123,6 +279,23 @@ struct LLM::Impl {
         }
     }
 
+    void clear_all_group_kv_cache_tensors()
+    {
+        for (int i = 0; i < _attr.axmodel_num; ++i)
+        {
+            auto &lyr = llama_layers[i];
+            const int devid = LLM_DEVID(lyr);
+            const int ng = lyr.layer.get_num_input_groups();
+            for (int gid = 0; gid < ng; ++gid)
+            {
+                auto &k = lyr.layer.get_input(gid, "K_cache");
+                auto &v = lyr.layer.get_input(gid, "V_cache");
+                llm_memset(LLM_WADDR(k), 0, k.nSize, devid);
+                llm_memset(LLM_WADDR(v), 0, v.nSize, devid);
+            }
+        }
+    }
+
     static inline std::vector<float> l2norm(std::vector<float> embedding)
     {
         float norm2 = 0.0f;
@@ -133,6 +306,56 @@ struct LLM::Impl {
             for (float &v : embedding) v /= norm;
         }
         return embedding;
+    }
+
+    bool use_gemma4_scaled_text_input() const
+    {
+        return gemma4_per_layer_helper.enabled();
+    }
+
+    float gemma4_text_scale() const
+    {
+        return std::sqrt((float)_attr.tokens_embed_size);
+    }
+
+    static inline void scale_bf16_buffer_inplace(unsigned short *data, size_t elem_count, float scale)
+    {
+        if (!data || elem_count == 0) return;
+        if (std::fabs(scale - 1.0f) < 1e-6f) return;
+        for (size_t i = 0; i < elem_count; ++i)
+        {
+            data[i] = bfloat16(bfloat16(data[i]).fp32() * scale).data;
+        }
+    }
+
+    bool is_vision_token_position(int abs_pos) const
+    {
+        return has_vision_state &&
+               abs_pos >= 0 &&
+               (size_t)abs_pos < vision_state.pos2vision.size() &&
+               vision_state.pos2vision[(size_t)abs_pos] >= 0;
+    }
+
+    void scale_prefill_text_embeds_inplace(unsigned short *data, int num_tokens, int abs_start_pos) const
+    {
+        if (!use_gemma4_scaled_text_input() || !data || num_tokens <= 0) return;
+
+        const float scale = gemma4_text_scale();
+        for (int i = 0; i < num_tokens; ++i)
+        {
+            if (is_vision_token_position(abs_start_pos + i)) continue;
+            scale_bf16_buffer_inplace(data + (size_t)i * (size_t)_attr.tokens_embed_size,
+                                      (size_t)_attr.tokens_embed_size,
+                                      scale);
+        }
+    }
+
+    void scale_all_embeds_inplace(unsigned short *data, int num_tokens) const
+    {
+        if (!use_gemma4_scaled_text_input() || !data || num_tokens <= 0) return;
+        scale_bf16_buffer_inplace(data,
+                                  (size_t)num_tokens * (size_t)_attr.tokens_embed_size,
+                                  gemma4_text_scale());
     }
 
     static inline int tolower_uc(int c) { return std::tolower((unsigned char)c); }
@@ -187,6 +410,20 @@ struct LLM::Impl {
         return decode_max_token_len_grp_[(size_t)idx];
     }
 
+    int prefill_history_capacity_by_gid(int gid) const
+    {
+        const int idx = group_index_by_gid(prefill_grpids_, gid);
+        if (idx < 0 || idx >= (int)prefill_history_kv_cache_num_grp.size()) return -1;
+        return prefill_history_kv_cache_num_grp[(size_t)idx];
+    }
+
+    int prefill_symbolic_capacity_by_gid(int gid) const
+    {
+        const int idx = group_index_by_gid(prefill_grpids_, gid);
+        if (idx < 0 || idx >= (int)prefill_symbolic_kv_cache_num_grp.size()) return -1;
+        return prefill_symbolic_kv_cache_num_grp[(size_t)idx];
+    }
+
     int choose_prefill_gid(int needed_tokens) const
     {
         if (prefill_grpids_.empty() || _attr.prefill_max_kv_cache_num_grp.empty()) return 1;
@@ -205,6 +442,90 @@ struct LLM::Impl {
             if (needed_tokens <= decode_max_token_len_grp_[i]) return decode_grpids_[i];
         }
         return decode_grpids_.back();
+    }
+
+    int select_prefill_group(int history_len, int chunk_tokens, bool prefer_symbolic_group = false) const
+    {
+        if (prefill_grpids_.empty()) return -1;
+
+        const int safe_history_len = std::max(0, history_len);
+        const int safe_chunk_tokens = std::max(0, chunk_tokens);
+        const int total_tokens = safe_history_len + safe_chunk_tokens;
+
+        if (prefer_symbolic_group && !prefill_symbolic_kv_cache_num_grp.empty())
+        {
+            for (size_t i = 0; i < prefill_grpids_.size() && i < prefill_symbolic_kv_cache_num_grp.size(); ++i)
+            {
+                if (total_tokens <= prefill_symbolic_kv_cache_num_grp[i])
+                    return prefill_grpids_[i];
+            }
+        }
+
+        for (size_t i = 0; i < prefill_grpids_.size() &&
+                           i < prefill_history_kv_cache_num_grp.size() &&
+                           i < _attr.prefill_max_kv_cache_num_grp.size();
+             ++i)
+        {
+            const int history_cap = prefill_history_kv_cache_num_grp[i];
+            const int total_cap = _attr.prefill_max_kv_cache_num_grp[i];
+            if (safe_history_len <= history_cap && total_tokens <= total_cap)
+                return prefill_grpids_[i];
+        }
+        return -1;
+    }
+
+    int select_stateless_prefill_group(int input_tokens) const
+    {
+        if (prefill_grpids_.empty()) return -1;
+
+        const int safe_input_tokens = std::max(0, input_tokens);
+        for (size_t i = 0; i < prefill_grpids_.size() && i < _attr.prefill_max_kv_cache_num_grp.size(); ++i)
+        {
+            if (safe_input_tokens <= _attr.prefill_max_kv_cache_num_grp[i])
+                return prefill_grpids_[i];
+        }
+        return -1;
+    }
+
+    void init_shared_kv_source_layers()
+    {
+        shared_kv_source_layers.assign(_attr.axmodel_num, -1);
+
+        if (_attr.layer_types.empty() || _attr.num_kv_shared_layers <= 0)
+            return;
+
+        const int num_layers = std::min(_attr.axmodel_num, (int)_attr.layer_types.size());
+        const int first_shared_layer = num_layers - _attr.num_kv_shared_layers;
+        if (first_shared_layer <= 0)
+            return;
+
+        std::vector<std::string> prev_layers(_attr.layer_types.begin(), _attr.layer_types.begin() + first_shared_layer);
+        for (int layer_idx = first_shared_layer; layer_idx < num_layers; ++layer_idx)
+        {
+            const std::string &layer_type = _attr.layer_types[(size_t)layer_idx];
+            for (int prev_idx = (int)prev_layers.size() - 1; prev_idx >= 0; --prev_idx)
+            {
+                if (prev_layers[(size_t)prev_idx] == layer_type)
+                {
+                    shared_kv_source_layers[(size_t)layer_idx] = prev_idx;
+                    break;
+                }
+            }
+        }
+    }
+
+    int kv_cache_size_for_layer(int layer_idx) const
+    {
+        if (layer_idx >= 0 && layer_idx < (int)layer_kv_cache_sizes.size() && layer_kv_cache_sizes[(size_t)layer_idx] > 0)
+            return layer_kv_cache_sizes[(size_t)layer_idx];
+        return _attr.kv_cache_size;
+    }
+
+    int shared_kv_source_for_layer(int layer_idx) const
+    {
+        if (layer_idx >= 0 && layer_idx < (int)shared_kv_source_layers.size())
+            return shared_kv_source_layers[(size_t)layer_idx];
+        return -1;
     }
 
     bool init_groups_from_model(ax_runner_t &ref_layer)
@@ -313,11 +634,22 @@ struct LLM::Impl {
             if (cap > 0) decode_pairs.push_back({cap, gid});
         }
 
-        // Build prefill groups: capacity from 2D mask shape, fallback to K_cache tokens.
-        std::vector<std::pair<int, int>> prefill_pairs; // (cap, gid)
+        // Build prefill groups:
+        // - total capacity: number of tokens handled by the prefill group (`history + chunk`)
+        // - history capacity: visible cached tokens before the current chunk
+        // - symbolic capacity: raw `K_cache` shape, useful for some multimodal models
+        struct PrefillGroupInfo {
+            int total_cap = -1;
+            int history_cap = -1;
+            int symbolic_cap = -1;
+            int gid = -1;
+        };
+        std::vector<PrefillGroupInfo> prefill_infos;
         for (const int gid : prefill_gids)
         {
-            int cap = -1;
+            int total_cap = -1;
+            int history_cap = -1;
+            int symbolic_cap = -1;
             try
             {
                 const auto &t_mask = ref_layer.get_input(gid, "mask");
@@ -325,31 +657,46 @@ struct LLM::Impl {
                 if (_attr.prefill_token_num > 0 && elems > 0 && (elems % _attr.prefill_token_num) == 0)
                 {
                     const int cols = elems / _attr.prefill_token_num;
-                    const int kv_from_mask = cols - _attr.prefill_token_num;
-                    if (kv_from_mask >= 0) cap = kv_from_mask;
+                    if (cols >= _attr.prefill_token_num)
+                    {
+                        total_cap = cols;
+                        history_cap = cols - _attr.prefill_token_num;
+                    }
                 }
             }
             catch (const std::exception &)
             {
             }
-            if (cap < 0)
+            try
             {
-                try
+                const auto &t_k = ref_layer.get_input(gid, "K_cache");
+                if (t_k.vShape.size() >= 2)
                 {
-                    const auto &t_k = ref_layer.get_input(gid, "K_cache");
-                    const size_t denom = (size_t)_attr.kv_cache_size * sizeof(unsigned short);
-                    if (denom > 0) cap = (int)((size_t)t_k.nSize / denom);
+                    symbolic_cap = (int)t_k.vShape[1];
                 }
-                catch (const std::exception &)
+                if (symbolic_cap <= 0)
                 {
+                    const size_t denom = (size_t)_attr.kv_cache_size * sizeof(unsigned short);
+                    if (denom > 0) symbolic_cap = (int)((size_t)t_k.nSize / denom);
                 }
             }
-            if (cap >= 0) prefill_pairs.push_back({cap, gid});
+            catch (const std::exception &)
+            {
+            }
+            if (total_cap < 0 && symbolic_cap >= 0)
+            {
+                total_cap = std::max(_attr.prefill_token_num, symbolic_cap + _attr.prefill_token_num);
+                history_cap = std::max(0, total_cap - _attr.prefill_token_num);
+            }
+            if (total_cap >= 0)
+            {
+                prefill_infos.push_back({total_cap, history_cap, symbolic_cap, gid});
+            }
         }
 
-        if (decode_pairs.empty() || prefill_pairs.empty())
+        if (decode_pairs.empty() || prefill_infos.empty())
         {
-            ALOGE("failed to parse groups (decode=%zu prefill=%zu)", decode_pairs.size(), prefill_pairs.size());
+            ALOGE("failed to parse groups (decode=%zu prefill=%zu)", decode_pairs.size(), prefill_infos.size());
             return false;
         }
 
@@ -360,7 +707,15 @@ struct LLM::Impl {
                         pairs.end());
         };
         dedup_sorted(decode_pairs);
-        dedup_sorted(prefill_pairs);
+        std::sort(prefill_infos.begin(), prefill_infos.end(), [](const PrefillGroupInfo &a, const PrefillGroupInfo &b) {
+            if (a.total_cap != b.total_cap) return a.total_cap < b.total_cap;
+            return a.gid < b.gid;
+        });
+        prefill_infos.erase(std::unique(prefill_infos.begin(), prefill_infos.end(),
+                                        [](const PrefillGroupInfo &a, const PrefillGroupInfo &b) {
+                                            return a.total_cap == b.total_cap;
+                                        }),
+                            prefill_infos.end());
 
         auto shape_to_str = [](const std::vector<unsigned int> &shape) -> std::string {
             std::string s;
@@ -397,18 +752,19 @@ struct LLM::Impl {
             {
             }
         }
-        for (const auto &p : prefill_pairs)
+        for (const auto &info : prefill_infos)
         {
-            const int cap = p.first;
-            const int gid = p.second;
+            const int gid = info.gid;
             try
             {
                 const auto &t_mask = ref_layer.get_input(gid, "mask");
                 const auto &t_k = ref_layer.get_input(gid, "K_cache");
                 const auto &t_v = ref_layer.get_input(gid, "V_cache");
-                ALOGD("prefill gid=%d cap=%d mask=%s(%zuB) K_cache=%s(%zuB) V_cache=%s(%zuB)",
+                ALOGD("prefill gid=%d total_cap=%d history_cap=%d symbolic_cap=%d mask=%s(%zuB) K_cache=%s(%zuB) V_cache=%s(%zuB)",
                       gid,
-                      cap,
+                      info.total_cap,
+                      info.history_cap,
+                      info.symbolic_cap,
                       shape_to_str(t_mask.vShape).c_str(),
                       (size_t)t_mask.nSize,
                       shape_to_str(t_k.vShape).c_str(),
@@ -431,10 +787,14 @@ struct LLM::Impl {
 
         prefill_grpids_.clear();
         _attr.prefill_max_kv_cache_num_grp.clear();
-        for (const auto &p : prefill_pairs)
+        prefill_history_kv_cache_num_grp.clear();
+        prefill_symbolic_kv_cache_num_grp.clear();
+        for (const auto &info : prefill_infos)
         {
-            _attr.prefill_max_kv_cache_num_grp.push_back(p.first);
-            prefill_grpids_.push_back(p.second);
+            _attr.prefill_max_kv_cache_num_grp.push_back(info.total_cap);
+            prefill_history_kv_cache_num_grp.push_back(std::max(0, info.history_cap));
+            prefill_symbolic_kv_cache_num_grp.push_back(std::max(0, info.symbolic_cap));
+            prefill_grpids_.push_back(info.gid);
         }
 
         // Default to the largest groups.
@@ -461,7 +821,12 @@ struct LLM::Impl {
         }
         for (size_t i = 0; i < prefill_grpids_.size(); ++i)
         {
-            ALOGI("prefill grp: %zu, gid: %d, prefill_max_kv_cache_num : %d", i, prefill_grpids_[i], _attr.prefill_max_kv_cache_num_grp[i]);
+            ALOGI("prefill grp: %zu, gid: %d, history_cap: %d, total_cap: %d, symbolic_cap: %d",
+                  i,
+                  prefill_grpids_[i],
+                  prefill_history_kv_cache_num_grp[i],
+                  _attr.prefill_max_kv_cache_num_grp[i],
+                  prefill_symbolic_kv_cache_num_grp[i]);
         }
         ALOGI("prefill_max_token_num : %d", _attr.prefill_max_token_num);
         return true;
@@ -526,6 +891,7 @@ struct LLM::Impl {
         this->_attr = attr;
         embedding_profile_for_tokenizer(_attr.tokenizer_type, embedding_append_eos, embedding_eos_token_id);
         init_layer_types();
+        init_shared_kv_source_layers();
         cache_ref_full_layer_idx = first_full_layer_idx();
         if (cache_ref_full_layer_idx < 0) cache_ref_full_layer_idx = 0;
         if (_attr.full_attention_interval > 0)
@@ -533,6 +899,10 @@ struct LLM::Impl {
             ALOGI("mixed attention enabled: full_attention_interval=%d ref_full_layer_idx=%d",
                   _attr.full_attention_interval,
                   cache_ref_full_layer_idx);
+        }
+        if (!_attr.layer_types.empty() && _attr.num_kv_shared_layers > 0)
+        {
+            ALOGI("shared kv enabled: num_kv_shared_layers=%d", _attr.num_kv_shared_layers);
         }
 
 #ifdef USE_AXCL
@@ -551,7 +921,7 @@ struct LLM::Impl {
         tokenizer = create_tokenizer(this->_attr.tokenizer_type);
         if (!tokenizer) { ALOGE("create_tokenizer(%s) failed", this->_attr.tokenizer_type.c_str()); return false; }
         if (!tokenizer->load(attr.url_tokenizer_model)) { ALOGE("tokenizer.init(%s) failed", attr.url_tokenizer_model.c_str()); return false; }
-        tokenizer->set_think_in_prompt(true);
+        tokenizer->set_think_in_prompt(!tokenizer_uses_hidden_channel_markup(this->_attr.tokenizer_type));
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
 
 #ifdef USE_AXCL
@@ -678,6 +1048,14 @@ struct LLM::Impl {
             ALOGI("kv_cache_size : %d, kv_cache_num: %d", _attr.kv_cache_size, _attr.kv_cache_num);
             if (_attr.max_token_len > _attr.kv_cache_num) { ALOGE("max_token_len(%d) > kv_cache_num(%d)", _attr.max_token_len, _attr.kv_cache_num); return false; }
             if (!init_groups_from_model(ref_layer)) return false;
+            layer_kv_cache_sizes.assign(_attr.axmodel_num, _attr.kv_cache_size);
+            for (int i = 0; i < _attr.axmodel_num; ++i)
+            {
+                auto &layer_k = llama_layers[(size_t)i].layer.get_input(decode_grpid, "K_cache");
+                const int layer_kv_size = (int)(layer_k.nSize / sizeof(unsigned short) / std::max(1, _attr.kv_cache_num));
+                if (layer_kv_size > 0)
+                    layer_kv_cache_sizes[(size_t)i] = layer_kv_size;
+            }
         }
 
         // embed file check → then init
@@ -697,6 +1075,23 @@ struct LLM::Impl {
             update_cqdm(&cqdm, attr.axmodel_num + 2, "count", "embed_selector init ok");
         }
         axllm::Logger::finish_inplace_line();
+
+        if (_attr.hidden_size_per_layer_input > 0)
+        {
+            if (!gemma4_per_layer_helper.Init(_attr.tokens_embed_num,
+                                              _attr.tokens_embed_size,
+                                              _attr.axmodel_num,
+                                              _attr.hidden_size_per_layer_input,
+                                              _attr.pad_token_id,
+                                              _attr.rms_norm_eps,
+                                              _attr.filename_tokens_embed_per_layer,
+                                              _attr.filename_per_layer_model_projection,
+                                              _attr.filename_per_layer_projection_norm))
+            {
+                ALOGE("Gemma4 per-layer helper init failed");
+                return false;
+            }
+        }
 
         // Optional VLM vision encoder (runtime controlled by attr.vlm_type).
         has_vision_state = false;
@@ -750,6 +1145,7 @@ struct LLM::Impl {
         for (int i = 0; i < _attr.axmodel_num; i++) llama_layers[i].layer.deinit();
         llama_post.deinit();
         embed_selector.Deinit();
+        gemma4_per_layer_helper.Deinit();
         if (vision) vision->Deinit();
 #ifdef USE_AXCL
         for (auto &devid : _attr.dev_ids) axcl_Exit(devid);
@@ -777,8 +1173,8 @@ struct LLM::Impl {
 
         const int prefill_split_num = (int)std::ceil((double)input_embed_num / (double)_attr.prefill_token_num);
 
-        const int prefill_grpid = choose_prefill_gid(input_embed_num);
-        const int kv_cache_num = prefill_capacity_by_gid(prefill_grpid);
+        const int prefill_grpid = select_stateless_prefill_group(input_embed_num);
+        const int kv_cache_num = prefill_history_capacity_by_gid(prefill_grpid);
         if (prefill_grpid < 0 || kv_cache_num <= 0)
         {
             ALOGE("invalid prefill_grpid=%d", prefill_grpid);
@@ -926,8 +1322,8 @@ struct LLM::Impl {
         v_caches.resize(_attr.axmodel_num);
 
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
-        const int prefill_grpid = choose_prefill_gid(input_embed_num);
-        const int kv_cache_num = prefill_capacity_by_gid(prefill_grpid);
+        const int prefill_grpid = select_stateless_prefill_group(input_embed_num);
+        const int kv_cache_num = prefill_history_capacity_by_gid(prefill_grpid);
         ALOGI("input token num : %d, prefill_split_num : %d prefill_grpid : %d kv_cache_num:%d", input_embed_num, prefill_split_num, prefill_grpid, kv_cache_num);
         if (prefill_grpid < 0 || kv_cache_num <= 0)
         {
@@ -1031,15 +1427,22 @@ struct LLM::Impl {
                    int _precompute_len, int input_num_token)
     {
         const int needed = _precompute_len + input_num_token;
+        const int first_chunk_tokens = std::min(input_num_token, _attr.prefill_token_num);
+        const bool prefer_symbolic_group = has_vision_state && _precompute_len > 0;
         decode_grpid = choose_decode_gid(std::max(1, needed));
-        _attr.prefill_grpid = choose_prefill_gid(needed);
+        _attr.prefill_grpid = select_prefill_group(_precompute_len, first_chunk_tokens, prefer_symbolic_group);
         int kv_cache_num = prefill_capacity_by_gid(_attr.prefill_grpid);
-        ALOGI("decode_grpid:%d prefill_grpid:%d kv_cache_num:%d precompute_len:%d input_num_token:%d",
+        const int history_cap = prefill_history_capacity_by_gid(_attr.prefill_grpid);
+        const int symbolic_cap = prefill_symbolic_capacity_by_gid(_attr.prefill_grpid);
+        ALOGI("decode_grpid:%d prefill_grpid:%d history_cap:%d total_cap:%d symbolic_cap:%d precompute_len:%d input_num_token:%d prefer_symbolic_group:%d",
               decode_grpid,
               _attr.prefill_grpid,
+              history_cap,
               kv_cache_num,
+              symbolic_cap,
               _precompute_len,
-              input_num_token);
+              input_num_token,
+              prefer_symbolic_group ? 1 : 0);
         if (_attr.prefill_grpid < 0 || kv_cache_num <= 0)
         {
             ALOGE("invalid prefill_grpid=%d", _attr.prefill_grpid);
@@ -1053,9 +1456,10 @@ struct LLM::Impl {
         remaining = ALIGN_DOWN(remaining, _attr.prefill_token_num);
         _attr.prefill_max_token_num = remaining;
         ALOGI("current prefill_max_token_num:%d", remaining);
-        if (_precompute_len + input_num_token > kv_cache_num) { ALOGE("precompute_len(%d) + input_num_token(%d) > kv_cache_num(%d)", _precompute_len, input_num_token, kv_cache_num); return -1; }
+        if (_precompute_len > history_cap) { ALOGE("precompute_len(%d) > history_cap(%d)", _precompute_len, history_cap); return -1; }
+        if (_precompute_len + first_chunk_tokens > kv_cache_num) { ALOGE("precompute_len(%d) + first_chunk_tokens(%d) > kv_cache_num(%d)", _precompute_len, first_chunk_tokens, kv_cache_num); return -1; }
         if (input_num_token > remaining) { ALOGE("input_num_token(%d) > prefill_max_token_num(%d)", input_num_token, remaining); return -1; }
-        if (_precompute_len == 0) { ALOGI("first run"); return 0; }
+        if (_precompute_len == 0) { clear_all_group_kv_cache_tensors(); ALOGI("first run"); return 0; }
         if (!b_os_kvcache) return 0;
         if (kv_k.size() != kv_v.size() || (int)kv_k.size() != _attr.axmodel_num) { ALOGE("kv cache size mismatch"); return -1; }
         for (int i = 0; i < _attr.axmodel_num; i++)
@@ -1082,7 +1486,7 @@ struct LLM::Impl {
 
     void ResetKVCache()
     {
-        last_tokens_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0;
+        last_tokens_ids.clear(); run_input_token_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0;
         decode_grpid = decode_grpids_.empty() ? 0 : decode_grpids_.back();
         _attr.prefill_grpid = prefill_grpids_.empty() ? 1 : prefill_grpids_.back();
         if (!_attr.prefill_max_kv_cache_num_grp.empty())
@@ -1106,13 +1510,38 @@ struct LLM::Impl {
     std::string Run(std::vector<unsigned short> &test_embed, int output_max_token = -1)
     {
         b_stop.store(false, std::memory_order_relaxed); std::string final_out;
+        utf8_filter = UTF8Filter();
+        ChannelSectionFilter channel_filter;
+        channel_filter.reset();
+        const bool hide_channel_markup = tokenizer_uses_hidden_channel_markup(_attr.tokenizer_type);
+        std::string streamed_visible_text;
+        std::string streamed_raw_visible_text;
+        auto emit_stream_chunk = [&](const std::string &chunk, float tps)
+        {
+            if (!_attr.runing_callback || chunk.empty())
+                return;
+
+            streamed_raw_visible_text += chunk;
+            const std::string visible_text = sanitize_utf8_text(streamed_raw_visible_text);
+            if (visible_text.size() <= streamed_visible_text.size())
+                return;
+            if (visible_text.compare(0, streamed_visible_text.size(), streamed_visible_text) != 0)
+            {
+                ALOGW("streamed visible text prefix mismatch, suppressing incremental emit");
+                streamed_visible_text = visible_text;
+                return;
+            }
+
+            const std::string delta = visible_text.substr(streamed_visible_text.size());
+            if (!delta.empty())
+            {
+                streamed_visible_text = visible_text;
+                _attr.runing_callback(delta, tps, _attr.reserve);
+            }
+        };
         bfloat16 bf16 = -65536.f;
         bfloat16 bf16_one = 1.0f;
-        // Decode mask is group-dependent:
-        // - old models: single decode group (e.g. 2k)
-        // - new models: multiple decode groups (2k/4k/8k/16k ...)
-        // Use the largest decode capacity so we can switch groups at runtime, but make sure the
-        // "last" mask element of each decode group is set to 0 (some models rely on it).
+
         int max_decode_cap = _attr.max_token_len;
         if (!decode_max_token_len_grp_.empty()) max_decode_cap = std::max(max_decode_cap, decode_max_token_len_grp_.back());
         if (max_decode_cap <= 0) max_decode_cap = _attr.kv_cache_num;
@@ -1128,20 +1557,67 @@ struct LLM::Impl {
             if (cap >= 0 && cap < (int)mask.size()) mask[(size_t)cap] = 0;
         }
         for (int i = 0; i < precompute_len + input_embed_num && i < (int)mask.size(); i++) mask[(size_t)i] = 0;
-        timer t_cost, ttft_timer; ttft_timer.start();
+        timer t_cost, ttft_timer, decode_timer; ttft_timer.start();
+        bool decode_timer_started = false;
 
-        // Prefill
-        // Pre-compute which prefill group id we will use per chunk, so we can propagate KV caches
-        // to the future groups (axcl-qwen3-vl behavior).
         std::vector<int> prefill_grp_list;
         const int default_prefill_gid = prefill_grpids_.empty() ? 1 : prefill_grpids_.front();
         prefill_grp_list.resize(prefill_split_num, default_prefill_gid);
         int max_prefill_gid = default_prefill_gid;
         for (int p = 0; p < prefill_split_num; ++p) {
             const int history_len = precompute_len + p * _attr.prefill_token_num;
-            int g = choose_prefill_gid(history_len);
+            const int chunk_tokens = (p == prefill_split_num - 1) ? (input_embed_num - p * _attr.prefill_token_num) : _attr.prefill_token_num;
+            const bool prefer_symbolic_group = has_vision_state && history_len > 0;
+            int g = select_prefill_group(history_len, chunk_tokens, prefer_symbolic_group);
+            if (g <= 0)
+            {
+                ALOGE("failed to select prefill group for history_len=%d chunk_tokens=%d", history_len, chunk_tokens);
+                return final_out;
+            }
             prefill_grp_list[p] = g;
             if (g > max_prefill_gid) max_prefill_gid = g;
+        }
+
+        const bool use_per_layer_input = gemma4_per_layer_helper.enabled();
+        const int per_layer_hidden = gemma4_per_layer_helper.hidden_size_per_layer_input();
+        std::vector<unsigned short> prefill_per_layer_inputs;
+        std::vector<unsigned short> decode_per_layer_input;
+        std::vector<unsigned short> per_layer_tmp;
+
+        if (use_per_layer_input)
+        {
+            if ((int)run_input_token_ids.size() != input_embed_num)
+            {
+                ALOGE("Gemma4 requires run_input_token_ids for prefill: ids=%zu embeds=%d",
+                      run_input_token_ids.size(),
+                      input_embed_num);
+                return final_out;
+            }
+
+            std::vector<int> per_layer_token_ids = run_input_token_ids;
+            std::vector<unsigned short> per_layer_embed = test_embed;
+            scale_all_embeds_inplace(per_layer_embed.data(), input_embed_num);
+            if (has_vision_state && !vision_state.pos2vision.empty())
+            {
+                for (int i = 0; i < input_embed_num; ++i)
+                {
+                    const int abs_pos = precompute_len + i;
+                    if ((size_t)abs_pos < vision_state.pos2vision.size() && vision_state.pos2vision[(size_t)abs_pos] >= 0)
+                    {
+                        per_layer_token_ids[(size_t)i] = gemma4_per_layer_helper.pad_token_id();
+                    }
+                }
+            }
+
+            if (!gemma4_per_layer_helper.Compute(per_layer_token_ids,
+                                                 per_layer_embed.data(),
+                                                 input_embed_num,
+                                                 _attr.tokens_embed_size,
+                                                 prefill_per_layer_inputs))
+            {
+                ALOGE("Gemma4 prefill per-layer input compute failed");
+                return final_out;
+            }
         }
 
         for (int p = 0; p < prefill_split_num; p++)
@@ -1150,11 +1626,8 @@ struct LLM::Impl {
             int input_num_token = (p == prefill_split_num - 1) ? input_embed_num - p * _attr.prefill_token_num : _attr.prefill_token_num;
             const int history_len = precompute_len + p * _attr.prefill_token_num;
 
-            // Pick the smallest prefill group that can cover `history_len` cached tokens.
-            // Qwen-VL models are sensitive to group/kv_cache_num mismatch.
             const int prefill_grpid = prefill_grp_list[p];
-            // Derive kv_cache_num from mask tensor shape when possible (more reliable than K_cache vShape on some models).
-            int kv_cache_num_p = prefill_capacity_by_gid(prefill_grpid);
+            int kv_cache_num_p = prefill_history_capacity_by_gid(prefill_grpid);
             {
                 const auto &mask_t = llama_layers[(size_t)cache_ref_full_layer_idx].layer.get_input(prefill_grpid, "mask");
                 const int mask_elems = (int)(mask_t.nSize / (int)sizeof(unsigned short));
@@ -1170,10 +1643,12 @@ struct LLM::Impl {
             std::vector<unsigned short> embed_tmp(_attr.prefill_token_num * _attr.tokens_embed_size, 0);
             std::vector<unsigned short> mask_tmp(_attr.prefill_token_num * (kv_cache_num_p + _attr.prefill_token_num), bf16.data);
             std::vector<unsigned short> linear_mask_tmp;
+            if (use_per_layer_input) per_layer_tmp.assign((size_t)_attr.prefill_token_num * (size_t)per_layer_hidden, 0);
 
             build_prefill_mask(mask_tmp, kv_cache_num_p, _attr.prefill_token_num, history_len, input_num_token);
             size_t copy_tokens = (p == prefill_split_num - 1) ? (size_t)(input_embed_num - p * _attr.prefill_token_num) : (size_t)_attr.prefill_token_num;
             memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, copy_tokens * _attr.tokens_embed_size * sizeof(unsigned short));
+            scale_prefill_text_embeds_inplace(embed_tmp.data(), input_num_token, history_len);
 
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
@@ -1229,6 +1704,45 @@ struct LLM::Impl {
                     llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), mask_tmp.size() * sizeof(unsigned short), devid);
                 }
                 auto &t_in = lyr.layer.get_input(prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
+                const int shared_src = shared_kv_source_for_layer(m);
+                if (shared_src >= 0)
+                {
+                    auto &src_layer = llama_layers[(size_t)shared_src];
+                    auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
+                    auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
+                    auto &dst_k = lyr.layer.get_input(prefill_grpid, "K_cache");
+                    auto &dst_v = lyr.layer.get_input(prefill_grpid, "V_cache");
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    const size_t visible_tokens = (size_t)(history_len + input_num_token);
+                    const size_t copy_k_bytes = std::min((size_t)dst_k.nSize, visible_tokens * (size_t)layer_kv * sizeof(unsigned short));
+                    const size_t copy_v_bytes = std::min((size_t)dst_v.nSize, visible_tokens * (size_t)layer_kv * sizeof(unsigned short));
+                    llm_memset(LLM_WADDR(dst_k), 0, dst_k.nSize, devid);
+                    llm_memset(LLM_WADDR(dst_v), 0, dst_v.nSize, devid);
+                    llm_d2d(LLM_WADDR(dst_k), LLM_RADDR(src_k), copy_k_bytes, devid);
+                    llm_d2d(LLM_WADDR(dst_v), LLM_RADDR(src_v), copy_v_bytes, devid);
+                }
+                if (use_per_layer_input)
+                {
+                    const ax_runner_tensor_t *t_per_layer = try_get_group_input_tensor(lyr.layer, prefill_grpid, "per_layer_input");
+                    if (!t_per_layer)
+                    {
+                        ALOGE("Gemma4 decoder layer %d is missing per_layer_input for group %d", m, prefill_grpid);
+                        return final_out;
+                    }
+                    std::fill(per_layer_tmp.begin(), per_layer_tmp.end(), 0);
+                    for (int j = 0; j < input_num_token; ++j)
+                    {
+                        const size_t src_off = (((size_t)p * (size_t)_attr.prefill_token_num + (size_t)j) * (size_t)_attr.axmodel_num + (size_t)m) * (size_t)per_layer_hidden;
+                        const size_t dst_off = (size_t)j * (size_t)per_layer_hidden;
+                        std::memcpy(per_layer_tmp.data() + dst_off,
+                                    prefill_per_layer_inputs.data() + src_off,
+                                    (size_t)per_layer_hidden * sizeof(unsigned short));
+                    }
+                    llm_h2d(LLM_WADDR(*t_per_layer),
+                            per_layer_tmp.data(),
+                            std::min((size_t)t_per_layer->nSize, per_layer_tmp.size() * sizeof(unsigned short)),
+                            devid);
+                }
                 lyr.layer.inference(prefill_grpid);
                 auto &out_k = lyr.layer.get_output(prefill_grpid, "K_cache_out");
                 auto &out_v = lyr.layer.get_output(prefill_grpid, "V_cache_out");
@@ -1236,8 +1750,6 @@ struct LLM::Impl {
                 auto &dec_v = lyr.layer.get_input(decode_grpid, "V_cache");
                 if (is_linear_layer(m))
                 {
-                    // Linear-attention layers keep a persistent state, not token-wise KV cache.
-                    // Copy the whole cache state tensor.
                     const size_t kbytes = std::min((size_t)dec_k.nSize, (size_t)out_k.nSize);
                     const size_t vbytes = std::min((size_t)dec_v.nSize, (size_t)out_v.nSize);
                     llm_d2d(LLM_WADDR(dec_k), LLM_RADDR(out_k), kbytes, devid);
@@ -1255,26 +1767,22 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    int kv_off = history_len * _attr.kv_cache_size;
-                    size_t kv_sz = (size_t)input_num_token * _attr.kv_cache_size * sizeof(unsigned short);
-                    // Sync current prefill chunk K/V into decode group on both AXCL and AX650.
-                    // Missing this causes decode stage to ignore prefill history (AX650 output degrades badly).
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    int kv_off = history_len * layer_kv;
+                    size_t kv_sz = (size_t)input_num_token * (size_t)layer_kv * sizeof(unsigned short);
                     llm_d2d((unsigned short *)LLM_WADDR(dec_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                     llm_d2d((unsigned short *)LLM_WADDR(dec_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
-                    // axcl-qwen3-vl behavior: do not write back to the current prefill group
-                    // (group-1 K/V cache capacity can be much smaller than one prefill chunk).
-                    // Only propagate to future prefill groups so the next chunk can reuse history.
                     const int ng = (int)lyr.layer.get_num_input_groups();
                     const int max_gid = std::min(max_prefill_gid, ng - 1);
                     for (int gid = prefill_grpid + 1; gid <= max_gid; ++gid) {
                         auto &gk = lyr.layer.get_input(gid, "K_cache");
                         auto &gv = lyr.layer.get_input(gid, "V_cache");
-                        const int cap_tokens_k = (int)(gk.nSize / (size_t)(_attr.kv_cache_size * (int)sizeof(unsigned short)));
-                        const int cap_tokens_v = (int)(gv.nSize / (size_t)(_attr.kv_cache_size * (int)sizeof(unsigned short)));
-                        if (kv_off + input_num_token <= cap_tokens_k) {
+                        const int cap_tokens_k = (int)(gk.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
+                        const int cap_tokens_v = (int)(gv.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
+                        if (kv_off / layer_kv + input_num_token <= cap_tokens_k) {
                             llm_d2d((unsigned short *)LLM_WADDR(gk) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                         }
-                        if (kv_off + input_num_token <= cap_tokens_v) {
+                        if (kv_off / layer_kv + input_num_token <= cap_tokens_v) {
                             llm_d2d((unsigned short *)LLM_WADDR(gv) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
                         }
                     }
@@ -1283,7 +1791,6 @@ struct LLM::Impl {
                 auto &t_out = lyr.layer.get_output(prefill_grpid, "output");
                 llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
 
-                // Optional Qwen3VL "deepstack" feature addition (legacy branches behavior).
                 if (has_vision_state &&
                     !vision_state.deepstack_features.empty() &&
                     (size_t)m < vision_state.deepstack_features.size() &&
@@ -1305,10 +1812,8 @@ struct LLM::Impl {
 
                         for (int di = 0; di < emb_sz; ++di)
                         {
-                            // bf16 -> fp32
                             unsigned int tmp_bf16 = ((unsigned int)ev[di]) << 16;
                             float fp32 = *reinterpret_cast<float *>(&tmp_bf16);
-                            // fp32 + deepstack -> bf16
                             ev[di] = bfloat16(fp32 + fv[di]).data;
                         }
                     }
@@ -1330,10 +1835,13 @@ struct LLM::Impl {
             next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
             token_ids.push_back(next_token);
             ALOGI("ttft: %.2f ms", ttft_timer.cost());
+            decode_timer.start();
+            decode_timer_started = true;
             if (_attr.runing_callback)
             {
-                auto str = utf8_filter.filter(tokenizer->decode(next_token));
-                if (!str.empty()) _attr.runing_callback(str, -1, _attr.reserve);
+                auto str = safe_decode_token(tokenizer, next_token);
+                if (hide_channel_markup) str = channel_filter.filter(str);
+                emit_stream_chunk(str, -1);
             }
         }
 
@@ -1352,6 +1860,18 @@ struct LLM::Impl {
                 }
             }
             embed_selector.getByIndex(next_token, embed);
+            scale_all_embeds_inplace(embed.data(), 1);
+            if (use_per_layer_input)
+            {
+                if (!gemma4_per_layer_helper.ComputeSingle(next_token,
+                                                           embed.data(),
+                                                           _attr.tokens_embed_size,
+                                                           decode_per_layer_input))
+                {
+                    ALOGE("Gemma4 decode per-layer input compute failed");
+                    return final_out;
+                }
+            }
 
 #ifdef USE_AXCL
             {
@@ -1361,6 +1881,37 @@ struct LLM::Impl {
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
                 if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m]; int devid = lyr.layer.get_devid();
+                auto &in_k = lyr.layer.get_input(decode_grpid, "K_cache");
+                auto &in_v = lyr.layer.get_input(decode_grpid, "V_cache");
+                const int shared_src = shared_kv_source_for_layer(m);
+                if (shared_src >= 0)
+                {
+                    auto &src_layer = llama_layers[(size_t)shared_src];
+                    auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
+                    auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    const size_t dst_tokens = (size_t)in_k.nSize / sizeof(unsigned short) / (size_t)std::max(1, layer_kv);
+                    const size_t visible_past = std::min((size_t)indices, dst_tokens > 0 ? (dst_tokens - 1) : 0);
+                    llm_memset(LLM_WADDR(in_k), 0, in_k.nSize, devid);
+                    llm_memset(LLM_WADDR(in_v), 0, in_v.nSize, devid);
+                    if (visible_past > 0)
+                    {
+                        const size_t past_bytes = visible_past * (size_t)layer_kv * sizeof(unsigned short);
+                        llm_d2d(LLM_WADDR(in_k), LLM_RADDR(src_k), std::min(past_bytes, (size_t)src_k.nSize), devid);
+                        llm_d2d(LLM_WADDR(in_v), LLM_RADDR(src_v), std::min(past_bytes, (size_t)src_v.nSize), devid);
+                    }
+                    if (dst_tokens > 0)
+                    {
+                        const size_t cur_off_bytes = (size_t)indices * (size_t)layer_kv * sizeof(unsigned short);
+                        const size_t dst_off_bytes = (dst_tokens - 1) * (size_t)layer_kv * sizeof(unsigned short);
+                        llm_d2d((unsigned char *)LLM_WADDR(in_k) + dst_off_bytes,
+                                (const unsigned char *)LLM_RADDR(src_k) + cur_off_bytes,
+                                sizeof(unsigned short) * (size_t)layer_kv, devid);
+                        llm_d2d((unsigned char *)LLM_WADDR(in_v) + dst_off_bytes,
+                                (const unsigned char *)LLM_RADDR(src_v) + cur_off_bytes,
+                                sizeof(unsigned short) * (size_t)layer_kv, devid);
+                    }
+                }
                 auto &t_idx = lyr.layer.get_input(decode_grpid, "indices"); llm_h2d(LLM_WADDR(t_idx), &indices, sizeof(indices), devid);
                 auto &t_mask= lyr.layer.get_input(decode_grpid, "mask");
                 if (is_linear_layer(m))
@@ -1374,6 +1925,20 @@ struct LLM::Impl {
                 {
                     llm_h2d(LLM_WADDR(t_mask), mask.data(), std::min((size_t)t_mask.nSize, mask.size() * sizeof(unsigned short)), devid);
                 }
+                if (use_per_layer_input)
+                {
+                    const ax_runner_tensor_t *t_per_layer = try_get_group_input_tensor(lyr.layer, decode_grpid, "per_layer_input");
+                    if (!t_per_layer)
+                    {
+                        ALOGE("Gemma4 decoder layer %d is missing decode per_layer_input", m);
+                        return final_out;
+                    }
+                    const size_t src_off = (size_t)m * (size_t)per_layer_hidden;
+                    llm_h2d(LLM_WADDR(*t_per_layer),
+                            decode_per_layer_input.data() + src_off,
+                            std::min((size_t)t_per_layer->nSize, (size_t)per_layer_hidden * sizeof(unsigned short)),
+                            devid);
+                }
                 lyr.layer.inference(decode_grpid);
                 auto &out_k = lyr.layer.get_output(decode_grpid, "K_cache_out"); auto &out_v = lyr.layer.get_output(decode_grpid, "V_cache_out");
                 auto &in_k  = lyr.layer.get_input(decode_grpid, "K_cache"); auto &in_v  = lyr.layer.get_input(decode_grpid, "V_cache");
@@ -1384,8 +1949,9 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    llm_d2d((unsigned short *)LLM_WADDR(in_k) + indices * _attr.kv_cache_size, LLM_RADDR(out_k), out_k.nSize, devid);
-                    llm_d2d((unsigned short *)LLM_WADDR(in_v) + indices * _attr.kv_cache_size, LLM_RADDR(out_v), out_v.nSize, devid);
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    llm_d2d((unsigned short *)LLM_WADDR(in_k) + indices * layer_kv, LLM_RADDR(out_k), std::min((size_t)out_k.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
+                    llm_d2d((unsigned short *)LLM_WADDR(in_v) + indices * layer_kv, LLM_RADDR(out_v), std::min((size_t)out_v.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
                 }
                 auto &cur_out = lyr.layer.get_output(decode_grpid, "output");
                 if (m == _attr.axmodel_num - 1)
@@ -1412,6 +1978,31 @@ struct LLM::Impl {
                 if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m];
                 auto &in_k = lyr.layer.get_input(decode_grpid, "K_cache"); auto *in_k_ptr = (unsigned short *)in_k.pVirAddr;
                 auto &in_v = lyr.layer.get_input(decode_grpid, "V_cache"); auto *in_v_ptr = (unsigned short *)in_v.pVirAddr;
+                const int shared_src = shared_kv_source_for_layer(m);
+                if (shared_src >= 0)
+                {
+                    auto &src_layer = llama_layers[(size_t)shared_src];
+                    auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
+                    auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    const size_t dst_tokens = (size_t)in_k.nSize / sizeof(unsigned short) / (size_t)std::max(1, layer_kv);
+                    const size_t visible_past = std::min((size_t)indices, dst_tokens > 0 ? (dst_tokens - 1) : 0);
+                    memset(in_k.pVirAddr, 0, in_k.nSize);
+                    memset(in_v.pVirAddr, 0, in_v.nSize);
+                    if (visible_past > 0)
+                    {
+                        const size_t past_bytes = visible_past * (size_t)layer_kv * sizeof(unsigned short);
+                        memcpy(in_k.pVirAddr, src_k.pVirAddr, std::min(past_bytes, (size_t)src_k.nSize));
+                        memcpy(in_v.pVirAddr, src_v.pVirAddr, std::min(past_bytes, (size_t)src_v.nSize));
+                    }
+                    if (dst_tokens > 0)
+                    {
+                        const size_t cur_off = (size_t)indices * (size_t)layer_kv;
+                        const size_t dst_off = (dst_tokens - 1) * (size_t)layer_kv;
+                        memcpy(in_k_ptr + dst_off, (const unsigned short *)src_k.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+                        memcpy(in_v_ptr + dst_off, (const unsigned short *)src_v.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+                    }
+                }
                 auto &t_idx = lyr.layer.get_input(decode_grpid, "indices"); memcpy(t_idx.pVirAddr, &indices, sizeof(indices));
                 auto &t_mask= lyr.layer.get_input(decode_grpid, "mask");
                 if (is_linear_layer(m))
@@ -1425,6 +2016,19 @@ struct LLM::Impl {
                 {
                     memcpy(t_mask.pVirAddr, mask.data(), std::min((size_t)t_mask.nSize, mask.size() * sizeof(unsigned short)));
                 }
+                if (use_per_layer_input)
+                {
+                    const ax_runner_tensor_t *t_per_layer = try_get_group_input_tensor(lyr.layer, decode_grpid, "per_layer_input");
+                    if (!t_per_layer)
+                    {
+                        ALOGE("Gemma4 decoder layer %d is missing decode per_layer_input", m);
+                        return final_out;
+                    }
+                    const size_t src_off = (size_t)m * (size_t)per_layer_hidden;
+                    memcpy(t_per_layer->pVirAddr,
+                           decode_per_layer_input.data() + src_off,
+                           std::min((size_t)t_per_layer->nSize, (size_t)per_layer_hidden * sizeof(unsigned short)));
+                }
                 auto &t_in  = lyr.layer.get_input(decode_grpid, "input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
                 lyr.layer.inference(decode_grpid);
                 auto &out_k = lyr.layer.get_output(decode_grpid, "K_cache_out");
@@ -1436,8 +2040,9 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    memcpy(in_k_ptr + indices * _attr.kv_cache_size, out_k.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
-                    memcpy(in_v_ptr + indices * _attr.kv_cache_size, out_v.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    memcpy(in_k_ptr + indices * layer_kv, out_k.pVirAddr, sizeof(unsigned short) * layer_kv);
+                    memcpy(in_v_ptr + indices * layer_kv, out_v.pVirAddr, sizeof(unsigned short) * layer_kv);
                 }
                 auto &t_out= lyr.layer.get_output(decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
             }
@@ -1451,19 +2056,52 @@ struct LLM::Impl {
             token_ids.push_back(next_token);
             if (_attr.runing_callback)
             {
-                float t_ms  = t_cost.cost(); float tps   = token_ids.size() / (t_ms / 1000.0f);
-                auto  str   = utf8_filter.filter(tokenizer->decode(next_token));
-                if (!str.empty()) _attr.runing_callback(str, tps, _attr.reserve);
+                float tps = -1.0f;
+                if (decode_timer_started)
+                {
+                    const int decode_tokens = std::max(0, (int)token_ids.size() - 1);
+                    const float decode_ms = decode_timer.cost();
+                    if (decode_tokens > 0 && decode_ms > 0.0f)
+                        tps = decode_tokens / (decode_ms / 1000.0f);
+                }
+                auto  str   = safe_decode_token(tokenizer, next_token);
+                if (hide_channel_markup) str = channel_filter.filter(str);
+                emit_stream_chunk(str, tps);
             }
             if (output_max_token > 0 && (int)token_ids.size() >= output_max_token) { b_hit_eos = true; break; }
             if (_attr.runing_callback == nullptr) update_cqdm(&cqdm, indices, "token", "");
         }
 
+        final_out = tokenizer->decode(token_ids);
+        if (hide_channel_markup)
+        {
+            final_out = strip_hidden_channel_sections(final_out);
+        }
+        final_out = sanitize_utf8_text(final_out);
+        if (_attr.runing_callback)
+        {
+            std::string tail;
+            if (hide_channel_markup)
+                tail = channel_filter.flush();
+            emit_stream_chunk(tail, -1);
+
+            if (final_out.size() > streamed_visible_text.size() &&
+                final_out.compare(0, streamed_visible_text.size(), streamed_visible_text) == 0)
+            {
+                _attr.runing_callback(final_out.substr(streamed_visible_text.size()), -1, _attr.reserve);
+            }
+        }
         printf("\n\n"); fflush(stdout);
-        float t_ms = t_cost.cost();
-        const float avg_tps = (t_ms > 0.0f) ? ((float)token_ids.size() / (t_ms / 1000.0f)) : 0.0f;
-        ALOGN("hit eos,tokens=%zu,avg %.2f token/s\n", token_ids.size(), avg_tps);
-        final_out = tokenizer->decode(token_ids); return final_out;
+        float avg_decode_tps = 0.0f;
+        if (decode_timer_started)
+        {
+            const int decode_tokens = std::max(0, (int)token_ids.size() - 1);
+            const float decode_ms = decode_timer.cost();
+            if (decode_tokens > 0 && decode_ms > 0.0f)
+                avg_decode_tps = decode_tokens / (decode_ms / 1000.0f);
+        }
+        ALOGN("hit eos,decode avg %.2f token/s\n", avg_decode_tps);
+        return final_out;
     }
 
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1)
@@ -1502,9 +2140,9 @@ struct LLM::Impl {
             }
             else
             {
-                // If history contains IMAGE/VIDEO, the caller must provide media inputs.
+                // If history contains multimodal content, the caller must provide media inputs.
                 bool need_media = false;
-                for (const auto &c : history) if (c.type == IMAGE || c.type == VIDEO) { need_media = true; break; }
+                for (const auto &c : history) if (c.type == IMAGE || c.type == VIDEO || c.type == AUDIO) { need_media = true; break; }
                 if (need_media)
                 {
                     ALOGE("vlm_type=%s/%d enabled but media_inputs is empty",
@@ -1550,7 +2188,9 @@ struct LLM::Impl {
             }
             embed_selector.getByIndex(tokens_diff[i], out_embed.data() + i * _attr.tokens_embed_size);
         }
+        run_input_token_ids = tokens_diff;
         auto reply = Run(out_embed, output_max_token);
+        run_input_token_ids.clear();
         GetKVCache(k_caches, v_caches, precompute_len);
         history.push_back({ASSISTANT, TEXT, reply});
         last_tokens_ids = tokenizer->encode(history);
