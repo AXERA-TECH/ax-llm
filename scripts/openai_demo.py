@@ -15,6 +15,8 @@ if __name__ == '__main__':
     parser.add_argument('--api_url', type=str, help='API URL', default="http://127.0.0.1:8000/v1")
     parser.add_argument('--image', type=str, default=None,
                         help='Optional image path for VLM. The image will be base64-encoded and sent as image_url.')
+    parser.add_argument('--audio', type=str, default=None,
+                        help='Optional audio path for VLM. The audio will be base64-encoded and sent as audio_url.')
     parser.add_argument('--prompt', type=str, default="hello",
                         help='User prompt text (default: "hello")')
     args = parser.parse_args()
@@ -23,29 +25,48 @@ if __name__ == '__main__':
     API_URL = args.api_url
     MODEL = args.model
 
-    # Build user content
-    if args.image:
-        # VLM mode: send image + text
-        image_path = args.image
-        if not os.path.isfile(image_path):
-            print(f"Error: image file not found: {image_path}")
+    if args.image and args.audio:
+        print("Error: this demo supports either --image or --audio, not both in the same request.")
+        exit(1)
+
+    def build_data_uri(path: str, kind: str) -> str:
+        if not os.path.isfile(path):
+            print(f"Error: {kind} file not found: {path}")
             exit(1)
 
-        # Detect MIME type from extension
-        ext = os.path.splitext(image_path)[1].lower().lstrip('.')
-        mime_map = {
-            'jpg': 'jpeg', 'jpeg': 'jpeg', 'png': 'png',
-            'gif': 'gif', 'bmp': 'bmp', 'webp': 'webp', 'tiff': 'tiff',
-        }
-        mime_ext = mime_map.get(ext, 'jpeg')
+        ext = os.path.splitext(path)[1].lower().lstrip('.')
+        if kind == "image":
+            mime_map = {
+                'jpg': 'jpeg', 'jpeg': 'jpeg', 'png': 'png',
+                'gif': 'gif', 'bmp': 'bmp', 'webp': 'webp', 'tiff': 'tiff',
+            }
+            mime_ext = mime_map.get(ext, 'jpeg')
+            mime = f"image/{mime_ext}"
+        else:
+            mime_map = {
+                'wav': 'wav',
+                'mp3': 'mpeg',
+                'flac': 'flac',
+                'ogg': 'ogg',
+                'm4a': 'mp4',
+            }
+            mime_ext = mime_map.get(ext, 'wav')
+            mime = f"audio/{mime_ext}"
 
-        with open(image_path, 'rb') as f:
+        with open(path, 'rb') as f:
             b64_data = base64.b64encode(f.read()).decode('utf-8')
 
-        data_uri = f"data:image/{mime_ext};base64,{b64_data}"
+        return f"data:{mime};base64,{b64_data}"
 
+    # Build user content
+    if args.image:
         user_content = [
-            {"type": "image_url", "image_url": {"url": data_uri}},
+            {"type": "image_url", "image_url": {"url": build_data_uri(args.image, "image")}},
+            {"type": "text", "text": args.prompt},
+        ]
+    elif args.audio:
+        user_content = [
+            {"type": "audio_url", "audio_url": {"url": build_data_uri(args.audio, "audio")}},
             {"type": "text", "text": args.prompt},
         ]
     else:
@@ -78,4 +99,3 @@ if __name__ == '__main__':
             ctx = delta.content
             print(ctx, end="", flush=True)
     print("\n")
-

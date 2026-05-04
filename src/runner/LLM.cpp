@@ -1119,6 +1119,8 @@ struct LLM::Impl {
                               _attr.vision_patch_size,
                               _attr.vision_fps,
                               _attr.vision_tokens_per_second,
+                              _attr.filename_audio_encoder_axmodel_5s,
+                              _attr.filename_audio_encoder_axmodel_30s,
                               verr))
             {
                 ALOGE("vision.Init(vlm_type=%s/%d) failed: %s",

@@ -303,6 +303,29 @@ python scripts/openai_demo.py --model AXERA-TECH/SmolLM2-360M-Instruct --prompt 
 python scripts/openai_demo.py --model AXERA-TECH/Qwen3-VL-2B-Instruct --image /path/to/image.jpg --prompt "描述一下这张图片"
 ```
 
+音频对话（Gemma4，当前每条消息支持单个音频文件）：
+```shell
+python scripts/openai_demo.py --model AXERA-TECH/gemma-4-E2B-it --audio /path/to/audio.wav --prompt "Transcribe the speech in its original language. Output only the transcription."
+```
+
+音频转写（OpenAI Audio API）：
+```shell
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F "model=AXERA-TECH/gemma-4-E2B-it" \
+  -F "file=@/path/to/audio.wav" \
+  -F "response_format=json"
+```
+
+音频翻译（OpenAI Audio API）：
+```shell
+curl http://127.0.0.1:8000/v1/audio/translations \
+  -F "model=AXERA-TECH/gemma-4-E2B-it" \
+  -F "file=@/path/to/audio.wav" \
+  -F "response_format=text"
+```
+
+`response_format` 目前支持 `json`、`text`、`srt`、`vtt`。
+
 > **参数说明**
 > | 参数 | 说明 | 默认值 |
 > |------|------|--------|
@@ -310,8 +333,9 @@ python scripts/openai_demo.py --model AXERA-TECH/Qwen3-VL-2B-Instruct --image /p
 > | `--api_url` | API 地址 | `http://127.0.0.1:8000/v1` |
 > | `--prompt` | 用户 prompt 文本 | `hello` |
 > | `--image` | 图片路径（可选，VLM 模式） | — |
+> | `--audio` | 音频路径（可选，Gemma4 模式） | — |
 >
-> 当指定 `--image` 时，脚本会将图片读取并以 `data:image/...;base64,...` 格式嵌入请求，服务端会自动解码为临时文件供视觉编码器使用。
+> 当指定 `--image` 或 `--audio` 时，脚本会将媒体读取并以 `data:...;base64,...` 格式嵌入请求，服务端会自动解码为临时文件供对应编码器使用。
 
 ## 技术讨论
 

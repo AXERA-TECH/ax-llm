@@ -309,6 +309,14 @@ struct ModelConfig
                 // Backward compatible with older branches.
                 attr.filename_image_encoder_axmodel = j["filename_image_encoder_axmodedl"].get<std::string>();
             }
+            if (j.contains("filename_audio_encoder_axmodel_5s"))
+            {
+                attr.filename_audio_encoder_axmodel_5s = j["filename_audio_encoder_axmodel_5s"].get<std::string>();
+            }
+            if (j.contains("filename_audio_encoder_axmodel_30s"))
+            {
+                attr.filename_audio_encoder_axmodel_30s = j["filename_audio_encoder_axmodel_30s"].get<std::string>();
+            }
 
             if (j.contains("vision_cache_dir"))
             {
@@ -395,6 +403,8 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
     config.attr.filename_per_layer_projection_norm = resolve_path(model_path, config.attr.filename_per_layer_projection_norm);
     config.attr.post_config_path = resolve_path(model_path, config.attr.post_config_path);
     config.attr.filename_image_encoder_axmodel = resolve_path(model_path, config.attr.filename_image_encoder_axmodel);
+    config.attr.filename_audio_encoder_axmodel_5s = resolve_path(model_path, config.attr.filename_audio_encoder_axmodel_5s);
+    config.attr.filename_audio_encoder_axmodel_30s = resolve_path(model_path, config.attr.filename_audio_encoder_axmodel_30s);
     config.attr.vision_cache_dir = resolve_path(model_path, config.attr.vision_cache_dir);
 }
 
@@ -560,7 +570,7 @@ int run_interactive_mode(ModelConfig &config)
     printf("Ctrl+C: 停止当前生成\n");
     if (config.attr.vlm_type != VLMType::None)
     {
-        printf("VLM enabled: after each prompt, input media path (empty = text-only). Use \"video:<frames_dir>\" for video, \"audio:<file>\" for reserved audio placeholder.\n");
+        printf("VLM enabled: after each prompt, input media path (empty = text-only). Use \"video:<frames_dir>\" for video, \"audio:<file>\" for audio.\n");
     }
     printf("----------------------------------------\n");
 
@@ -740,18 +750,67 @@ static std::vector<uint8_t> base64_decode_bytes(const std::string &encoded)
     return out;
 }
 
-// Detect "data:image/<ext>;base64,<payload>" and return the extension + payload.
+static std::string normalize_extension(std::string ext, const std::string &fallback = "bin")
+{
+    if (!ext.empty() && ext[0] == '.')
+    {
+        ext.erase(0, 1);
+    }
+    for (char &c : ext)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    ext.erase(std::remove_if(ext.begin(), ext.end(), [](unsigned char c) {
+        return !std::isalnum(c);
+    }), ext.end());
+    return ext.empty() ? fallback : ext;
+}
+
+static std::string write_bytes_to_tempfile(const std::string &ext, const std::vector<uint8_t> &bytes)
+{
+    if (bytes.empty()) return {};
+
+    const std::string safe_ext = normalize_extension(ext);
+    // Detect "data:<mime>/<ext>;base64,<payload>" and return the extension + payload.
+    // Uses simple string operations instead of regex to avoid stack overflow on large payloads.
+    std::filesystem::path tmpdir;
+    try
+    {
+        tmpdir = std::filesystem::temp_directory_path() / "axllm_media";
+    }
+    catch (...)
+    {
+        tmpdir = std::filesystem::current_path() / "tmp" / "axllm_media";
+    }
+    std::filesystem::create_directories(tmpdir);
+
+    static std::atomic<uint64_t> g_tmp_seq{0};
+    const auto now = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+    const uint64_t seq = g_tmp_seq.fetch_add(1, std::memory_order_relaxed);
+    const auto path = tmpdir / ("media_" + std::to_string(now) + "_" + std::to_string(seq) + "." + safe_ext);
+
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) return {};
+    ofs.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+    ofs.close();
+    return path.string();
+}
+
+// Detect "data:<mime>/<ext>;base64,<payload>" and return the extension + payload.
 // Uses simple string operations instead of regex to avoid stack overflow on large payloads.
 static bool parse_base64_data_uri(const std::string &uri, std::string &ext, std::string &payload)
 {
-    const std::string prefix = "data:image/";
+    const std::string prefix = "data:";
     if (uri.compare(0, prefix.size(), prefix) != 0) return false;
 
     auto semi = uri.find(';', prefix.size());
     if (semi == std::string::npos) return false;
 
-    ext = uri.substr(prefix.size(), semi - prefix.size());
-    if (ext.empty()) return false;
+    const std::string mime = uri.substr(prefix.size(), semi - prefix.size());
+    if (mime.empty()) return false;
+    auto slash = mime.rfind('/');
+    ext = (slash == std::string::npos) ? mime : mime.substr(slash + 1);
+    if (ext.empty()) ext = "bin";
 
     const std::string b64tag = "base64,";
     if (uri.compare(semi + 1, b64tag.size(), b64tag) != 0) return false;
@@ -768,35 +827,22 @@ static bool parse_base64_data_uri(const std::string &uri, std::string &ext, std:
 static std::string save_base64_to_tempfile(const std::string &ext, const std::string &payload)
 {
     auto bytes = base64_decode_bytes(payload);
-    if (bytes.empty()) return {};
-
-    std::filesystem::path tmpdir;
-    try
-    {
-        tmpdir = std::filesystem::temp_directory_path() / "axllm_images";
-    }
-    catch (...)
-    {
-        tmpdir = std::filesystem::current_path() / "tmp" / "axllm_images";
-    }
-    std::filesystem::create_directories(tmpdir);
-
-    // Generate a unique filename
-    static std::atomic<uint64_t> g_tmp_seq{0};
-    const auto now = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
-    const uint64_t seq = g_tmp_seq.fetch_add(1, std::memory_order_relaxed);
-    const auto path = tmpdir / ("img_" + std::to_string(now) + "_" + std::to_string(seq) + "." + ext);
-
-    std::ofstream ofs(path, std::ios::binary);
-    if (!ofs) return {};
-    ofs.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
-    ofs.close();
-    return path.string();
+    return write_bytes_to_tempfile(ext, bytes);
 }
 
-// Resolve an image URI: if it's a base64 data-URI, decode to a temp file.
+static std::string save_upload_to_tempfile(const std::string &filename, const std::vector<uint8_t> &bytes)
+{
+    std::string ext = "wav";
+    if (!filename.empty())
+    {
+        ext = std::filesystem::path(filename).extension().string();
+    }
+    return write_bytes_to_tempfile(ext, bytes);
+}
+
+// Resolve a media URI: if it's a base64 data-URI, decode to a temp file.
 // Otherwise return as-is (file path / directory).
-static std::string resolve_image_uri(const std::string &uri, std::vector<std::string> &temp_files)
+static std::string resolve_media_uri(const std::string &uri, std::vector<std::string> &temp_files)
 {
     std::string ext, payload;
     if (parse_base64_data_uri(uri, ext, payload))
@@ -819,6 +865,100 @@ static void cleanup_temp_files(std::vector<std::string> &files)
         std::filesystem::remove(f);
     }
     files.clear();
+}
+
+static std::string lower_copy(std::string value)
+{
+    for (char &c : value)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+static std::string build_audio_task_instruction(const openai_api::ASRRequest &req)
+{
+    std::string instruction;
+    if (req.task == "translation")
+    {
+        instruction =
+            "Translate the following speech segment into English. "
+            "Only output the translated text.";
+    }
+    else
+    {
+        instruction =
+            "Transcribe the following speech segment in its original language. "
+            "Only output the transcription text.";
+    }
+
+    if (!req.prompt.empty())
+    {
+        instruction += "\n\nAdditional user prompt:\n" + trim_copy(req.prompt);
+    }
+    return instruction;
+}
+
+static std::string format_audio_task_text(const std::string &text, const std::string &response_format)
+{
+    const std::string normalized = lower_copy(response_format.empty() ? "json" : response_format);
+    if (normalized == "srt")
+    {
+        return "1\n00:00:00,000 --> 00:00:30,000\n" + trim_copy(text) + "\n";
+    }
+    if (normalized == "vtt")
+    {
+        return "WEBVTT\n\n00:00.000 --> 00:30.000\n" + trim_copy(text) + "\n";
+    }
+    return text;
+}
+
+static bool run_audio_api_request(LLM &llm,
+                                  const openai_api::ASRRequest &req,
+                                  std::string &final_text,
+                                  std::string &err)
+{
+    std::vector<Content> history;
+    if (!req.language.empty())
+    {
+        history.push_back({SYSTEM, TEXT, "The target language for this audio task is: " + req.language + "."});
+    }
+
+    const size_t user_index = history.size();
+    history.push_back({USER, AUDIO, build_audio_task_instruction(req)});
+
+    std::vector<MediaInputs> media_inputs;
+    std::vector<std::string> temp_files;
+    const std::string audio_path = save_upload_to_tempfile(req.filename, req.audio_data);
+    if (audio_path.empty())
+    {
+        err = "failed to persist uploaded audio payload";
+        return false;
+    }
+    temp_files.push_back(audio_path);
+    media_inputs.push_back({user_index, {audio_path}});
+
+    llm.getAttr()->runing_callback = nullptr;
+    std::vector<Content> out_history;
+    try
+    {
+        out_history = llm.Run(history, media_inputs, llm.getAttr()->max_token_len);
+    }
+    catch (...)
+    {
+        cleanup_temp_files(temp_files);
+        throw;
+    }
+    cleanup_temp_files(temp_files);
+
+    if (!out_history.empty() && out_history.back().role == ASSISTANT)
+    {
+        final_text = out_history.back().data;
+        return true;
+    }
+
+    err = "model produced no assistant response";
+    return false;
 }
 
 static std::string extract_media_url(const nlohmann::json &item, const char *primary_key, const char *fallback_key = nullptr)
@@ -917,21 +1057,14 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                         }
                         media_type = part_type;
 
-                        if (part_type == IMAGE)
+                        if (temp_files)
                         {
-                            if (temp_files)
-                            {
-                                media_uris.push_back(resolve_image_uri(raw_url, *temp_files));
-                            }
-                            else
-                            {
-                                std::vector<std::string> dummy;
-                                media_uris.push_back(resolve_image_uri(raw_url, dummy));
-                            }
+                            media_uris.push_back(resolve_media_uri(raw_url, *temp_files));
                         }
                         else
                         {
-                            media_uris.push_back(raw_url);
+                            std::vector<std::string> dummy;
+                            media_uris.push_back(resolve_media_uri(raw_url, dummy));
                         }
                     }
                 }
@@ -1089,6 +1222,11 @@ int run_server_mode(const ModelConfig &config, int port)
     }
     else
     {
+        const bool has_audio_encoder =
+            config.attr.vlm_type == VLMType::Gemma4VL &&
+            (file_exist(config.attr.filename_audio_encoder_axmodel_5s) ||
+             file_exist(config.attr.filename_audio_encoder_axmodel_30s));
+
         openai_api::ChatModelOptions options;
         options.supports_vision = config.attr.vlm_type != VLMType::None;
         options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
@@ -1142,6 +1280,37 @@ int run_server_mode(const ModelConfig &config, int port)
 
         cleanup_temp_files(temp_files);
         provider->end(); });
+
+        if (has_audio_encoder)
+        {
+            g_server.registerASR(model_name, [&llm](const openai_api::ASRRequest &req,
+                                                    std::shared_ptr<openai_api::BaseDataProvider> provider)
+                                 {
+                if (!provider->is_writable()) {
+                    ALOGE("provider not writable");
+                    return;
+                }
+
+                std::string final_text;
+                std::string err;
+                if (!run_audio_api_request(llm, req, final_text, err)) {
+                    provider->push(openai_api::OutputChunk::Error("audio_request_error", err));
+                    provider->end();
+                    return;
+                }
+
+                const std::string response_format = lower_copy(req.response_format.empty() ? "json" : req.response_format);
+                if (response_format == "json" || response_format == "verbose_json") {
+                    provider->push(openai_api::OutputChunk::Json({
+                        {"text", final_text},
+                        {"model", req.model},
+                    }, req.model));
+                } else {
+                    provider->push(openai_api::OutputChunk::FinalText(
+                        format_audio_task_text(final_text, response_format), req.model));
+                }
+                provider->end(); });
+        }
 
         printf("Starting server on port %d with model '%s'...\n", port, model_name.c_str());
         {

@@ -16,7 +16,7 @@ using LLMRuningCallback = std::function<void(std::string str, float token_per_se
 // `history[content_index].type` can be IMAGE / VIDEO / AUDIO.
 // For IMAGE: each uri can be a file or a directory of images (sorted).
 // For VIDEO: uri is typically a directory of frames (sorted).
-// For AUDIO: the interface is reserved for future runtime support; some models may skip it today.
+// For AUDIO: current Gemma4 support expects one audio file per message.
 struct MediaInputs {
     size_t content_index = 0;
     std::vector<std::string> uris;
@@ -69,6 +69,8 @@ struct LLMAttrType {
 
     // Vision encoder axmodel (image/video encoder). Required if `vlm_type != VLMType::None`.
     std::string filename_image_encoder_axmodel = "image_encoder.axmodel";
+    std::string filename_audio_encoder_axmodel_5s = "gemma4_audio_5s.axmodel";
+    std::string filename_audio_encoder_axmodel_30s = "gemma4_audio_30s.axmodel";
 
     // Optional: vision embedding cache directory. If empty: memory-only cache for the process lifetime.
     // If set: read/write encoded embeddings for repeated images across runs.

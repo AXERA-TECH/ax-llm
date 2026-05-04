@@ -148,6 +148,7 @@ add_subdirectory(third_party/openai-api.cpp)
 # ---------------------------------------------------------------------------
 set(COMMON_SOURCES
     src/runner/utils/memory_utils.cpp
+    src/runner/utils/audio_processor.cpp
     src/runner/utils/cqdm.cpp
     src/runner/utils/logger.cpp
     src/runner/utils/net_utils.cpp
