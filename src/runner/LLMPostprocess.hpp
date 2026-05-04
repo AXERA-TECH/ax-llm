@@ -21,6 +21,7 @@ private:
         float temperature = 1.0f;
         bool has_top_p = false;
         float top_p = 1.0f;
+        bool force_greedy = false;
     };
 
     struct EffectiveSampling
@@ -327,6 +328,15 @@ private:
         eff.enable_top_k_sampling = enable_top_k_sampling;
         eff.top_k = top_k;
 
+        if (ov.force_greedy)
+        {
+            eff.greedy = true;
+            eff.enable_temperature = false;
+            eff.enable_top_p_sampling = false;
+            eff.enable_top_k_sampling = false;
+            return eff;
+        }
+
         eff.greedy = eff.enable_temperature && eff.temperature <= 0.0f;
         if (eff.greedy)
         {
@@ -336,6 +346,7 @@ private:
         }
         else
         {
+            if (eff.top_p >= 1.0f) eff.enable_top_p_sampling = false;
             if (eff.top_k < 1) eff.enable_top_k_sampling = false;
             if (eff.enable_top_p_sampling && eff.enable_top_k_sampling)
             {
@@ -375,6 +386,7 @@ public:
         ov.temperature = temperature;
         ov.has_top_p = has_top_p;
         ov.top_p = top_p;
+        ov.force_greedy = !has_temperature && !has_top_p;
     }
 
     void clear_request_sampling_override()
@@ -466,9 +478,18 @@ public:
 
     int apply_bf16(const unsigned short *logits, int n, const std::vector<int> &history)
     {
+        const auto eff = resolve_effective_sampling();
+        if (!eff.enable_repetition_penalty &&
+            !eff.enable_diversity_penalty &&
+            !eff.enable_top_p_sampling &&
+            !eff.enable_top_k_sampling)
+        {
+            return argmax_index_bf16(logits, n);
+        }
+
         std::vector<float> fp32_logits((size_t)std::max(0, n));
         for (int i = 0; i < n; ++i)
             fp32_logits[(size_t)i] = bfloat16(logits[i]).fp32();
-        return apply_logits(fp32_logits, history, resolve_effective_sampling());
+        return apply_logits(fp32_logits, history, eff);
     }
 };

@@ -10,6 +10,7 @@
 #include <string>
 #include <cctype>
 #include <cstdlib>
+#include <optional>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -140,6 +141,94 @@ struct ModelConfig
 
     bool is_embedding_model() const { return is_embedding; }
 
+    static std::optional<nlohmann::json> load_json_file(const std::filesystem::path &path)
+    {
+        try
+        {
+            std::ifstream f(path);
+            if (!f.is_open()) return std::nullopt;
+            nlohmann::json j;
+            f >> j;
+            return j;
+        }
+        catch (const std::exception &e)
+        {
+            ALOGW("failed to parse optional config %s: %s", path.string().c_str(), e.what());
+            return std::nullopt;
+        }
+    }
+
+    static std::optional<int> json_int_value(const nlohmann::json &j, const char *key)
+    {
+        if (j.contains(key) && j[key].is_number_integer())
+            return j[key].get<int>();
+        if (j.contains("text_config") && j["text_config"].contains(key) && j["text_config"][key].is_number_integer())
+            return j["text_config"][key].get<int>();
+        return std::nullopt;
+    }
+
+    static std::optional<std::vector<std::string>> json_string_list_value(const nlohmann::json &j, const char *key)
+    {
+        if (j.contains(key) && j[key].is_array())
+            return j[key].get<std::vector<std::string>>();
+        if (j.contains("text_config") && j["text_config"].contains(key) && j["text_config"][key].is_array())
+            return j["text_config"][key].get<std::vector<std::string>>();
+        return std::nullopt;
+    }
+
+    static std::vector<std::filesystem::path> model_sidecar_config_paths(const std::filesystem::path &model_dir)
+    {
+        std::vector<std::filesystem::path> paths;
+        try
+        {
+            for (const auto &entry : std::filesystem::directory_iterator(model_dir))
+            {
+                if (!entry.is_directory()) continue;
+                const auto name = entry.path().filename().string();
+                if (name.find("tokenizer") == std::string::npos) continue;
+                const auto config_path = entry.path() / "config.json";
+                if (std::filesystem::exists(config_path)) paths.push_back(config_path);
+            }
+        }
+        catch (const std::exception &e)
+        {
+            ALOGW("failed to scan sidecar configs under %s: %s", model_dir.string().c_str(), e.what());
+        }
+        return paths;
+    }
+
+    static std::optional<int> sidecar_int_value(const std::filesystem::path &model_dir, const char *key)
+    {
+        for (const auto &path : model_sidecar_config_paths(model_dir))
+        {
+            auto j = load_json_file(path);
+            if (!j.has_value()) continue;
+            auto value = json_int_value(*j, key);
+            if (value.has_value())
+            {
+                ALOGI("loaded %s=%d from %s", key, *value, path.string().c_str());
+                return value;
+            }
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<std::vector<std::string>> sidecar_string_list_value(const std::filesystem::path &model_dir, const char *key)
+    {
+        for (const auto &path : model_sidecar_config_paths(model_dir))
+        {
+            auto j = load_json_file(path);
+            if (!j.has_value()) continue;
+            auto value = json_string_list_value(*j, key);
+            if (value.has_value())
+            {
+                ALOGI("loaded %s[%zu] from %s", key, value->size(), path.string().c_str());
+                return value;
+            }
+        }
+        return std::nullopt;
+    }
+
     bool load_from_json(const std::string &config_path)
     {
         if (!file_exist(config_path))
@@ -150,6 +239,7 @@ struct ModelConfig
 
         try
         {
+            const std::filesystem::path model_dir = std::filesystem::path(config_path).parent_path();
             std::ifstream f(config_path);
             nlohmann::json j;
             f >> j;
@@ -209,14 +299,23 @@ struct ModelConfig
             {
                 attr.num_kv_shared_layers = j["text_config"]["num_kv_shared_layers"].get<int>();
             }
-            attr.layer_types.clear();
-            if (j.contains("layer_types"))
+            attr.sliding_window = 0;
+            if (auto v = json_int_value(j, "sliding_window"); v.has_value())
             {
-                attr.layer_types = j["layer_types"].get<std::vector<std::string>>();
+                attr.sliding_window = *v;
             }
-            else if (j.contains("text_config") && j["text_config"].contains("layer_types"))
+            else if (auto v = sidecar_int_value(model_dir, "sliding_window"); v.has_value())
             {
-                attr.layer_types = j["text_config"]["layer_types"].get<std::vector<std::string>>();
+                attr.sliding_window = *v;
+            }
+            attr.layer_types.clear();
+            if (auto v = json_string_list_value(j, "layer_types"); v.has_value())
+            {
+                attr.layer_types = std::move(*v);
+            }
+            else if (auto v = sidecar_string_list_value(model_dir, "layer_types"); v.has_value())
+            {
+                attr.layer_types = std::move(*v);
             }
 
             check_key("tokens_embed_num");

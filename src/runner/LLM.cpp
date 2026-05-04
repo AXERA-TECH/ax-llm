@@ -264,16 +264,115 @@ struct LLM::Impl {
                                           int kv_cache_num,
                                           int token_rows,
                                           int history_len,
-                                          int valid_rows)
+                                          int valid_rows,
+                                          bool sliding_attention = false,
+                                          int sliding_window = 0)
     {
         bfloat16 bf16 = -65536.f;
         std::fill(mask_tmp.begin(), mask_tmp.end(), bf16.data);
         const int rows = std::max(0, std::min(token_rows, valid_rows));
         for (int r = 0; r < rows; ++r) {
             auto row = mask_tmp.data() + r * (kv_cache_num + token_rows);
-            for (int j = 0; j < history_len; ++j) row[j] = 0;
-            int cur = kv_cache_num; for (int j = cur; j < cur + r + 1; ++j) row[j] = 0;
+            int history_start = 0;
+            int current_start = 0;
+            if (sliding_attention && sliding_window > 0)
+            {
+                const int q_pos = history_len + r;
+                history_start = std::max(0, q_pos - sliding_window + 1);
+                current_start = std::max(0, r - sliding_window + 1);
+            }
+            for (int j = history_start; j < history_len; ++j) row[j] = 0;
+            int cur = kv_cache_num; for (int j = cur + current_start; j < cur + r + 1; ++j) row[j] = 0;
         }
+    }
+
+    void build_layer_prefill_mask(std::vector<unsigned short> &mask_tmp,
+                                  int kv_cache_num,
+                                  int token_rows,
+                                  int history_len,
+                                  int valid_rows,
+                                  int layer_idx) const
+    {
+        build_prefill_mask(mask_tmp,
+                           kv_cache_num,
+                           token_rows,
+                           history_len,
+                           valid_rows,
+                           is_sliding_attention_layer(layer_idx),
+                           _attr.sliding_window);
+    }
+
+    static inline void build_decode_mask(std::vector<unsigned short> &mask_tmp,
+                                         int visible_past_tokens,
+                                         bool sliding_attention,
+                                         int sliding_window)
+    {
+        bfloat16 bf16 = -65536.f;
+        std::fill(mask_tmp.begin(), mask_tmp.end(), bf16.data);
+        if (mask_tmp.empty()) return;
+
+        const int cache_len = (int)mask_tmp.size() - 1;
+        const int end = std::min(std::max(0, visible_past_tokens), cache_len);
+        int start = 0;
+        if (sliding_attention && sliding_window > 0)
+        {
+            start = std::max(0, end - sliding_window + 1);
+        }
+        for (int i = start; i < end; ++i) mask_tmp[(size_t)i] = 0;
+        mask_tmp.back() = 0;
+    }
+
+    void build_layer_decode_mask(std::vector<unsigned short> &mask_tmp,
+                                 int visible_past_tokens,
+                                 int layer_idx) const
+    {
+        build_decode_mask(mask_tmp,
+                          visible_past_tokens,
+                          is_sliding_attention_layer(layer_idx),
+                          _attr.sliding_window);
+    }
+
+    void copy_shared_prefill_cache(const ax_runner_tensor_t &dst,
+                                   const ax_runner_tensor_t &src,
+                                   int layer_kv,
+                                   int history_len,
+                                   int current_dst_start,
+                                   int current_src_start,
+                                   int current_tokens,
+                                   int devid)
+    {
+        if (layer_kv <= 0) return;
+        const size_t bytes_per_token = (size_t)layer_kv * sizeof(unsigned short);
+        if (bytes_per_token == 0) return;
+
+        const size_t dst_tokens = (size_t)dst.nSize / bytes_per_token;
+        const size_t src_tokens = (size_t)src.nSize / bytes_per_token;
+        const size_t history_tokens = std::min({(size_t)std::max(0, history_len), dst_tokens, src_tokens});
+
+        llm_memset(LLM_WADDR(dst), 0, dst.nSize, devid);
+        if (history_tokens > 0)
+        {
+            llm_d2d(LLM_WADDR(dst),
+                    LLM_RADDR(src),
+                    history_tokens * bytes_per_token,
+                    devid);
+        }
+
+        const size_t dst_start = (size_t)std::max(0, current_dst_start);
+        const size_t src_start = (size_t)std::max(0, current_src_start);
+        if (current_tokens <= 0 || dst_start >= dst_tokens || src_start >= src_tokens)
+            return;
+
+        const size_t copy_tokens = std::min({(size_t)current_tokens, dst_tokens - dst_start, src_tokens - src_start});
+        if (copy_tokens == 0)
+            return;
+
+        auto *dst_base = (unsigned char *)LLM_WADDR(dst);
+        const auto *src_base = (const unsigned char *)LLM_RADDR(src);
+        llm_d2d(dst_base + dst_start * bytes_per_token,
+                src_base + src_start * bytes_per_token,
+                copy_tokens * bytes_per_token,
+                devid);
     }
 
     void clear_all_group_kv_cache_tensors()
@@ -832,12 +931,37 @@ struct LLM::Impl {
     void init_layer_types()
     {
         layer_is_linear_attn.assign(_attr.axmodel_num, false);
+        if (!_attr.layer_types.empty())
+        {
+            const int num_layers = std::min(_attr.axmodel_num, (int)_attr.layer_types.size());
+            for (int i = 0; i < num_layers; ++i)
+            {
+                const std::string &layer_type = _attr.layer_types[(size_t)i];
+                if (layer_type == "linear_attention")
+                {
+                    layer_is_linear_attn[(size_t)i] = true;
+                }
+                else if (layer_type == "full_attention" || layer_type == "sliding_attention")
+                {
+                    // Gemma4 uses `sliding_attention` to distinguish local/global attention style,
+                    // not the legacy runtime's "linear attention" cache/mask path.
+                    layer_is_linear_attn[(size_t)i] = false;
+                }
+                else
+                {
+                    ALOGW("unknown layer_type[%d]=%s, fallback to full-attention", i, layer_type.c_str());
+                    layer_is_linear_attn[(size_t)i] = false;
+                }
+            }
+            return;
+        }
+
         const int interval = _attr.full_attention_interval;
         if (interval <= 0) return;
         for (int i = 0; i < _attr.axmodel_num; ++i)
         {
             const bool is_full = (((i + 1) % interval) == 0);
-            layer_is_linear_attn[i] = !is_full;
+            layer_is_linear_attn[(size_t)i] = !is_full;
         }
     }
 
@@ -846,6 +970,14 @@ struct LLM::Impl {
         return layer_idx >= 0 &&
                layer_idx < (int)layer_is_linear_attn.size() &&
                layer_is_linear_attn[(size_t)layer_idx];
+    }
+
+    bool is_sliding_attention_layer(int layer_idx) const
+    {
+        return _attr.sliding_window > 0 &&
+               layer_idx >= 0 &&
+               layer_idx < (int)_attr.layer_types.size() &&
+               _attr.layer_types[(size_t)layer_idx] == "sliding_attention";
     }
 
     int first_full_layer_idx() const
@@ -900,6 +1032,28 @@ struct LLM::Impl {
         if (!_attr.layer_types.empty() && _attr.num_kv_shared_layers > 0)
         {
             ALOGI("shared kv enabled: num_kv_shared_layers=%d", _attr.num_kv_shared_layers);
+        }
+        if (!_attr.layer_types.empty())
+        {
+            int sliding_count = 0;
+            int full_count = 0;
+            int linear_count = 0;
+            for (const auto &layer_type : _attr.layer_types)
+            {
+                if (layer_type == "sliding_attention")
+                    sliding_count++;
+                else if (layer_type == "full_attention")
+                    full_count++;
+                else if (layer_type == "linear_attention")
+                    linear_count++;
+            }
+            ALOGI("attention config: layers=%zu sliding=%d full=%d linear=%d sliding_window=%d ref_full_layer_idx=%d",
+                  _attr.layer_types.size(),
+                  sliding_count,
+                  full_count,
+                  linear_count,
+                  _attr.sliding_window,
+                  cache_ref_full_layer_idx);
         }
 
 #ifdef USE_AXCL
@@ -1574,18 +1728,12 @@ struct LLM::Impl {
         int max_decode_cap = _attr.max_token_len;
         if (!decode_max_token_len_grp_.empty()) max_decode_cap = std::max(max_decode_cap, decode_max_token_len_grp_.back());
         if (max_decode_cap <= 0) max_decode_cap = _attr.kv_cache_num;
-        std::vector<unsigned short> mask((size_t)max_decode_cap + 1, bf16.data);
+        std::vector<unsigned short> decode_mask((size_t)max_decode_cap + 1, bf16.data);
         std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
         std::vector<int> token_ids;
         int input_embed_num  = (int)(test_embed.size() / _attr.tokens_embed_size);
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
         ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
-        if (!mask.empty()) mask.back() = 0;
-        for (const int cap : decode_max_token_len_grp_)
-        {
-            if (cap >= 0 && cap < (int)mask.size()) mask[(size_t)cap] = 0;
-        }
-        for (int i = 0; i < precompute_len + input_embed_num && i < (int)mask.size(); i++) mask[(size_t)i] = 0;
         timer t_cost, ttft_timer, decode_timer; ttft_timer.start();
         bool decode_timer_started = false;
 
@@ -1676,7 +1824,6 @@ struct LLM::Impl {
             std::vector<unsigned short> linear_mask_tmp;
             if (use_per_layer_input) per_layer_tmp.assign((size_t)_attr.prefill_token_num * (size_t)per_layer_hidden, 0);
 
-            build_prefill_mask(mask_tmp, kv_cache_num_p, _attr.prefill_token_num, history_len, input_num_token);
             size_t copy_tokens = (p == prefill_split_num - 1) ? (size_t)(input_embed_num - p * _attr.prefill_token_num) : (size_t)_attr.prefill_token_num;
             memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, copy_tokens * _attr.tokens_embed_size * sizeof(unsigned short));
             scale_prefill_text_embeds_inplace(embed_tmp.data(), input_num_token, history_len);
@@ -1732,7 +1879,8 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), mask_tmp.size() * sizeof(unsigned short), devid);
+                    build_layer_prefill_mask(mask_tmp, kv_cache_num_p, _attr.prefill_token_num, history_len, input_num_token, m);
+                    llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
                 }
                 auto &t_in = lyr.layer.get_input(prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
                 const int shared_src = shared_kv_source_for_layer(m);
@@ -1744,13 +1892,22 @@ struct LLM::Impl {
                     auto &dst_k = lyr.layer.get_input(prefill_grpid, "K_cache");
                     auto &dst_v = lyr.layer.get_input(prefill_grpid, "V_cache");
                     const int layer_kv = kv_cache_size_for_layer(m);
-                    const size_t visible_tokens = (size_t)(history_len + input_num_token);
-                    const size_t copy_k_bytes = std::min((size_t)dst_k.nSize, visible_tokens * (size_t)layer_kv * sizeof(unsigned short));
-                    const size_t copy_v_bytes = std::min((size_t)dst_v.nSize, visible_tokens * (size_t)layer_kv * sizeof(unsigned short));
-                    llm_memset(LLM_WADDR(dst_k), 0, dst_k.nSize, devid);
-                    llm_memset(LLM_WADDR(dst_v), 0, dst_v.nSize, devid);
-                    llm_d2d(LLM_WADDR(dst_k), LLM_RADDR(src_k), copy_k_bytes, devid);
-                    llm_d2d(LLM_WADDR(dst_v), LLM_RADDR(src_v), copy_v_bytes, devid);
+                    copy_shared_prefill_cache(dst_k,
+                                              src_k,
+                                              layer_kv,
+                                              history_len,
+                                              kv_cache_num_p,
+                                              history_len,
+                                              input_num_token,
+                                              devid);
+                    copy_shared_prefill_cache(dst_v,
+                                              src_v,
+                                              layer_kv,
+                                              history_len,
+                                              kv_cache_num_p,
+                                              history_len,
+                                              input_num_token,
+                                              devid);
                 }
                 if (use_per_layer_input)
                 {
@@ -1975,7 +2132,8 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    llm_h2d(LLM_WADDR(t_mask), mask.data(), std::min((size_t)t_mask.nSize, mask.size() * sizeof(unsigned short)), devid);
+                    build_layer_decode_mask(decode_mask, (int)indices, m);
+                    llm_h2d(LLM_WADDR(t_mask), decode_mask.data(), std::min((size_t)t_mask.nSize, decode_mask.size() * sizeof(unsigned short)), devid);
                 }
                 if (use_per_layer_input)
                 {
@@ -2002,8 +2160,32 @@ struct LLM::Impl {
                 else
                 {
                     const int layer_kv = kv_cache_size_for_layer(m);
-                    llm_d2d((unsigned short *)LLM_WADDR(in_k) + indices * layer_kv, LLM_RADDR(out_k), std::min((size_t)out_k.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
-                    llm_d2d((unsigned short *)LLM_WADDR(in_v) + indices * layer_kv, LLM_RADDR(out_v), std::min((size_t)out_v.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
+                    if (shared_src >= 0)
+                    {
+                        const size_t dst_tokens = (size_t)in_k.nSize / sizeof(unsigned short) / (size_t)std::max(1, layer_kv);
+                        if (dst_tokens > 0)
+                        {
+                            const size_t cur_off = (size_t)indices * (size_t)layer_kv;
+                            const size_t tail_off = (dst_tokens - 1) * (size_t)layer_kv;
+                            const size_t copy_bytes = sizeof(unsigned short) * (size_t)layer_kv;
+                            // Shared-KV layers consume the source layer's KV. Preserve that
+                            // source KV in the past slot; their own K_cache_out is not the
+                            // cache that should be visible to the next decode token.
+                            llm_d2d((unsigned short *)LLM_WADDR(in_k) + cur_off,
+                                    (unsigned short *)LLM_RADDR(in_k) + tail_off,
+                                    copy_bytes,
+                                    devid);
+                            llm_d2d((unsigned short *)LLM_WADDR(in_v) + cur_off,
+                                    (unsigned short *)LLM_RADDR(in_v) + tail_off,
+                                    copy_bytes,
+                                    devid);
+                        }
+                    }
+                    else
+                    {
+                        llm_d2d((unsigned short *)LLM_WADDR(in_k) + indices * layer_kv, LLM_RADDR(out_k), std::min((size_t)out_k.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
+                        llm_d2d((unsigned short *)LLM_WADDR(in_v) + indices * layer_kv, LLM_RADDR(out_v), std::min((size_t)out_v.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
+                    }
                 }
                 auto &cur_out = lyr.layer.get_output(decode_grpid, "output");
                 if (m == _attr.axmodel_num - 1)
@@ -2034,13 +2216,13 @@ struct LLM::Impl {
                 const auto shared_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
                 if (shared_src >= 0)
                 {
+                    auto &src_layer = llama_layers[(size_t)shared_src];
+                    auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
+                    auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
                     const int layer_kv = kv_cache_size_for_layer(m);
                     const size_t dst_tokens = (size_t)in_k.nSize / sizeof(unsigned short) / (size_t)std::max(1, layer_kv);
                     if (need_full_shared_sync)
                     {
-                        auto &src_layer = llama_layers[(size_t)shared_src];
-                        auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
-                        auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
                         const size_t visible_past = std::min((size_t)indices, dst_tokens > 0 ? (dst_tokens - 1) : 0);
                         memset(in_k.pVirAddr, 0, in_k.nSize);
                         memset(in_v.pVirAddr, 0, in_v.nSize);
@@ -2053,9 +2235,6 @@ struct LLM::Impl {
                     }
                     if (dst_tokens > 0)
                     {
-                        auto &src_layer = llama_layers[(size_t)shared_src];
-                        auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
-                        auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
                         const size_t cur_off = (size_t)indices * (size_t)layer_kv;
                         const size_t dst_off = (dst_tokens - 1) * (size_t)layer_kv;
                         memcpy(in_k_ptr + dst_off, (const unsigned short *)src_k.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
@@ -2076,7 +2255,8 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    memcpy(t_mask.pVirAddr, mask.data(), std::min((size_t)t_mask.nSize, mask.size() * sizeof(unsigned short)));
+                    build_layer_decode_mask(decode_mask, (int)indices, m);
+                    memcpy(t_mask.pVirAddr, decode_mask.data(), std::min((size_t)t_mask.nSize, decode_mask.size() * sizeof(unsigned short)));
                 }
                 if (use_per_layer_input)
                 {
@@ -2109,8 +2289,24 @@ struct LLM::Impl {
                 else
                 {
                     const int layer_kv = kv_cache_size_for_layer(m);
-                    memcpy(in_k_ptr + indices * layer_kv, out_k.pVirAddr, sizeof(unsigned short) * layer_kv);
-                    memcpy(in_v_ptr + indices * layer_kv, out_v.pVirAddr, sizeof(unsigned short) * layer_kv);
+                    if (shared_src >= 0)
+                    {
+                        const size_t dst_tokens = (size_t)in_k.nSize / sizeof(unsigned short) / (size_t)std::max(1, layer_kv);
+                        if (dst_tokens > 0)
+                        {
+                            const size_t cur_off = (size_t)indices * (size_t)layer_kv;
+                            const size_t tail_off = (dst_tokens - 1) * (size_t)layer_kv;
+                            // See the AXCL branch above: shared layers must retain the
+                            // source layer KV in their visible past cache.
+                            memcpy(in_k_ptr + cur_off, in_k_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+                            memcpy(in_v_ptr + cur_off, in_v_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+                        }
+                    }
+                    else
+                    {
+                        memcpy(in_k_ptr + indices * layer_kv, out_k.pVirAddr, sizeof(unsigned short) * layer_kv);
+                        memcpy(in_v_ptr + indices * layer_kv, out_v.pVirAddr, sizeof(unsigned short) * layer_kv);
+                    }
                 }
                 auto &t_out= lyr.layer.get_output(decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
                 if (decode_profile_enabled)
@@ -2125,7 +2321,6 @@ struct LLM::Impl {
             last_shared_sync_decode_grpid = decode_grpid;
 #endif
 
-            if (indices < mask.size()) mask[indices] = 0;
             if (tokenizer->is_stop(next_token)) { b_hit_eos = true; break; }
             token_ids.push_back(next_token);
             if (_attr.runing_callback)

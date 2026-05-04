@@ -32,6 +32,7 @@ struct LLMAttrType {
     // When 0, all layers are treated as full-attention (default).
     int full_attention_interval = 0;
     int num_kv_shared_layers = 0;
+    int sliding_window = 0;
     std::vector<std::string> layer_types;
 
     int prefill_token_num = 96; // auto calc
