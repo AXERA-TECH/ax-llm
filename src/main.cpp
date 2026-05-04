@@ -1240,6 +1240,18 @@ int run_server_mode(const ModelConfig &config, int port)
             return;
         }
 
+        struct SamplingOverrideGuard {
+            LLM &llm;
+            SamplingOverrideGuard(LLM &llm, const openai_api::ChatRequest &req) : llm(llm)
+            {
+                llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
+            }
+            ~SamplingOverrideGuard()
+            {
+                llm.ClearRequestSamplingOverride();
+            }
+        } sampling_guard(llm, req);
+
         std::vector<Content> history;
         std::vector<MediaInputs> media_inputs;
         std::vector<std::string> temp_files;

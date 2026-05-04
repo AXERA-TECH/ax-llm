@@ -7,12 +7,44 @@
 #include <numeric>
 #include <cmath>
 #include <unordered_set>
+#include "utils/bfloat16.hpp"
 #include "utils/json.hpp"
 #include "utils/sample_log.h"
 
 class LLMPostprocess
 {
 private:
+    struct RequestSamplingOverride
+    {
+        bool has_temperature = false;
+        float temperature = 1.0f;
+        bool has_top_p = false;
+        float top_p = 1.0f;
+    };
+
+    struct EffectiveSampling
+    {
+        bool enable_temperature = false;
+        float temperature = 1.0f;
+        bool enable_repetition_penalty = false;
+        float repetition_penalty = 1.0f;
+        int penalty_window = 20;
+        bool enable_diversity_penalty = false;
+        std::vector<int> common_phrases;
+        float diversity_penalty = 1.0f;
+        bool enable_top_p_sampling = false;
+        float top_p = 1.0f;
+        bool enable_top_k_sampling = false;
+        int top_k = 1;
+        bool greedy = false;
+    };
+
+    static thread_local RequestSamplingOverride &request_override()
+    {
+        static thread_local RequestSamplingOverride override_cfg;
+        return override_cfg;
+    }
+
     // 	控制随机性
     void apply_temperature(std::vector<float> &logits, float temperature)
     {
@@ -61,6 +93,32 @@ private:
                 logits[token] *= std::sqrt(repetition_penalty);
             }
         }
+    }
+
+    static int argmax_index(const std::vector<float> &logits)
+    {
+        if (logits.empty())
+            return 0;
+        return (int)std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+    }
+
+    static int argmax_index_bf16(const unsigned short *logits, int n)
+    {
+        if (!logits || n <= 0)
+            return 0;
+
+        int max_index = 0;
+        float max_value = bfloat16(logits[0]).fp32();
+        for (int i = 1; i < n; ++i)
+        {
+            const float value = bfloat16(logits[i]).fp32();
+            if (value > max_value)
+            {
+                max_value = value;
+                max_index = i;
+            }
+        }
+        return max_index;
     }
 
     // 增强多样性
@@ -234,8 +292,90 @@ private:
     bool enable_top_k_sampling = false;
     int top_k = 1;
 
+    EffectiveSampling resolve_effective_sampling() const
+    {
+        EffectiveSampling eff;
+        const auto &ov = request_override();
+
+        eff.enable_temperature = enable_temperature;
+        eff.temperature = temperature;
+        if (ov.has_temperature)
+        {
+            eff.enable_temperature = true;
+            eff.temperature = ov.temperature;
+        }
+
+        eff.enable_repetition_penalty = enable_repetition_penalty;
+        eff.repetition_penalty = repetition_penalty;
+        eff.penalty_window = penalty_window;
+        eff.enable_diversity_penalty = enable_diversity_penalty;
+        eff.common_phrases = common_phrases;
+        eff.diversity_penalty = diversity_penalty;
+
+        eff.enable_top_p_sampling = enable_top_p_sampling;
+        eff.top_p = top_p;
+        if (ov.has_top_p)
+        {
+            eff.enable_top_p_sampling = true;
+            eff.top_p = ov.top_p;
+        }
+
+        eff.enable_top_k_sampling = enable_top_k_sampling;
+        eff.top_k = top_k;
+
+        eff.greedy = eff.enable_temperature && eff.temperature <= 0.0f;
+        if (eff.greedy)
+        {
+            eff.enable_temperature = false;
+            eff.enable_top_p_sampling = false;
+            eff.enable_top_k_sampling = false;
+        }
+        else
+        {
+            if (eff.top_p >= 1.0f) eff.enable_top_p_sampling = false;
+            if (eff.top_k < 1) eff.enable_top_k_sampling = false;
+            if (eff.enable_top_p_sampling && eff.enable_top_k_sampling)
+            {
+                ALOGW("Both top_p and top_k enabled; prefer top_p and disable top_k");
+                eff.enable_top_k_sampling = false;
+            }
+        }
+
+        return eff;
+    }
+
+    int apply_logits(std::vector<float> &logits, const std::vector<int> &history, const EffectiveSampling &eff)
+    {
+        if (eff.enable_temperature)
+            apply_temperature(logits, eff.temperature);
+        if (eff.enable_repetition_penalty)
+            apply_repetition_penalty(logits, history, eff.repetition_penalty, eff.penalty_window);
+        if (eff.enable_diversity_penalty)
+            apply_diversity_penalty(logits, eff.common_phrases, eff.diversity_penalty);
+
+        if (eff.enable_top_p_sampling)
+            return faster_top_p_sampling(logits, eff.top_p);
+        else if (eff.enable_top_k_sampling)
+            return top_k_sampling(logits, eff.top_k);
+        return argmax_index(logits);
+    }
+
 public:
     LLMPostprocess() {}
+
+    void set_request_sampling_override(bool has_temperature, float temperature, bool has_top_p, float top_p)
+    {
+        auto &ov = request_override();
+        ov.has_temperature = has_temperature;
+        ov.temperature = temperature;
+        ov.has_top_p = has_top_p;
+        ov.top_p = top_p;
+    }
+
+    void clear_request_sampling_override()
+    {
+        request_override() = {};
+    }
 
     void set_temperature(bool enable, float temperature)
     {
@@ -311,23 +451,18 @@ public:
 
     int apply(std::vector<float> &logits, const std::vector<int> &history)
     {
-        if (enable_temperature)
-            apply_temperature(logits, temperature);
-        if (enable_repetition_penalty)
-            apply_repetition_penalty(logits, history, repetition_penalty, penalty_window);
-        if (enable_diversity_penalty)
-            apply_diversity_penalty(logits, common_phrases, diversity_penalty);
+        return apply_logits(logits, history, resolve_effective_sampling());
+    }
 
-        if (enable_top_p_sampling)
-            return faster_top_p_sampling(logits, top_p);
-        else if (enable_top_k_sampling)
-            return top_k_sampling(logits, top_k);
-        else
-        {
-            // 最大值
-            float max_logit = *std::max_element(logits.begin(), logits.end());
-            int max_index = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
-            return max_index;
-        }
+    int apply_bf16(const unsigned short *logits, int n, const std::vector<int> &history)
+    {
+        const auto eff = resolve_effective_sampling();
+        if (eff.greedy && !eff.enable_repetition_penalty && !eff.enable_diversity_penalty)
+            return argmax_index_bf16(logits, n);
+
+        std::vector<float> fp32_logits((size_t)std::max(0, n));
+        for (int i = 0; i < n; ++i)
+            fp32_logits[(size_t)i] = bfloat16(logits[i]).fp32();
+        return apply_logits(fp32_logits, history, eff);
     }
 };

@@ -501,6 +501,14 @@ public:
     bool enabled() const { return enabled_; }
     int hidden_size_per_layer_input() const { return hidden_size_per_layer_input_; }
     int pad_token_id() const { return pad_token_id_; }
+    void reset_decode_stats(bool enable) const
+    {
+        decode_stats_enabled_.store(enable, std::memory_order_relaxed);
+        decode_cache_hits_.store(0, std::memory_order_relaxed);
+        decode_cache_misses_.store(0, std::memory_order_relaxed);
+    }
+    uint64_t decode_cache_hits() const { return decode_cache_hits_.load(std::memory_order_relaxed); }
+    uint64_t decode_cache_misses() const { return decode_cache_misses_.load(std::memory_order_relaxed); }
 
     bool Compute(const std::vector<int> &token_ids,
                  const unsigned short *input_bf16,
@@ -602,10 +610,14 @@ public:
             auto it = decode_cache_.find(token_id);
             if (it != decode_cache_.end())
             {
+                if (decode_stats_enabled_.load(std::memory_order_relaxed))
+                    decode_cache_hits_.fetch_add(1, std::memory_order_relaxed);
                 out = it->second;
                 return true;
             }
         }
+        if (enabled_ && decode_stats_enabled_.load(std::memory_order_relaxed))
+            decode_cache_misses_.fetch_add(1, std::memory_order_relaxed);
         std::vector<int> ids = {token_id};
         if (!Compute(ids, input_bf16, 1, input_hidden_size, out))
             return false;
@@ -615,4 +627,7 @@ public:
 
 private:
     mutable std::unordered_map<int, std::vector<unsigned short>> decode_cache_;
+    mutable std::atomic<bool> decode_stats_enabled_{false};
+    mutable std::atomic<uint64_t> decode_cache_hits_{0};
+    mutable std::atomic<uint64_t> decode_cache_misses_{0};
 };

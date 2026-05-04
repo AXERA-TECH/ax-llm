@@ -2,8 +2,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
@@ -251,13 +253,8 @@ struct LLM::Impl {
     // ---- small helpers ----
     static int post_process(LLMPostprocess &postprocess, unsigned short *p, int n, std::vector<int> &history, float *val = 0)
     {
-        std::vector<float> logits(n);
-        for (int i = 0; i < n; i++)
-        {
-            unsigned int proc = p[i] << 16;
-            logits[i] = *reinterpret_cast<float *>(&proc);
-        }
-        return postprocess.apply(logits, history);
+        (void)val;
+        return postprocess.apply_bf16(p, n, history);
     }
 
     static inline void fill_indices(unsigned int *dst, int start, int count)
@@ -1511,6 +1508,17 @@ struct LLM::Impl {
 
     std::string Run(std::vector<unsigned short> &test_embed, int output_max_token = -1)
     {
+        using DecodeClock = std::chrono::steady_clock;
+        struct DecodeProfileStats
+        {
+            uint64_t per_layer_ns = 0;
+            uint64_t shared_kv_ns = 0;
+            uint64_t prep_ns = 0;
+            uint64_t inference_ns = 0;
+            uint64_t outcopy_ns = 0;
+            uint64_t post_ns = 0;
+        };
+
         b_stop.store(false, std::memory_order_relaxed); std::string final_out;
         utf8_filter = UTF8Filter();
         ChannelSectionFilter channel_filter;
@@ -1582,6 +1590,8 @@ struct LLM::Impl {
 
         const bool use_per_layer_input = gemma4_per_layer_helper.enabled();
         const int per_layer_hidden = gemma4_per_layer_helper.hidden_size_per_layer_input();
+        const bool decode_profile_enabled = std::getenv("AXLLM_PROFILE_DECODE") != nullptr;
+        DecodeProfileStats decode_profile{};
         std::vector<unsigned short> prefill_per_layer_inputs;
         std::vector<unsigned short> decode_per_layer_input;
         std::vector<unsigned short> per_layer_tmp;
@@ -1827,6 +1837,9 @@ struct LLM::Impl {
         }
 
         int next_token = -1; t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
+        if (use_per_layer_input)
+            gemma4_per_layer_helper.reset_decode_stats(decode_profile_enabled);
+        int last_shared_sync_decode_grpid = -1;
         {
             auto &t_in = llama_post.get_input("input");
             llm_h2d(LLM_WADDR(t_in), embed.data(), embed.size() * sizeof(unsigned short), LLM_DEVID(llama_layers.back()));
@@ -1853,6 +1866,7 @@ struct LLM::Impl {
         for (unsigned int indices = decode_start; indices < (unsigned int)_attr.max_token_len; indices++)
         {
             if (b_stop.load(std::memory_order_relaxed)) break;
+            bool need_full_shared_sync = false;
             {
                 const int want_gid = choose_decode_gid((int)indices + 1);
                 if (want_gid != decode_grpid)
@@ -1860,11 +1874,13 @@ struct LLM::Impl {
                     ALOGI("switch decode_grpid: %d -> %d (ctx=%u)", decode_grpid, want_gid, indices + 1);
                     decode_grpid = want_gid;
                 }
+                need_full_shared_sync = (decode_grpid != last_shared_sync_decode_grpid);
             }
             embed_selector.getByIndex(next_token, embed);
             scale_all_embeds_inplace(embed.data(), 1);
             if (use_per_layer_input)
             {
+                const auto t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
                 if (!gemma4_per_layer_helper.ComputeSingle(next_token,
                                                            embed.data(),
                                                            _attr.tokens_embed_size,
@@ -1873,6 +1889,8 @@ struct LLM::Impl {
                     ALOGE("Gemma4 decode per-layer input compute failed");
                     return final_out;
                 }
+                if (decode_profile_enabled)
+                    decode_profile.per_layer_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - t0).count();
             }
 
 #ifdef USE_AXCL
@@ -1981,30 +1999,40 @@ struct LLM::Impl {
                 auto &in_k = lyr.layer.get_input(decode_grpid, "K_cache"); auto *in_k_ptr = (unsigned short *)in_k.pVirAddr;
                 auto &in_v = lyr.layer.get_input(decode_grpid, "V_cache"); auto *in_v_ptr = (unsigned short *)in_v.pVirAddr;
                 const int shared_src = shared_kv_source_for_layer(m);
+                const auto shared_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
                 if (shared_src >= 0)
                 {
-                    auto &src_layer = llama_layers[(size_t)shared_src];
-                    auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
-                    auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
                     const int layer_kv = kv_cache_size_for_layer(m);
                     const size_t dst_tokens = (size_t)in_k.nSize / sizeof(unsigned short) / (size_t)std::max(1, layer_kv);
-                    const size_t visible_past = std::min((size_t)indices, dst_tokens > 0 ? (dst_tokens - 1) : 0);
-                    memset(in_k.pVirAddr, 0, in_k.nSize);
-                    memset(in_v.pVirAddr, 0, in_v.nSize);
-                    if (visible_past > 0)
+                    if (need_full_shared_sync)
                     {
-                        const size_t past_bytes = visible_past * (size_t)layer_kv * sizeof(unsigned short);
-                        memcpy(in_k.pVirAddr, src_k.pVirAddr, std::min(past_bytes, (size_t)src_k.nSize));
-                        memcpy(in_v.pVirAddr, src_v.pVirAddr, std::min(past_bytes, (size_t)src_v.nSize));
+                        auto &src_layer = llama_layers[(size_t)shared_src];
+                        auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
+                        auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
+                        const size_t visible_past = std::min((size_t)indices, dst_tokens > 0 ? (dst_tokens - 1) : 0);
+                        memset(in_k.pVirAddr, 0, in_k.nSize);
+                        memset(in_v.pVirAddr, 0, in_v.nSize);
+                        if (visible_past > 0)
+                        {
+                            const size_t past_bytes = visible_past * (size_t)layer_kv * sizeof(unsigned short);
+                            memcpy(in_k.pVirAddr, src_k.pVirAddr, std::min(past_bytes, (size_t)src_k.nSize));
+                            memcpy(in_v.pVirAddr, src_v.pVirAddr, std::min(past_bytes, (size_t)src_v.nSize));
+                        }
                     }
                     if (dst_tokens > 0)
                     {
+                        auto &src_layer = llama_layers[(size_t)shared_src];
+                        auto &src_k = src_layer.layer.get_input(decode_grpid, "K_cache");
+                        auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
                         const size_t cur_off = (size_t)indices * (size_t)layer_kv;
                         const size_t dst_off = (dst_tokens - 1) * (size_t)layer_kv;
                         memcpy(in_k_ptr + dst_off, (const unsigned short *)src_k.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
                         memcpy(in_v_ptr + dst_off, (const unsigned short *)src_v.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
                     }
                 }
+                if (decode_profile_enabled)
+                    decode_profile.shared_kv_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - shared_t0).count();
+                const auto prep_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
                 auto &t_idx = lyr.layer.get_input(decode_grpid, "indices"); memcpy(t_idx.pVirAddr, &indices, sizeof(indices));
                 auto &t_mask= lyr.layer.get_input(decode_grpid, "mask");
                 if (is_linear_layer(m))
@@ -2032,7 +2060,13 @@ struct LLM::Impl {
                            std::min((size_t)t_per_layer->nSize, (size_t)per_layer_hidden * sizeof(unsigned short)));
                 }
                 auto &t_in  = lyr.layer.get_input(decode_grpid, "input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
+                if (decode_profile_enabled)
+                    decode_profile.prep_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - prep_t0).count();
+                const auto infer_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
                 lyr.layer.inference(decode_grpid);
+                if (decode_profile_enabled)
+                    decode_profile.inference_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - infer_t0).count();
+                const auto out_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
                 auto &out_k = lyr.layer.get_output(decode_grpid, "K_cache_out");
                 auto &out_v = lyr.layer.get_output(decode_grpid, "V_cache_out");
                 if (is_linear_layer(m))
@@ -2047,10 +2081,16 @@ struct LLM::Impl {
                     memcpy(in_v_ptr + indices * layer_kv, out_v.pVirAddr, sizeof(unsigned short) * layer_kv);
                 }
                 auto &t_out= lyr.layer.get_output(decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
+                if (decode_profile_enabled)
+                    decode_profile.outcopy_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - out_t0).count();
             }
+            const auto post_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
             auto &t_in = llama_post.get_input("input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             llama_post.inference(); auto &t_out = llama_post.get_output("output");
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
+            if (decode_profile_enabled)
+                decode_profile.post_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - post_t0).count();
+            last_shared_sync_decode_grpid = decode_grpid;
 #endif
 
             if (indices < mask.size()) mask[indices] = 0;
@@ -2101,6 +2141,29 @@ struct LLM::Impl {
             const float decode_ms = decode_timer.cost();
             if (decode_tokens > 0 && decode_ms > 0.0f)
                 avg_decode_tps = decode_tokens / (decode_ms / 1000.0f);
+        }
+        if (decode_profile_enabled)
+        {
+            const int decode_tokens = std::max(0, (int)token_ids.size() - 1);
+            if (decode_tokens > 0)
+            {
+                const auto avg_ms = [decode_tokens](uint64_t ns) {
+                    return (double)ns / ((double)decode_tokens * 1e6);
+                };
+                ALOGN("decode profile avg/token: per_layer=%.3f ms, shared_kv=%.3f ms, prep=%.3f ms, inference=%.3f ms, outcopy=%.3f ms, post=%.3f ms\n",
+                      avg_ms(decode_profile.per_layer_ns),
+                      avg_ms(decode_profile.shared_kv_ns),
+                      avg_ms(decode_profile.prep_ns),
+                      avg_ms(decode_profile.inference_ns),
+                      avg_ms(decode_profile.outcopy_ns),
+                      avg_ms(decode_profile.post_ns));
+                if (use_per_layer_input)
+                {
+                    ALOGN("decode profile cache: hits=%llu misses=%llu\n",
+                          (unsigned long long)gemma4_per_layer_helper.decode_cache_hits(),
+                          (unsigned long long)gemma4_per_layer_helper.decode_cache_misses());
+                }
+            }
         }
         ALOGN("hit eos,decode avg %.2f token/s\n", avg_decode_tps);
         return final_out;
@@ -2217,6 +2280,8 @@ void LLM::Stop() { impl_->Stop(); }
 LLMAttrType *LLM::getAttr() { return &impl_->_attr; }
 LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
+void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p); }
+void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
 bool LLM::EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings) { return impl_->EmbedBatch(inputs, out_embeddings); }

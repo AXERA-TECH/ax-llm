@@ -109,6 +109,8 @@ public:
     LLMAttrType *getAttr();
     LLMPostprocess *getPostprocess();
     LLaMaEmbedSelector *getEmbedSelector();
+    void SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p);
+    void ClearRequestSamplingOverride();
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
     bool EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings);
