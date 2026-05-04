@@ -1087,24 +1087,6 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         history.push_back(content);
     }
 
-        for (auto &content : history)
-        {
-            switch (content.role)
-            {
-            case SYSTEM:
-                axllm::Logger::print_chat_role("system", axllm::TextColor::Yellow, content.data);
-                break;
-            case USER:
-                axllm::Logger::print_chat_role("user", axllm::TextColor::Green, content.data);
-                break;
-            case ASSISTANT:
-                axllm::Logger::print_chat_role("assistant", axllm::TextColor::Default, content.data);
-                break;
-            default:
-                break;
-            }
-        }
-
     return true;
 }
 
@@ -1239,6 +1221,17 @@ int run_server_mode(const ModelConfig &config, int port)
             ALOGE("provider not writable");
             return;
         }
+
+        ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f messages=%zu stop=%zu",
+              req.model.c_str(),
+              req.stream ? 1 : 0,
+              req.max_tokens,
+              req.has_temperature ? 1 : 0,
+              req.temperature,
+              req.has_top_p ? 1 : 0,
+              req.top_p,
+              req.parsed_messages.size(),
+              req.stop.size());
 
         struct SamplingOverrideGuard {
             LLM &llm;

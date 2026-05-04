@@ -1135,6 +1135,7 @@ struct LLM::Impl {
                 ALOGW("load postprocess config(%s) failed", this->_attr.post_config_path.c_str());
             }
         }
+        postprocess.set_pad_token_id(_attr.pad_token_id);
         ALOGI("LLM init ok");
         return true;
     }
@@ -1340,7 +1341,12 @@ struct LLM::Impl {
 
         if (input_embed_num == 0)
         {
-            for (int i = 0; i < _attr.axmodel_num; i++) { k_caches[i].resize(prefill_precompute_len * _attr.kv_cache_size); v_caches[i].resize(prefill_precompute_len * _attr.kv_cache_size); }
+            for (int i = 0; i < _attr.axmodel_num; i++)
+            {
+                const int layer_kv = kv_cache_size_for_layer(i);
+                k_caches[i].resize((size_t)prefill_precompute_len * (size_t)layer_kv);
+                v_caches[i].resize((size_t)prefill_precompute_len * (size_t)layer_kv);
+            }
             ALOGI("input token num is 0, skip");
             return 0;
         }
@@ -1376,8 +1382,9 @@ struct LLM::Impl {
                 auto &out_v  = lyr.layer.get_output(prefill_grpid, "V_cache_out");
                 auto &pre_k  = lyr.layer.get_input(prefill_grpid, "K_cache");
                 auto &pre_v  = lyr.layer.get_input(prefill_grpid, "V_cache");
-                int kv_off = p * _attr.prefill_token_num * _attr.kv_cache_size;
-                size_t kv_sz = (size_t)_attr.prefill_token_num * _attr.kv_cache_size * sizeof(unsigned short);
+                const int layer_kv = kv_cache_size_for_layer(m);
+                int kv_off = p * _attr.prefill_token_num * layer_kv;
+                size_t kv_sz = (size_t)_attr.prefill_token_num * (size_t)layer_kv * sizeof(unsigned short);
                 llm_d2d((unsigned short *)LLM_WADDR(pre_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                 llm_d2d((unsigned short *)LLM_WADDR(pre_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
                 auto &t_out = lyr.layer.get_output(prefill_grpid, "output"); llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), std::min((size_t)t_out.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
@@ -1387,12 +1394,14 @@ struct LLM::Impl {
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
             auto &lyr = llama_layers[i]; int devid = LLM_DEVID(lyr);
-            k_caches[i].resize(prefill_precompute_len * _attr.kv_cache_size);
-            v_caches[i].resize(prefill_precompute_len * _attr.kv_cache_size);
+            const int layer_kv = kv_cache_size_for_layer(i);
+            k_caches[i].resize((size_t)prefill_precompute_len * (size_t)layer_kv);
+            v_caches[i].resize((size_t)prefill_precompute_len * (size_t)layer_kv);
             auto &t_k = lyr.layer.get_input(prefill_grpid, "K_cache");
             auto &t_v = lyr.layer.get_input(prefill_grpid, "V_cache");
-            llm_d2h(k_caches[i].data(), LLM_RADDR(t_k), prefill_precompute_len * _attr.kv_cache_size * sizeof(unsigned short), devid);
-            llm_d2h(v_caches[i].data(), LLM_RADDR(t_v), prefill_precompute_len * _attr.kv_cache_size * sizeof(unsigned short), devid);
+            const size_t kv_bytes = (size_t)prefill_precompute_len * (size_t)layer_kv * sizeof(unsigned short);
+            llm_d2h(k_caches[i].data(), LLM_RADDR(t_k), kv_bytes, devid);
+            llm_d2h(v_caches[i].data(), LLM_RADDR(t_v), kv_bytes, devid);
         }
         return 0;
     }
@@ -1400,21 +1409,29 @@ struct LLM::Impl {
     int GetKVCache(std::vector<std::vector<unsigned short>> &kv_k, std::vector<std::vector<unsigned short>> &kv_v, int &kv_precompute_len)
     {
         bfloat16 bf16 = -65536.f;
+        int inferred_precompute_len = 0;
         auto &t_mask = llama_layers[(size_t)cache_ref_full_layer_idx].layer.get_input(decode_grpid, "mask");
         std::vector<unsigned short> mask(t_mask.nSize / sizeof(unsigned short), bf16.data);
         llm_d2h(mask.data(), LLM_RADDR(t_mask), t_mask.nSize, LLM_DEVID(llama_layers[(size_t)cache_ref_full_layer_idx]));
-        kv_precompute_len = 0; for (size_t i = 0; i < mask.size(); i++) { if (mask[i] == bf16.data) { kv_precompute_len = (int)i + 1; break; } }
-        ALOGI("precompute_len:%d, remaining:%d", kv_precompute_len, _attr.prefill_max_kv_cache_num_grp.back() - kv_precompute_len);
+        for (size_t i = 0; i < mask.size(); i++) { if (mask[i] == bf16.data) { inferred_precompute_len = (int)i + 1; break; } }
+        kv_precompute_len = precompute_len > 0 ? precompute_len : inferred_precompute_len;
+        ALOGI("precompute_len:%d, remaining:%d%s",
+              kv_precompute_len,
+              _attr.prefill_max_kv_cache_num_grp.back() - kv_precompute_len,
+              precompute_len > 0 ? " (tracked)" : " (mask inferred)");
         if (b_os_kvcache)
         {
             kv_k.resize(_attr.axmodel_num); kv_v.resize(_attr.axmodel_num);
             for (int i = 0; i < _attr.axmodel_num; i++)
             {
                 auto &lyr = llama_layers[i]; int devid = LLM_DEVID(lyr);
-                kv_k[i].resize(kv_precompute_len * _attr.kv_cache_size); kv_v[i].resize(kv_precompute_len * _attr.kv_cache_size);
+                const int layer_kv = kv_cache_size_for_layer(i);
+                kv_k[i].resize((size_t)kv_precompute_len * (size_t)layer_kv);
+                kv_v[i].resize((size_t)kv_precompute_len * (size_t)layer_kv);
                 auto &t_k = lyr.layer.get_input(decode_grpid, "K_cache"); auto &t_v = lyr.layer.get_input(decode_grpid, "V_cache");
-                llm_d2h(kv_k[i].data(), LLM_RADDR(t_k), kv_precompute_len * _attr.kv_cache_size * sizeof(unsigned short), devid);
-                llm_d2h(kv_v[i].data(), LLM_RADDR(t_v), kv_precompute_len * _attr.kv_cache_size * sizeof(unsigned short), devid);
+                const size_t kv_bytes = (size_t)kv_precompute_len * (size_t)layer_kv * sizeof(unsigned short);
+                llm_d2h(kv_k[i].data(), LLM_RADDR(t_k), kv_bytes, devid);
+                llm_d2h(kv_v[i].data(), LLM_RADDR(t_v), kv_bytes, devid);
             }
         }
         _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp.back();
@@ -1469,12 +1486,14 @@ struct LLM::Impl {
             auto &pk = lyr.layer.get_input(_attr.prefill_grpid, "K_cache"); auto &pv = lyr.layer.get_input(_attr.prefill_grpid, "V_cache");
             llm_memset(LLM_WADDR(pk), 0, pk.nSize, devid); llm_memset(LLM_WADDR(pv), 0, pv.nSize, devid);
         }
-        size_t kv_bytes = (size_t)_precompute_len * _attr.kv_cache_size * sizeof(unsigned short);
         for (int m = 0; m < _attr.axmodel_num; m++)
         {
             auto &lyr  = llama_layers[m]; int devid = LLM_DEVID(lyr);
             auto &kc = kv_k[m]; auto &vc = kv_v[m];
-            if ((int)kc.size() < _precompute_len * _attr.kv_cache_size || (int)vc.size() < _precompute_len * _attr.kv_cache_size) { ALOGE("kv_cache buffer too small for layer %d", m); return -1; }
+            const int layer_kv = kv_cache_size_for_layer(m);
+            const size_t kv_elems = (size_t)_precompute_len * (size_t)layer_kv;
+            const size_t kv_bytes = kv_elems * sizeof(unsigned short);
+            if (kc.size() < kv_elems || vc.size() < kv_elems) { ALOGE("kv_cache buffer too small for layer %d", m); return -1; }
             auto &dk = lyr.layer.get_input(decode_grpid, "K_cache"); auto &dv = lyr.layer.get_input(decode_grpid, "V_cache");
             llm_h2d(LLM_WADDR(dk), kc.data(), kv_bytes, devid); llm_h2d(LLM_WADDR(dv), vc.data(), kv_bytes, devid);
             auto &pk = lyr.layer.get_input(_attr.prefill_grpid, "K_cache"); auto &pv = lyr.layer.get_input(_attr.prefill_grpid, "V_cache");
@@ -1837,6 +1856,7 @@ struct LLM::Impl {
         }
 
         int next_token = -1; t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
+        bool b_hit_eos = false;
         if (use_per_layer_input)
             gemma4_per_layer_helper.reset_decode_stats(decode_profile_enabled);
         int last_shared_sync_decode_grpid = -1;
@@ -1848,22 +1868,34 @@ struct LLM::Impl {
             llm_d2h(t_out.pVirAddr, LLM_RADDR(t_out), t_out.nSize, llama_post.get_devid());
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr;
             next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
-            token_ids.push_back(next_token);
             ALOGI("ttft: %.2f ms", ttft_timer.cost());
-            decode_timer.start();
-            decode_timer_started = true;
-            if (_attr.runing_callback)
+            b_hit_eos = tokenizer->is_stop(next_token);
+            if (b_hit_eos)
             {
-                auto str = safe_decode_token(tokenizer, next_token);
-                if (hide_channel_markup) str = channel_filter.filter(str);
-                emit_stream_chunk(str, -1);
+                ALOGW("first decode token hit stop: token=%d piece='%s' precompute_len=%d input_tokens=%d",
+                      next_token,
+                      safe_decode_token(tokenizer, next_token).c_str(),
+                      precompute_len,
+                      input_embed_num);
+            }
+            if (!b_hit_eos)
+            {
+                token_ids.push_back(next_token);
+                decode_timer.start();
+                decode_timer_started = true;
+                if (_attr.runing_callback)
+                {
+                    auto str = safe_decode_token(tokenizer, next_token);
+                    if (hide_channel_markup) str = channel_filter.filter(str);
+                    emit_stream_chunk(str, -1);
+                }
             }
         }
 
-        t_cost.start(); bool b_hit_eos = false;
+        t_cost.start();
         unsigned int decode_start = (unsigned int)(precompute_len + input_embed_num);
         if (has_vision_state && vision_state.decode_start > 0) decode_start = (unsigned int)vision_state.decode_start;
-        for (unsigned int indices = decode_start; indices < (unsigned int)_attr.max_token_len; indices++)
+        for (unsigned int indices = decode_start; !b_hit_eos && indices < (unsigned int)_attr.max_token_len; indices++)
         {
             if (b_stop.load(std::memory_order_relaxed)) break;
             bool need_full_shared_sync = false;
@@ -2114,6 +2146,7 @@ struct LLM::Impl {
             if (_attr.runing_callback == nullptr) update_cqdm(&cqdm, indices, "token", "");
         }
 
+        const int generated_token_count = (int)token_ids.size();
         final_out = tokenizer->decode(token_ids);
         if (hide_channel_markup)
         {
@@ -2166,6 +2199,10 @@ struct LLM::Impl {
             }
         }
         ALOGN("hit eos,decode avg %.2f token/s\n", avg_decode_tps);
+        if (generated_token_count >= 0)
+        {
+            precompute_len = decode_start + generated_token_count;
+        }
         return final_out;
     }
 
@@ -2222,7 +2259,8 @@ struct LLM::Impl {
             new_tokens = tokenizer->encode(history);
         }
 
-        int offset = 0; auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
+        int offset = 0;
+        auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
         bool not_append = !(offset == (int)last_tokens_ids.size() && (int)new_tokens.size() >= (int)last_tokens_ids.size());
         if (not_append) { ALOGW("history not append (rollback/modify). force ResetKVCache and recompute."); ResetKVCache(); tokens_diff = new_tokens; offset = 0; }
         if (tokens_diff.empty())
@@ -2256,10 +2294,10 @@ struct LLM::Impl {
         run_input_token_ids = tokens_diff;
         auto reply = Run(out_embed, output_max_token);
         run_input_token_ids.clear();
-        GetKVCache(k_caches, v_caches, precompute_len);
         history.push_back({ASSISTANT, TEXT, reply});
         last_tokens_ids = tokenizer->encode(history);
         if (last_tokens_ids.size() >= 2) last_tokens_ids.erase(last_tokens_ids.end() - 2, last_tokens_ids.end());
+        GetKVCache(k_caches, v_caches, precompute_len);
 
         has_vision_state = false;
         vision_state = {};

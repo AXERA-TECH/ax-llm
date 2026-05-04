@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <limits>
 #include <unordered_set>
 #include "utils/bfloat16.hpp"
 #include "utils/json.hpp"
@@ -102,23 +103,25 @@ private:
         return (int)std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
     }
 
-    static int argmax_index_bf16(const unsigned short *logits, int n)
+    int argmax_index_bf16(const unsigned short *logits, int n) const
     {
         if (!logits || n <= 0)
             return 0;
 
-        int max_index = 0;
-        float max_value = bfloat16(logits[0]).fp32();
-        for (int i = 1; i < n; ++i)
+        int max_index = -1;
+        float max_value = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < n; ++i)
         {
+            if (pad_token_id >= 0 && i == pad_token_id)
+                continue;
             const float value = bfloat16(logits[i]).fp32();
-            if (value > max_value)
+            if (max_index < 0 || value > max_value)
             {
                 max_value = value;
                 max_index = i;
             }
         }
-        return max_index;
+        return max_index >= 0 ? max_index : 0;
     }
 
     // 增强多样性
@@ -291,6 +294,7 @@ private:
 
     bool enable_top_k_sampling = false;
     int top_k = 1;
+    int pad_token_id = -1;
 
     EffectiveSampling resolve_effective_sampling() const
     {
@@ -332,7 +336,6 @@ private:
         }
         else
         {
-            if (eff.top_p >= 1.0f) eff.enable_top_p_sampling = false;
             if (eff.top_k < 1) eff.enable_top_k_sampling = false;
             if (eff.enable_top_p_sampling && eff.enable_top_k_sampling)
             {
@@ -352,6 +355,8 @@ private:
             apply_repetition_penalty(logits, history, eff.repetition_penalty, eff.penalty_window);
         if (eff.enable_diversity_penalty)
             apply_diversity_penalty(logits, eff.common_phrases, eff.diversity_penalty);
+        if (pad_token_id >= 0 && pad_token_id < (int)logits.size())
+            logits[(size_t)pad_token_id] = -std::numeric_limits<float>::infinity();
 
         if (eff.enable_top_p_sampling)
             return faster_top_p_sampling(logits, eff.top_p);
@@ -410,6 +415,11 @@ public:
         this->top_k = top_k;
     }
 
+    void set_pad_token_id(int token_id)
+    {
+        pad_token_id = token_id;
+    }
+
     bool load_config(std::string config_path)
     {
         std::ifstream config_file(config_path);
@@ -456,13 +466,9 @@ public:
 
     int apply_bf16(const unsigned short *logits, int n, const std::vector<int> &history)
     {
-        const auto eff = resolve_effective_sampling();
-        if (eff.greedy && !eff.enable_repetition_penalty && !eff.enable_diversity_penalty)
-            return argmax_index_bf16(logits, n);
-
         std::vector<float> fp32_logits((size_t)std::max(0, n));
         for (int i = 0; i < n; ++i)
             fp32_logits[(size_t)i] = bfloat16(logits[i]).fp32();
-        return apply_logits(fp32_logits, history, eff);
+        return apply_logits(fp32_logits, history, resolve_effective_sampling());
     }
 };
