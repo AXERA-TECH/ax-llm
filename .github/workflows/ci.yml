@@ -27,6 +27,10 @@ jobs:
           chmod +x ./build_axcl_x86.sh
           bash -euxo pipefail ./build_axcl_x86.sh
 
+      - name: Tokenizer smoke (AXCL x86)
+        run: |
+          ./build_x86/install/bin/tokenizer_smoke
+
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -78,6 +82,11 @@ jobs:
             -DBUILD_AXCL=ON \
             -DAXCL_DIR="${PWD}/${axcl_root}"
           cmake --build . -j 2
+
+      - name: Tokenizer smoke (Windows mingw64)
+        shell: msys2 {0}
+        run: |
+          ./build_mingw64/tokenizer_smoke.exe
 
   build-ax650-aarch64:
     name: AX650 aarch64 cross-build

@@ -259,4 +259,11 @@ if(BUILD_AXCL)
     install(TARGETS llm_smoke DESTINATION bin)
 endif()
 
+# ---------------------------------------------------------------------------
+# Tokenizer smoke test (host runnable; no HW required)
+# ---------------------------------------------------------------------------
+add_executable(tokenizer_smoke tools/tokenizer_smoke.cpp)
+target_link_libraries(tokenizer_smoke tokenizer)
+install(TARGETS tokenizer_smoke DESTINATION bin)
+
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)
