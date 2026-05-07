@@ -109,6 +109,7 @@ public:
     LLaMaEmbedSelector *getEmbedSelector();
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
+    bool Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding);
     bool EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings);
 
     int GenerateKVCachePrefill(std::vector<int> &ids,

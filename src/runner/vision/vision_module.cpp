@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -728,6 +729,10 @@ bool VisionModule::Init(VLMType type,
                         "|ps=" + std::to_string(patch_size_) +
                         "|fps=" + std::to_string(fps_) +
                         "|tps=" + std::to_string(tokens_per_second_);
+    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) {
+        cache_key_prefix_ += "|resize=pillow_bicubic";
+    }
+    cache_key_prefix_ += "|bf16=rn_even";
 
     // Sanity checks after auto inference.
     if (vision_width_ <= 0 || vision_height_ <= 0) {
@@ -867,7 +872,7 @@ static bool encode_block_normalized_float(ax_runner_t& enc, int devid, int out_i
         std::vector<float> tmp(elem_count);
         if (out0.pVirAddr) std::memcpy(tmp.data(), out0.pVirAddr, (size_t)elem_count * sizeof(float));
         else v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
-        for (int i = 0; i < elem_count; ++i) out_bf16[i] = bfloat16(tmp[i]).data;
+        for (int i = 0; i < elem_count; ++i) out_bf16[i] = fp32_to_bfloat16_rne(tmp[i]);
     }
     return true;
 }
@@ -935,7 +940,7 @@ static bool encode_block_u8(ax_runner_t& enc, int devid, int out_is_bf16,
         } else {
             v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
         }
-        for (int i = 0; i < elem_count; ++i) out_bf16[i] = bfloat16(tmp[i]).data;
+        for (int i = 0; i < elem_count; ++i) out_bf16[i] = fp32_to_bfloat16_rne(tmp[i]);
     }
 
     if (deepstack_out && deepstack_layers > 0) {
@@ -1055,7 +1060,7 @@ static bool encode_classic_image(ax_runner_t& enc, int devid, int out_is_bf16, i
 
     std::vector<float> tmp(elem_count);
     v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
-    for (int i = 0; i < elem_count; ++i) out_bf16[i] = bfloat16(tmp[i]).data;
+    for (int i = 0; i < elem_count; ++i) out_bf16[i] = fp32_to_bfloat16_rne(tmp[i]);
     return true;
 }
 
@@ -1397,6 +1402,17 @@ bool VisionModule::BuildInjectionState(const std::vector<int>& input_ids,
             if (v.size() != total_elems) {
                 err = "deepstack feature size mismatch";
                 return false;
+            }
+        }
+
+        // Match python reference: deepstack visual embeds are cast to bf16 before injection.
+        for (auto& v : state_out.deepstack_features) {
+            for (size_t i = 0; i < v.size(); ++i) {
+                const unsigned short bf = fp32_to_bfloat16_rne(v[i]);
+                std::uint32_t proc = (std::uint32_t)bf << 16;
+                float fp32;
+                std::memcpy(&fp32, &proc, sizeof(fp32));
+                v[i] = fp32;
             }
         }
     }

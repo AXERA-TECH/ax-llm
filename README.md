@@ -28,6 +28,7 @@
 #### VLM（多模态）
 - Qwen3-VL-2B-Instruct
 - Qwen3.5-2B
+- Qwen3-VL-Embedding-2B（Embedding，多模态）
 - SmolVLM2-500M-Video-Instruct
 - FastVLM-1.5B-GPTQ-Int4
 - InternVL3_5-1B-GPTQ-INT4
@@ -188,6 +189,18 @@ curl -s http://127.0.0.1:8000/v1/embeddings \
 ```
 
 也可参考 Python 示例：`python3 scripts/openai_embedding_demo.py --model <model_name> --api_url http://127.0.0.1:8000/v1`（需先 `pip install openai`）。
+
+#### 多模态 Embedding（messages 扩展）
+
+对于支持视觉输入的 Embedding 模型（如 `Qwen3-VL-Embedding-2B`），`/v1/embeddings` 额外支持传入 `messages`（格式与 `/v1/chat/completions` 相同），从而实现图文 embedding：
+
+```shell
+python3 scripts/openai_vl_embedding_demo.py \
+  --model <model_name> \
+  --api_url http://127.0.0.1:8000/v1 \
+  --image /path/to/image.jpg \
+  --text "Describe this image"
+```
 
 ## 运行示例
 ### 命令行对话

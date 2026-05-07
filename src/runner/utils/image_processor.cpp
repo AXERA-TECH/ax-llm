@@ -2,10 +2,229 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 #include "files.hpp"
+
+namespace {
+
+// A minimal Pillow-compatible bicubic resizer for uint8 RGB images.
+// Matches Pillow's `Image.resize(..., Image.Resampling.BICUBIC)` implementation (Pillow 12.x)
+// based on src/libImaging/Resample.c.
+//
+// This exists because OpenCV's INTER_CUBIC differs from Pillow's bicubic kernel/rounding,
+// and Qwen3-VL embedding alignment is sensitive to those small pixel-level differences.
+struct PillowAxisCoeffs
+{
+    int ksize = 0;
+    std::vector<int> bounds;         // [outSize * 2] => xmin, count
+    std::vector<int32_t> coeffs_int; // [outSize * ksize], fixed-point normalized
+};
+
+constexpr int kPillowPrecisionBits = 22; // 32 - 8 - 2
+
+static inline double pillow_bicubic_filter(double x)
+{
+    // https://en.wikipedia.org/wiki/Bicubic_interpolation#Bicubic_convolution_algorithm
+    constexpr double a = -0.5;
+    if (x < 0.0) x = -x;
+    if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+    return 0.0;
+}
+
+static inline uint8_t pillow_clip8(int in)
+{
+    // Equivalent to Pillow's lookup-table clip8(in >> PRECISION_BITS).
+    const int v = in >> kPillowPrecisionBits;
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+}
+
+static bool pillow_precompute_axis_coeffs(int inSize, int outSize, PillowAxisCoeffs& out)
+{
+    if (inSize <= 0 || outSize <= 0) return false;
+
+    const double in0 = 0.0;
+    const double in1 = (double)inSize;
+    double filterscale = (in1 - in0) / (double)outSize;
+    const double scale = filterscale;
+    if (filterscale < 1.0) filterscale = 1.0;
+
+    const double support = 2.0 * filterscale; // bicubic support is 2.0
+    const int ksize = (int)std::ceil(support) * 2 + 1;
+    if (ksize <= 0) return false;
+
+    out.ksize = ksize;
+    out.bounds.assign((size_t)outSize * 2, 0);
+    out.coeffs_int.assign((size_t)outSize * (size_t)ksize, 0);
+
+    const double ss = 1.0 / filterscale;
+    const double fixed_scale = (double)(1u << kPillowPrecisionBits);
+
+    std::vector<double> tmp((size_t)ksize, 0.0);
+
+    for (int xx = 0; xx < outSize; ++xx)
+    {
+        const double center = in0 + (xx + 0.5) * scale;
+        double ww = 0.0;
+
+        // Round the value (matches Pillow's (int)(... + 0.5) cast behavior).
+        int xmin = (int)(center - support + 0.5);
+        if (xmin < 0) xmin = 0;
+
+        int xmax = (int)(center + support + 0.5);
+        if (xmax > inSize) xmax = inSize;
+        xmax -= xmin; // convert to count
+        if (xmax < 0) xmax = 0;
+        if (xmax > ksize) xmax = ksize;
+
+        std::fill(tmp.begin(), tmp.end(), 0.0);
+        for (int x = 0; x < xmax; ++x)
+        {
+            const double w = pillow_bicubic_filter((x + xmin - center + 0.5) * ss);
+            tmp[(size_t)x] = w;
+            ww += w;
+        }
+
+        if (ww != 0.0)
+        {
+            for (int x = 0; x < xmax; ++x) tmp[(size_t)x] /= ww;
+        }
+
+        out.bounds[(size_t)xx * 2 + 0] = xmin;
+        out.bounds[(size_t)xx * 2 + 1] = xmax;
+
+        int32_t* dst = out.coeffs_int.data() + (size_t)xx * (size_t)ksize;
+        for (int x = 0; x < ksize; ++x)
+        {
+            const double v = tmp[(size_t)x] * fixed_scale;
+            if (tmp[(size_t)x] < 0.0) dst[x] = (int32_t)(-0.5 + v);
+            else dst[x] = (int32_t)(0.5 + v);
+        }
+    }
+
+    return true;
+}
+
+static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<unsigned char>& output_rgb, int dst_w, int dst_h)
+{
+    const int src_w = axcv::width(src_bgr);
+    const int src_h = axcv::height(src_bgr);
+    const int channels = axcv::channels(src_bgr);
+    if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 || channels <= 0 || axcv::empty(src_bgr)) {
+        return false;
+    }
+
+    // Fast path: no resize needed, just BGR->RGB.
+    if (src_w == dst_w && src_h == dst_h)
+    {
+        output_rgb.resize((size_t)dst_w * (size_t)dst_h * 3);
+        for (int y = 0; y < src_h; ++y)
+        {
+            const uint8_t* sp = axcv::row_ptr(src_bgr, y);
+            uint8_t* dp = output_rgb.data() + (size_t)y * (size_t)dst_w * 3;
+            for (int x = 0; x < dst_w; ++x)
+            {
+                const uint8_t* px = sp + (size_t)x * (size_t)channels;
+                dp[3 * x + 0] = px[2];
+                dp[3 * x + 1] = px[1];
+                dp[3 * x + 2] = px[0];
+            }
+        }
+        return true;
+    }
+
+    // Convert to Pillow-like RGBX (4 bytes per pixel, X=0) for bit-exact resampling.
+    const int src_step = src_w * 4;
+    std::vector<uint8_t> src_rgbx((size_t)src_h * (size_t)src_step);
+    for (int y = 0; y < src_h; ++y)
+    {
+        const uint8_t* sp = axcv::row_ptr(src_bgr, y);
+        uint8_t* dp = src_rgbx.data() + (size_t)y * (size_t)src_step;
+        for (int x = 0; x < src_w; ++x)
+        {
+            const uint8_t* px = sp + (size_t)x * (size_t)channels;
+            dp[4 * x + 0] = px[2]; // R
+            dp[4 * x + 1] = px[1]; // G
+            dp[4 * x + 2] = px[0]; // B
+            dp[4 * x + 3] = 0;     // X
+        }
+    }
+
+    PillowAxisCoeffs xcoeff, ycoeff;
+    if (!pillow_precompute_axis_coeffs(src_w, dst_w, xcoeff)) return false;
+    if (!pillow_precompute_axis_coeffs(src_h, dst_h, ycoeff)) return false;
+
+    // Horizontal pass: [src_h, dst_w, 4]
+    const int tmp_step = dst_w * 4;
+    std::vector<uint8_t> tmp_rgbx((size_t)src_h * (size_t)tmp_step, 0);
+    for (int yy = 0; yy < src_h; ++yy)
+    {
+        const uint8_t* row = src_rgbx.data() + (size_t)yy * (size_t)src_step;
+        uint8_t* out_row = tmp_rgbx.data() + (size_t)yy * (size_t)tmp_step;
+        for (int xx = 0; xx < dst_w; ++xx)
+        {
+            const int xmin = xcoeff.bounds[(size_t)xx * 2 + 0];
+            const int xmax = xcoeff.bounds[(size_t)xx * 2 + 1];
+            const int32_t* k = xcoeff.coeffs_int.data() + (size_t)xx * (size_t)xcoeff.ksize;
+
+            int ss0 = 1 << (kPillowPrecisionBits - 1);
+            int ss1 = 1 << (kPillowPrecisionBits - 1);
+            int ss2 = 1 << (kPillowPrecisionBits - 1);
+            for (int x = 0; x < xmax; ++x)
+            {
+                const int sx = x + xmin;
+                const uint8_t* px = row + (size_t)sx * 4;
+                const int32_t kw = k[x];
+                ss0 += (int)px[0] * kw;
+                ss1 += (int)px[1] * kw;
+                ss2 += (int)px[2] * kw;
+            }
+            out_row[4 * xx + 0] = pillow_clip8(ss0);
+            out_row[4 * xx + 1] = pillow_clip8(ss1);
+            out_row[4 * xx + 2] = pillow_clip8(ss2);
+            out_row[4 * xx + 3] = 0;
+        }
+    }
+
+    // Vertical pass -> RGB output [dst_h, dst_w, 3]
+    output_rgb.resize((size_t)dst_h * (size_t)dst_w * 3);
+    for (int yy = 0; yy < dst_h; ++yy)
+    {
+        const int ymin = ycoeff.bounds[(size_t)yy * 2 + 0];
+        const int ymax = ycoeff.bounds[(size_t)yy * 2 + 1];
+        const int32_t* k = ycoeff.coeffs_int.data() + (size_t)yy * (size_t)ycoeff.ksize;
+
+        uint8_t* out_row = output_rgb.data() + (size_t)yy * (size_t)dst_w * 3;
+        for (int xx = 0; xx < dst_w; ++xx)
+        {
+            int ss0 = 1 << (kPillowPrecisionBits - 1);
+            int ss1 = 1 << (kPillowPrecisionBits - 1);
+            int ss2 = 1 << (kPillowPrecisionBits - 1);
+            for (int y = 0; y < ymax; ++y)
+            {
+                const uint8_t* row = tmp_rgbx.data() + (size_t)(y + ymin) * (size_t)tmp_step;
+                const uint8_t* px = row + (size_t)xx * 4;
+                const int32_t kw = k[y];
+                ss0 += (int)px[0] * kw;
+                ss1 += (int)px[1] * kw;
+                ss2 += (int)px[2] * kw;
+            }
+            out_row[3 * xx + 0] = pillow_clip8(ss0);
+            out_row[3 * xx + 1] = pillow_clip8(ss1);
+            out_row[3 * xx + 2] = pillow_clip8(ss2);
+        }
+    }
+
+    return true;
+}
+
+} // namespace
 
 std::vector<axcv::Mat> ReadImages(const std::string& path) {
     std::vector<axcv::Mat> src;
@@ -45,20 +264,15 @@ int Qwen2VideoProcessor(std::vector<axcv::Mat>& src,
                         int patch_size) {
     if (src.empty()) return 0;
 
-    std::vector<axcv::Mat> imgs_resized;
+    std::vector<std::vector<unsigned char>> imgs_resized;
     imgs_resized.reserve(src.size());
 
     for (auto& img : src) {
-        axcv::Mat img_rs;
-        if (axcv::width(img) != tgt_w || axcv::height(img) != tgt_h) {
-            axcv::resize(img, img_rs, tgt_w, tgt_h);
-        } else {
-            img_rs = img;
+        std::vector<unsigned char> rgb;
+        if (!pillow_resize_bgr_to_rgb_u8(img, rgb, tgt_w, tgt_h)) {
+            return 0;
         }
-        axcv::Mat rgb;
-        axcv::cvtColorBGR2RGB(img_rs, rgb);
-        img_rs = std::move(rgb);
-        imgs_resized.push_back(img_rs);
+        imgs_resized.push_back(std::move(rgb));
     }
 
     if (imgs_resized.empty()) return 0;
@@ -70,17 +284,13 @@ int Qwen2VideoProcessor(std::vector<axcv::Mat>& src,
         }
     }
 
-    const int channel = axcv::channels(imgs_resized[0]); // 3
+    const int channel = 3;
     std::vector<unsigned char> patches;
     patches.resize(imgs_resized.size() * (size_t)tgt_w * (size_t)tgt_h * (size_t)channel);
-    // Pack to contiguous [T, H, W, C] regardless of backend stride.
     for (size_t i = 0; i < imgs_resized.size(); ++i) {
-        const auto& m = imgs_resized[i];
+        const auto& rgb = imgs_resized[i];
         unsigned char* dst = patches.data() + i * (size_t)tgt_w * (size_t)tgt_h * (size_t)channel;
-        for (int r = 0; r < tgt_h; ++r) {
-            const uint8_t* sp = axcv::row_ptr(m, r);
-            std::memcpy(dst + (size_t)r * (size_t)tgt_w * (size_t)channel, sp, (size_t)tgt_w * (size_t)channel);
-        }
+        std::memcpy(dst, rgb.data(), (size_t)tgt_w * (size_t)tgt_h * (size_t)channel);
     }
 
     const int grid_t = (int)imgs_resized.size() / temporal_patch_size;

@@ -81,6 +81,19 @@ const ax_runner_tensor_t *try_get_group_input_tensor(RunnerT &runner, int grpid,
     return nullptr;
 }
 
+template <typename RunnerT>
+const ax_runner_tensor_t *try_get_output_tensor(RunnerT &runner, const std::string &name)
+{
+    try
+    {
+        return &runner.get_output(name);
+    }
+    catch (...)
+    {
+    }
+    return nullptr;
+}
+
 static inline std::string safe_decode_token(const std::shared_ptr<BaseTokenizer> &tokenizer, int token_id)
 {
     if (!tokenizer)
@@ -422,6 +435,27 @@ struct LLM::Impl {
         const int idx = group_index_by_gid(prefill_grpids_, gid);
         if (idx < 0 || idx >= (int)prefill_symbolic_kv_cache_num_grp.size()) return -1;
         return prefill_symbolic_kv_cache_num_grp[(size_t)idx];
+    }
+
+    int prefill_history_capacity_by_mask(int prefill_grpid)
+    {
+        if (_attr.prefill_token_num <= 0) return -1;
+        if (cache_ref_full_layer_idx < 0 || cache_ref_full_layer_idx >= _attr.axmodel_num) return -1;
+        try
+        {
+            const auto &mask_t = llama_layers[(size_t)cache_ref_full_layer_idx].layer.get_input(prefill_grpid, "mask");
+            const int mask_elems = (int)((size_t)mask_t.nSize / sizeof(unsigned short));
+            if (mask_elems <= 0) return -1;
+            if ((mask_elems % _attr.prefill_token_num) != 0) return -1;
+            const int cols = mask_elems / _attr.prefill_token_num;
+            const int kv_from_mask = cols - _attr.prefill_token_num;
+            if (kv_from_mask < 0) return -1;
+            return kv_from_mask;
+        }
+        catch (...)
+        {
+        }
+        return -1;
     }
 
     int choose_prefill_gid(int needed_tokens) const
@@ -1164,6 +1198,20 @@ struct LLM::Impl {
             return true;
         }
 
+        // Debug: print token ids for alignment checks (opt-in via env var).
+        // Useful when aligning embedding outputs against Python reference scripts.
+        if (std::getenv("AXLLM_DEBUG_EMBED_TOKEN_IDS"))
+        {
+            std::string s;
+            s.reserve(token_ids.size() * 8);
+            for (size_t i = 0; i < token_ids.size(); ++i)
+            {
+                if (i) s.push_back(',');
+                s += std::to_string(token_ids[i]);
+            }
+            ALOGI("EmbedTokens token_ids(len=%zu): %s", token_ids.size(), s.c_str());
+        }
+
         const int input_embed_num = (int)token_ids.size();
         if (_attr.prefill_token_num <= 0 || _attr.tokens_embed_size <= 0 || _attr.kv_cache_size <= 0)
         {
@@ -1173,34 +1221,49 @@ struct LLM::Impl {
 
         const int prefill_split_num = (int)std::ceil((double)input_embed_num / (double)_attr.prefill_token_num);
 
-        const int prefill_grpid = select_stateless_prefill_group(input_embed_num);
-        const int kv_cache_num = prefill_history_capacity_by_gid(prefill_grpid);
-        if (prefill_grpid < 0 || kv_cache_num <= 0)
-        {
-            ALOGE("invalid prefill_grpid=%d", prefill_grpid);
-            return false;
-        }
+        // Stateless embedding: clear all KV caches once to avoid group-specific assumptions (e.g. gid=1 may have history_cap=0).
+        clear_all_group_kv_cache_tensors();
 
-        // Clear KV caches for this run (embedding is stateless).
-        for (int i = 0; i < _attr.axmodel_num; i++)
+        std::vector<int> prefill_grp_list;
+        prefill_grp_list.resize(prefill_split_num, -1);
+        for (int p = 0; p < prefill_split_num; ++p)
         {
-            auto &lyr = llama_layers[i];
-            const int devid = LLM_DEVID(lyr);
-            const auto &k = lyr.layer.get_input(prefill_grpid, "K_cache");
-            const auto &v = lyr.layer.get_input(prefill_grpid, "V_cache");
-            llm_memset(LLM_WADDR(k), 0, (size_t)k.nSize, devid);
-            llm_memset(LLM_WADDR(v), 0, (size_t)v.nSize, devid);
+            const int history_len = p * _attr.prefill_token_num;
+            const int chunk_tokens = (p == prefill_split_num - 1) ? (input_embed_num - p * _attr.prefill_token_num) : _attr.prefill_token_num;
+            const bool prefer_symbolic_group = has_vision_state && history_len > 0;
+            const int gid = select_prefill_group(history_len, chunk_tokens, prefer_symbolic_group);
+            if (gid < 0)
+            {
+                ALOGE("failed to select prefill group for embedding: history_len=%d chunk_tokens=%d", history_len, chunk_tokens);
+                return false;
+            }
+            prefill_grp_list[p] = gid;
         }
 
         std::vector<unsigned short> all_embed((size_t)input_embed_num * (size_t)_attr.tokens_embed_size);
         for (int i = 0; i < input_embed_num; i++)
         {
+            if (has_vision_state &&
+                (size_t)i < vision_state.pos2vision.size() &&
+                vision_state.pos2vision[(size_t)i] >= 0 &&
+                !vision_state.vision_embed.empty())
+            {
+                const int vidx = vision_state.pos2vision[(size_t)i];
+                const size_t src_off = (size_t)vidx * (size_t)_attr.tokens_embed_size;
+                if (src_off + (size_t)_attr.tokens_embed_size <= vision_state.vision_embed.size())
+                {
+                    std::memcpy(all_embed.data() + (size_t)i * (size_t)_attr.tokens_embed_size,
+                                vision_state.vision_embed.data() + src_off,
+                                (size_t)_attr.tokens_embed_size * sizeof(unsigned short));
+                    continue;
+                }
+            }
             embed_selector.getByIndex((unsigned int)token_ids[(size_t)i], all_embed.data() + (size_t)i * (size_t)_attr.tokens_embed_size);
         }
 
         std::vector<unsigned short> last_hidden((size_t)_attr.tokens_embed_size, 0);
         std::vector<unsigned short> embed_tmp((size_t)_attr.prefill_token_num * (size_t)_attr.tokens_embed_size, 0);
-        std::vector<unsigned short> mask_tmp((size_t)_attr.prefill_token_num * (size_t)(kv_cache_num + _attr.prefill_token_num), bfloat16(-65536.f).data);
+        std::vector<unsigned short> mask_tmp;
 
         for (int p = 0; p < prefill_split_num; p++)
         {
@@ -1209,6 +1272,17 @@ struct LLM::Impl {
             const int history_len = p * _attr.prefill_token_num;
             const int input_num_token = (p == prefill_split_num - 1) ? (input_embed_num - p * _attr.prefill_token_num) : _attr.prefill_token_num;
 
+            const int prefill_grpid = prefill_grp_list[p];
+            int kv_cache_num = prefill_history_capacity_by_gid(prefill_grpid);
+            const int kv_from_mask = prefill_history_capacity_by_mask(prefill_grpid);
+            if (kv_from_mask >= 0) kv_cache_num = kv_from_mask;
+            if (kv_cache_num < 0)
+            {
+                ALOGE("invalid kv_cache_num=%d for prefill_grpid=%d", kv_cache_num, prefill_grpid);
+                return false;
+            }
+
+            mask_tmp.assign((size_t)_attr.prefill_token_num * (size_t)(kv_cache_num + _attr.prefill_token_num), bfloat16(-65536.f).data);
             build_prefill_mask(mask_tmp, kv_cache_num, _attr.prefill_token_num, history_len, input_num_token);
 
             std::fill(embed_tmp.begin(), embed_tmp.end(), 0);
@@ -1227,7 +1301,40 @@ struct LLM::Impl {
                 const auto &t_idx = lyr.layer.get_input(prefill_grpid, "indices");
                 unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr;
                 std::memset(idx_ptr, 0, (size_t)t_idx.nSize);
-                fill_indices(idx_ptr, history_len, _attr.prefill_token_num);
+                {
+                    const int start_pos = history_len;
+                    const int idx_elems = (int)(t_idx.nSize / (int)sizeof(unsigned int));
+                    int idx_rows = _attr.prefill_token_num > 0 ? (idx_elems / _attr.prefill_token_num) : 1;
+                    if (idx_rows <= 0) idx_rows = 1;
+
+                    const bool use_pos_ids = has_vision_state &&
+                                             idx_rows >= 3 &&
+                                             vision_state.position_ids.size() >= 3 &&
+                                             !vision_state.position_ids.empty();
+
+                    // Some models (e.g. Qwen-VL mRoPE) use multi-row indices. For multimodal embedding,
+                    // use vision_state.position_ids when available; otherwise fill sequential positions.
+                    for (int r = 0; r < idx_rows; ++r)
+                    {
+                        for (int j = 0; j < input_num_token; ++j)
+                        {
+                            unsigned int v = (unsigned int)(start_pos + j);
+                            if (use_pos_ids)
+                            {
+                                if ((size_t)r < vision_state.position_ids.size())
+                                {
+                                    const auto &row = vision_state.position_ids[(size_t)r];
+                                    const int abs_pos = start_pos + j;
+                                    if ((size_t)abs_pos < row.size())
+                                    {
+                                        v = (unsigned int)row[(size_t)abs_pos];
+                                    }
+                                }
+                            }
+                            idx_ptr[(size_t)r * (size_t)_attr.prefill_token_num + (size_t)j] = v;
+                        }
+                    }
+                }
                 llm_h2d(LLM_WADDR(t_idx), idx_ptr, (size_t)t_idx.nSize, devid);
 
                 // mask
@@ -1254,6 +1361,33 @@ struct LLM::Impl {
                 // output -> embed_tmp for next layer
                 const auto &t_out = lyr.layer.get_output(prefill_grpid, "output");
                 llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), std::min((size_t)t_out.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
+
+                // Qwen3-VL deepstack injection (vision tokens only).
+                if (has_vision_state &&
+                    !vision_state.deepstack_features.empty() &&
+                    (size_t)m < vision_state.deepstack_features.size() &&
+                    !vision_state.deepstack_features[m].empty())
+                {
+                    const int start_pos = history_len;
+                    const int emb_sz = _attr.tokens_embed_size;
+                    const auto &feat = vision_state.deepstack_features[m];
+                    for (int j = 0; j < input_num_token; ++j)
+                    {
+                        const int abs_pos = start_pos + j;
+                        if ((size_t)abs_pos >= vision_state.pos2vision.size()) continue;
+                        const int vidx = vision_state.pos2vision[(size_t)abs_pos];
+                        if (vidx < 0) continue;
+
+                        const float *fv = feat.data() + (size_t)vidx * (size_t)emb_sz;
+                        unsigned short *ev = embed_tmp.data() + (size_t)j * (size_t)emb_sz;
+                        for (int di = 0; di < emb_sz; ++di)
+                        {
+                            unsigned int tmp_bf16 = ((unsigned int)ev[di]) << 16;
+                            float fp32 = *reinterpret_cast<float *>(&tmp_bf16);
+                            ev[di] = fp32_to_bfloat16_rne(fp32 + fv[di]);
+                        }
+                    }
+                }
             }
 
             if (p == prefill_split_num - 1)
@@ -1268,14 +1402,108 @@ struct LLM::Impl {
             }
         }
 
-        // For now, use last hidden state directly as embeddings (common for Qwen3-Embedding).
+        // Prefer post-process normalized output when available (e.g. Qwen3-VL-Embedding post exposes `output_norm`).
+        // Otherwise fall back to the last hidden state directly.
+        std::vector<unsigned short> embed_bf16 = last_hidden;
+
+        const ax_runner_tensor_t *t_post_out = nullptr;
+        const ax_runner_tensor_t *t_out_norm = try_get_output_tensor(llama_post, "output_norm");
+        if (t_out_norm && (size_t)t_out_norm->nSize == (size_t)_attr.tokens_embed_size * sizeof(unsigned short))
+        {
+            t_post_out = t_out_norm;
+        }
+        else
+        {
+            const ax_runner_tensor_t *t_out = try_get_output_tensor(llama_post, "output");
+            if (t_out && (size_t)t_out->nSize == (size_t)_attr.tokens_embed_size * sizeof(unsigned short))
+            {
+                t_post_out = t_out;
+            }
+        }
+
+        if (t_post_out)
+        {
+            const auto &t_in = llama_post.get_input("input");
+            llm_h2d(LLM_WADDR(t_in),
+                    last_hidden.data(),
+                    std::min((size_t)t_in.nSize, last_hidden.size() * sizeof(unsigned short)),
+                    llama_post.get_devid());
+            llama_post.inference();
+
+            std::vector<unsigned short> post_out((size_t)_attr.tokens_embed_size);
+            llm_d2h(post_out.data(),
+                    LLM_RADDR(*t_post_out),
+                    std::min((size_t)t_post_out->nSize, post_out.size() * sizeof(unsigned short)),
+                    llama_post.get_devid());
+            embed_bf16 = std::move(post_out);
+        }
+
         out_embedding.resize((size_t)_attr.tokens_embed_size);
         for (int i = 0; i < _attr.tokens_embed_size; i++)
         {
-            out_embedding[(size_t)i] = bfloat16(last_hidden[(size_t)i]).fp32();
+            out_embedding[(size_t)i] = bfloat16(embed_bf16[(size_t)i]).fp32();
         }
         out_embedding = l2norm(std::move(out_embedding));
         return true;
+    }
+
+    bool EmbedHistory(const std::vector<Content> &history_in,
+                      const std::vector<::MediaInputs> &media_inputs,
+                      std::vector<float> &out_embedding)
+    {
+        if (!tokenizer)
+        {
+            ALOGE("LLM not initialized");
+            return false;
+        }
+
+        has_vision_state = false;
+        vision_state = {};
+
+        std::vector<int> token_ids;
+        if (vision && vision->enabled())
+        {
+            if (!media_inputs.empty())
+            {
+                std::vector<vision::MediaInputs> vmins;
+                vmins.reserve(media_inputs.size());
+                for (const auto &m : media_inputs) vmins.push_back({m.content_index, m.uris});
+
+                std::vector<Content> prepared_history;
+                vision::RunState st;
+                std::string verr;
+                if (!vision->Prepare(history_in, vmins, prepared_history, token_ids, st, verr))
+                {
+                    ALOGE("vision.Prepare failed: %s", verr.c_str());
+                    return false;
+                }
+                (void)prepared_history;
+                vision_state = std::move(st);
+                has_vision_state = true;
+            }
+            else
+            {
+                token_ids = tokenizer->encode(history_in);
+            }
+        }
+        else
+        {
+            token_ids = tokenizer->encode(history_in);
+        }
+
+        // Align with Python reference implementations for Qwen3/Qwen3-VL embedding models:
+        // they include the final pad/end-of-text token (151643) as the pooled position.
+        if (embedding_append_eos && embedding_eos_token_id >= 0)
+        {
+            token_ids.push_back(embedding_eos_token_id);
+        }
+
+        const bool ok = EmbedTokens(token_ids, out_embedding);
+
+        has_vision_state = false;
+        vision_state = {};
+
+        return ok;
     }
 
     bool EmbedText(const std::string &text, std::vector<float> &out_embedding)
@@ -1323,9 +1551,11 @@ struct LLM::Impl {
 
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
         const int prefill_grpid = select_stateless_prefill_group(input_embed_num);
-        const int kv_cache_num = prefill_history_capacity_by_gid(prefill_grpid);
+        int kv_cache_num = prefill_history_capacity_by_gid(prefill_grpid);
+        const int kv_from_mask = prefill_history_capacity_by_mask(prefill_grpid);
+        if (kv_from_mask >= 0) kv_cache_num = kv_from_mask;
         ALOGI("input token num : %d, prefill_split_num : %d prefill_grpid : %d kv_cache_num:%d", input_embed_num, prefill_split_num, prefill_grpid, kv_cache_num);
-        if (prefill_grpid < 0 || kv_cache_num <= 0)
+        if (prefill_grpid < 0 || kv_cache_num < 0)
         {
             ALOGE("invalid prefill_grpid=%d", prefill_grpid);
             return -1;
@@ -1814,7 +2044,7 @@ struct LLM::Impl {
                         {
                             unsigned int tmp_bf16 = ((unsigned int)ev[di]) << 16;
                             float fp32 = *reinterpret_cast<float *>(&tmp_bf16);
-                            ev[di] = bfloat16(fp32 + fv[di]).data;
+                            ev[di] = fp32_to_bfloat16_rne(fp32 + fv[di]);
                         }
                     }
                 }
@@ -2216,6 +2446,7 @@ LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
+bool LLM::Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding) { return impl_->EmbedHistory(history, media_inputs, out_embedding); }
 bool LLM::EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings) { return impl_->EmbedBatch(inputs, out_embeddings); }
 
 int LLM::GenerateKVCachePrefill(std::vector<int> &ids, std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int &pre_len) { return impl_->GenerateKVCachePrefill(ids, k, v, pre_len); }

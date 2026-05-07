@@ -954,23 +954,23 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         history.push_back(content);
     }
 
-        for (auto &content : history)
+    for (const auto &content : history)
+    {
+        switch (content.role)
         {
-            switch (content.role)
-            {
-            case SYSTEM:
-                axllm::Logger::print_chat_role("system", axllm::TextColor::Yellow, content.data);
-                break;
-            case USER:
-                axllm::Logger::print_chat_role("user", axllm::TextColor::Green, content.data);
-                break;
-            case ASSISTANT:
-                axllm::Logger::print_chat_role("assistant", axllm::TextColor::Default, content.data);
-                break;
-            default:
-                break;
-            }
+        case SYSTEM:
+            axllm::Logger::print_chat_role("system", axllm::TextColor::Yellow, content.data);
+            break;
+        case USER:
+            axllm::Logger::print_chat_role("user", axllm::TextColor::Green, content.data);
+            break;
+        case ASSISTANT:
+            axllm::Logger::print_chat_role("assistant", axllm::TextColor::Default, content.data);
+            break;
+        default:
+            break;
         }
+    }
 
     return true;
 }
@@ -1037,6 +1037,39 @@ int run_server_mode(const ModelConfig &config, int port)
 
             if (!req.encoding_format.empty() && req.encoding_format != "float") {
                 ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
+            }
+
+            // vLLM-style extension: allow `messages` (including multimodal image/video parts) for embeddings.
+            // When `messages` is provided, it takes precedence over `input`.
+            if (req.raw.contains("messages") && req.raw["messages"].is_array())
+            {
+                std::vector<Content> history;
+                std::vector<MediaInputs> media_inputs;
+                std::vector<std::string> temp_files;
+                if (!handle_api_messages(req.raw["messages"], history, &media_inputs, &temp_files))
+                {
+                    ALOGE("handle_api_messages failed for embeddings messages");
+                    cleanup_temp_files(temp_files);
+                    provider->end();
+                    return;
+                }
+
+                std::vector<float> embedding;
+                if (!llm.Embed(history, media_inputs, embedding))
+                {
+                    ALOGE("Embed(messages) failed");
+                    cleanup_temp_files(temp_files);
+                    provider->end();
+                    return;
+                }
+                cleanup_temp_files(temp_files);
+
+                std::vector<std::vector<float>> embeds;
+                embeds.push_back(std::move(embedding));
+                auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
+                provider->push(chunk);
+                provider->end();
+                return;
             }
 
             std::vector<std::vector<float>> embeds;

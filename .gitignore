@@ -8,3 +8,10 @@ tools/test.cpp
 qtproj/LLM-Chat/CMakeLists.txt.user
 axcl
 scripts/windows_axcl_mingw_validate.sh
+
+# Local-only work files (keep repo clean)
+device.md
+scripts/__pycache__/
+scripts/cert.pem
+scripts/key.pem
+scripts/output.wav

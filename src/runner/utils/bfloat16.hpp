@@ -1,4 +1,9 @@
 #pragma once
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <utility>
 #include <vector>
 
 struct bfloat16
@@ -41,6 +46,14 @@ public:
         return *this;
     }
 };
+
+static inline unsigned short fp32_to_bfloat16_rne(float float_val)
+{
+    std::uint32_t bits;
+    std::memcpy(&bits, &float_val, sizeof(bits));
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    return static_cast<unsigned short>(bits >> 16);
+}
 
 static std::vector<std::pair<int, float>> topk_bfloat16(unsigned short *arr, int size, int k)
 {
