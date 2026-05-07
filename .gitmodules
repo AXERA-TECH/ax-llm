@@ -1,9 +1,9 @@
 [submodule "third_party/tokenizer.axera"]
 	path = third_party/tokenizer.axera
-	url = https://github.com/ZHEQIUSHUI/tokenizer.axera
+	url = git@github.com:ZHEQIUSHUI/tokenizer.axera.git
 [submodule "third_party/openai-api.cpp"]
 	path = third_party/openai-api.cpp
-	url = https://github.com/ZHEQIUSHUI/openai-api.cpp
+	url = git@github.com:ZHEQIUSHUI/openai-api.cpp.git
 [submodule "third_party/SimpleCV"]
 	path = third_party/SimpleCV
-	url = https://github.com/ZHEQIUSHUI/SimpleCV.git
+	url = git@github.com:ZHEQIUSHUI/SimpleCV.git
