@@ -85,6 +85,8 @@ struct LLMAttrType {
     int vision_patch_size = 14;
     int vision_fps = 1;              // for qwen2.5-vl time scaling
     int vision_tokens_per_second = 1;
+    int vision_num_frames = 0;       // for frame-sampled video input
+    bool vision_do_sample_frames = true;
 
 #ifndef USE_AXCL
     bool b_use_mmap_load_layer = true;
@@ -112,6 +114,7 @@ public:
     LLaMaEmbedSelector *getEmbedSelector();
     void SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p);
     void ClearRequestSamplingOverride();
+    std::string GetLastError() const;
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
     bool EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings);

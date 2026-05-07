@@ -429,6 +429,8 @@ struct ModelConfig
             if (j.contains("vision_patch_size")) attr.vision_patch_size = j["vision_patch_size"].get<int>();
             if (j.contains("vision_fps")) attr.vision_fps = j["vision_fps"].get<int>();
             if (j.contains("vision_tokens_per_second")) attr.vision_tokens_per_second = j["vision_tokens_per_second"].get<int>();
+            if (j.contains("vision_num_frames")) attr.vision_num_frames = j["vision_num_frames"].get<int>();
+            if (j.contains("vision_do_sample_frames")) attr.vision_do_sample_frames = j["vision_do_sample_frames"].get<bool>();
 
 #if USE_AXCL
             if (j.contains("devices"))
@@ -505,6 +507,64 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
     config.attr.filename_audio_encoder_axmodel_5s = resolve_path(model_path, config.attr.filename_audio_encoder_axmodel_5s);
     config.attr.filename_audio_encoder_axmodel_30s = resolve_path(model_path, config.attr.filename_audio_encoder_axmodel_30s);
     config.attr.vision_cache_dir = resolve_path(model_path, config.attr.vision_cache_dir);
+}
+
+static void load_gemma4_video_defaults(ModelConfig &config, const std::string &model_path)
+{
+    if (config.attr.vlm_type != VLMType::Gemma4VL || config.attr.vision_num_frames > 0)
+    {
+        return;
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    candidates.push_back(std::filesystem::path(model_path) / "processor_config.json");
+
+    std::error_code ec;
+    for (const auto &entry : std::filesystem::directory_iterator(model_path, ec))
+    {
+        if (ec) break;
+        if (!entry.is_directory(ec) || ec) continue;
+        candidates.push_back(entry.path() / "processor_config.json");
+    }
+
+    for (const auto &candidate : candidates)
+    {
+        if (!std::filesystem::is_regular_file(candidate, ec) || ec)
+        {
+            ec.clear();
+            continue;
+        }
+
+        try
+        {
+            std::ifstream file(candidate);
+            if (!file.is_open()) continue;
+
+            nlohmann::json j;
+            file >> j;
+            if (!j.contains("video_processor") || !j["video_processor"].is_object()) continue;
+
+            const auto &vp = j["video_processor"];
+            if (vp.contains("num_frames") && vp["num_frames"].is_number_integer())
+            {
+                config.attr.vision_num_frames = vp["num_frames"].get<int>();
+                ALOGI("Gemma4 video num_frames loaded from %s: %d",
+                      candidate.string().c_str(),
+                      config.attr.vision_num_frames);
+                return;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            ALOGW("Failed to read Gemma4 processor config %s: %s",
+                  candidate.string().c_str(),
+                  e.what());
+        }
+    }
+
+    config.attr.vision_num_frames = 32;
+    ALOGW("Gemma4 processor_config.json not found; fallback video num_frames=%d",
+          config.attr.vision_num_frames);
 }
 
 static std::string trim_copy(const std::string &s)
@@ -1355,11 +1415,13 @@ int run_server_mode(const ModelConfig &config, int port)
         }
 
         if (req.stream) {
-            auto callback = [provider, model_id = req.model](std::string str, float token_per_sec, void *reserve) {
+            bool streamed_any = false;
+            auto callback = [provider, model_id = req.model, &streamed_any](std::string str, float token_per_sec, void *reserve) {
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
                 }
+                if (!str.empty()) streamed_any = true;
                 auto chunk = openai_api::OutputChunk::TextDelta(str, model_id);
                 provider->push(chunk);
                 fprintf(stdout, "%s", str.c_str());
@@ -1369,12 +1431,25 @@ int run_server_mode(const ModelConfig &config, int port)
             llm.getAttr()->runing_callback = callback;
             if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
             else llm.Run(history, req.max_tokens);
+            const std::string llm_error = llm.GetLastError();
+            if (!llm_error.empty() && !streamed_any) {
+                ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
+                provider->push(openai_api::OutputChunk::TextDelta(llm_error, req.model));
+                provider->push(openai_api::OutputChunk::FinalText("", req.model));
+            }
         } else {
             llm.getAttr()->runing_callback = nullptr;
             auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, req.max_tokens) : llm.Run(history, req.max_tokens);
             std::string final_text;
             if (!out_history.empty() && out_history.back().role == ASSISTANT) {
                 final_text = out_history.back().data;
+            }
+            if (final_text.empty()) {
+                const std::string llm_error = llm.GetLastError();
+                if (!llm_error.empty()) {
+                    ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
+                    final_text = llm_error;
+                }
             }
             auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
             fprintf(stdout, "%s", final_text.c_str());
@@ -1530,6 +1605,7 @@ int main(int argc, char *argv[])
 
     // Resolve relative paths to absolute paths based on model_path
     resolve_config_paths(config, model_path);
+    load_gemma4_video_defaults(config, model_path);
 
     if (mode == "run")
     {

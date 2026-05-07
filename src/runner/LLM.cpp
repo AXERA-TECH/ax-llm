@@ -110,6 +110,27 @@ static inline std::string sanitize_utf8_text(const std::string &text)
     return filter.filter(text);
 }
 
+static inline bool same_history_content(const Content &lhs, const Content &rhs)
+{
+    return lhs.role == rhs.role &&
+           lhs.type == rhs.type &&
+           lhs.data == rhs.data;
+}
+
+static inline bool is_history_prefix(const std::vector<Content> &prefix, const std::vector<Content> &full)
+{
+    if (prefix.size() > full.size())
+        return false;
+
+    for (size_t i = 0; i < prefix.size(); ++i)
+    {
+        if (!same_history_content(prefix[i], full[i]))
+            return false;
+    }
+
+    return true;
+}
+
 static inline bool tokenizer_uses_hidden_channel_markup(const std::string &tokenizer_type)
 {
     return tokenizer_type == "Gemma4" || tokenizer_type == "Gemma4VL";
@@ -211,6 +232,7 @@ struct LLM::Impl {
     LLaMaEmbedSelector embed_selector;
     Gemma4PerLayerHelper gemma4_per_layer_helper;
 
+    std::vector<Content> last_history_snapshot;
     std::vector<int> last_tokens_ids;
     std::vector<int> run_input_token_ids;
     bool b_os_kvcache = false;
@@ -249,6 +271,37 @@ struct LLM::Impl {
     std::vector<int> prefill_grpids_;            // sorted by prefill capacity (ascending), aligns with _attr.prefill_max_kv_cache_num_grp
     std::atomic<bool> b_stop{false};
     LLMPostprocess postprocess;
+    std::string last_error_message;
+
+    static std::string context_limit_user_message()
+    {
+        return "当前会话上下文已超过该模型的长度上限，请使用 /clean 清空历史并重新开始对话。";
+    }
+
+    static std::string video_quality_reset_notice()
+    {
+        return "提示：为保证视频解析质量，本次视频请求已按新会话处理，未使用此前对话上下文。\n\n";
+    }
+
+    void clear_last_error()
+    {
+        last_error_message.clear();
+    }
+
+    void set_last_error(std::string message)
+    {
+        last_error_message = std::move(message);
+    }
+
+    void set_context_limit_error()
+    {
+        last_error_message = context_limit_user_message();
+    }
+
+    std::string get_last_error() const
+    {
+        return last_error_message;
+    }
 
     // ---- small helpers ----
     static int post_process(LLMPostprocess &postprocess, unsigned short *p, int n, std::vector<int> &history, float *val = 0)
@@ -1270,6 +1323,8 @@ struct LLM::Impl {
                               _attr.vision_patch_size,
                               _attr.vision_fps,
                               _attr.vision_tokens_per_second,
+                              _attr.vision_num_frames,
+                              _attr.vision_do_sample_frames,
                               _attr.filename_audio_encoder_axmodel_5s,
                               _attr.filename_audio_encoder_axmodel_30s,
                               verr))
@@ -1615,6 +1670,7 @@ struct LLM::Impl {
               prefer_symbolic_group ? 1 : 0);
         if (_attr.prefill_grpid < 0 || kv_cache_num <= 0)
         {
+            set_context_limit_error();
             ALOGE("invalid prefill_grpid=%d", _attr.prefill_grpid);
             return -1;
         }
@@ -1626,12 +1682,28 @@ struct LLM::Impl {
         remaining = ALIGN_DOWN(remaining, _attr.prefill_token_num);
         _attr.prefill_max_token_num = remaining;
         ALOGI("current prefill_max_token_num:%d", remaining);
-        if (_precompute_len > history_cap) { ALOGE("precompute_len(%d) > history_cap(%d)", _precompute_len, history_cap); return -1; }
-        if (_precompute_len + first_chunk_tokens > kv_cache_num) { ALOGE("precompute_len(%d) + first_chunk_tokens(%d) > kv_cache_num(%d)", _precompute_len, first_chunk_tokens, kv_cache_num); return -1; }
-        if (input_num_token > remaining) { ALOGE("input_num_token(%d) > prefill_max_token_num(%d)", input_num_token, remaining); return -1; }
+        if (_precompute_len > history_cap) {
+            set_context_limit_error();
+            ALOGE("precompute_len(%d) > history_cap(%d)", _precompute_len, history_cap);
+            return -1;
+        }
+        if (_precompute_len + first_chunk_tokens > kv_cache_num) {
+            set_context_limit_error();
+            ALOGE("precompute_len(%d) + first_chunk_tokens(%d) > kv_cache_num(%d)", _precompute_len, first_chunk_tokens, kv_cache_num);
+            return -1;
+        }
+        if (input_num_token > remaining) {
+            set_context_limit_error();
+            ALOGE("input_num_token(%d) > prefill_max_token_num(%d)", input_num_token, remaining);
+            return -1;
+        }
         if (_precompute_len == 0) { clear_all_group_kv_cache_tensors(); ALOGI("first run"); return 0; }
         if (!b_os_kvcache) return 0;
-        if (kv_k.size() != kv_v.size() || (int)kv_k.size() != _attr.axmodel_num) { ALOGE("kv cache size mismatch"); return -1; }
+        if (kv_k.size() != kv_v.size() || (int)kv_k.size() != _attr.axmodel_num) {
+            set_last_error("模型运行失败，请重新尝试。");
+            ALOGE("kv cache size mismatch");
+            return -1;
+        }
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
             auto &lyr  = llama_layers[i]; int devid = LLM_DEVID(lyr);
@@ -1647,7 +1719,11 @@ struct LLM::Impl {
             const int layer_kv = kv_cache_size_for_layer(m);
             const size_t kv_elems = (size_t)_precompute_len * (size_t)layer_kv;
             const size_t kv_bytes = kv_elems * sizeof(unsigned short);
-            if (kc.size() < kv_elems || vc.size() < kv_elems) { ALOGE("kv_cache buffer too small for layer %d", m); return -1; }
+            if (kc.size() < kv_elems || vc.size() < kv_elems) {
+                set_last_error("模型运行失败，请重新尝试。");
+                ALOGE("kv_cache buffer too small for layer %d", m);
+                return -1;
+            }
             auto &dk = lyr.layer.get_input(decode_grpid, "K_cache"); auto &dv = lyr.layer.get_input(decode_grpid, "V_cache");
             llm_h2d(LLM_WADDR(dk), kc.data(), kv_bytes, devid); llm_h2d(LLM_WADDR(dv), vc.data(), kv_bytes, devid);
             auto &pk = lyr.layer.get_input(_attr.prefill_grpid, "K_cache"); auto &pv = lyr.layer.get_input(_attr.prefill_grpid, "V_cache");
@@ -1658,7 +1734,7 @@ struct LLM::Impl {
 
     void ResetKVCache()
     {
-        last_tokens_ids.clear(); run_input_token_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0;
+        last_tokens_ids.clear(); last_history_snapshot.clear(); run_input_token_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0;
         decode_grpid = decode_grpids_.empty() ? 0 : decode_grpids_.back();
         _attr.prefill_grpid = prefill_grpids_.empty() ? 1 : prefill_grpids_.back();
         if (!_attr.prefill_max_kv_cache_num_grp.empty())
@@ -2408,9 +2484,18 @@ struct LLM::Impl {
 
     std::vector<Content> Run(std::vector<Content> history, const std::vector<::MediaInputs> &media_inputs, int output_max_token = -1)
     {
+        clear_last_error();
         has_vision_state = false;
 
+        const bool raw_history_not_append = !last_history_snapshot.empty() && !is_history_prefix(last_history_snapshot, history);
+        if (raw_history_not_append)
+        {
+            ALOGW("raw history not append. force ResetKVCache before request processing.");
+            ResetKVCache();
+        }
+
         std::vector<int> new_tokens;
+        std::string response_prefix;
 
         if (vision && vision->enabled())
         {
@@ -2421,14 +2506,52 @@ struct LLM::Impl {
                 vmins.reserve(media_inputs.size());
                 for (const auto &m : media_inputs) vmins.push_back({m.content_index, m.uris});
 
+                vision::PromptBudget budget;
+                budget.last_tokens = last_tokens_ids;
+                budget.precompute_len = precompute_len;
+                budget.prefill_token_num = _attr.prefill_token_num;
+                const int max_cap = !_attr.prefill_max_kv_cache_num_grp.empty()
+                                        ? _attr.prefill_max_kv_cache_num_grp.back()
+                                        : _attr.prefill_max_token_num;
+                budget.max_total_tokens = max_cap;
+                budget.max_history_tokens = (_attr.prefill_token_num > 0)
+                                                ? std::max(0, max_cap - _attr.prefill_token_num)
+                                                : std::max(0, max_cap);
+                int remaining = std::max(0, max_cap - precompute_len);
+                if (_attr.prefill_token_num > 0)
+                {
+                    remaining = ALIGN_DOWN(remaining, _attr.prefill_token_num);
+                }
+                budget.max_tail_tokens = remaining;
+
                 std::vector<Content> prepared_history;
                 std::vector<int> input_ids;
                 vision::RunState st;
+                vision::PrepareMetadata prepare_meta;
                 std::string verr;
-                if (!vision->Prepare(history, vmins, prepared_history, input_ids, st, verr))
+                if (!vision->Prepare(history, vmins, &budget, prepared_history, input_ids, st, verr, &prepare_meta))
                 {
+                    if (verr.find("exceeds current prefill budget") != std::string::npos ||
+                        verr.find("exceeds current history budget") != std::string::npos ||
+                        verr.find("history budget") != std::string::npos) {
+                        set_context_limit_error();
+                    } else {
+                        set_last_error("多模态输入处理失败，请重新开始会话后再试一次。");
+                    }
                     ALOGE("vision.Prepare failed: %s", verr.c_str());
                     return history;
+                }
+                if (prepare_meta.auto_reset_for_video)
+                {
+                    ALOGW("video request auto reset history for quality: current_frames=%d fresh_frames=%d",
+                          prepare_meta.current_video_frames,
+                          prepare_meta.fresh_video_frames);
+                    ResetKVCache();
+                    response_prefix = video_quality_reset_notice();
+                    if (_attr.runing_callback)
+                    {
+                        _attr.runing_callback(response_prefix, -1, _attr.reserve);
+                    }
                 }
                 history = std::move(prepared_history);
                 new_tokens = std::move(input_ids);
@@ -2489,7 +2612,12 @@ struct LLM::Impl {
         run_input_token_ids = tokens_diff;
         auto reply = Run(out_embed, output_max_token);
         run_input_token_ids.clear();
+        if (!response_prefix.empty())
+        {
+            reply = response_prefix + reply;
+        }
         history.push_back({ASSISTANT, TEXT, reply});
+        last_history_snapshot = history;
         last_tokens_ids = tokenizer->encode(history);
         if (last_tokens_ids.size() >= 2) last_tokens_ids.erase(last_tokens_ids.end() - 2, last_tokens_ids.end());
         GetKVCache(k_caches, v_caches, precompute_len);
@@ -2515,6 +2643,7 @@ LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
 void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p); }
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
+std::string LLM::GetLastError() const { return impl_->get_last_error(); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
 bool LLM::EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings) { return impl_->EmbedBatch(inputs, out_embeddings); }

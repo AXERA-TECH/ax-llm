@@ -38,6 +38,21 @@ struct MediaInputs {
     std::vector<std::string> uris;
 };
 
+struct PromptBudget {
+    std::vector<int> last_tokens;
+    int precompute_len = 0;
+    int prefill_token_num = 0;
+    int max_tail_tokens = 0;
+    int max_history_tokens = 0;
+    int max_total_tokens = 0;
+};
+
+struct PrepareMetadata {
+    bool auto_reset_for_video = false;
+    int current_video_frames = -1;
+    int fresh_video_frames = -1;
+};
+
 class VisionModule {
 public:
     VisionModule();
@@ -67,6 +82,8 @@ public:
               int patch_size,
               int fps,
               int tokens_per_second,
+              int video_num_frames,
+              bool video_do_sample_frames,
               const std::string& audio_encoder_axmodel_5s,
               const std::string& audio_encoder_axmodel_30s,
               std::string& err);
@@ -78,10 +95,12 @@ public:
     // - build `state_out` for multimodal injection and (optional) mRoPE position ids.
     bool Prepare(const std::vector<Content>& history_in,
                  const std::vector<MediaInputs>& media_inputs,
+                 const PromptBudget* budget,
                  std::vector<Content>& history_out,
                  std::vector<int>& input_ids_out,
                  RunState& state_out,
-                 std::string& err);
+                 std::string& err,
+                 PrepareMetadata* meta = nullptr);
 
 private:
     bool enabled_ = false;
@@ -98,6 +117,8 @@ private:
     int patch_size_ = 14;
     int fps_ = 1;
     int tokens_per_second_ = 1;
+    int video_num_frames_ = 0;
+    bool video_do_sample_frames_ = true;
 
     int deepstack_layers_ = 0;
 

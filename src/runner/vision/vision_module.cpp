@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <regex>
 #include <numeric>
+#include <sstream>
 
 #include "bfloat16.hpp"
 #include "sample_log.h"
@@ -47,7 +48,316 @@ struct AudioEncoderRuntime {
     std::string axmodel_path;
 };
 
+struct ScopedTempDirs {
+    std::vector<std::string> dirs;
+
+    ~ScopedTempDirs()
+    {
+        for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) {
+            std::error_code ec;
+            std::filesystem::remove_all(*it, ec);
+        }
+    }
+
+    void add(const std::string& dir)
+    {
+        if (!dir.empty()) dirs.push_back(dir);
+    }
+};
+
+struct VideoFrameFitResult {
+    int frame_count = 0;
+    int tail_tokens = -1;
+};
+
+struct Gemma4VideoPlan {
+    std::vector<std::string> sampled_uris;
+    ScopedTempDirs temp_dirs;
+    int frame_count = 0;
+    int fitted_tail_tokens = -1;
+    int total_frame_count = 0;
+    int max_tail_tokens = -1;
+    int precompute_len = 0;
+};
+
 } // namespace
+
+static std::string lower_ext(const std::string& path)
+{
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return ext;
+}
+
+static bool is_supported_frame_file(const std::string& path)
+{
+    const std::string ext = lower_ext(path);
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".webp";
+}
+
+static std::vector<std::string> filter_supported_frame_files(const std::vector<std::string>& files)
+{
+    std::vector<std::string> filtered;
+    filtered.reserve(files.size());
+    for (const auto& file : files) {
+        if (is_supported_frame_file(file)) filtered.push_back(file);
+    }
+    return filtered;
+}
+
+static std::string shell_quote(const std::string& value)
+{
+    std::string quoted;
+    quoted.reserve(value.size() + 2);
+    quoted.push_back('\'');
+    for (char c : value) {
+        if (c == '\'') quoted += "'\\''";
+        else quoted.push_back(c);
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
+static bool command_exists(const char* name)
+{
+    if (!name || !*name) return false;
+    const char* path_env = std::getenv("PATH");
+    if (!path_env || !*path_env) return false;
+
+    std::stringstream ss(path_env);
+    std::string dir;
+    while (std::getline(ss, dir, ':')) {
+        if (dir.empty()) dir = ".";
+        std::error_code ec;
+        const auto candidate = std::filesystem::path(dir) / name;
+        const auto st = std::filesystem::status(candidate, ec);
+        if (!ec && std::filesystem::exists(st) && !std::filesystem::is_directory(st)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool make_temp_dir(const std::string& prefix, std::string& out_dir, std::string& err)
+{
+    std::filesystem::path root;
+    try {
+        root = std::filesystem::temp_directory_path() / "axllm_video_frames";
+        std::filesystem::create_directories(root);
+    } catch (const std::exception& e) {
+        err = "failed to create temporary video root: " + std::string(e.what());
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const auto candidate = root / (prefix + "_" + std::to_string((long long)now) + "_" + std::to_string(attempt));
+        std::error_code ec;
+        if (std::filesystem::create_directory(candidate, ec)) {
+            out_dir = candidate.string();
+            return true;
+        }
+        if (ec && ec.value() != 0 && ec != std::errc::file_exists) {
+            err = "failed to create temporary frame directory: " + ec.message();
+            return false;
+        }
+    }
+
+    err = "failed to allocate a unique temporary frame directory";
+    return false;
+}
+
+static bool extract_video_frames_ffmpeg(const std::string& video_path,
+                                        std::vector<std::string>& frame_files,
+                                        std::string& temp_dir_out,
+                                        std::string& err)
+{
+    frame_files.clear();
+    temp_dir_out.clear();
+
+    if (!command_exists("ffmpeg")) {
+        err = "ffmpeg is not available in PATH, so raw video container decoding is unavailable";
+        return false;
+    }
+
+    if (!make_temp_dir("video", temp_dir_out, err)) return false;
+
+    const auto pattern = (std::filesystem::path(temp_dir_out) / "frame_%06d.jpg").string();
+    const std::string cmd =
+        "ffmpeg -hide_banner -loglevel error -y -i " + shell_quote(video_path) +
+        " -vsync 0 " + shell_quote(pattern) + " >/dev/null 2>&1";
+
+    ALOGI("Extracting raw video container to frames: %s -> %s", video_path.c_str(), temp_dir_out.c_str());
+    if (std::system(cmd.c_str()) != 0) {
+        std::error_code ec;
+        std::filesystem::remove_all(temp_dir_out, ec);
+        temp_dir_out.clear();
+        err = "ffmpeg failed to decode video container: " + video_path;
+        return false;
+    }
+
+    frame_files = filter_supported_frame_files(list_files(temp_dir_out));
+    if (frame_files.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(temp_dir_out, ec);
+        temp_dir_out.clear();
+        err = "ffmpeg produced no decodable image frames for video container: " + video_path;
+        return false;
+    }
+
+    return true;
+}
+
+static bool collect_video_frame_paths(const std::vector<std::string>& uris,
+                                      std::vector<std::string>& frame_files,
+                                      ScopedTempDirs* temp_dirs,
+                                      std::string& err)
+{
+    frame_files.clear();
+    if (uris.empty()) {
+        err = "media.uris empty";
+        return false;
+    }
+
+    if (uris.size() == 1) {
+        const auto& uri = uris[0];
+        if (is_directory(uri)) {
+            frame_files = filter_supported_frame_files(list_files(uri));
+            if (frame_files.empty()) {
+                err = "no video frames loaded";
+                return false;
+            }
+            return true;
+        }
+        if (!is_file(uri)) {
+            err = "invalid video uri: " + uri;
+            return false;
+        }
+        if (is_supported_frame_file(uri)) {
+            frame_files.push_back(uri);
+            return true;
+        }
+
+        std::string temp_dir;
+        if (!extract_video_frames_ffmpeg(uri, frame_files, temp_dir, err)) return false;
+        if (temp_dirs) temp_dirs->add(temp_dir);
+        return true;
+    }
+
+    frame_files.reserve(uris.size());
+    for (const auto& uri : uris) {
+        if (is_directory(uri)) {
+            err = "VIDEO uri list contains a directory; use a single frames_dir uri instead";
+            return false;
+        }
+        if (!is_file(uri)) {
+            err = "invalid video frame uri: " + uri;
+            return false;
+        }
+        if (!is_supported_frame_file(uri)) {
+            err = "VIDEO uri list contains a non-image file; pass a single raw video file or an ordered image-frame list";
+            return false;
+        }
+        frame_files.push_back(uri);
+    }
+    return true;
+}
+
+static std::vector<std::string> sample_frame_paths(const std::vector<std::string>& frame_files,
+                                                   int target_count,
+                                                   bool do_sample_frames)
+{
+    if (target_count <= 0 || frame_files.empty()) return {};
+    if (target_count >= (int)frame_files.size()) return frame_files;
+    if (!do_sample_frames) return std::vector<std::string>(frame_files.begin(), frame_files.begin() + target_count);
+
+    std::vector<std::string> sampled;
+    sampled.reserve((size_t)target_count);
+    const size_t n = frame_files.size();
+    for (int i = 0; i < target_count; ++i) {
+        const size_t idx = (size_t)(((unsigned long long)(2 * i + 1) * (unsigned long long)n) /
+                                    (unsigned long long)(2 * target_count));
+        sampled.push_back(frame_files[std::min(idx, n - 1)]);
+    }
+    return sampled;
+}
+
+static int count_appended_tokens(const std::vector<int>& prev_tokens,
+                                 const std::vector<int>& next_tokens)
+{
+    if (prev_tokens.empty()) return (int)next_tokens.size();
+    if (next_tokens.size() >= prev_tokens.size() &&
+        std::equal(prev_tokens.begin(), prev_tokens.end(), next_tokens.begin())) {
+        return (int)(next_tokens.size() - prev_tokens.size());
+    }
+    return (int)next_tokens.size();
+}
+
+static VideoFrameFitResult fit_gemma4_video_frame_count(const std::shared_ptr<BaseTokenizer>& tokenizer,
+                                                        std::vector<Content> probe_history,
+                                                        size_t content_index,
+                                                        int frame_cap,
+                                                        int tokens_per_block,
+                                                        const std::vector<int>& prev_tokens,
+                                                        int max_tail_tokens)
+{
+    VideoFrameFitResult result;
+    if (!tokenizer || content_index >= probe_history.size() || frame_cap <= 0 || max_tail_tokens <= 0)
+        return result;
+
+    auto fits_frame_count = [&](int frame_count, int* tail_tokens_out) -> bool {
+        probe_history[content_index].num_media = frame_count;
+        probe_history[content_index].num_media_tokens = tokens_per_block;
+        const auto probe_ids = tokenizer->encode(probe_history);
+        const int tail_tokens = count_appended_tokens(prev_tokens, probe_ids);
+        if (tail_tokens_out) *tail_tokens_out = tail_tokens;
+        return tail_tokens <= max_tail_tokens;
+    };
+
+    int lo = 1;
+    int hi = frame_cap;
+    while (lo <= hi) {
+        const int mid = lo + (hi - lo) / 2;
+        int tail_tokens = 0;
+        if (fits_frame_count(mid, &tail_tokens)) {
+            result.frame_count = mid;
+            result.tail_tokens = tail_tokens;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    if (result.frame_count <= 0) {
+        int min_tail_tokens = 0;
+        (void)fits_frame_count(1, &min_tail_tokens);
+        result.tail_tokens = min_tail_tokens;
+    }
+
+    return result;
+}
+
+static bool has_non_system_history_before(const std::vector<Content>& history, size_t end_index)
+{
+    for (size_t i = 0; i < end_index; ++i) {
+        if (history[i].role != SYSTEM) return true;
+    }
+    return false;
+}
+
+static void build_video_fresh_history(const std::vector<Content>& history_in,
+                                      size_t keep_index,
+                                      std::vector<Content>& history_out,
+                                      size_t& keep_index_out)
+{
+    history_out.clear();
+    history_out.reserve(history_in.size());
+    for (const auto& c : history_in) {
+        if (c.role == SYSTEM) history_out.push_back(c);
+    }
+    keep_index_out = history_out.size();
+    history_out.push_back(history_in[keep_index]);
+}
 
 struct VisionModule::Impl {
     ax_runner_t encoder;
@@ -554,6 +864,8 @@ bool VisionModule::Init(VLMType type,
                         int patch_size,
                         int fps,
                         int tokens_per_second,
+                        int video_num_frames,
+                        bool video_do_sample_frames,
                         const std::string& audio_encoder_axmodel_5s,
                         const std::string& audio_encoder_axmodel_30s,
                         std::string& err)
@@ -586,6 +898,8 @@ bool VisionModule::Init(VLMType type,
     patch_size_ = patch_size;
     fps_ = fps;
     tokens_per_second_ = tokens_per_second;
+    video_num_frames_ = video_num_frames;
+    video_do_sample_frames_ = video_do_sample_frames;
 
     // Load encoder axmodel (all supported VLM types in this repo need it).
     if (encoder_axmodel.empty()) {
@@ -830,6 +1144,7 @@ bool VisionModule::Init(VLMType type,
     }
 
     if (type_ == VLMType::Gemma4VL) {
+        if (video_num_frames_ <= 0) video_num_frames_ = 32;
         if (!audio_encoder_axmodel_5s.empty() && is_file(audio_encoder_axmodel_5s)) {
             if (!init_audio_profile(impl_->audio_5s, audio_encoder_axmodel_5s, devid, tokens_embed_size_, err)) {
                 return false;
@@ -843,6 +1158,9 @@ bool VisionModule::Init(VLMType type,
         if (!impl_->audio_5s.encoder_inited && !impl_->audio_30s.encoder_inited) {
             ALOGW("Gemma4 audio encoders are not configured or missing; AUDIO inputs will be rejected.");
         }
+        ALOGI("Gemma4 video config: num_frames=%d do_sample_frames=%d",
+              video_num_frames_,
+              video_do_sample_frames_ ? 1 : 0);
     }
 
     cache_key_prefix_ = "vlm=" + std::string(VLMTypeName(type_)) + "|enc=" + normalize_path_for_key(encoder_axmodel) +
@@ -1490,45 +1808,39 @@ bool VisionModule::EncodeForContent(const Content& content,
     }
 
     // VIDEO
-    if (type_ == VLMType::Gemma4VL) {
-        out_num_media_for_tokenizer = 0;
-        out_num_media_tokens = 0;
-        ALOGW("Gemma4 video input is reserved but not implemented yet, skip %zu uri(s)", media.uris.size());
-        return true;
-    }
     // Supports:
-    // - 1 uri: a directory of frames (recommended), or a single image file
+    // - 1 uri: a directory of frames (recommended), or a single image frame file
     // - N uris: an ordered list of image frame files (useful for base64 uploads)
+    ScopedTempDirs temp_dirs;
+    std::vector<std::string> frame_files;
+    if (!collect_video_frame_paths(media.uris, frame_files, &temp_dirs, err)) return false;
+
     std::vector<axcv::Mat> frames;
-    if (media.uris.size() == 1)
-    {
-        frames = ReadImages(media.uris[0]);
-        if (frames.empty()) { err = "no video frames loaded"; return false; }
-    }
-    else
-    {
-        frames.reserve(media.uris.size());
-        for (const auto &uri : media.uris)
-        {
-            if (is_directory(uri))
-            {
-                err = "VIDEO uri list contains a directory; use a single frames_dir uri instead";
-                return false;
-            }
-            if (!is_file(uri))
-            {
-                err = "invalid video frame uri: " + uri;
-                return false;
-            }
-            axcv::Mat img = axcv::imread(uri, axcv::IMREAD_COLOR);
-            if (axcv::empty(img))
-            {
-                err = "failed to read video frame: " + uri;
-                return false;
-            }
-            frames.push_back(img);
+    frames.reserve(frame_files.size());
+    for (const auto& file : frame_files) {
+        axcv::Mat img = axcv::imread(file, axcv::IMREAD_COLOR);
+        if (axcv::empty(img)) {
+            err = "failed to read video frame: " + file;
+            return false;
         }
-        if (frames.empty()) { err = "no video frames loaded"; return false; }
+        frames.push_back(img);
+    }
+    if (frames.empty()) { err = "no video frames loaded"; return false; }
+
+    if (type_ == VLMType::Gemma4VL) {
+        out_num_media_for_tokenizer = (int)frames.size();
+        out_num_media_tokens = tokens_per_block_;
+        out_blocks.reserve(frames.size());
+        for (auto& frame : frames) {
+            std::vector<unsigned char> pv;
+            Gemma4ImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_);
+            std::vector<unsigned short> emb;
+            if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                               pv, emb, 0.0f, 1.0f, 0, nullptr, err))
+                return false;
+            out_blocks.push_back(std::move(emb));
+        }
+        return true;
     }
 
     if (type_ == VLMType::SmolVLM2) {
@@ -1647,20 +1959,128 @@ bool VisionModule::BuildInjectionState(const std::vector<int>& input_ids,
 
 bool VisionModule::Prepare(const std::vector<Content>& history_in,
                            const std::vector<MediaInputs>& media_inputs,
+                           const PromptBudget* budget,
                            std::vector<Content>& history_out,
                            std::vector<int>& input_ids_out,
                            RunState& state_out,
-                           std::string& err)
+                           std::string& err,
+                           PrepareMetadata* meta)
 {
     if (!enabled_) { err = "vision module disabled"; return false; }
     if (!tokenizer_) { err = "tokenizer not set"; return false; }
 
+    if (meta) *meta = {};
+
     history_out = history_in;
+    std::vector<MediaInputs> media_inputs_work = media_inputs;
+    std::unordered_map<size_t, Gemma4VideoPlan> gemma4_video_plans;
+    ScopedTempDirs planned_temp_dirs;
+
+    if (type_ == VLMType::Gemma4VL && budget) {
+        size_t video_count = 0;
+        size_t video_index = (size_t)-1;
+        for (size_t i = 0; i < history_in.size(); ++i) {
+            if (history_in[i].type == VIDEO) {
+                ++video_count;
+                video_index = i;
+            }
+        }
+
+        if (video_count == 1 && video_index == history_in.size() - 1 && history_in[video_index].role == USER) {
+            auto media_it = std::find_if(media_inputs.begin(), media_inputs.end(),
+                                         [video_index](const MediaInputs& m) { return m.content_index == video_index; });
+            if (media_it != media_inputs.end()) {
+                Gemma4VideoPlan plan;
+                std::vector<std::string> all_frame_files;
+                if (!collect_video_frame_paths(media_it->uris, all_frame_files, &planned_temp_dirs, err)) return false;
+
+                const int frame_cap = (video_num_frames_ > 0)
+                                          ? std::min((int)all_frame_files.size(), video_num_frames_)
+                                          : (int)all_frame_files.size();
+                if (frame_cap <= 0) {
+                    err = "Gemma4 video has no usable frames";
+                    return false;
+                }
+
+                const bool has_prior_non_system = has_non_system_history_before(history_in, video_index);
+                const bool can_compare_fresh = has_prior_non_system && budget->precompute_len > 0 && budget->max_total_tokens > 0;
+
+                VideoFrameFitResult current_fit;
+                if (budget->max_history_tokens > 0 && budget->precompute_len > budget->max_history_tokens) {
+                    current_fit.frame_count = 0;
+                    current_fit.tail_tokens = budget->max_tail_tokens + 1;
+                } else {
+                    current_fit = fit_gemma4_video_frame_count(tokenizer_,
+                                                               history_in,
+                                                               video_index,
+                                                               frame_cap,
+                                                               tokens_per_block_,
+                                                               budget->last_tokens,
+                                                               budget->max_tail_tokens);
+                }
+
+                VideoFrameFitResult fresh_fit;
+                std::vector<Content> fresh_history;
+                size_t fresh_video_index = (size_t)-1;
+                if (can_compare_fresh) {
+                    build_video_fresh_history(history_in, video_index, fresh_history, fresh_video_index);
+                    fresh_fit = fit_gemma4_video_frame_count(tokenizer_,
+                                                             fresh_history,
+                                                             fresh_video_index,
+                                                             frame_cap,
+                                                             tokens_per_block_,
+                                                             {},
+                                                             budget->max_total_tokens);
+                }
+
+                const bool auto_reset_for_video = can_compare_fresh && fresh_fit.frame_count > current_fit.frame_count;
+                if (meta) {
+                    meta->auto_reset_for_video = auto_reset_for_video;
+                    meta->current_video_frames = current_fit.frame_count;
+                    meta->fresh_video_frames = can_compare_fresh ? fresh_fit.frame_count : -1;
+                }
+
+                if (auto_reset_for_video) {
+                    history_out = std::move(fresh_history);
+                    media_inputs_work.clear();
+                    media_inputs_work.push_back({fresh_video_index, media_it->uris});
+                    video_index = fresh_video_index;
+                    plan.frame_count = fresh_fit.frame_count;
+                    plan.fitted_tail_tokens = fresh_fit.tail_tokens;
+                    plan.max_tail_tokens = budget->max_total_tokens;
+                    plan.precompute_len = 0;
+                    ALOGI("Gemma4 video auto reset selected: current_frames=%d fresh_frames=%d precompute_len=%d",
+                          current_fit.frame_count,
+                          fresh_fit.frame_count,
+                          budget->precompute_len);
+                } else {
+                    if (current_fit.frame_count <= 0) {
+                        err = "Gemma4 video prompt exceeds current prefill budget: 1 frame requires " +
+                              std::to_string(current_fit.tail_tokens) + " tail tokens, budget allows " +
+                              std::to_string(budget->max_tail_tokens);
+                        return false;
+                    }
+                    plan.frame_count = current_fit.frame_count;
+                    plan.fitted_tail_tokens = current_fit.tail_tokens;
+                    plan.max_tail_tokens = budget->max_tail_tokens;
+                    plan.precompute_len = budget->precompute_len;
+                }
+
+                plan.total_frame_count = (int)all_frame_files.size();
+                plan.sampled_uris = sample_frame_paths(all_frame_files, plan.frame_count, video_do_sample_frames_);
+                if ((int)plan.sampled_uris.size() != plan.frame_count) {
+                    err = "Gemma4 video frame sampler produced an unexpected frame count";
+                    return false;
+                }
+                gemma4_video_plans.emplace(video_index, std::move(plan));
+            }
+        }
+    }
 
     // Map content_index -> MediaInputs (at most one entry per content index).
     std::unordered_map<size_t, MediaInputs> media_map;
-    media_map.reserve(media_inputs.size());
-    for (const auto& m : media_inputs) media_map[m.content_index] = m;
+    media_map.reserve(media_inputs_work.size());
+    for (const auto& m : media_inputs_work) media_map[m.content_index] = m;
 
     std::vector<std::vector<unsigned short>> all_blocks;
     std::vector<std::vector<float>> all_deepstack;
@@ -1678,11 +2098,76 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
             return false;
         }
 
+        MediaInputs effective_media = it->second;
+        ScopedTempDirs temp_dirs;
+        if (type_ == VLMType::Gemma4VL && c.type == VIDEO) {
+            auto plan_it = gemma4_video_plans.find(i);
+            if (plan_it != gemma4_video_plans.end()) {
+                effective_media.uris = plan_it->second.sampled_uris;
+                ALOGI("Gemma4 video frames selected: %d/%d (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
+                      plan_it->second.frame_count,
+                      plan_it->second.total_frame_count,
+                      video_num_frames_,
+                      plan_it->second.fitted_tail_tokens,
+                      plan_it->second.max_tail_tokens,
+                      plan_it->second.precompute_len);
+            } else {
+                std::vector<std::string> all_frame_files;
+                if (!collect_video_frame_paths(it->second.uris, all_frame_files, &temp_dirs, err)) return false;
+
+                int frame_cap = (video_num_frames_ > 0)
+                                    ? std::min((int)all_frame_files.size(), video_num_frames_)
+                                    : (int)all_frame_files.size();
+                if (frame_cap <= 0) {
+                    err = "Gemma4 video has no usable frames";
+                    return false;
+                }
+
+                int fitted_tail_tokens = -1;
+                if (budget) {
+                    if (budget->max_history_tokens > 0 && budget->precompute_len > budget->max_history_tokens) {
+                        err = "Gemma4 video prompt exceeds current history budget before frame injection";
+                        return false;
+                    }
+
+                    const auto fit = fit_gemma4_video_frame_count(tokenizer_,
+                                                                  history_out,
+                                                                  i,
+                                                                  frame_cap,
+                                                                  tokens_per_block_,
+                                                                  budget->last_tokens,
+                                                                  budget->max_tail_tokens);
+                    if (fit.frame_count <= 0) {
+                        err = "Gemma4 video prompt exceeds current prefill budget: 1 frame requires " +
+                              std::to_string(fit.tail_tokens) + " tail tokens, budget allows " +
+                              std::to_string(budget->max_tail_tokens);
+                        return false;
+                    }
+                    frame_cap = fit.frame_count;
+                    fitted_tail_tokens = fit.tail_tokens;
+                }
+
+                effective_media.uris = sample_frame_paths(all_frame_files, frame_cap, video_do_sample_frames_);
+                if ((int)effective_media.uris.size() != frame_cap) {
+                    err = "Gemma4 video frame sampler produced an unexpected frame count";
+                    return false;
+                }
+
+                ALOGI("Gemma4 video frames selected: %d/%zu (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
+                      frame_cap,
+                      all_frame_files.size(),
+                      video_num_frames_,
+                      fitted_tail_tokens,
+                      budget ? budget->max_tail_tokens : -1,
+                      budget ? budget->precompute_len : 0);
+            }
+        }
+
         int num_media_for_tokenizer = 0;
         int num_media_tokens = 0;
         std::vector<std::vector<unsigned short>> blocks;
         std::vector<std::vector<int>> img_grid, vid_grid;
-        if (!EncodeForContent(c, it->second, num_media_for_tokenizer, num_media_tokens, blocks,
+        if (!EncodeForContent(c, effective_media, num_media_for_tokenizer, num_media_tokens, blocks,
                               (deepstack_layers_ > 0 ? &all_deepstack : nullptr),
                               img_grid, vid_grid, err))
             return false;
