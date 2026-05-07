@@ -136,6 +136,7 @@ struct ModelConfig
     std::string model_name = "AXERA-TECH/Qwen3-1.7B";
     LLMAttrType attr;
     int port = 8000;
+    int server_timeout_ms = 300000; // 5 minutes
     bool is_embedding = false;
 
     bool is_embedding_model() const { return is_embedding; }
@@ -347,6 +348,10 @@ struct ModelConfig
             if (j.contains("port"))
             {
                 port = j["port"].get<int>();
+            }
+            if (j.contains("server_timeout_ms"))
+            {
+                server_timeout_ms = j["server_timeout_ms"].get<int>();
             }
 
             return true;
@@ -1209,7 +1214,13 @@ int run_server_mode(const ModelConfig &config, int port)
                 printf("  POST %s/chat/completions\n", base.c_str());
             }
         }
-        g_server.setTimeout(std::chrono::milliseconds(300000));  // 5 minutes timeout for long-running requests
+        int timeout_ms = config.server_timeout_ms;
+        if (timeout_ms <= 0)
+        {
+            ALOGW("invalid server_timeout_ms=%d, fallback to default 300000ms", timeout_ms);
+            timeout_ms = 300000;
+        }
+        g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
         g_server.run(port);
 
         llm.Deinit();
