@@ -181,6 +181,7 @@ jobs:
             wget -O "${tc_tar}" "${tc_url}"
             tar -xf "${tc_tar}"
           fi
+          export PATH="${PWD}/${tc_root}/bin:${PATH}"
 
           cmake -S .. -B . \
             -DCMAKE_BUILD_TYPE=Release \

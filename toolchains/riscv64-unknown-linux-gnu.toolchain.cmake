@@ -2,17 +2,29 @@
 SET (CMAKE_SYSTEM_NAME Linux)
 SET (CMAKE_SYSTEM_PROCESSOR riscv64)
 
+# CMake may re-run toolchain logic in nested try_compile() projects.
+# Propagate these custom hints into try_compile builds and persist via ENV.
+if (NOT DEFINED CMAKE_TRY_COMPILE_PLATFORM_VARIABLES)
+    set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES "")
+endif()
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES RISCV64_TOOLCHAIN_BIN RISCV64_GCC RISCV64_GXX)
+list(REMOVE_DUPLICATES CMAKE_TRY_COMPILE_PLATFORM_VARIABLES)
+
 set(RISCV64_GCC "" CACHE FILEPATH "Path to riscv64 gcc")
 set(RISCV64_GXX "" CACHE FILEPATH "Path to riscv64 g++")
 
 set(RISCV64_TOOLCHAIN_BIN "" CACHE PATH "Path to RISC-V toolchain bin directory")
+if (NOT RISCV64_TOOLCHAIN_BIN AND DEFINED ENV{RISCV64_TOOLCHAIN_BIN})
+    set(RISCV64_TOOLCHAIN_BIN "$ENV{RISCV64_TOOLCHAIN_BIN}")
+endif()
 if (NOT RISCV64_TOOLCHAIN_BIN)
-    if (EXISTS "/home/axera/gcc-14.3-riscv64-unknown-linux-gnu-2.39/bin")
-        set(RISCV64_TOOLCHAIN_BIN "/home/axera/gcc-14.3-riscv64-unknown-linux-gnu-2.39/bin")
-    endif()
+    # no default: prefer explicit -DRISCV64_TOOLCHAIN_BIN=... or PATH lookup
 endif()
 
 if (RISCV64_TOOLCHAIN_BIN AND EXISTS "${RISCV64_TOOLCHAIN_BIN}")
+    # Persist for nested try_compile invocations (CMake may not propagate cache entries reliably).
+    set(ENV{RISCV64_TOOLCHAIN_BIN} "${RISCV64_TOOLCHAIN_BIN}")
+
     list(PREPEND CMAKE_PROGRAM_PATH "${RISCV64_TOOLCHAIN_BIN}")
     if (NOT RISCV64_GCC)
         if (EXISTS "${RISCV64_TOOLCHAIN_BIN}/riscv64-unknown-linux-gnu-gcc")
