@@ -141,3 +141,61 @@ jobs:
           path: |
             build_aarch64/install/**
             build_aarch64/main_axcl* 
+
+  build-axcl-riscv64:
+    name: AXCL riscv64 cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential unzip wget xz-utils
+
+      - name: Build (AXCL riscv64)
+        run: |
+          set -euxo pipefail
+
+          build_dir=build_riscv64
+          mkdir -p "${build_dir}"
+          cd "${build_dir}"
+
+          axcl_url="https://github.com/ZHEQIUSHUI/assets/releases/download/risc-v/axcl_linux_riscv_3.14.0.zip"
+          axcl_zip="axcl_linux_riscv_3.14.0.zip"
+          axcl_root="axcl_linux_riscv"
+          axcl_dir="${PWD}/${axcl_root}"
+
+          if [ ! -d "${axcl_root}" ]; then
+            wget -O "${axcl_zip}" "${axcl_url}"
+            unzip -q "${axcl_zip}"
+          fi
+
+          tc_url="https://github.com/ZHEQIUSHUI/assets/releases/download/risc-v/gcc-14.3-riscv64-unknown-linux-gnu-2.39.tar.xz"
+          tc_tar="gcc-14.3-riscv64-unknown-linux-gnu-2.39.tar.xz"
+          tc_root="gcc-14.3-riscv64-unknown-linux-gnu-2.39"
+          if [ ! -d "${tc_root}" ]; then
+            wget -O "${tc_tar}" "${tc_url}"
+            tar -xf "${tc_tar}"
+          fi
+
+          cmake -S .. -B . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=./install \
+            -DBUILD_AX650=OFF \
+            -DBUILD_AXCL=ON \
+            -DAXCL_DIR="${axcl_dir}" \
+            -DRISCV64_TOOLCHAIN_BIN="${PWD}/${tc_root}/bin" \
+            -DCMAKE_TOOLCHAIN_FILE=../toolchains/riscv64-unknown-linux-gnu.toolchain.cmake
+          cmake --build . -j 8
+          cmake --install .
+
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: axcl-riscv64-artifacts
+          path: |
+            build_riscv64/install/**
