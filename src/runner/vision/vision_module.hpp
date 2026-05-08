@@ -33,10 +33,24 @@ struct RunState {
 
 // Media inputs aligned to `history` by index.
 // `history[content_index].type` can be IMAGE / VIDEO / AUDIO.
-// AUDIO is currently a reserved placeholder interface for future runtime support.
 struct MediaInputs {
     size_t content_index = 0;
     std::vector<std::string> uris;
+};
+
+struct PromptBudget {
+    std::vector<int> last_tokens;
+    int precompute_len = 0;
+    int prefill_token_num = 0;
+    int max_tail_tokens = 0;
+    int max_history_tokens = 0;
+    int max_total_tokens = 0;
+};
+
+struct PrepareMetadata {
+    bool auto_reset_for_video = false;
+    int current_video_frames = -1;
+    int fresh_video_frames = -1;
 };
 
 class VisionModule {
@@ -68,19 +82,25 @@ public:
               int patch_size,
               int fps,
               int tokens_per_second,
+              int video_num_frames,
+              bool video_do_sample_frames,
+              const std::string& audio_encoder_axmodel_5s,
+              const std::string& audio_encoder_axmodel_30s,
               std::string& err);
 
     void Deinit();
 
     // Prepare `history_out` by filling `num_media/num_media_tokens`, then:
     // - `input_ids_out = tokenizer->encode(history_out)`
-    // - build `state_out` for vision injection and (optional) mRoPE position ids.
+    // - build `state_out` for multimodal injection and (optional) mRoPE position ids.
     bool Prepare(const std::vector<Content>& history_in,
                  const std::vector<MediaInputs>& media_inputs,
+                 const PromptBudget* budget,
                  std::vector<Content>& history_out,
                  std::vector<int>& input_ids_out,
                  RunState& state_out,
-                 std::string& err);
+                 std::string& err,
+                 PrepareMetadata* meta = nullptr);
 
 private:
     bool enabled_ = false;
@@ -97,6 +117,8 @@ private:
     int patch_size_ = 14;
     int fps_ = 1;
     int tokens_per_second_ = 1;
+    int video_num_frames_ = 0;
+    bool video_do_sample_frames_ = true;
 
     int deepstack_layers_ = 0;
 
@@ -105,6 +127,7 @@ private:
     // Placeholder token ids to locate vision positions inside input_ids.
     int image_pad_id_ = -1;
     int video_pad_id_ = -1;
+    int audio_pad_id_ = -1;
     int vision_start_id_ = -1; // used by mRoPE only
 
     // A small cache for image -> encoded blocks (bf16). Video is not cached.
@@ -122,6 +145,7 @@ private:
     bool EncodeForContent(const Content& content,
                           const MediaInputs& media,
                           int& out_num_media_for_tokenizer,
+                          int& out_num_media_tokens,
                           std::vector<std::vector<unsigned short>>& out_blocks,
                           std::vector<std::vector<float>>* out_deepstack_append,
                           std::vector<std::vector<int>>& out_image_grid_thw,

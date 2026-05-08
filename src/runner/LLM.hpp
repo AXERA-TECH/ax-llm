@@ -16,7 +16,7 @@ using LLMRuningCallback = std::function<void(std::string str, float token_per_se
 // `history[content_index].type` can be IMAGE / VIDEO / AUDIO.
 // For IMAGE: each uri can be a file or a directory of images (sorted).
 // For VIDEO: uri is typically a directory of frames (sorted).
-// For AUDIO: the interface is reserved for future runtime support; some models may skip it today.
+// For AUDIO: current Gemma4 support expects one audio file per message.
 struct MediaInputs {
     size_t content_index = 0;
     std::vector<std::string> uris;
@@ -32,6 +32,7 @@ struct LLMAttrType {
     // When 0, all layers are treated as full-attention (default).
     int full_attention_interval = 0;
     int num_kv_shared_layers = 0;
+    int sliding_window = 0;
     std::vector<std::string> layer_types;
 
     int prefill_token_num = 96; // auto calc
@@ -69,6 +70,8 @@ struct LLMAttrType {
 
     // Vision encoder axmodel (image/video encoder). Required if `vlm_type != VLMType::None`.
     std::string filename_image_encoder_axmodel = "image_encoder.axmodel";
+    std::string filename_audio_encoder_axmodel_5s = "gemma4_audio_5s.axmodel";
+    std::string filename_audio_encoder_axmodel_30s = "gemma4_audio_30s.axmodel";
 
     // Optional: vision embedding cache directory. If empty: memory-only cache for the process lifetime.
     // If set: read/write encoded embeddings for repeated images across runs.
@@ -82,6 +85,8 @@ struct LLMAttrType {
     int vision_patch_size = 14;
     int vision_fps = 1;              // for qwen2.5-vl time scaling
     int vision_tokens_per_second = 1;
+    int vision_num_frames = 0;       // for frame-sampled video input
+    bool vision_do_sample_frames = true;
 
 #ifndef USE_AXCL
     bool b_use_mmap_load_layer = true;
@@ -107,6 +112,9 @@ public:
     LLMAttrType *getAttr();
     LLMPostprocess *getPostprocess();
     LLaMaEmbedSelector *getEmbedSelector();
+    void SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p);
+    void ClearRequestSamplingOverride();
+    std::string GetLastError() const;
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
     bool Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding);

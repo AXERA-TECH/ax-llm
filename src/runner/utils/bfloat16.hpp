@@ -25,24 +25,25 @@ public:
         data = _data;
     }
 
-    float fp32()
+    float fp32() const
     {
-        return *this;
+        return static_cast<float>(*this);
     }
 
     // cast to float
-    operator float()
+    operator float() const
     {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wuninitialized"
-        unsigned int proc = data << 16;
-        return *reinterpret_cast<float *>(&proc);
-#pragma GCC diagnostic pop
+        uint32_t proc = static_cast<uint32_t>(data) << 16;
+        float out = 0.0f;
+        std::memcpy(&out, &proc, sizeof(out));
+        return out;
     }
     // cast to bfloat16
     bfloat16 &operator=(float float_val)
     {
-        data = (*reinterpret_cast<unsigned int *>(&float_val)) >> 16;
+        uint32_t proc = 0;
+        std::memcpy(&proc, &float_val, sizeof(proc));
+        data = static_cast<unsigned short>(proc >> 16);
         return *this;
     }
 };
