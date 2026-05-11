@@ -1386,13 +1386,14 @@ int run_server_mode(const ModelConfig &config, int port)
                 printf("  GET  %s/health\n", base.c_str());
                 printf("  GET  %s/v1/models\n", base.c_str());
                 printf("  POST %s/v1/embeddings\n", base.c_str());
+                printf("  POST %s/embedding\n", base.c_str());
+                printf("  POST %s/embeddings\n", base.c_str());
             }
             printf("Aliases:\n");
             for (const auto &host : hosts)
             {
                 const std::string base = "http://" + host + ":" + std::to_string(port);
                 printf("  GET  %s/models\n", base.c_str());
-                printf("  POST %s/embeddings\n", base.c_str());
             }
         }
         g_server.run(port);
