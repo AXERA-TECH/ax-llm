@@ -615,7 +615,8 @@ std::string read_line_with_utf8_support()
 #else
     char c;
 
-    while (read(STDIN_FILENO, &c, 1) == 1)
+    ssize_t nread = 0;
+    while ((nread = read(STDIN_FILENO, &c, 1)) == 1)
     {
         if (c == '\n' || c == '\r')
         {
@@ -676,6 +677,14 @@ std::string read_line_with_utf8_support()
             printf("%c", c);
             fflush(stdout);
         }
+    }
+
+    // EOF: behave like Ctrl+D on an empty line to exit interactive mode gracefully.
+    if (nread == 0 && line.empty())
+    {
+        printf("\n");
+        fflush(stdout);
+        return "/exit";
     }
 
     return line;

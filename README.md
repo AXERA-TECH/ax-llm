@@ -133,6 +133,44 @@ axllm
 
 如需 API/Gradio 示例，可继续使用 `scripts/` 下的脚本（与分支功能一致）。
 
+### Docker（CI 导出镜像）
+
+本仓库提供 GitHub Actions 工作流 `Docker Images` 用于构建并导出 Docker 镜像（按后端/架构拆分），产物为 `.tar.gz`：
+
+- `docker-axcl-amd64`：AXCL（PCIe）x86_64 Host
+- `docker-axcl-arm64`：AXCL（PCIe）aarch64 Host
+- `docker-ax650-arm64`：AX650（板端）aarch64
+
+下载 artifact 后加载镜像：
+
+```shell
+docker load -i axllm-axcl-amd64.tar.gz
+```
+
+如需将镜像推送到 GHCR，可在 Actions 手动触发 `Docker Images` 并将 `publish_ghcr=true`，随后可通过 `ghcr.io/<owner>/` 拉取：
+
+```shell
+docker pull ghcr.io/<owner>/axllm-axcl-amd64:<sha>
+```
+
+AXCL 运行示例（Host 已安装 AXCL Driver，需透传设备节点；最简单可用 `--privileged`）：
+
+```shell
+docker run --rm --network host --privileged \
+  -v /path/to/models:/models \
+  axllm-axcl-amd64:<sha> serve /models/<model_dir> --port 8000
+```
+
+AX650 运行示例（板端，需挂载 `/soc` 提供运行库）：
+
+```shell
+docker run --rm --network host --privileged \
+  -v /soc:/soc:ro \
+  -e LD_LIBRARY_PATH=/soc/lib:$LD_LIBRARY_PATH \
+  -v /path/to/models:/models \
+  axllm-ax650-arm64:<sha> serve /models/<model_dir> --port 8000
+```
+
 ### VLM 使用说明
 
 - 使用 VLM 模型目录运行 `axllm run <vlm_model_path>`
@@ -156,6 +194,11 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 ### Embedding（/v1/embeddings）使用说明
 
 `axllm` 支持在 `serve` 模式下加载 Embedding 模型，并提供 OpenAI 兼容的 `/v1/embeddings` 接口（Embedding 模型 **不支持** `run` 交互模式）。
+
+同时提供 llama.cpp 兼容的 Embedding 路径：
+
+- `POST /embedding`：单条 embedding（llama.cpp 风格，返回 `{ "embedding": [...], "model": "..." }`）
+- `POST /embeddings`：批量 embedding（llama.cpp 风格，返回 `[{ "index": 0, "embedding": [...] }, ...]`）
 
 1) 在 Embedding 模型目录的 `config.json` 中启用开关：
 

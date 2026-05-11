@@ -1,0 +1,153 @@
+name: Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_ghcr:
+        description: 'Push built images to GHCR (ghcr.io)'
+        required: false
+        default: 'false'
+  push:
+    branches: [axllm]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-axcl-amd64:
+    name: Docker (AXCL amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential unzip wget curl
+
+      - name: Build (AXCL x86)
+        env:
+          AXLLM_CMAKE_ARGS: -DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=TRUE
+        run: |
+          chmod +x ./build_axcl_x86.sh
+          bash -euxo pipefail ./build_axcl_x86.sh
+
+      - name: Build Docker image (AXCL amd64)
+        run: |
+          mkdir -p dist
+          bash -euxo pipefail ./scripts/docker/build_axcl_image.sh \
+            --arch amd64 \
+            --tag axllm-axcl-amd64:${GITHUB_SHA} \
+            --output dist/axllm-axcl-amd64.tar.gz
+
+      - name: Push to GHCR (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_ghcr == 'true' }}
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag axllm-axcl-amd64:${GITHUB_SHA} ghcr.io/${{ github.repository_owner }}/axllm-axcl-amd64:${GITHUB_SHA}
+          docker push ghcr.io/${{ github.repository_owner }}/axllm-axcl-amd64:${GITHUB_SHA}
+
+      - name: Archive image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-axcl-amd64
+          path: dist/axllm-axcl-amd64.tar.gz
+
+  docker-axcl-arm64:
+    name: Docker (AXCL arm64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential unzip wget curl
+
+      - name: Build (AXCL aarch64 cross)
+        env:
+          AXLLM_CMAKE_ARGS: -DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=TRUE
+        run: |
+          chmod +x ./build_axcl_aarch64.sh
+          bash -euxo pipefail ./build_axcl_aarch64.sh
+
+      - name: Build Docker image (AXCL arm64)
+        run: |
+          mkdir -p dist
+          bash -euxo pipefail ./scripts/docker/build_axcl_image.sh \
+            --arch arm64 \
+            --tag axllm-axcl-arm64:${GITHUB_SHA} \
+            --output dist/axllm-axcl-arm64.tar.gz
+
+      - name: Push to GHCR (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_ghcr == 'true' }}
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag axllm-axcl-arm64:${GITHUB_SHA} ghcr.io/${{ github.repository_owner }}/axllm-axcl-arm64:${GITHUB_SHA}
+          docker push ghcr.io/${{ github.repository_owner }}/axllm-axcl-arm64:${GITHUB_SHA}
+
+      - name: Archive image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-axcl-arm64
+          path: dist/axllm-axcl-arm64.tar.gz
+
+  docker-ax650-arm64:
+    name: Docker (AX650 arm64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential unzip wget curl
+
+      - name: Build (AX650 aarch64 cross)
+        env:
+          AXLLM_CMAKE_ARGS: -DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=TRUE
+        run: |
+          chmod +x ./build_ax650.sh
+          bash -euxo pipefail ./build_ax650.sh
+
+      - name: Build Docker image (AX650 arm64)
+        run: |
+          mkdir -p dist
+          bash -euxo pipefail ./scripts/docker/build_ax650_image.sh \
+            --tag axllm-ax650-arm64:${GITHUB_SHA} \
+            --output dist/axllm-ax650-arm64.tar.gz
+
+      - name: Push to GHCR (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_ghcr == 'true' }}
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag axllm-ax650-arm64:${GITHUB_SHA} ghcr.io/${{ github.repository_owner }}/axllm-ax650-arm64:${GITHUB_SHA}
+          docker push ghcr.io/${{ github.repository_owner }}/axllm-ax650-arm64:${GITHUB_SHA}
+
+      - name: Archive image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-ax650-arm64
+          path: dist/axllm-ax650-arm64.tar.gz

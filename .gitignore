@@ -8,6 +8,10 @@ tools/test.cpp
 qtproj/LLM-Chat/CMakeLists.txt.user
 axcl
 scripts/windows_axcl_mingw_validate.sh
+!scripts/docker/
+!scripts/docker/*.sh
+!docker/axcl/
+!docker/axcl/Dockerfile
 
 # Local-only work files (keep repo clean)
 device.md
