@@ -219,6 +219,7 @@ int ax_runner_ax650::sub_init()
                 if (!n || 0 != strcmp(n, name)) continue;
                 auto &buf = first_data.pInputs[i];
                 if ((size_t)buf.nSize >= want_bytes) return 0;
+                const AX_U32 old_size = buf.nSize;
 
                 if (buf.phyAddr != 0) AX_SYS_MemFree(buf.phyAddr, buf.pVirAddr);
 
@@ -234,8 +235,9 @@ int ax_runner_ax650::sub_init()
                     buf.pVirAddr = nullptr;
                     return ret;
                 }
+                buf.nSize = (AX_U32)want_bytes;
                 memset(buf.pVirAddr, 0, want_bytes);
-                ALOGD("realloc %s buffer: group0_size=%d -> max_group_size=%zu", name, buf.nSize, want_bytes);
+                ALOGD("realloc %s buffer: group0_size=%u -> max_group_size=%zu", name, old_size, want_bytes);
                 return 0;
             }
 
@@ -282,6 +284,10 @@ int ax_runner_ax650::sub_init()
 
                 last_io_data.pInputs[i].phyAddr = first_buf->phyAddr;
                 last_io_data.pInputs[i].pVirAddr = first_buf->pVirAddr;
+                // Intermediate groups reuse buffers by referencing `last_io_data` as the shared pool.
+                // Make sure the shared pool reflects the actual allocated bytes (which may exceed the
+                // last group's symbolic tensor size for multi-shape models).
+                last_io_data.pInputs[i].nSize = first_buf->nSize;
             }
         }
 
