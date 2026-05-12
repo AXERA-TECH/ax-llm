@@ -458,10 +458,21 @@ struct LLM::Impl {
             const int ng = lyr.layer.get_num_input_groups();
             for (int gid = 0; gid < ng; ++gid)
             {
-                auto &k = lyr.layer.get_input(gid, "K_cache");
-                auto &v = lyr.layer.get_input(gid, "V_cache");
-                llm_memset(LLM_WADDR(k), 0, k.nSize, devid);
-                llm_memset(LLM_WADDR(v), 0, v.nSize, devid);
+                // Some models/backends may not map KV cache buffers into CPU virtual address
+                // space for every group (or may use group-suffixed tensor names). Clearing KV
+                // is best-effort: skip tensors that are missing or not writable from host.
+                const auto *k = try_get_group_input_tensor(lyr.layer, gid, "K_cache");
+                const auto *v = try_get_group_input_tensor(lyr.layer, gid, "V_cache");
+                if (k)
+                {
+                    void *kaddr = LLM_WADDR(*k);
+                    if (kaddr && k->nSize) llm_memset(kaddr, 0, k->nSize, devid);
+                }
+                if (v)
+                {
+                    void *vaddr = LLM_WADDR(*v);
+                    if (vaddr && v->nSize) llm_memset(vaddr, 0, v->nSize, devid);
+                }
             }
         }
     }
