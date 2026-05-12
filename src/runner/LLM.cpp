@@ -369,15 +369,18 @@ struct LLM::Impl {
     }
 
     static inline void build_decode_mask(std::vector<unsigned short> &mask_tmp,
+                                         int mask_elems,
                                          int visible_past_tokens,
                                          bool sliding_attention,
                                          int sliding_window)
     {
         bfloat16 bf16 = -65536.f;
-        std::fill(mask_tmp.begin(), mask_tmp.end(), bf16.data);
-        if (mask_tmp.empty()) return;
+        if (mask_elems <= 0) return;
+        const int elems = std::min(mask_elems, (int)mask_tmp.size());
+        if (elems <= 0) return;
+        std::fill(mask_tmp.begin(), mask_tmp.begin() + elems, bf16.data);
 
-        const int cache_len = (int)mask_tmp.size() - 1;
+        const int cache_len = elems - 1;
         const int end = std::min(std::max(0, visible_past_tokens), cache_len);
         int start = 0;
         if (sliding_attention && sliding_window > 0)
@@ -385,14 +388,19 @@ struct LLM::Impl {
             start = std::max(0, end - sliding_window + 1);
         }
         for (int i = start; i < end; ++i) mask_tmp[(size_t)i] = 0;
-        mask_tmp.back() = 0;
+        // Each decode shape-group has its own mask length. When sharing a larger
+        // `decode_mask` buffer across groups, make sure we unmask the tail
+        // element within the active prefix (not `mask_tmp.back()`).
+        mask_tmp[(size_t)(elems - 1)] = 0;
     }
 
     void build_layer_decode_mask(std::vector<unsigned short> &mask_tmp,
+                                 int mask_elems,
                                  int visible_past_tokens,
                                  int layer_idx) const
     {
         build_decode_mask(mask_tmp,
+                          mask_elems,
                           visible_past_tokens,
                           is_sliding_attention_layer(layer_idx),
                           _attr.sliding_window);
@@ -2438,8 +2446,12 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    build_layer_decode_mask(decode_mask, (int)indices, m);
-                    llm_h2d(LLM_WADDR(t_mask), decode_mask.data(), std::min((size_t)t_mask.nSize, decode_mask.size() * sizeof(unsigned short)), devid);
+                    const int mask_elems = (int)((size_t)t_mask.nSize / sizeof(unsigned short));
+                    build_layer_decode_mask(decode_mask, mask_elems, (int)indices, m);
+                    llm_h2d(LLM_WADDR(t_mask),
+                            decode_mask.data(),
+                            std::min((size_t)t_mask.nSize, (size_t)mask_elems * sizeof(unsigned short)),
+                            devid);
                 }
                 if (use_per_layer_input)
                 {
@@ -2560,8 +2572,11 @@ struct LLM::Impl {
                 }
                 else
                 {
-                    build_layer_decode_mask(decode_mask, (int)indices, m);
-                    memcpy(t_mask.pVirAddr, decode_mask.data(), std::min((size_t)t_mask.nSize, decode_mask.size() * sizeof(unsigned short)));
+                    const int mask_elems = (int)((size_t)t_mask.nSize / sizeof(unsigned short));
+                    build_layer_decode_mask(decode_mask, mask_elems, (int)indices, m);
+                    memcpy(t_mask.pVirAddr,
+                           decode_mask.data(),
+                           std::min((size_t)t_mask.nSize, (size_t)mask_elems * sizeof(unsigned short)));
                 }
                 if (use_per_layer_input)
                 {
