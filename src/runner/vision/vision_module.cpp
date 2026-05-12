@@ -380,6 +380,15 @@ static bool env_flag_false(const char* v)
     return (s == "0" || s == "false" || s == "off" || s == "no");
 }
 
+static size_t env_size_t(const char* v, size_t fallback)
+{
+    if (!v || !*v) return fallback;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    if (end == v || (end && *end != '\0') || n < 0) return fallback;
+    return (size_t)n;
+}
+
 static bool try_infer_qwen_hw_from_input_bytes(size_t input_nbytes,
                                                int temporal_patch_size,
                                                int channels,
@@ -850,6 +859,9 @@ void VisionModule::Deinit()
     audio_pad_id_ = -1;
     vision_start_id_ = -1;
     image_cache_.clear();
+    image_cache_lru_.clear();
+    image_cache_lru_pos_.clear();
+    image_cache_max_entries_ = 8;
 }
 
 bool VisionModule::Init(VLMType type,
@@ -884,6 +896,9 @@ bool VisionModule::Init(VLMType type,
         ALOGW("Vision cache disabled by env AXLLM_VISION_CACHE=0 (disk+mem cache bypassed).");
         cache_dir_.clear();
     }
+    // Memory cache size limit: protects long-running `serve` mode from unbounded growth
+    // when users send lots of distinct images (especially base64 uploads that become temp files).
+    image_cache_max_entries_ = env_size_t(std::getenv("AXLLM_VISION_MEM_CACHE_SIZE"), image_cache_max_entries_);
 
     if (type_ == VLMType::None) {
         enabled_ = false;
@@ -1669,11 +1684,33 @@ bool VisionModule::EncodeForContent(const Content& content,
         out_num_media_tokens = tokens_per_block_;
         out_image_grid_thw.reserve(image_files.size());
 
+        const bool mem_cache_enabled = cache_enabled_ && image_cache_max_entries_ > 0;
+        auto touch_cache_key = [&](const std::string& key) {
+            if (!mem_cache_enabled) return;
+            auto it = image_cache_lru_pos_.find(key);
+            if (it != image_cache_lru_pos_.end()) {
+                image_cache_lru_.splice(image_cache_lru_.end(), image_cache_lru_, it->second);
+                it->second = std::prev(image_cache_lru_.end());
+                return;
+            }
+            image_cache_lru_.push_back(key);
+            image_cache_lru_pos_[key] = std::prev(image_cache_lru_.end());
+        };
+        auto evict_cache_if_needed = [&]() {
+            if (!mem_cache_enabled) return;
+            while (image_cache_max_entries_ > 0 && image_cache_.size() > image_cache_max_entries_) {
+                const std::string old = image_cache_lru_.front();
+                image_cache_lru_.pop_front();
+                image_cache_lru_pos_.erase(old);
+                image_cache_.erase(old);
+            }
+        };
+
         for (const auto& file : image_files) {
             const std::string key = make_image_cache_key(cache_key_prefix_, file);
 
             if (cache_enabled_) {
-                auto it = image_cache_.find(key);
+                auto it = mem_cache_enabled ? image_cache_.find(key) : image_cache_.end();
                 if (it == image_cache_.end()) {
                     std::vector<std::vector<unsigned short>> cached_blocks;
                     std::vector<std::vector<float>> cached_deepstack;
@@ -1682,12 +1719,32 @@ bool VisionModule::EncodeForContent(const Content& content,
                         CachedImage ci;
                         ci.blocks_bf16 = std::move(cached_blocks);
                         ci.deepstack_features = std::move(cached_deepstack);
-                        it = image_cache_.emplace(key, std::move(ci)).first;
+                        if (mem_cache_enabled) {
+                            it = image_cache_.emplace(key, std::move(ci)).first;
+                            touch_cache_key(key);
+                            evict_cache_if_needed();
+                        } else {
+                            // Mem cache disabled: directly use disk cached data without keeping it.
+                            for (const auto& b : ci.blocks_bf16) out_blocks.push_back(b);
+                            if (out_deepstack_append && !ci.deepstack_features.empty()) {
+                                if (out_deepstack_append->size() != ci.deepstack_features.size()) {
+                                    err = "deepstack cache layer count mismatch";
+                                    return false;
+                                }
+                                for (size_t li = 0; li < ci.deepstack_features.size(); ++li) {
+                                    const auto& v = ci.deepstack_features[li];
+                                    (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
+                                }
+                            }
+                            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+                            continue;
+                        }
                     }
                 }
 
                 if (it != image_cache_.end()) {
                     ALOGI("vision cache hit (mem): %s", file.c_str());
+                    touch_cache_key(key);
                     for (const auto& b : it->second.blocks_bf16) out_blocks.push_back(b);
                     if (out_deepstack_append && !it->second.deepstack_features.empty()) {
                         if (out_deepstack_append->size() != it->second.deepstack_features.size()) {
@@ -1786,10 +1843,14 @@ bool VisionModule::EncodeForContent(const Content& content,
             if (cache_enabled_) {
                 ALOGI("vision cache store: %s", file.c_str());
                 disk_cache_save(cache_dir_, key, tokens_embed_size_, tokens_per_block_, blocks_for_one, deepstack_for_one);
-                CachedImage ci;
-                ci.blocks_bf16 = blocks_for_one;
-                ci.deepstack_features = deepstack_for_one;
-                image_cache_[key] = std::move(ci);
+                if (mem_cache_enabled) {
+                    CachedImage ci;
+                    ci.blocks_bf16 = blocks_for_one;
+                    ci.deepstack_features = deepstack_for_one;
+                    image_cache_[key] = std::move(ci);
+                    touch_cache_key(key);
+                    evict_cache_if_needed();
+                }
             }
 
             for (auto& b : blocks_for_one) out_blocks.push_back(std::move(b));

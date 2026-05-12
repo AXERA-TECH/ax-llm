@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -136,6 +137,11 @@ private:
         std::vector<std::vector<float>> deepstack_features;   // per layer (optional)
     };
     std::unordered_map<std::string, CachedImage> image_cache_;
+    // Simple LRU bookkeeping for `image_cache_` to prevent unbounded growth in long-running `serve` mode.
+    // Controlled by env `AXLLM_VISION_MEM_CACHE_SIZE` (0 disables mem cache; default is small).
+    size_t image_cache_max_entries_ = 8;
+    std::list<std::string> image_cache_lru_;
+    std::unordered_map<std::string, std::list<std::string>::iterator> image_cache_lru_pos_;
     std::string cache_dir_;
     std::string cache_key_prefix_;
 
