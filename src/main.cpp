@@ -338,6 +338,21 @@ struct ModelConfig
             {
                 attr.filename_per_layer_projection_norm = j["filename_per_layer_projection_norm"].get<std::string>();
             }
+#ifdef USE_AXCL
+            if (const char *env = std::getenv("AXLLM_AXCL_DISABLE_SHARED_KV"); env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0'))
+            {
+                attr.num_kv_shared_layers = 0;
+                ALOGW("AXCL override: disable shared kv via AXLLM_AXCL_DISABLE_SHARED_KV");
+            }
+            if (const char *env = std::getenv("AXLLM_AXCL_DISABLE_PER_LAYER_INPUT"); env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0'))
+            {
+                attr.hidden_size_per_layer_input = 0;
+                attr.filename_tokens_embed_per_layer.clear();
+                attr.filename_per_layer_model_projection.clear();
+                attr.filename_per_layer_projection_norm.clear();
+                ALOGW("AXCL override: disable Gemma4 per-layer input via AXLLM_AXCL_DISABLE_PER_LAYER_INPUT");
+            }
+#endif
 
             // Load options
             if (j.contains("b_use_mmap_load_embed"))

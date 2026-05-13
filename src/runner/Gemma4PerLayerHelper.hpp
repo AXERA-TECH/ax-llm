@@ -181,8 +181,34 @@ class Gemma4PerLayerHelper
     // Scalar fp32 dot product. Kept as a fallback when NEON isn't available.
     static inline float dot_f32_scalar(const float *a, const float *b, int n)
     {
-        float sum = 0.0f;
-        for (int i = 0; i < n; ++i) sum += a[i] * b[i];
+        int i = 0;
+        float acc16[16] = {0};
+        for (; i + 16 <= n; i += 16)
+        {
+            for (int k = 0; k < 16; ++k)
+                acc16[k] += a[i + k] * b[i + k];
+        }
+
+        float acc4[4] = {0};
+        for (; i + 4 <= n; i += 4)
+        {
+            for (int k = 0; k < 4; ++k)
+                acc4[k] += a[i + k] * b[i + k];
+        }
+
+        float lane_sum[4] = {0};
+        for (int lane = 0; lane < 4; ++lane)
+        {
+            lane_sum[lane] =
+                acc16[lane] +
+                acc16[4 + lane] +
+                acc16[8 + lane] +
+                acc16[12 + lane] +
+                acc4[lane];
+        }
+
+        float sum = lane_sum[0] + lane_sum[1] + lane_sum[2] + lane_sum[3];
+        for (; i < n; ++i) sum += a[i] * b[i];
         return sum;
     }
 
@@ -537,21 +563,17 @@ public:
         const float *norm = projection_norm_ptr();
 
         std::atomic<int> bad_token(-2);
+        const bool disable_parallel = std::getenv("AXLLM_DISABLE_GEMMA4_PER_LAYER_OMP") != nullptr;
 
-        // Parallelize across tokens when we have more than one. For decode (num_tokens==1)
-        // OpenMP has overhead with no benefit; let the runtime skip the team spawn.
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if(num_tokens > 1)
-#endif
-        for (int token_idx = 0; token_idx < num_tokens; ++token_idx)
+        auto compute_token = [&](int token_idx)
         {
-            if (bad_token.load(std::memory_order_relaxed) != -2) continue;
+            if (bad_token.load(std::memory_order_relaxed) != -2) return;
             const int token_id = token_ids[(size_t)token_idx];
             if (token_id < 0 || token_id >= vocab_size_)
             {
                 int expected = -2;
                 bad_token.compare_exchange_strong(expected, token_id);
-                continue;
+                return;
             }
 
             std::vector<float> input_fp32((size_t)hidden_size_);
@@ -586,6 +608,22 @@ public:
                     out[out_base + (size_t)h] = bfloat16((proj_fp32 + token_fp32) * merge_scale_).data;
                 }
             }
+        };
+
+        if (disable_parallel || num_tokens <= 1)
+        {
+            for (int token_idx = 0; token_idx < num_tokens; ++token_idx)
+                compute_token(token_idx);
+        }
+        else
+        {
+            // Parallelize across tokens when we have more than one. For decode (num_tokens==1)
+            // OpenMP has overhead with no benefit; let the runtime skip the team spawn.
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+#endif
+            for (int token_idx = 0; token_idx < num_tokens; ++token_idx)
+                compute_token(token_idx);
         }
 
         const int bad = bad_token.load(std::memory_order_relaxed);

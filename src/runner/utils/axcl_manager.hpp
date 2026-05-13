@@ -8,6 +8,7 @@
 #include <atomic>
 #include <future>
 #include <chrono>
+#include <cstdlib>
 
 #include <axcl.h>
 #include "ax_cmm_utils.hpp"
@@ -24,6 +25,22 @@ private:
     std::atomic<bool> stop_flag;
 
     std::promise<bool> initPromise;
+
+    static bool force_sync_enabled()
+    {
+        return std::getenv("AXLLM_AXCL_FORCE_SYNC") != nullptr;
+    }
+
+    static axclrtEngineVNpuKind vnpu_mode()
+    {
+        const char *env = std::getenv("AXLLM_AXCL_VNPU_MODE");
+        if (!env || !*env) return AXCL_VNPU_DISABLE;
+        if (0 == std::strcmp(env, "0") || 0 == std::strcmp(env, "disable")) return AXCL_VNPU_DISABLE;
+        if (0 == std::strcmp(env, "1") || 0 == std::strcmp(env, "enable")) return AXCL_VNPU_ENABLE;
+        if (0 == std::strcmp(env, "2") || 0 == std::strcmp(env, "big_little")) return AXCL_VNPU_BIG_LITTLE;
+        if (0 == std::strcmp(env, "3") || 0 == std::strcmp(env, "little_big")) return AXCL_VNPU_LITTLE_BIG;
+        return AXCL_VNPU_DISABLE;
+    }
 
     void run(int devid)
     {
@@ -51,7 +68,9 @@ private:
             initPromise.set_value(false); // 初始化失败
             return;
         }
-        if (const auto ret = axclrtEngineInit(AXCL_VNPU_DISABLE); 0 != ret)
+        const axclrtEngineVNpuKind init_vnpu = vnpu_mode();
+        ALOGI("AXCLWorker init vnpu mode %d", (int)init_vnpu);
+        if (const auto ret = axclrtEngineInit(init_vnpu); 0 != ret)
         {
             ALOGE("axclrtEngineInit %d", ret);
             initPromise.set_value(false); // 初始化失败
@@ -136,11 +155,17 @@ private:
     }
     axclError axclrtMemset_func(void *devPtr, uint8_t value, size_t count)
     {
-        return axclrtMemset(devPtr, value, count);
+        const axclError ret = axclrtMemset(devPtr, value, count);
+        if (ret == 0 && force_sync_enabled())
+            return axclrtSynchronizeDevice();
+        return ret;
     }
     axclError axclrtMemcpy_func(void *dstPtr, const void *srcPtr, size_t count, axclrtMemcpyKind kind)
     {
-        return axclrtMemcpy(dstPtr, srcPtr, count, kind);
+        const axclError ret = axclrtMemcpy(dstPtr, srcPtr, count, kind);
+        if (ret == 0 && force_sync_enabled())
+            return axclrtSynchronizeDevice();
+        return ret;
     }
     axclError axclrtMemcmp_func(const void *devPtr1, const void *devPtr2, size_t count)
     {
@@ -336,7 +361,10 @@ private:
     // 38. axclrtEngineExecute
     axclError axclrtEngineExecute_func(uint64_t modelId, uint64_t contextId, uint32_t group, axclrtEngineIO io)
     {
-        return axclrtEngineExecute(modelId, contextId, group, io);
+        const axclError ret = axclrtEngineExecute(modelId, contextId, group, io);
+        if (ret == 0 && force_sync_enabled())
+            return axclrtSynchronizeDevice();
+        return ret;
     }
     // 39. axclrtEngineExecuteAsync
     axclError axclrtEngineExecuteAsync_func(uint64_t modelId, uint64_t contextId, uint32_t group, axclrtEngineIO io, axclrtStream stream)

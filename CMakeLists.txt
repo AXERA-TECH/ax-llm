@@ -252,12 +252,18 @@ if(BUILD_AXCL)
         ${AXCL_LINK_LIBS}
         ${AXLLM_VISION_LIBS}
     )
+    add_executable(axcl_io_probe tools/axcl_io_probe.cpp)
+    target_include_directories(axcl_io_probe PRIVATE ${AXCL_INCLUDE_DIRS})
+    target_compile_definitions(axcl_io_probe PRIVATE USE_AXCL)
+    target_link_libraries(axcl_io_probe ${AXCL_LINK_LIBS})
     if(NOT WIN32)
         set_target_properties(axllm PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
         set_target_properties(llm_smoke PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
+        set_target_properties(axcl_io_probe PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
     endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
+    install(TARGETS axcl_io_probe DESTINATION bin)
 endif()
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)

@@ -112,6 +112,9 @@ static int prepare_io_struct_only(int grpid, axclrtEngineIOInfo io_info, axclrtE
     return 0;
 }
 
+static int alloc_host_buffer(void **host_ptr, size_t size, int devid);
+static void free_host_buffer(void *host_ptr, int devid);
+
 static int prepare_io_with_alloc(int grpid, axclrtEngineIOInfo io_info, axclrtEngineIO io,
                                  std::vector<ax_runner_tensor_t> &input, std::vector<ax_runner_tensor_t> &output,
                                  int _devid, std::vector<std::string> skip_alloc_input_names = {}, std::vector<std::string> skip_alloc_output_names = {})
@@ -137,13 +140,13 @@ static int prepare_io_with_alloc(int grpid, axclrtEngineIOInfo io_info, axclrtEn
             return ret;
         }
         input[i].phyAddr = (unsigned long long)devPtr;
-        input[i].pVirAddr = malloc(input[i].nSize);
-        if (input[i].pVirAddr == nullptr)
+        ret = alloc_host_buffer(&input[i].pVirAddr, input[i].nSize, _devid);
+        if (ret != 0)
         {
-            printf("malloc failed, ret: %d\n", ret);
+            axcl_Free(devPtr, _devid);
+            input[i].phyAddr = 0;
             return ret;
         }
-        memset(input[i].pVirAddr, 0, input[i].nSize);
         axcl_Memset(devPtr, 0, input[i].nSize, _devid);
     }
 
@@ -161,16 +164,111 @@ static int prepare_io_with_alloc(int grpid, axclrtEngineIOInfo io_info, axclrtEn
             return ret;
         }
         output[i].phyAddr = (unsigned long long)devPtr;
-        output[i].pVirAddr = malloc(output[i].nSize);
-        if (output[i].pVirAddr == nullptr)
+        ret = alloc_host_buffer(&output[i].pVirAddr, output[i].nSize, _devid);
+        if (ret != 0)
         {
-            printf("malloc failed, ret: %d\n", ret);
+            axcl_Free(devPtr, _devid);
+            output[i].phyAddr = 0;
             return ret;
         }
-        memset(output[i].pVirAddr, 0, output[i].nSize);
         axcl_Memset(devPtr, 0, output[i].nSize, _devid);
     }
     return 0;
+}
+
+static ax_runner_tensor_t *find_tensor_by_name(std::vector<ax_runner_tensor_t> &tensors, const std::string &name)
+{
+    for (auto &tensor : tensors)
+    {
+        if (tensor.sName == name)
+        {
+            return &tensor;
+        }
+    }
+    return nullptr;
+}
+
+static bool debug_bindings_enabled()
+{
+    return std::getenv("AXLLM_AXCL_DEBUG_BINDINGS") != nullptr;
+}
+
+static bool should_log_binding_name(const std::string &name)
+{
+    return name == "indices" ||
+           name == "input" ||
+           name == "mask" ||
+           name == "per_layer_input" ||
+           name == "K_cache" ||
+           name == "V_cache" ||
+           name == "output" ||
+           name == "K_cache_out" ||
+           name == "V_cache_out";
+}
+
+static void dump_group_tensor_bindings(const char *kind, size_t grpid, const std::vector<ax_runner_tensor_t> &tensors)
+{
+    if (!debug_bindings_enabled())
+    {
+        return;
+    }
+    for (const auto &tensor : tensors)
+    {
+        if (!should_log_binding_name(tensor.sName))
+        {
+            continue;
+        }
+        ALOGI("AXCL_BIND group=%zu kind=%s name=%s idx=%d size=%zu phy=0x%llx host=%p",
+              grpid,
+              kind,
+              tensor.sName.c_str(),
+              tensor.nIdx,
+              (size_t)tensor.nSize,
+              (unsigned long long)tensor.phyAddr,
+              tensor.pVirAddr);
+    }
+}
+
+static int allocate_tensor_storage(ax_runner_tensor_t &tensor, int devid)
+{
+    void *devPtr = nullptr;
+    int ret = axcl_Malloc(&devPtr, tensor.nSize, axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST, devid);
+    if (ret != 0)
+    {
+        ALOGE("axcl_Malloc(%s, %zu) failed, ret=%d", tensor.sName.c_str(), (size_t)tensor.nSize, ret);
+        return ret;
+    }
+
+    tensor.phyAddr = (unsigned long long)devPtr;
+    ret = alloc_host_buffer(&tensor.pVirAddr, tensor.nSize, devid);
+    if (ret != 0)
+    {
+        axcl_Free(devPtr, devid);
+        tensor.phyAddr = 0;
+        return ret;
+    }
+    axcl_Memset(devPtr, 0, tensor.nSize, devid);
+    return 0;
+}
+
+static int alloc_host_buffer(void **host_ptr, size_t size, int devid)
+{
+    int ret = axcl_MallocHost(host_ptr, size, devid);
+    if (ret != 0)
+    {
+        ALOGE("axcl_MallocHost(%zu) failed, ret=%d", size, ret);
+        return ret;
+    }
+    memset(*host_ptr, 0, size);
+    return 0;
+}
+
+static void free_host_buffer(void *host_ptr, int devid)
+{
+    if (host_ptr)
+    {
+        axcl_FreeHost(host_ptr, devid);
+    }
 }
 
 struct ax_joint_runner_ax650_handle_t
@@ -222,13 +320,21 @@ int ax_runner_axcl::sub_init()
     // memset(&m_handle->io_datas[0], 0, sizeof(AXCL_IO_DATA_T) * group_count);
 
     std::vector<std::string> skip_alloc_input_names = {"K_cache", "V_cache"};
+    const bool disable_group_alias = std::getenv("AXLLM_AXCL_DISABLE_GROUP_ALIAS") != nullptr;
+    const bool dedicate_prefill_indices = std::getenv("AXLLM_AXCL_DEDICATE_PREFILL_INDICES") != nullptr;
+    const bool dedicate_prefill_kv = std::getenv("AXLLM_AXCL_DEDICATE_PREFILL_KV") != nullptr;
+    const bool dedicate_prefill_outputs = std::getenv("AXLLM_AXCL_DEDICATE_PREFILL_OUTPUTS") != nullptr;
     // 1. 分配 IO 资源
     for (size_t grpid = 0; grpid < group_count; grpid++)
     {
         ret = axcl_EngineCreateIO(m_handle->io_info, &m_handle->ios[grpid], dev_id);
 
+        if (disable_group_alias)
+        {
+            ret = prepare_io_with_alloc(grpid, m_handle->io_info, m_handle->ios[grpid], mgroup_input_tensors[grpid], mgroup_output_tensors[grpid], dev_id);
+        }
         // 原有逻辑保持不变：Group 0 和 Last Group 分配物理内存，中间 Group 不分配
-        if (grpid == 0)
+        else if (grpid == 0)
         {
             ret = prepare_io_with_alloc(grpid, m_handle->io_info, m_handle->ios[grpid], mgroup_input_tensors[grpid], mgroup_output_tensors[grpid], dev_id);
         }
@@ -248,6 +354,7 @@ int ax_runner_axcl::sub_init()
     // We share KV buffers across shape groups to save memory, but some models
     // (e.g. multi-decode 2k/4k/8k/16k) have different KV sizes per group.
     // Group 0 might not be the largest, so allocate KV based on max required size.
+    if (!disable_group_alias)
     {
         size_t max_k_bytes = 0;
         size_t max_v_bytes = 0;
@@ -267,10 +374,11 @@ int ax_runner_axcl::sub_init()
             {
                 if (t.sName != name) continue;
                 if ((size_t)t.nSize >= want_bytes) return 0;
+                const size_t old_size = (size_t)t.nSize;
 
                 // Free the original (smaller) buffers from group 0.
                 if (t.phyAddr) axcl_Free((void *)t.phyAddr, dev_id);
-                if (t.pVirAddr) free(t.pVirAddr);
+                free_host_buffer(t.pVirAddr, dev_id);
 
                 void *devPtr = nullptr;
                 int ret = axcl_Malloc(&devPtr, want_bytes, axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST, dev_id);
@@ -282,17 +390,17 @@ int ax_runner_axcl::sub_init()
                     return ret;
                 }
                 t.phyAddr = (unsigned long long)devPtr;
-                t.pVirAddr = malloc(want_bytes);
-                if (t.pVirAddr == nullptr)
+                ret = alloc_host_buffer(&t.pVirAddr, want_bytes, dev_id);
+                if (ret != 0)
                 {
-                    ALOGE("malloc(%s, %zu) failed", name, want_bytes);
                     axcl_Free(devPtr, dev_id);
                     t.phyAddr = 0;
-                    return -1;
+                    t.pVirAddr = nullptr;
+                    return ret;
                 }
-                memset(t.pVirAddr, 0, want_bytes);
+                t.nSize = want_bytes;
                 axcl_Memset(devPtr, 0, want_bytes, dev_id);
-                ALOGD("realloc %s buffer: group0_size=%d -> max_group_size=%zu", name, t.nSize, want_bytes);
+                ALOGD("realloc %s buffer: group0_size=%zu -> max_group_size=%zu", name, old_size, want_bytes);
                 return 0;
             }
             // No KV tensor in group 0 (should not happen).
@@ -307,7 +415,7 @@ int ax_runner_axcl::sub_init()
         if (ret != 0) return ret;
     }
 
-    if (group_count > 2)
+    if (!disable_group_alias && group_count > 2)
     {
         auto &first_input = mgroup_input_tensors[0];
         auto &last_input = mgroup_input_tensors[group_count - 1];
@@ -316,14 +424,22 @@ int ax_runner_axcl::sub_init()
         {
             if (std::find(skip_alloc_input_names.begin(), skip_alloc_input_names.end(), last_input[i].sName) != skip_alloc_input_names.end())
             {
-                for (size_t j = 0; j < first_input.size(); ++j)
+                ax_runner_tensor_t *shared = find_tensor_by_name(first_input, last_input[i].sName);
+                if (shared == nullptr)
                 {
-                    if (first_input[j].sName == last_input[i].sName)
-                    {
-                        last_input[i].phyAddr = first_input[j].phyAddr;
-                        last_input[i].pVirAddr = first_input[j].pVirAddr;
-                    }
+                    ALOGE("failed to find shared input buffer for %s in group0", last_input[i].sName.c_str());
+                    return -1;
                 }
+                if (shared->nSize < last_input[i].nSize)
+                {
+                    ALOGE("shared input buffer too small for %s: src=%zu dst=%zu",
+                          last_input[i].sName.c_str(),
+                          (size_t)shared->nSize,
+                          (size_t)last_input[i].nSize);
+                    return -1;
+                }
+                last_input[i].phyAddr = shared->phyAddr;
+                last_input[i].pVirAddr = shared->pVirAddr;
             }
         }
 
@@ -331,20 +447,108 @@ int ax_runner_axcl::sub_init()
         {
             auto &input = mgroup_input_tensors[grpid];
 
-            // 安全检查：确保维度匹配再拷贝
-            size_t min_inputs = std::min(input.size(), last_input.size());
-            for (size_t i = 0; i < min_inputs; i++)
+            // Gemma4 prefill groups may not keep identical tensor ordering across groups.
+            for (size_t i = 0; i < input.size(); i++)
             {
-                input[i].phyAddr = last_input[i].phyAddr;
-                input[i].pVirAddr = last_input[i].pVirAddr;
+                ax_runner_tensor_t *shared = find_tensor_by_name(last_input, input[i].sName);
+                if (shared == nullptr)
+                {
+                    ALOGE("failed to find shared input buffer for group %zu tensor %s", grpid, input[i].sName.c_str());
+                    return -1;
+                }
+                if (shared->nSize < input[i].nSize)
+                {
+                    ALOGE("shared input buffer too small for group %zu tensor %s: src=%zu dst=%zu",
+                          grpid,
+                          input[i].sName.c_str(),
+                          (size_t)shared->nSize,
+                          (size_t)input[i].nSize);
+                    return -1;
+                }
+                input[i].phyAddr = shared->phyAddr;
+                input[i].pVirAddr = shared->pVirAddr;
             }
 
             auto &output = mgroup_output_tensors[grpid];
-            size_t min_outputs = std::min(output.size(), last_output.size());
-            for (size_t i = 0; i < min_outputs; i++)
+            for (size_t i = 0; i < output.size(); i++)
             {
-                output[i].phyAddr = last_output[i].phyAddr;
-                output[i].pVirAddr = last_output[i].pVirAddr;
+                ax_runner_tensor_t *shared = find_tensor_by_name(last_output, output[i].sName);
+                if (shared == nullptr)
+                {
+                    ALOGE("failed to find shared output buffer for group %zu tensor %s", grpid, output[i].sName.c_str());
+                    return -1;
+                }
+                if (shared->nSize < output[i].nSize)
+                {
+                    ALOGE("shared output buffer too small for group %zu tensor %s: src=%zu dst=%zu",
+                          grpid,
+                          output[i].sName.c_str(),
+                          (size_t)shared->nSize,
+                          (size_t)output[i].nSize);
+                    return -1;
+                }
+                output[i].phyAddr = shared->phyAddr;
+                output[i].pVirAddr = shared->pVirAddr;
+            }
+        }
+    }
+
+    if (!disable_group_alias && dedicate_prefill_indices)
+    {
+        for (size_t grpid = 1; grpid < group_count; ++grpid)
+        {
+            auto &inputs = mgroup_input_tensors[grpid];
+            ax_runner_tensor_t *tensor = find_tensor_by_name(inputs, "indices");
+            if (!tensor)
+            {
+                continue;
+            }
+            ret = allocate_tensor_storage(*tensor, dev_id);
+            if (ret != 0)
+            {
+                return ret;
+            }
+        }
+    }
+
+    if (!disable_group_alias && dedicate_prefill_kv)
+    {
+        for (size_t grpid = 1; grpid < group_count; ++grpid)
+        {
+            auto &inputs = mgroup_input_tensors[grpid];
+            for (const char *name : {"K_cache", "V_cache"})
+            {
+                ax_runner_tensor_t *tensor = find_tensor_by_name(inputs, name);
+                if (!tensor)
+                {
+                    continue;
+                }
+                ret = allocate_tensor_storage(*tensor, dev_id);
+                if (ret != 0)
+                {
+                    return ret;
+                }
+            }
+        }
+    }
+
+    if (!disable_group_alias && dedicate_prefill_outputs)
+    {
+        for (size_t grpid = 1; grpid < group_count; ++grpid)
+        {
+            auto &outputs = mgroup_output_tensors[grpid];
+            for (const char *name : {"K_cache_out", "V_cache_out", "output"})
+            {
+                ax_runner_tensor_t *tensor = find_tensor_by_name(outputs, name);
+                if (!tensor)
+                {
+                    continue;
+                }
+                ret = allocate_tensor_storage(*tensor, dev_id);
+                if (ret != 0)
+                {
+                    return ret;
+                }
             }
         }
     }
@@ -370,6 +574,20 @@ int ax_runner_axcl::sub_init()
     if (!mgroup_input_tensors.empty())
         minput_tensors = mgroup_input_tensors[0];
 
+    if (debug_bindings_enabled())
+    {
+        const size_t last_grpid = group_count > 0 ? group_count - 1 : 0;
+        for (size_t grpid = 0; grpid < group_count; ++grpid)
+        {
+            if (grpid != 0 && grpid != 1 && grpid != last_grpid)
+            {
+                continue;
+            }
+            dump_group_tensor_bindings("input", grpid, mgroup_input_tensors[grpid]);
+            dump_group_tensor_bindings("output", grpid, mgroup_output_tensors[grpid]);
+        }
+    }
+
     // print_io_info(minput_tensors, mtensors);
 
     build_tensor_maps();
@@ -379,11 +597,11 @@ int ax_runner_axcl::sub_init()
 
 int ax_runner_axcl::init(const char *model_file, int devid)
 {
-    if (!m_handle)
+    if (m_handle)
     {
-        m_handle = new ax_joint_runner_ax650_handle_t;
+        deinit();
     }
-    memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
+    m_handle = new ax_joint_runner_ax650_handle_t;
     this->dev_id = devid;
 
     int ret = axcl_EngineLoadFromFile(model_file, &m_handle->handle, dev_id);
@@ -397,11 +615,11 @@ int ax_runner_axcl::init(const char *model_file, int devid)
 
 int ax_runner_axcl::init(char *model_buffer, size_t model_size, int devid)
 {
-    if (!m_handle)
+    if (m_handle)
     {
-        m_handle = new ax_joint_runner_ax650_handle_t;
+        deinit();
     }
-    memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
+    m_handle = new ax_joint_runner_ax650_handle_t;
     this->dev_id = devid;
 
     void *devMem = nullptr;
@@ -437,7 +655,7 @@ void ax_runner_axcl::deinit()
                 }
                 if (free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
                 {
-                    free(tensor.pVirAddr);
+                    free_host_buffer(tensor.pVirAddr, dev_id);
                     free_vir_addr.push_back(tensor.pVirAddr);
                 }
             }
@@ -450,7 +668,7 @@ void ax_runner_axcl::deinit()
                 }
                 if (free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
                 {
-                    free(tensor.pVirAddr);
+                    free_host_buffer(tensor.pVirAddr, dev_id);
                     free_vir_addr.push_back(tensor.pVirAddr);
                 }
             }

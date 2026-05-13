@@ -8,9 +8,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <queue>
+#include <sstream>
 #include <thread>
 
 #include "bfloat16.hpp"
@@ -40,9 +42,88 @@ using ax_runner_t = ax_runner_ax650;
 
 #ifdef USE_AXCL
 static inline void llm_memset(void *phy, int val, size_t n, int devid) { axcl_Memset(phy, (uint8_t)val, n, devid); }
-static inline void llm_h2d(void *phy_dst, const void *src, size_t n, int devid) { axcl_Memcpy(phy_dst, src, n, AXCL_MEMCPY_HOST_TO_DEVICE, devid); }
-static inline void llm_d2h(void *dst, const void *phy_src, size_t n, int devid) { axcl_Memcpy(dst, phy_src, n, AXCL_MEMCPY_DEVICE_TO_HOST, devid); }
-static inline void llm_d2d(void *phy_dst, const void *phy_src, size_t n, int devid) { axcl_Memcpy(phy_dst, phy_src, n, AXCL_MEMCPY_DEVICE_TO_DEVICE, devid); }
+
+struct AxclPinnedHostBuffer
+{
+    void *ptr = nullptr;
+    int devid = 0;
+
+    AxclPinnedHostBuffer(size_t size, int device_id) : devid(device_id)
+    {
+        if (size == 0) return;
+        if (axcl_MallocHost(&ptr, size, devid) != 0)
+            ptr = nullptr;
+    }
+
+    ~AxclPinnedHostBuffer()
+    {
+        if (ptr) axcl_FreeHost(ptr, devid);
+    }
+
+    AxclPinnedHostBuffer(const AxclPinnedHostBuffer &) = delete;
+    AxclPinnedHostBuffer &operator=(const AxclPinnedHostBuffer &) = delete;
+};
+
+static inline void llm_h2d(void *phy_dst, const void *src, size_t n, int devid)
+{
+    if (!phy_dst || !src || n == 0) return;
+    AxclPinnedHostBuffer pinned(n, devid);
+    if (!pinned.ptr)
+    {
+        ALOGE("axcl_MallocHost failed in llm_h2d, size=%zu devid=%d", n, devid);
+        return;
+    }
+    std::memcpy(pinned.ptr, src, n);
+    const int ret = axcl_Memcpy(phy_dst, pinned.ptr, n, AXCL_MEMCPY_HOST_TO_DEVICE, devid);
+    if (ret != 0)
+        ALOGE("axcl H2D memcpy failed, size=%zu devid=%d ret=%d", n, devid, ret);
+}
+
+static inline void llm_d2h(void *dst, const void *phy_src, size_t n, int devid)
+{
+    if (!dst || !phy_src || n == 0) return;
+    AxclPinnedHostBuffer pinned(n, devid);
+    if (!pinned.ptr)
+    {
+        ALOGE("axcl_MallocHost failed in llm_d2h, size=%zu devid=%d", n, devid);
+        return;
+    }
+    const int ret = axcl_Memcpy(pinned.ptr, phy_src, n, AXCL_MEMCPY_DEVICE_TO_HOST, devid);
+    if (ret != 0)
+    {
+        ALOGE("axcl D2H memcpy failed, size=%zu devid=%d ret=%d", n, devid, ret);
+        return;
+    }
+    std::memcpy(dst, pinned.ptr, n);
+}
+
+static inline void llm_d2d(void *phy_dst, const void *phy_src, size_t n, int devid)
+{
+    if (!phy_dst || !phy_src || n == 0) return;
+    const int ret = axcl_Memcpy(phy_dst, phy_src, n, AXCL_MEMCPY_DEVICE_TO_DEVICE, devid);
+    if (ret != 0)
+        ALOGE("axcl D2D memcpy failed, size=%zu devid=%d ret=%d", n, devid, ret);
+}
+
+static inline void llm_d2d_via_host(void *phy_dst, const void *phy_src, size_t n, int devid)
+{
+    if (!phy_dst || !phy_src || n == 0) return;
+    AxclPinnedHostBuffer pinned(n, devid);
+    if (!pinned.ptr)
+    {
+        ALOGE("axcl_MallocHost failed in llm_d2d_via_host, size=%zu devid=%d", n, devid);
+        return;
+    }
+    int ret = axcl_Memcpy(pinned.ptr, phy_src, n, AXCL_MEMCPY_DEVICE_TO_HOST, devid);
+    if (ret != 0)
+    {
+        ALOGE("axcl D2H memcpy failed in llm_d2d_via_host, size=%zu devid=%d ret=%d", n, devid, ret);
+        return;
+    }
+    ret = axcl_Memcpy(phy_dst, pinned.ptr, n, AXCL_MEMCPY_HOST_TO_DEVICE, devid);
+    if (ret != 0)
+        ALOGE("axcl H2D memcpy failed in llm_d2d_via_host, size=%zu devid=%d ret=%d", n, devid, ret);
+}
 #define LLM_WADDR(t)      ((void *)(t).phyAddr)
 #define LLM_RADDR(t)      ((const void *)(t).phyAddr)
 #define LLM_DEVID(layer_obj) ((layer_obj).layer.get_devid())
@@ -57,6 +138,16 @@ static inline void llm_d2d(void *vir_dst, const void *vir_src, size_t n, int /*d
 #endif
 
 namespace {
+
+static inline int getenv_positive_int(const char *name, int fallback)
+{
+    const char *env = std::getenv(name);
+    if (!env || env[0] == '\0') return fallback;
+    char *end = nullptr;
+    const long v = std::strtol(env, &end, 10);
+    if (end == env || v <= 0 || v > std::numeric_limits<int>::max()) return fallback;
+    return (int)v;
+}
 
 template <typename RunnerT>
 const ax_runner_tensor_t *try_get_group_input_tensor(RunnerT &runner, int grpid, const std::string &name)
@@ -485,6 +576,255 @@ struct LLM::Impl {
                vision_state.pos2vision[(size_t)abs_pos] >= 0;
     }
 
+    bool debug_multimodal_enabled() const
+    {
+        const char *env = std::getenv("AXLLM_DEBUG_MM");
+        return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+    }
+
+    bool debug_decode_trace_enabled() const
+    {
+        const char *env = std::getenv("AXLLM_DEBUG_DECODE_TRACE");
+        return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+    }
+
+    bool debug_prefill_trace_enabled() const
+    {
+        const char *env = std::getenv("AXLLM_DEBUG_PREFILL_TRACE");
+        return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+    }
+
+    bool env_flag_enabled(const char *name) const
+    {
+        const char *env = std::getenv(name);
+        return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+    }
+
+    int debug_decode_trace_steps() const
+    {
+        return getenv_positive_int("AXLLM_DEBUG_DECODE_TRACE_STEPS", 1);
+    }
+
+    int debug_decode_trace_layers() const
+    {
+        return getenv_positive_int("AXLLM_DEBUG_DECODE_TRACE_LAYERS", _attr.axmodel_num);
+    }
+
+    bool debug_decode_trace_matches_layer(int layer_idx) const
+    {
+        const char *env = std::getenv("AXLLM_DEBUG_DECODE_TRACE_LAYER_SET");
+        if (!env || env[0] == '\0')
+            return layer_idx < debug_decode_trace_layers();
+
+        std::istringstream iss(env);
+        std::string token;
+        while (std::getline(iss, token, ','))
+        {
+            token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char c) { return std::isspace(c) != 0; }), token.end());
+            if (token.empty()) continue;
+
+            const size_t dash = token.find('-');
+            if (dash == std::string::npos)
+            {
+                if (layer_idx == std::atoi(token.c_str()))
+                    return true;
+                continue;
+            }
+
+            const int begin = std::atoi(token.substr(0, dash).c_str());
+            const int end = std::atoi(token.substr(dash + 1).c_str());
+            if (begin <= layer_idx && layer_idx <= end)
+                return true;
+        }
+        return false;
+    }
+
+    static uint64_t fnv1a64(const void *data, size_t size)
+    {
+        const auto *p = static_cast<const unsigned char *>(data);
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < size; ++i)
+        {
+            h ^= (uint64_t)p[i];
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    static std::string summarize_bf16_tensor(const unsigned short *data, size_t elems, size_t sample = 8)
+    {
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss.precision(4);
+        oss << "n=" << elems << " hash=0x" << std::hex << fnv1a64(data, elems * sizeof(unsigned short)) << std::dec << " vals=[";
+        const size_t n = std::min(elems, sample);
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (i) oss << ",";
+            oss << bfloat16(data[i]).fp32();
+        }
+        if (elems > n) oss << ",...";
+        oss << "]";
+        return oss.str();
+    }
+
+    void trace_decode_embed_if_needed(int step_idx, unsigned int indices, int next_token, const std::vector<unsigned short> &embed_data)
+    {
+        if (!debug_decode_trace_enabled() || step_idx >= debug_decode_trace_steps()) return;
+        ALOGI("DTRACE step=%d idx=%u token=%d piece='%s' embed %s",
+              step_idx,
+              indices,
+              next_token,
+              safe_decode_token(tokenizer, next_token).c_str(),
+              summarize_bf16_tensor(embed_data.data(), embed_data.size()).c_str());
+    }
+
+    void trace_decode_layer_tensor_if_needed(int step_idx,
+                                             int layer_idx,
+                                             const char *tag,
+                                             const unsigned short *data,
+                                             size_t elems)
+    {
+        if (!debug_decode_trace_enabled() || step_idx >= debug_decode_trace_steps()) return;
+        if (!debug_decode_trace_matches_layer(layer_idx)) return;
+        ALOGI("DTRACE step=%d layer=%d %s %s",
+              step_idx,
+              layer_idx,
+              tag,
+              summarize_bf16_tensor(data, elems).c_str());
+    }
+
+    void trace_decode_logits_if_needed(int step_idx, const unsigned short *data, size_t elems)
+    {
+        if (!debug_decode_trace_enabled() || step_idx >= debug_decode_trace_steps()) return;
+        const int k = (int)std::min<size_t>(5, elems);
+        auto topk = topk_bfloat16(const_cast<unsigned short *>(data), (int)elems, k);
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss.precision(4);
+        oss << "n=" << elems << " hash=0x" << std::hex << fnv1a64(data, elems * sizeof(unsigned short)) << std::dec << " topk=[";
+        for (size_t i = 0; i < topk.size(); ++i)
+        {
+            if (i) oss << ",";
+            oss << "(" << topk[i].first << ":" << topk[i].second << ")";
+        }
+        oss << "]";
+        ALOGI("DTRACE step=%d post_logits %s", step_idx, oss.str().c_str());
+    }
+
+    void trace_prefill_tensor_if_needed(int chunk_idx,
+                                        int layer_idx,
+                                        const char *tag,
+                                        const unsigned short *data,
+                                        size_t elems)
+    {
+        if (!debug_prefill_trace_enabled()) return;
+        if (layer_idx != 0) return;
+        ALOGI("PTRACE chunk=%d layer=%d %s %s",
+              chunk_idx,
+              layer_idx,
+              tag,
+              summarize_bf16_tensor(data, elems).c_str());
+    }
+
+    void trace_prefill_indices_if_needed(int chunk_idx,
+                                         int layer_idx,
+                                         const char *tag,
+                                         const unsigned int *data,
+                                         size_t elems)
+    {
+        if (!debug_prefill_trace_enabled()) return;
+        if (layer_idx != 0) return;
+
+        std::ostringstream oss;
+        oss << "n=" << elems << " vals=[";
+        const size_t n = std::min<size_t>(elems, 16);
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (i) oss << ",";
+            oss << data[i];
+        }
+        if (elems > n) oss << ",...";
+        oss << "]";
+        ALOGI("PTRACE chunk=%d layer=%d %s %s", chunk_idx, layer_idx, tag, oss.str().c_str());
+    }
+
+    void log_vision_position_summary(const char *tag) const
+    {
+        if (!debug_multimodal_enabled() || !has_vision_state) return;
+
+        int count = 0;
+        int first = -1;
+        int last = -1;
+        std::vector<std::pair<int, int>> ranges;
+        int range_start = -1;
+        for (size_t i = 0; i < vision_state.pos2vision.size(); ++i)
+        {
+            const bool is_vision = vision_state.pos2vision[i] >= 0;
+            if (is_vision)
+            {
+                if (first < 0) first = (int)i;
+                last = (int)i;
+                ++count;
+                if (range_start < 0) range_start = (int)i;
+            }
+            else if (range_start >= 0)
+            {
+                ranges.push_back({range_start, (int)i - 1});
+                range_start = -1;
+            }
+        }
+        if (range_start >= 0) ranges.push_back({range_start, (int)vision_state.pos2vision.size() - 1});
+
+        std::string range_text;
+        for (size_t i = 0; i < ranges.size(); ++i)
+        {
+            if (i) range_text += ",";
+            range_text += std::to_string(ranges[i].first) + "-" + std::to_string(ranges[i].second);
+        }
+        if (range_text.empty()) range_text = "(none)";
+
+        ALOGI("MMDBG %s: seq=%zu vision_tokens=%d first=%d last=%d ranges=%s decode_start=%d",
+              tag,
+              vision_state.pos2vision.size(),
+              count,
+              first,
+              last,
+              range_text.c_str(),
+              vision_state.decode_start);
+    }
+
+    void log_prefill_chunk_vision_summary(int p, int history_len, int input_num_token, int prefill_grpid) const
+    {
+        if (!debug_multimodal_enabled() || !has_vision_state || vision_state.pos2vision.empty()) return;
+
+        const int begin = std::max(0, history_len);
+        const int end = std::min((int)vision_state.pos2vision.size(), history_len + input_num_token);
+        int count = 0;
+        int first = -1;
+        int last = -1;
+        for (int pos = begin; pos < end; ++pos)
+        {
+            if (vision_state.pos2vision[(size_t)pos] < 0) continue;
+            if (first < 0) first = pos;
+            last = pos;
+            ++count;
+        }
+        if (count > 0)
+        {
+            ALOGI("MMDBG prefill chunk: p=%d grpid=%d history_len=%d input_tokens=%d vision_tokens=%d first=%d last=%d slice_start=%d slice_end=%d",
+                  p,
+                  prefill_grpid,
+                  history_len,
+                  input_num_token,
+                  count,
+                  first,
+                  last,
+                  begin,
+                  end - 1);
+        }
+    }
+
     void scale_prefill_text_embeds_inplace(unsigned short *data, int num_tokens, int abs_start_pos) const
     {
         if (!use_gemma4_scaled_text_input() || !data || num_tokens <= 0) return;
@@ -600,6 +940,24 @@ struct LLM::Impl {
         const int safe_history_len = std::max(0, history_len);
         const int safe_chunk_tokens = std::max(0, chunk_tokens);
         const int total_tokens = safe_history_len + safe_chunk_tokens;
+        const int forced_gid = getenv_positive_int("AXLLM_FORCE_PREFILL_GID", -1);
+
+        if (forced_gid > 0)
+        {
+            const int history_cap = prefill_history_capacity_by_gid(forced_gid);
+            const int total_cap = prefill_capacity_by_gid(forced_gid);
+            if (history_cap >= 0 && total_cap >= 0 &&
+                safe_history_len <= history_cap && total_tokens <= total_cap)
+            {
+                return forced_gid;
+            }
+            ALOGW("forced prefill gid=%d rejected for history_len=%d chunk_tokens=%d history_cap=%d total_cap=%d",
+                  forced_gid,
+                  safe_history_len,
+                  safe_chunk_tokens,
+                  history_cap,
+                  total_cap);
+        }
 
         if (prefer_symbolic_group && !prefill_symbolic_kv_cache_num_grp.empty())
         {
@@ -1448,7 +1806,13 @@ struct LLM::Impl {
                 llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
 
                 // inference
-                lyr.layer.inference(prefill_grpid);
+                const int infer_ret = lyr.layer.inference(prefill_grpid);
+                if (infer_ret != 0)
+                {
+                    ALOGE("prefill layer inference failed: layer=%d grpid=%d devid=%d ret=%d input_tokens=%d history_len=%d",
+                          m, prefill_grpid, devid, infer_ret, input_num_token, history_len);
+                    return false;
+                }
 
                 // KV cache update
                 const size_t kv_off = (size_t)history_len * (size_t)_attr.kv_cache_size;
@@ -1830,8 +2194,11 @@ struct LLM::Impl {
             prefill_grp_list[p] = g;
             if (g > max_prefill_gid) max_prefill_gid = g;
         }
+        log_vision_position_summary("run_prefill");
 
-        const bool use_per_layer_input = gemma4_per_layer_helper.enabled();
+        const bool disable_per_layer_input = env_flag_enabled("AXLLM_DISABLE_GEMMA4_PER_LAYER_INPUT");
+        const bool disable_shared_kv = env_flag_enabled("AXLLM_DISABLE_SHARED_KV");
+        const bool use_per_layer_input = gemma4_per_layer_helper.enabled() && !disable_per_layer_input;
         const int per_layer_hidden = gemma4_per_layer_helper.hidden_size_per_layer_input();
         const bool decode_profile_enabled = std::getenv("AXLLM_PROFILE_DECODE") != nullptr;
         DecodeProfileStats decode_profile{};
@@ -1894,6 +2261,7 @@ struct LLM::Impl {
             }
             ALOGI("prefill chunk p=%d history_len=%d grpid=%d kv_cache_num=%d input_tokens=%d",
                   p, history_len, prefill_grpid, kv_cache_num_p, input_num_token);
+            log_prefill_chunk_vision_summary(p, history_len, input_num_token, prefill_grpid);
 
             std::vector<unsigned short> embed_tmp(_attr.prefill_token_num * _attr.tokens_embed_size, 0);
             std::vector<unsigned short> mask_tmp(_attr.prefill_token_num * (kv_cache_num_p + _attr.prefill_token_num), bf16.data);
@@ -1944,6 +2312,12 @@ struct LLM::Impl {
                     }
                 }
                 llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
+                if (debug_prefill_trace_enabled() && p == 0 && m == 0)
+                {
+                    std::vector<unsigned int> idx_trace((size_t)t_idx.nSize / sizeof(unsigned int), 0);
+                    llm_d2h(idx_trace.data(), LLM_RADDR(t_idx), t_idx.nSize, devid);
+                    trace_prefill_indices_if_needed(p, m, "indices_dev", idx_trace.data(), idx_trace.size());
+                }
                 auto &t_mask = lyr.layer.get_input(prefill_grpid, "mask");
                 if (is_linear_layer(m))
                 {
@@ -1958,8 +2332,20 @@ struct LLM::Impl {
                     build_layer_prefill_mask(mask_tmp, kv_cache_num_p, _attr.prefill_token_num, history_len, input_num_token, m);
                     llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
                 }
+                if (debug_prefill_trace_enabled() && p == 0 && m == 0)
+                {
+                    std::vector<unsigned short> mask_trace((size_t)t_mask.nSize / sizeof(unsigned short), 0);
+                    llm_d2h(mask_trace.data(), LLM_RADDR(t_mask), t_mask.nSize, devid);
+                    trace_prefill_tensor_if_needed(p, m, "mask_dev", mask_trace.data(), mask_trace.size());
+                }
                 auto &t_in = lyr.layer.get_input(prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
-                const int shared_src = shared_kv_source_for_layer(m);
+                if (debug_prefill_trace_enabled() && p == 0 && m == 0)
+                {
+                    std::vector<unsigned short> input_trace((size_t)t_in.nSize / sizeof(unsigned short), 0);
+                    llm_d2h(input_trace.data(), LLM_RADDR(t_in), t_in.nSize, devid);
+                    trace_prefill_tensor_if_needed(p, m, "input_dev", input_trace.data(), input_trace.size());
+                }
+                const int shared_src = disable_shared_kv ? -1 : shared_kv_source_for_layer(m);
                 if (shared_src >= 0)
                 {
                     auto &src_layer = llama_layers[(size_t)shared_src];
@@ -2002,16 +2388,38 @@ struct LLM::Impl {
                                     prefill_per_layer_inputs.data() + src_off,
                                     (size_t)per_layer_hidden * sizeof(unsigned short));
                     }
+                    if (debug_prefill_trace_enabled() && p == 0 && m == 0)
+                    {
+                        trace_prefill_tensor_if_needed(p, m, "per_layer_input_host", per_layer_tmp.data(), per_layer_tmp.size());
+                    }
                     llm_h2d(LLM_WADDR(*t_per_layer),
                             per_layer_tmp.data(),
                             std::min((size_t)t_per_layer->nSize, per_layer_tmp.size() * sizeof(unsigned short)),
                             devid);
+                    if (debug_prefill_trace_enabled() && p == 0 && m == 0)
+                    {
+                        std::vector<unsigned short> per_layer_trace((size_t)t_per_layer->nSize / sizeof(unsigned short), 0);
+                        llm_d2h(per_layer_trace.data(), LLM_RADDR(*t_per_layer), t_per_layer->nSize, devid);
+                        trace_prefill_tensor_if_needed(p, m, "per_layer_input_dev", per_layer_trace.data(), per_layer_trace.size());
+                    }
                 }
                 lyr.layer.inference(prefill_grpid);
                 auto &out_k = lyr.layer.get_output(prefill_grpid, "K_cache_out");
                 auto &out_v = lyr.layer.get_output(prefill_grpid, "V_cache_out");
                 auto &dec_k = lyr.layer.get_input(decode_grpid, "K_cache");
                 auto &dec_v = lyr.layer.get_input(decode_grpid, "V_cache");
+                if (debug_prefill_trace_enabled() && p == 0 && m == 0)
+                {
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    const size_t kv_tokens = (size_t)std::max(1, input_num_token);
+                    const size_t kv_elems = kv_tokens * (size_t)std::max(1, layer_kv);
+                    std::vector<unsigned short> out_k_trace(kv_elems, 0);
+                    std::vector<unsigned short> out_v_trace(kv_elems, 0);
+                    llm_d2h(out_k_trace.data(), LLM_RADDR(out_k), kv_elems * sizeof(unsigned short), devid);
+                    llm_d2h(out_v_trace.data(), LLM_RADDR(out_v), kv_elems * sizeof(unsigned short), devid);
+                    trace_prefill_tensor_if_needed(p, m, "prefill_k_cache_out", out_k_trace.data(), out_k_trace.size());
+                    trace_prefill_tensor_if_needed(p, m, "prefill_v_cache_out", out_v_trace.data(), out_v_trace.size());
+                }
                 if (is_linear_layer(m))
                 {
                     const size_t kbytes = std::min((size_t)dec_k.nSize, (size_t)out_k.nSize);
@@ -2051,8 +2459,26 @@ struct LLM::Impl {
                         }
                     }
                 }
+                if (debug_prefill_trace_enabled() && p == 0 && m == 0)
+                {
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    const size_t kv_tokens = (size_t)std::max(1, input_num_token);
+                    const size_t kv_elems = kv_tokens * (size_t)std::max(1, layer_kv);
+                    std::vector<unsigned short> dec_k_trace(kv_elems, 0);
+                    std::vector<unsigned short> dec_v_trace(kv_elems, 0);
+                    llm_d2h(dec_k_trace.data(), LLM_RADDR(dec_k), kv_elems * sizeof(unsigned short), devid);
+                    llm_d2h(dec_v_trace.data(), LLM_RADDR(dec_v), kv_elems * sizeof(unsigned short), devid);
+                    trace_prefill_tensor_if_needed(p, m, "decode_k_cache_after_prefill", dec_k_trace.data(), dec_k_trace.size());
+                    trace_prefill_tensor_if_needed(p, m, "decode_v_cache_after_prefill", dec_v_trace.data(), dec_v_trace.size());
+                }
 
                 auto &t_out = lyr.layer.get_output(prefill_grpid, "output");
+                if (debug_prefill_trace_enabled() && p == 0 && m == 0)
+                {
+                    std::vector<unsigned short> out_trace((size_t)t_out.nSize / sizeof(unsigned short), 0);
+                    llm_d2h(out_trace.data(), LLM_RADDR(t_out), t_out.nSize, devid);
+                    trace_prefill_tensor_if_needed(p, m, "output_dev", out_trace.data(), out_trace.size());
+                }
                 llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
 
                 if (has_vision_state &&
@@ -2093,13 +2519,21 @@ struct LLM::Impl {
         if (use_per_layer_input)
             gemma4_per_layer_helper.reset_decode_stats(decode_profile_enabled);
         int last_shared_sync_decode_grpid = -1;
+        const bool axcl_decode_host_chain = std::getenv("AXLLM_AXCL_DECODE_HOST_CHAIN") != nullptr;
+        const bool axcl_kv_host_copy = std::getenv("AXLLM_AXCL_KV_HOST_COPY") != nullptr;
         {
             auto &t_in = llama_post.get_input("input");
             llm_h2d(LLM_WADDR(t_in), embed.data(), embed.size() * sizeof(unsigned short), LLM_DEVID(llama_layers.back()));
-            llama_post.inference();
+            const int post_ret = llama_post.inference();
+            if (post_ret != 0)
+            {
+                ALOGE("post inference failed: devid=%d ret=%d", llama_post.get_devid(), post_ret);
+                return final_out;
+            }
             auto &t_out = llama_post.get_output("output");
             llm_d2h(t_out.pVirAddr, LLM_RADDR(t_out), t_out.nSize, llama_post.get_devid());
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr;
+            trace_decode_logits_if_needed(0, post_out, (size_t)_attr.tokens_embed_num);
             next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
             ALOGI("ttft: %.2f ms", ttft_timer.cost());
             b_hit_eos = tokenizer->is_stop(next_token);
@@ -2131,6 +2565,7 @@ struct LLM::Impl {
         for (unsigned int indices = decode_start; !b_hit_eos && indices < (unsigned int)_attr.max_token_len; indices++)
         {
             if (b_stop.load(std::memory_order_relaxed)) break;
+            const int step_idx = (int)(indices - decode_start);
             bool need_full_shared_sync = false;
             {
                 const int want_gid = choose_decode_gid((int)indices + 1);
@@ -2143,6 +2578,7 @@ struct LLM::Impl {
             }
             embed_selector.getByIndex(next_token, embed);
             scale_all_embeds_inplace(embed.data(), 1);
+            trace_decode_embed_if_needed(step_idx, indices, next_token, embed);
             if (use_per_layer_input)
             {
                 const auto t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
@@ -2163,12 +2599,16 @@ struct LLM::Impl {
                 auto &l0_in = llama_layers[0].layer.get_input(decode_grpid, "input");
                 llm_h2d(LLM_WADDR(l0_in), embed.data(), l0_in.nSize, llama_layers[0].layer.get_devid());
             }
+            auto axcl_copy_kv = [&](void *dst, const void *src, size_t bytes, int dev) {
+                if (axcl_kv_host_copy) llm_d2d_via_host(dst, src, bytes, dev);
+                else llm_d2d(dst, src, bytes, dev);
+            };
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
                 if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m]; int devid = lyr.layer.get_devid();
                 auto &in_k = lyr.layer.get_input(decode_grpid, "K_cache");
                 auto &in_v = lyr.layer.get_input(decode_grpid, "V_cache");
-                const int shared_src = shared_kv_source_for_layer(m);
+                const int shared_src = disable_shared_kv ? -1 : shared_kv_source_for_layer(m);
                 if (shared_src >= 0)
                 {
                     auto &src_layer = llama_layers[(size_t)shared_src];
@@ -2176,25 +2616,28 @@ struct LLM::Impl {
                     auto &src_v = src_layer.layer.get_input(decode_grpid, "V_cache");
                     const int layer_kv = kv_cache_size_for_layer(m);
                     const size_t dst_tokens = (size_t)in_k.nSize / sizeof(unsigned short) / (size_t)std::max(1, layer_kv);
-                    const size_t visible_past = std::min((size_t)indices, dst_tokens > 0 ? (dst_tokens - 1) : 0);
-                    llm_memset(LLM_WADDR(in_k), 0, in_k.nSize, devid);
-                    llm_memset(LLM_WADDR(in_v), 0, in_v.nSize, devid);
-                    if (visible_past > 0)
+                    if (need_full_shared_sync)
                     {
-                        const size_t past_bytes = visible_past * (size_t)layer_kv * sizeof(unsigned short);
-                        llm_d2d(LLM_WADDR(in_k), LLM_RADDR(src_k), std::min(past_bytes, (size_t)src_k.nSize), devid);
-                        llm_d2d(LLM_WADDR(in_v), LLM_RADDR(src_v), std::min(past_bytes, (size_t)src_v.nSize), devid);
+                        const size_t visible_past = std::min((size_t)indices, dst_tokens > 0 ? (dst_tokens - 1) : 0);
+                        llm_memset(LLM_WADDR(in_k), 0, in_k.nSize, devid);
+                        llm_memset(LLM_WADDR(in_v), 0, in_v.nSize, devid);
+                        if (visible_past > 0)
+                        {
+                            const size_t past_bytes = visible_past * (size_t)layer_kv * sizeof(unsigned short);
+                            axcl_copy_kv(LLM_WADDR(in_k), LLM_RADDR(src_k), std::min(past_bytes, (size_t)src_k.nSize), devid);
+                            axcl_copy_kv(LLM_WADDR(in_v), LLM_RADDR(src_v), std::min(past_bytes, (size_t)src_v.nSize), devid);
+                        }
                     }
                     if (dst_tokens > 0)
                     {
                         const size_t cur_off_bytes = (size_t)indices * (size_t)layer_kv * sizeof(unsigned short);
                         const size_t dst_off_bytes = (dst_tokens - 1) * (size_t)layer_kv * sizeof(unsigned short);
-                        llm_d2d((unsigned char *)LLM_WADDR(in_k) + dst_off_bytes,
-                                (const unsigned char *)LLM_RADDR(src_k) + cur_off_bytes,
-                                sizeof(unsigned short) * (size_t)layer_kv, devid);
-                        llm_d2d((unsigned char *)LLM_WADDR(in_v) + dst_off_bytes,
-                                (const unsigned char *)LLM_RADDR(src_v) + cur_off_bytes,
-                                sizeof(unsigned short) * (size_t)layer_kv, devid);
+                        axcl_copy_kv((unsigned char *)LLM_WADDR(in_k) + dst_off_bytes,
+                                     (const unsigned char *)LLM_RADDR(src_k) + cur_off_bytes,
+                                     sizeof(unsigned short) * (size_t)layer_kv, devid);
+                        axcl_copy_kv((unsigned char *)LLM_WADDR(in_v) + dst_off_bytes,
+                                     (const unsigned char *)LLM_RADDR(src_v) + cur_off_bytes,
+                                     sizeof(unsigned short) * (size_t)layer_kv, devid);
                     }
                 }
                 auto &t_idx = lyr.layer.get_input(decode_grpid, "indices"); llm_h2d(LLM_WADDR(t_idx), &indices, sizeof(indices), devid);
@@ -2211,6 +2654,22 @@ struct LLM::Impl {
                     build_layer_decode_mask(decode_mask, (int)indices, m);
                     llm_h2d(LLM_WADDR(t_mask), decode_mask.data(), std::min((size_t)t_mask.nSize, decode_mask.size() * sizeof(unsigned short)), devid);
                 }
+                if (debug_prefill_trace_enabled() && step_idx < debug_decode_trace_steps() && m == 0)
+                {
+                    std::vector<unsigned short> mask_trace((size_t)t_mask.nSize / sizeof(unsigned short), 0);
+                    llm_d2h(mask_trace.data(), LLM_RADDR(t_mask), t_mask.nSize, devid);
+                    trace_prefill_tensor_if_needed(step_idx, 0, "decode_mask_dev", mask_trace.data(), mask_trace.size());
+
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    const size_t cache_tokens = std::min<size_t>((size_t)indices + 1, (size_t)32);
+                    const size_t cache_elems = cache_tokens * (size_t)std::max(1, layer_kv);
+                    std::vector<unsigned short> k_trace(cache_elems, 0);
+                    std::vector<unsigned short> v_trace(cache_elems, 0);
+                    llm_d2h(k_trace.data(), LLM_RADDR(in_k), cache_elems * sizeof(unsigned short), devid);
+                    llm_d2h(v_trace.data(), LLM_RADDR(in_v), cache_elems * sizeof(unsigned short), devid);
+                    trace_prefill_tensor_if_needed(step_idx, 0, "decode_k_cache_prefix", k_trace.data(), k_trace.size());
+                    trace_prefill_tensor_if_needed(step_idx, 0, "decode_v_cache_prefix", v_trace.data(), v_trace.size());
+                }
                 if (use_per_layer_input)
                 {
                     const ax_runner_tensor_t *t_per_layer = try_get_group_input_tensor(lyr.layer, decode_grpid, "per_layer_input");
@@ -2220,18 +2679,29 @@ struct LLM::Impl {
                         return final_out;
                     }
                     const size_t src_off = (size_t)m * (size_t)per_layer_hidden;
+                    if (debug_prefill_trace_enabled() && step_idx < debug_decode_trace_steps() && m == 0)
+                    {
+                        trace_prefill_tensor_if_needed(step_idx, 0, "decode_per_layer_input_host",
+                                                       decode_per_layer_input.data() + src_off,
+                                                       (size_t)per_layer_hidden);
+                    }
                     llm_h2d(LLM_WADDR(*t_per_layer),
                             decode_per_layer_input.data() + src_off,
                             std::min((size_t)t_per_layer->nSize, (size_t)per_layer_hidden * sizeof(unsigned short)),
                             devid);
                 }
-                lyr.layer.inference(decode_grpid);
+                const int infer_ret = lyr.layer.inference(decode_grpid);
+                if (infer_ret != 0)
+                {
+                    ALOGE("decode layer inference failed: layer=%d grpid=%d devid=%d ret=%d indices=%u",
+                          m, decode_grpid, devid, infer_ret, indices);
+                    return final_out;
+                }
                 auto &out_k = lyr.layer.get_output(decode_grpid, "K_cache_out"); auto &out_v = lyr.layer.get_output(decode_grpid, "V_cache_out");
-                auto &in_k  = lyr.layer.get_input(decode_grpid, "K_cache"); auto &in_v  = lyr.layer.get_input(decode_grpid, "V_cache");
                 if (is_linear_layer(m))
                 {
-                    llm_d2d(LLM_WADDR(in_k), LLM_RADDR(out_k), std::min((size_t)in_k.nSize, (size_t)out_k.nSize), devid);
-                    llm_d2d(LLM_WADDR(in_v), LLM_RADDR(out_v), std::min((size_t)in_v.nSize, (size_t)out_v.nSize), devid);
+                    axcl_copy_kv(LLM_WADDR(in_k), LLM_RADDR(out_k), std::min((size_t)in_k.nSize, (size_t)out_k.nSize), devid);
+                    axcl_copy_kv(LLM_WADDR(in_v), LLM_RADDR(out_v), std::min((size_t)in_v.nSize, (size_t)out_v.nSize), devid);
                 }
                 else
                 {
@@ -2247,40 +2717,70 @@ struct LLM::Impl {
                             // Shared-KV layers consume the source layer's KV. Preserve that
                             // source KV in the past slot; their own K_cache_out is not the
                             // cache that should be visible to the next decode token.
-                            llm_d2d((unsigned short *)LLM_WADDR(in_k) + cur_off,
-                                    (unsigned short *)LLM_RADDR(in_k) + tail_off,
-                                    copy_bytes,
-                                    devid);
-                            llm_d2d((unsigned short *)LLM_WADDR(in_v) + cur_off,
-                                    (unsigned short *)LLM_RADDR(in_v) + tail_off,
-                                    copy_bytes,
-                                    devid);
+                            axcl_copy_kv((unsigned short *)LLM_WADDR(in_k) + cur_off,
+                                         (unsigned short *)LLM_RADDR(in_k) + tail_off,
+                                         copy_bytes,
+                                         devid);
+                            axcl_copy_kv((unsigned short *)LLM_WADDR(in_v) + cur_off,
+                                         (unsigned short *)LLM_RADDR(in_v) + tail_off,
+                                         copy_bytes,
+                                         devid);
                         }
                     }
                     else
                     {
-                        llm_d2d((unsigned short *)LLM_WADDR(in_k) + indices * layer_kv, LLM_RADDR(out_k), std::min((size_t)out_k.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
-                        llm_d2d((unsigned short *)LLM_WADDR(in_v) + indices * layer_kv, LLM_RADDR(out_v), std::min((size_t)out_v.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
+                        axcl_copy_kv((unsigned short *)LLM_WADDR(in_k) + indices * layer_kv, LLM_RADDR(out_k), std::min((size_t)out_k.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
+                        axcl_copy_kv((unsigned short *)LLM_WADDR(in_v) + indices * layer_kv, LLM_RADDR(out_v), std::min((size_t)out_v.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
                     }
                 }
                 auto &cur_out = lyr.layer.get_output(decode_grpid, "output");
+                if (debug_decode_trace_enabled() && step_idx < debug_decode_trace_steps() && m < debug_decode_trace_layers())
+                {
+                    std::vector<unsigned short> trace_out((size_t)_attr.tokens_embed_size, 0);
+                    llm_d2h(trace_out.data(),
+                            LLM_RADDR(cur_out),
+                            std::min((size_t)cur_out.nSize, trace_out.size() * sizeof(unsigned short)),
+                            devid);
+                    trace_decode_layer_tensor_if_needed(step_idx, m, "output", trace_out.data(), trace_out.size());
+                }
                 if (m == _attr.axmodel_num - 1)
                 {
                     auto &post_in = llama_post.get_input("input");
-                    if (llama_post.get_devid() == devid) { llm_d2d(LLM_WADDR(post_in), LLM_RADDR(cur_out), post_in.nSize, devid); }
-                    else { llm_d2h(cur_out.pVirAddr, LLM_RADDR(cur_out), cur_out.nSize, devid); llm_h2d(LLM_WADDR(post_in), cur_out.pVirAddr, post_in.nSize, llama_post.get_devid()); }
+                    if (!axcl_decode_host_chain && llama_post.get_devid() == devid)
+                    {
+                        llm_d2d(LLM_WADDR(post_in), LLM_RADDR(cur_out), post_in.nSize, devid);
+                    }
+                    else
+                    {
+                        llm_d2h(cur_out.pVirAddr, LLM_RADDR(cur_out), cur_out.nSize, devid);
+                        llm_h2d(LLM_WADDR(post_in), cur_out.pVirAddr, post_in.nSize, llama_post.get_devid());
+                    }
                 }
                 else
                 {
                     auto &next_in = llama_layers[m + 1].layer.get_input(decode_grpid, "input"); int next_devid = llama_layers[m + 1].layer.get_devid();
-                    if (next_devid == devid) { llm_d2d(LLM_WADDR(next_in), LLM_RADDR(cur_out), next_in.nSize, devid); }
-                    else { llm_d2h(cur_out.pVirAddr, LLM_RADDR(cur_out), cur_out.nSize, devid); llm_h2d(LLM_WADDR(next_in), cur_out.pVirAddr, next_in.nSize, next_devid); }
+                    if (!axcl_decode_host_chain && next_devid == devid)
+                    {
+                        llm_d2d(LLM_WADDR(next_in), LLM_RADDR(cur_out), next_in.nSize, devid);
+                    }
+                    else
+                    {
+                        llm_d2h(cur_out.pVirAddr, LLM_RADDR(cur_out), cur_out.nSize, devid);
+                        llm_h2d(LLM_WADDR(next_in), cur_out.pVirAddr, next_in.nSize, next_devid);
+                    }
                 }
             }
-            llama_post.inference();
+            const int post_ret = llama_post.inference();
+            if (post_ret != 0)
+            {
+                ALOGE("decode post inference failed: devid=%d ret=%d", llama_post.get_devid(), post_ret);
+                return final_out;
+            }
             {
                 auto &t_out = llama_post.get_output("output"); llm_d2h(t_out.pVirAddr, LLM_RADDR(t_out), t_out.nSize, llama_post.get_devid());
-                unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
+                unsigned short *post_out = (unsigned short *)t_out.pVirAddr;
+                trace_decode_logits_if_needed(step_idx + 1, post_out, (size_t)_attr.tokens_embed_num);
+                next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
             }
 #else // AX650
             for (int m = 0; m < _attr.axmodel_num; m++)
@@ -2288,7 +2788,7 @@ struct LLM::Impl {
                 if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m];
                 auto &in_k = lyr.layer.get_input(decode_grpid, "K_cache"); auto *in_k_ptr = (unsigned short *)in_k.pVirAddr;
                 auto &in_v = lyr.layer.get_input(decode_grpid, "V_cache"); auto *in_v_ptr = (unsigned short *)in_v.pVirAddr;
-                const int shared_src = shared_kv_source_for_layer(m);
+                const int shared_src = disable_shared_kv ? -1 : shared_kv_source_for_layer(m);
                 const auto shared_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
                 if (shared_src >= 0)
                 {
@@ -2334,6 +2834,22 @@ struct LLM::Impl {
                     build_layer_decode_mask(decode_mask, (int)indices, m);
                     memcpy(t_mask.pVirAddr, decode_mask.data(), std::min((size_t)t_mask.nSize, decode_mask.size() * sizeof(unsigned short)));
                 }
+                if (debug_prefill_trace_enabled() && step_idx < debug_decode_trace_steps() && m == 0)
+                {
+                    trace_prefill_tensor_if_needed(step_idx, 0, "decode_mask_dev",
+                                                   (const unsigned short *)t_mask.pVirAddr,
+                                                   (size_t)t_mask.nSize / sizeof(unsigned short));
+
+                    const int layer_kv = kv_cache_size_for_layer(m);
+                    const size_t cache_tokens = std::min<size_t>((size_t)indices + 1, (size_t)32);
+                    const size_t cache_elems = cache_tokens * (size_t)std::max(1, layer_kv);
+                    trace_prefill_tensor_if_needed(step_idx, 0, "decode_k_cache_prefix",
+                                                   in_k_ptr,
+                                                   cache_elems);
+                    trace_prefill_tensor_if_needed(step_idx, 0, "decode_v_cache_prefix",
+                                                   in_v_ptr,
+                                                   cache_elems);
+                }
                 if (use_per_layer_input)
                 {
                     const ax_runner_tensor_t *t_per_layer = try_get_group_input_tensor(lyr.layer, decode_grpid, "per_layer_input");
@@ -2343,6 +2859,12 @@ struct LLM::Impl {
                         return final_out;
                     }
                     const size_t src_off = (size_t)m * (size_t)per_layer_hidden;
+                    if (debug_prefill_trace_enabled() && step_idx < debug_decode_trace_steps() && m == 0)
+                    {
+                        trace_prefill_tensor_if_needed(step_idx, 0, "decode_per_layer_input_host",
+                                                       decode_per_layer_input.data() + src_off,
+                                                       (size_t)per_layer_hidden);
+                    }
                     memcpy(t_per_layer->pVirAddr,
                            decode_per_layer_input.data() + src_off,
                            std::min((size_t)t_per_layer->nSize, (size_t)per_layer_hidden * sizeof(unsigned short)));
@@ -2385,17 +2907,20 @@ struct LLM::Impl {
                     }
                 }
                 auto &t_out= lyr.layer.get_output(decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
+                trace_decode_layer_tensor_if_needed(step_idx, m, "output", embed.data(), embed.size());
                 if (decode_profile_enabled)
                     decode_profile.outcopy_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - out_t0).count();
             }
             const auto post_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
             auto &t_in = llama_post.get_input("input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             llama_post.inference(); auto &t_out = llama_post.get_output("output");
-            unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
+            unsigned short *post_out = (unsigned short *)t_out.pVirAddr;
+            trace_decode_logits_if_needed(step_idx + 1, post_out, (size_t)_attr.tokens_embed_num);
+            next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
             if (decode_profile_enabled)
                 decode_profile.post_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - post_t0).count();
-            last_shared_sync_decode_grpid = decode_grpid;
 #endif
+            last_shared_sync_decode_grpid = decode_grpid;
 
             if (tokenizer->is_stop(next_token)) { b_hit_eos = true; break; }
             token_ids.push_back(next_token);
@@ -2557,6 +3082,7 @@ struct LLM::Impl {
                 new_tokens = std::move(input_ids);
                 vision_state = std::move(st);
                 has_vision_state = true;
+                log_vision_position_summary("prepare");
             }
             else
             {
@@ -2579,6 +3105,16 @@ struct LLM::Impl {
 
         int offset = 0;
         auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
+        if (debug_multimodal_enabled())
+        {
+            ALOGI("MMDBG diff: last_tokens=%zu new_tokens=%zu offset=%d diff=%zu precompute_len=%d has_vision=%d",
+                  last_tokens_ids.size(),
+                  new_tokens.size(),
+                  offset,
+                  tokens_diff.size(),
+                  precompute_len,
+                  has_vision_state ? 1 : 0);
+        }
         bool not_append = !(offset == (int)last_tokens_ids.size() && (int)new_tokens.size() >= (int)last_tokens_ids.size());
         if (not_append) { ALOGW("history not append (rollback/modify). force ResetKVCache and recompute."); ResetKVCache(); tokens_diff = new_tokens; offset = 0; }
         if (tokens_diff.empty())
