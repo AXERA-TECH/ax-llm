@@ -248,6 +248,7 @@ struct LLM::Impl {
     std::vector<Content> last_history_snapshot;
     std::vector<int> last_tokens_ids;
     std::vector<int> run_input_token_ids;
+    std::vector<int> last_run_generated_token_ids;
     bool b_os_kvcache = false;
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     int precompute_len = 0;
@@ -261,6 +262,9 @@ struct LLM::Impl {
     std::unique_ptr<vision::VisionModule> vision;
     vision::RunState vision_state;
     bool has_vision_state = false;
+    int cached_mrope_next_pos = -1;
+    int active_prefill_pos_start = -1;
+    int active_token_pos_start = -1;
 
     struct LLMLayer {
         ax_runner_t layer;
@@ -711,6 +715,28 @@ struct LLM::Impl {
         return -1;
     }
 
+    int prefill_history_capacity_for_layer_group(int layer_idx, int prefill_grpid)
+    {
+        if (_attr.prefill_token_num <= 0) return -1;
+        if (layer_idx < 0 || layer_idx >= _attr.axmodel_num) return -1;
+        try
+        {
+            const auto &mask_t = llama_layers[(size_t)layer_idx].layer.get_input(prefill_grpid, "mask");
+            const int mask_elems = (int)((size_t)mask_t.nSize / sizeof(unsigned short));
+            if (mask_elems > 0 && (mask_elems % _attr.prefill_token_num) == 0)
+            {
+                const int cols = mask_elems / _attr.prefill_token_num;
+                const int kv_from_mask = cols - _attr.prefill_token_num;
+                if (kv_from_mask >= 0) return kv_from_mask;
+            }
+        }
+        catch (const std::exception &)
+        {
+        }
+
+        return -1;
+    }
+
     int choose_prefill_gid(int needed_tokens) const
     {
         if (prefill_grpids_.empty() || _attr.prefill_max_kv_cache_num_grp.empty()) return 1;
@@ -909,11 +935,11 @@ struct LLM::Impl {
         }
     }
 
-    void sync_linear_state_to_layer_groups(int layer_idx,
-                                           ax_runner_t &layer,
-                                           const ax_runner_tensor_t &out_k,
-                                           const ax_runner_tensor_t &out_v,
-                                           int devid) const
+    void sync_linear_state_to_decode_groups(int layer_idx,
+                                            ax_runner_t &layer,
+                                            const ax_runner_tensor_t &out_k,
+                                            const ax_runner_tensor_t &out_v,
+                                            int devid) const
     {
         if (layer_idx >= 0 && layer_idx < (int)layer_decode_grpids_.size())
         {
@@ -925,12 +951,30 @@ struct LLM::Impl {
             for (const int gid : decode_grpids_)
                 copy_linear_state_to_group(layer, gid, out_k, out_v, devid);
         }
+    }
 
-        if (layer_idx >= 0 && layer_idx < (int)layer_prefill_grpids_.size())
-        {
-            for (const int gid : layer_prefill_grpids_[(size_t)layer_idx])
-                copy_linear_state_to_group(layer, gid, out_k, out_v, devid);
-        }
+    void sync_linear_state_to_prefill_groups(int layer_idx,
+                                             ax_runner_t &layer,
+                                             const ax_runner_tensor_t &out_k,
+                                             const ax_runner_tensor_t &out_v,
+                                             int devid,
+                                             bool skip_cold_prefill_group) const
+    {
+        if (layer_idx < 0 || layer_idx >= (int)layer_prefill_grpids_.size()) return;
+        const auto &gids = layer_prefill_grpids_[(size_t)layer_idx];
+        const size_t start = (skip_cold_prefill_group && gids.size() > 1) ? 1 : 0;
+        for (size_t i = start; i < gids.size(); ++i)
+            copy_linear_state_to_group(layer, gids[i], out_k, out_v, devid);
+    }
+
+    void sync_linear_state_after_prefill(int layer_idx,
+                                         ax_runner_t &layer,
+                                         const ax_runner_tensor_t &out_k,
+                                         const ax_runner_tensor_t &out_v,
+                                         int devid) const
+    {
+        sync_linear_state_to_decode_groups(layer_idx, layer, out_k, out_v, devid);
+        sync_linear_state_to_prefill_groups(layer_idx, layer, out_k, out_v, devid, true);
     }
 
     void copy_linear_input_state_to_group(ax_runner_t &layer,
@@ -970,21 +1014,23 @@ struct LLM::Impl {
         const size_t bytes_per_token = (size_t)layer_kv * sizeof(unsigned short);
         if (bytes_per_token == 0) return;
 
-        if (clear_dst && dst_gid != src_gid)
-        {
-            llm_memset(LLM_WADDR(dst_k), 0, dst_k.nSize, devid);
-            llm_memset(LLM_WADDR(dst_v), 0, dst_v.nSize, devid);
-        }
-
         const size_t src_tokens_k = (size_t)src_k.nSize / bytes_per_token;
         const size_t src_tokens_v = (size_t)src_v.nSize / bytes_per_token;
         const size_t dst_tokens_k = (size_t)dst_k.nSize / bytes_per_token;
         const size_t dst_tokens_v = (size_t)dst_v.nSize / bytes_per_token;
         const size_t copy_tokens_k = std::min({(size_t)valid_tokens, src_tokens_k, dst_tokens_k});
         const size_t copy_tokens_v = std::min({(size_t)valid_tokens, src_tokens_v, dst_tokens_v});
-        if (copy_tokens_k > 0)
+        const bool same_k_buffer = LLM_WADDR(dst_k) == LLM_RADDR(src_k);
+        const bool same_v_buffer = LLM_WADDR(dst_v) == LLM_RADDR(src_v);
+
+        if (clear_dst && dst_gid != src_gid && !same_k_buffer)
+            llm_memset(LLM_WADDR(dst_k), 0, dst_k.nSize, devid);
+        if (clear_dst && dst_gid != src_gid && !same_v_buffer)
+            llm_memset(LLM_WADDR(dst_v), 0, dst_v.nSize, devid);
+
+        if (copy_tokens_k > 0 && !same_k_buffer)
             llm_d2d(LLM_WADDR(dst_k), LLM_RADDR(src_k), copy_tokens_k * bytes_per_token, devid);
-        if (copy_tokens_v > 0)
+        if (copy_tokens_v > 0 && !same_v_buffer)
             llm_d2d(LLM_WADDR(dst_v), LLM_RADDR(src_v), copy_tokens_v * bytes_per_token, devid);
     }
 
@@ -994,6 +1040,11 @@ struct LLM::Impl {
                                           bool sync_prefill_groups)
     {
         if (valid_tokens <= 0) return;
+        ALOGI("sync KV cache from decode: src_gid=%d dst_gid=%d valid_tokens=%d sync_prefill=%d",
+              src_decode_grpid,
+              dst_decode_grpid,
+              valid_tokens,
+              sync_prefill_groups ? 1 : 0);
         for (int m = 0; m < _attr.axmodel_num; ++m)
         {
             auto &lyr = llama_layers[(size_t)m];
@@ -1446,13 +1497,149 @@ struct LLM::Impl {
     }
 #endif
 
-    std::vector<int> diff_token_ids(const std::vector<int> &ids1, const std::vector<int> &ids2, int &offset)
+    std::vector<int> diff_token_ids(const std::vector<int> &ids1, const std::vector<int> &ids2, int &offset) const
     {
         int min_len = (int)std::min(ids1.size(), ids2.size());
         offset = 0;
         for (int i = 0; i < min_len; i++) { if (ids1[i] == ids2[i]) offset++; else break; }
         if (offset >= (int)ids2.size()) return {};
         return std::vector<int>(ids2.begin() + offset, ids2.end());
+    }
+
+
+    bool is_qwen_chat_tokenizer() const
+    {
+        const std::string key = key_of(_attr.tokenizer_type);
+        return key.find("qwen") != std::string::npos;
+    }
+
+    bool has_new_media_input(const std::vector<::MediaInputs> &media_inputs, size_t append_start) const
+    {
+        for (const auto &media : media_inputs)
+        {
+            if (media.content_index >= append_start)
+                return true;
+        }
+        return false;
+    }
+
+    bool appended_history_is_text_only_user_turn(const std::vector<Content> &history, size_t append_start) const
+    {
+        if (append_start >= history.size()) return false;
+        for (size_t i = append_start; i < history.size(); ++i)
+        {
+            const auto &content = history[i];
+            if (content.role != USER || content.type != TEXT)
+                return false;
+        }
+        return history.back().role == USER;
+    }
+
+    std::vector<int> encode_text_without_tokenizer_prefix(const std::string &text) const
+    {
+        std::vector<int> ids = tokenizer->encode(text);
+        const std::vector<int> prefix = tokenizer->encode(std::string());
+        if (!prefix.empty() && ids.size() >= prefix.size() &&
+            std::equal(prefix.begin(), prefix.end(), ids.begin()))
+        {
+            ids.erase(ids.begin(), ids.begin() + static_cast<std::vector<int>::difference_type>(prefix.size()));
+        }
+        return ids;
+    }
+
+    std::string describe_token_prefix(const std::vector<int> &ids, size_t max_count) const
+    {
+        std::string out;
+        const size_t n = std::min(max_count, ids.size());
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (i) out += ", ";
+            out += std::to_string(ids[i]);
+            out += "='";
+            out += sanitize_utf8_text(safe_decode_token(tokenizer, ids[i]));
+            out += "'";
+        }
+        if (ids.size() > n) out += ", ...";
+        return out;
+    }
+
+    std::string describe_token_window(const std::vector<int> &ids, int center, int radius) const
+    {
+        if (ids.empty()) return {};
+        const int begin = std::max(0, center - radius);
+        const int end = std::min((int)ids.size(), center + radius + 1);
+        std::string out;
+        for (int i = begin; i < end; ++i)
+        {
+            if (!out.empty()) out += ", ";
+            if (i == center) out += "*";
+            out += std::to_string(i);
+            out += ":";
+            out += std::to_string(ids[(size_t)i]);
+            out += "='";
+            out += sanitize_utf8_text(safe_decode_token(tokenizer, ids[(size_t)i]));
+            out += "'";
+        }
+        return out;
+    }
+
+    bool build_qwen_cached_text_turn_tokens(const std::vector<Content> &history,
+                                            size_t append_start,
+                                            std::vector<int> &new_tokens) const
+    {
+        if (!tokenizer || !is_qwen_chat_tokenizer()) return false;
+        if (last_history_snapshot.empty() || append_start != last_history_snapshot.size()) return false;
+        if (last_history_snapshot.back().role != ASSISTANT) return false;
+        if (!appended_history_is_text_only_user_turn(history, append_start)) return false;
+        if ((int)last_tokens_ids.size() != precompute_len) return false;
+
+        // Prefer the tokenizer's real chat template. This keeps text-only follow-up
+        // turns aligned with Qwen's prompt formatting and any tokenizer-side policy
+        // (for example thinking retention) instead of relying on a hand-written suffix.
+        std::vector<int> full_tokens = tokenizer->encode(history);
+        int full_offset = 0;
+        auto full_diff = diff_token_ids(last_tokens_ids, full_tokens, full_offset);
+        if (full_offset == (int)last_tokens_ids.size() &&
+            full_tokens.size() >= last_tokens_ids.size() &&
+            !full_diff.empty())
+        {
+            ALOGI("Qwen cached text turn uses full template diff: input_tokens=%zu head=[%s]",
+                  full_diff.size(),
+                  describe_token_prefix(full_diff, 8).c_str());
+            new_tokens = std::move(full_tokens);
+            return true;
+        }
+
+        ALOGW("Qwen cached text turn full-template prefix mismatch: offset=%d cached=%zu full=%zu, fallback to suffix",
+              full_offset,
+              last_tokens_ids.size(),
+              full_tokens.size());
+        ALOGI("cached token window near mismatch: [%s]",
+              describe_token_window(last_tokens_ids, full_offset, 4).c_str());
+        ALOGI("full-template token window near mismatch: [%s]",
+              describe_token_window(full_tokens, full_offset, 4).c_str());
+
+        std::string suffix;
+        suffix.reserve(256);
+        suffix += "<|im_end|>\n";
+        for (size_t i = append_start; i < history.size(); ++i)
+        {
+            suffix += "<|im_start|>user\n";
+            suffix += history[i].data;
+            suffix += "<|im_end|>\n";
+        }
+        suffix += "<|im_start|>assistant\n";
+
+        std::vector<int> suffix_tokens = encode_text_without_tokenizer_prefix(suffix);
+        if (suffix_tokens.empty()) return false;
+
+        ALOGI("Qwen cached text turn uses suffix fallback: input_tokens=%zu head=[%s]",
+              suffix_tokens.size(),
+              describe_token_prefix(suffix_tokens, 8).c_str());
+
+        new_tokens = last_tokens_ids;
+        new_tokens.insert(new_tokens.end(), suffix_tokens.begin(), suffix_tokens.end());
+        return true;
     }
 
     bool Init(LLMAttrType attr)
@@ -1937,7 +2124,7 @@ struct LLM::Impl {
                 {
                     (void)in_k;
                     (void)in_v;
-                    sync_linear_state_to_layer_groups(m, lyr.layer, out_k, out_v, devid);
+                    sync_linear_state_after_prefill(m, lyr.layer, out_k, out_v, devid);
                 }
                 else
                 {
@@ -2232,7 +2419,7 @@ struct LLM::Impl {
                 {
                     (void)dec_k;
                     (void)dec_v;
-                    sync_linear_state_to_layer_groups(m, lyr.layer, out_k, out_v, devid);
+                    sync_linear_state_after_prefill(m, lyr.layer, out_k, out_v, devid);
                 }
                 else
                 {
@@ -2462,7 +2649,7 @@ struct LLM::Impl {
 
     void ResetKVCache()
     {
-        last_tokens_ids.clear(); last_history_snapshot.clear(); run_input_token_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0; reset_full_cache_slot_state();
+        last_tokens_ids.clear(); last_history_snapshot.clear(); run_input_token_ids.clear(); last_run_generated_token_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0; cached_mrope_next_pos = -1; active_prefill_pos_start = -1; active_token_pos_start = -1; reset_full_cache_slot_state();
         decode_grpid = decode_grpids_.empty() ? 0 : decode_grpids_.back();
         _attr.prefill_grpid = prefill_grpids_.empty() ? 1 : prefill_grpids_.back();
         if (!_attr.prefill_max_kv_cache_num_grp.empty())
@@ -2544,8 +2731,6 @@ struct LLM::Impl {
         std::vector<int> prefill_grp_list;
         const int default_prefill_gid = prefill_grpids_.empty() ? 1 : prefill_grpids_.front();
         prefill_grp_list.resize(prefill_split_num, default_prefill_gid);
-        int max_prefill_gid = default_prefill_gid;
-        // ALOGI("max_prefill_gid %d", max_prefill_gid);
         for (int p = 0; p < prefill_split_num; ++p) {
             const int history_len = precompute_len + p * _attr.prefill_token_num;
             const int chunk_tokens = (p == prefill_split_num - 1) ? (input_embed_num - p * _attr.prefill_token_num) : _attr.prefill_token_num;
@@ -2557,7 +2742,6 @@ struct LLM::Impl {
                 return final_out;
             }
             prefill_grp_list[p] = g;
-            if (g > max_prefill_gid) max_prefill_gid = g;
         }
 
         const bool use_per_layer_input = gemma4_per_layer_helper.enabled();
@@ -2585,7 +2769,7 @@ struct LLM::Impl {
             {
                 for (int i = 0; i < input_embed_num; ++i)
                 {
-                    const int abs_pos = precompute_len + i;
+                    const int abs_pos = (active_token_pos_start >= 0) ? (active_token_pos_start + i) : (precompute_len + i);
                     if ((size_t)abs_pos < vision_state.pos2vision.size() && vision_state.pos2vision[(size_t)abs_pos] >= 0)
                     {
                         per_layer_token_ids[(size_t)i] = gemma4_per_layer_helper.pad_token_id();
@@ -2609,40 +2793,57 @@ struct LLM::Impl {
             if (b_stop.load(std::memory_order_relaxed)) break;
             int input_num_token = (p == prefill_split_num - 1) ? input_embed_num - p * _attr.prefill_token_num : _attr.prefill_token_num;
             const int history_len = precompute_len + p * _attr.prefill_token_num;
+            const int token_start_pos = (active_token_pos_start >= 0)
+                                            ? active_token_pos_start + p * _attr.prefill_token_num
+                                            : history_len;
+            const int rope_start_pos = (active_prefill_pos_start >= 0)
+                                           ? active_prefill_pos_start + p * _attr.prefill_token_num
+                                           : history_len;
 
             const int prefill_grpid = prefill_grp_list[p];
             // ALOGI("prefill group for chunk %d: %d", p, prefill_grpid);
-            int kv_cache_num_p = prefill_history_capacity_by_gid(prefill_grpid);
-            {
-                const auto &mask_t = llama_layers[(size_t)cache_ref_full_layer_idx].layer.get_input(prefill_grpid, "mask");
-                const int mask_elems = (int)(mask_t.nSize / (int)sizeof(unsigned short));
-                if (_attr.prefill_token_num > 0 && mask_elems > 0 && (mask_elems % _attr.prefill_token_num) == 0) {
-                    const int cols = mask_elems / _attr.prefill_token_num;
-                    const int kv_from_mask = cols - _attr.prefill_token_num;
-                    if (kv_from_mask >= 0) kv_cache_num_p = kv_from_mask;
-                }
-            }
+            int kv_cache_num_p = prefill_history_capacity_for_layer_group(cache_ref_full_layer_idx, prefill_grpid);
+            if (kv_cache_num_p < 0) kv_cache_num_p = prefill_history_capacity_by_gid(prefill_grpid);
             ALOGI("prefill chunk p=%d history_len=%d grpid=%d kv_cache_num=%d input_tokens=%d",
                   p, history_len, prefill_grpid, kv_cache_num_p, input_num_token);
 
             std::vector<unsigned short> embed_tmp(_attr.prefill_token_num * _attr.tokens_embed_size, 0);
-            std::vector<unsigned short> mask_tmp(_attr.prefill_token_num * (kv_cache_num_p + _attr.prefill_token_num), bf16.data);
+            std::vector<unsigned short> mask_tmp;
             std::vector<unsigned short> linear_mask_tmp;
             if (use_per_layer_input) per_layer_tmp.assign((size_t)_attr.prefill_token_num * (size_t)per_layer_hidden, 0);
 
             size_t copy_tokens = (p == prefill_split_num - 1) ? (size_t)(input_embed_num - p * _attr.prefill_token_num) : (size_t)_attr.prefill_token_num;
             memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, copy_tokens * _attr.tokens_embed_size * sizeof(unsigned short));
-            scale_prefill_text_embeds_inplace(embed_tmp.data(), input_num_token, history_len);
+            scale_prefill_text_embeds_inplace(embed_tmp.data(), input_num_token, token_start_pos);
 
             for (int m = 0; m < _attr.axmodel_num; m++)
             {
                 if (b_stop.load(std::memory_order_relaxed)) break;
                 auto &lyr   = llama_layers[m]; int devid = LLM_DEVID(lyr);
                 const int layer_prefill_grpid = prefill_gid_for_layer(m, prefill_grpid);
+                int layer_kv_cache_num = prefill_history_capacity_for_layer_group(m, layer_prefill_grpid);
+                if (layer_kv_cache_num < 0) layer_kv_cache_num = kv_cache_num_p;
+                if (layer_kv_cache_num < history_len && !is_linear_layer(m))
+                {
+                    ALOGE("prefill layer %d group %d history_len=%d exceeds layer history cap=%d",
+                          m,
+                          layer_prefill_grpid,
+                          history_len,
+                          layer_kv_cache_num);
+                    return final_out;
+                }
+                if (layer_prefill_grpid != prefill_grpid)
+                {
+                    ALOGD("prefill layer group remap: layer=%d global_gid=%d layer_gid=%d history_cap=%d",
+                          m,
+                          prefill_grpid,
+                          layer_prefill_grpid,
+                          layer_kv_cache_num);
+                }
                 auto &t_idx = lyr.layer.get_input(layer_prefill_grpid, "indices");
                 unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
                 {
-                    const int start_pos = history_len;
+                    const int seq_start_pos = rope_start_pos;
                     const int idx_elems = (int)(t_idx.nSize / (int)sizeof(unsigned int));
                     int idx_rows = idx_elems / _attr.prefill_token_num;
                     if (idx_rows <= 0) idx_rows = 1;
@@ -2656,14 +2857,14 @@ struct LLM::Impl {
                         // ALOGI("r %d, idx_rows: %d", r, idx_rows);
                         for (int j = 0; j < input_num_token; ++j)
                         {
-                            unsigned int v = (unsigned int)(start_pos + j);
+                            unsigned int v = (unsigned int)(seq_start_pos + j);
                             if (use_pos_ids)
                             {
                                 if ((size_t)r < vision_state.position_ids.size())
                                 {
                                     const auto &row = vision_state.position_ids[r];
-                                    if ((size_t)(start_pos + j) < row.size())
-                                        v = (unsigned int)row[start_pos + j];
+                                    if ((size_t)(token_start_pos + j) < row.size())
+                                        v = (unsigned int)row[token_start_pos + j];
                                 }
                             }
                             idx_ptr[r * _attr.prefill_token_num + j] = v;
@@ -2682,10 +2883,11 @@ struct LLM::Impl {
                 }
                 else
                 {
+                    mask_tmp.assign((size_t)_attr.prefill_token_num * (size_t)(layer_kv_cache_num + _attr.prefill_token_num), bf16.data);
                     if (use_sparse_full_cache_mask())
-                        build_sparse_layer_prefill_mask(mask_tmp, kv_cache_num_p, _attr.prefill_token_num, history_len, input_num_token, m);
+                        build_sparse_layer_prefill_mask(mask_tmp, layer_kv_cache_num, _attr.prefill_token_num, history_len, input_num_token, m);
                     else
-                        build_layer_prefill_mask(mask_tmp, kv_cache_num_p, _attr.prefill_token_num, history_len, input_num_token, m);
+                        build_layer_prefill_mask(mask_tmp, layer_kv_cache_num, _attr.prefill_token_num, history_len, input_num_token, m);
                     llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
                 }
                 auto &t_in = lyr.layer.get_input(layer_prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
@@ -2703,7 +2905,7 @@ struct LLM::Impl {
                                               src_k,
                                               layer_kv,
                                               history_len,
-                                              kv_cache_num_p,
+                                              layer_kv_cache_num,
                                               history_len,
                                               input_num_token,
                                               devid);
@@ -2711,7 +2913,7 @@ struct LLM::Impl {
                                               src_v,
                                               layer_kv,
                                               history_len,
-                                              kv_cache_num_p,
+                                              layer_kv_cache_num,
                                               history_len,
                                               input_num_token,
                                               devid);
@@ -2748,7 +2950,7 @@ struct LLM::Impl {
                 {
                     (void)dec_k;
                     (void)dec_v;
-                    sync_linear_state_to_layer_groups(m, lyr.layer, out_k, out_v, devid);
+                    sync_linear_state_after_prefill(m, lyr.layer, out_k, out_v, devid);
                 }
                 else
                 {
@@ -2757,10 +2959,15 @@ struct LLM::Impl {
                     size_t kv_sz = (size_t)input_num_token * (size_t)layer_kv * sizeof(unsigned short);
                     llm_d2d((unsigned short *)LLM_WADDR(dec_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                     llm_d2d((unsigned short *)LLM_WADDR(dec_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
-                    mark_full_cache_slots(history_len, input_num_token);
-                    const int ng = (int)lyr.layer.get_num_input_groups();
-                    const int max_gid = std::min(max_prefill_gid, ng - 1);
-                    for (int gid = layer_prefill_grpid + 1; gid <= max_gid; ++gid) {
+                    std::vector<int> future_prefill_gids;
+                    future_prefill_gids.reserve((size_t)std::max(0, prefill_split_num - p - 1));
+                    for (int q = p + 1; q < prefill_split_num; ++q)
+                    {
+                        const int future_gid = prefill_gid_for_layer(m, prefill_grp_list[(size_t)q]);
+                        if (std::find(future_prefill_gids.begin(), future_prefill_gids.end(), future_gid) == future_prefill_gids.end())
+                            future_prefill_gids.push_back(future_gid);
+                    }
+                    for (const int gid : future_prefill_gids) {
                         auto &gk = lyr.layer.get_input(gid, "K_cache");
                         auto &gv = lyr.layer.get_input(gid, "V_cache");
                         const int cap_tokens_k = (int)(gk.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
@@ -2782,7 +2989,7 @@ struct LLM::Impl {
                     (size_t)m < vision_state.deepstack_features.size() &&
                     !vision_state.deepstack_features[m].empty())
                 {
-                    const int start_pos = history_len;
+                    const int start_pos = token_start_pos;
                     const int emb_sz = _attr.tokens_embed_size;
                     const auto &feat = vision_state.deepstack_features[m];
 
@@ -2806,6 +3013,7 @@ struct LLM::Impl {
                 }
             }
 
+            mark_full_cache_slots(history_len, input_num_token);
             if (p == prefill_split_num - 1)
                 memcpy(embed.data(), embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
         }
@@ -2851,6 +3059,7 @@ struct LLM::Impl {
         const unsigned int dense_decode_start = (unsigned int)(precompute_len + input_embed_num);
         unsigned int decode_start = dense_decode_start;
         if (has_vision_state && vision_state.decode_start > 0) decode_start = (unsigned int)vision_state.decode_start;
+        else if (active_prefill_pos_start >= 0) decode_start = (unsigned int)(active_prefill_pos_start + input_embed_num);
         if (decode_start != dense_decode_start)
         {
             ALOGI("VLM decode positions: rope_start=%u dense_kv_start=%u", decode_start, dense_decode_start);
@@ -2971,7 +3180,7 @@ struct LLM::Impl {
                 {
                     (void)in_k;
                     (void)in_v;
-                    sync_linear_state_to_layer_groups(m, lyr.layer, out_k, out_v, devid);
+                    sync_linear_state_to_decode_groups(m, lyr.layer, out_k, out_v, devid);
                 }
                 else
                 {
@@ -3111,7 +3320,7 @@ struct LLM::Impl {
                 {
                     (void)in_k;
                     (void)in_v;
-                    sync_linear_state_to_layer_groups(m, lyr.layer, out_k, out_v, 0);
+                    sync_linear_state_to_decode_groups(m, lyr.layer, out_k, out_v, 0);
                 }
                 else
                 {
@@ -3170,6 +3379,7 @@ struct LLM::Impl {
         }
 
         const int generated_token_count = (int)token_ids.size();
+        last_run_generated_token_ids = token_ids;
         final_out = tokenizer->decode(token_ids);
         if (hide_channel_markup)
         {
@@ -3225,7 +3435,13 @@ struct LLM::Impl {
         if (generated_token_count >= 0)
         {
             precompute_len = dense_decode_start + generated_token_count;
+            if ((has_vision_state && !vision_state.position_ids.empty()) || active_prefill_pos_start >= 0)
+                cached_mrope_next_pos = (int)decode_start + generated_token_count;
+            else
+                cached_mrope_next_pos = -1;
         }
+        active_prefill_pos_start = -1;
+        active_token_pos_start = -1;
         return final_out;
     }
 
@@ -3239,17 +3455,51 @@ struct LLM::Impl {
         clear_last_error();
         has_vision_state = false;
 
+        std::vector<int> new_tokens;
+        std::string response_prefix;
+        bool used_cached_text_turn = false;
+        const size_t append_start = last_history_snapshot.size();
+        const bool no_new_media_input = !has_new_media_input(media_inputs, append_start);
+        const bool cached_text_turn_requested = vision && vision->enabled() &&
+                                                is_qwen_chat_tokenizer() &&
+                                                !last_history_snapshot.empty() &&
+                                                precompute_len > 0 &&
+                                                no_new_media_input &&
+                                                history.size() > append_start &&
+                                                appended_history_is_text_only_user_turn(history, append_start);
         const bool raw_history_not_append = !last_history_snapshot.empty() && !is_history_prefix(last_history_snapshot, history);
         if (raw_history_not_append)
         {
+            if (cached_text_turn_requested)
+            {
+                set_last_error("检测到历史被修改，无法复用已有图像 KV。请保持返回的 history 继续追加，或 /reset 后重新开始。");
+                ALOGE("text-only VLM turn cannot reuse KV because history is not append; refuse full recompute");
+                return history;
+            }
             ALOGW("raw history not append. force ResetKVCache before request processing.");
             ResetKVCache();
         }
 
-        std::vector<int> new_tokens;
-        std::string response_prefix;
+        const bool history_appended = !last_history_snapshot.empty() &&
+                                      is_history_prefix(last_history_snapshot, history) &&
+                                      history.size() > append_start;
 
-        if (vision && vision->enabled())
+        if (cached_text_turn_requested)
+        {
+            if (!history_appended || !build_qwen_cached_text_turn_tokens(history, append_start, new_tokens))
+            {
+                set_last_error("无法复用已有图像 KV，已拒绝重新编码历史。请 /reset 后重新开始。");
+                ALOGE("failed to build cached text-only turn tokens; refuse vision Prepare/full recompute");
+                return history;
+            }
+            used_cached_text_turn = true;
+            ALOGI("reuse cached KV for text-only turn: cached_tokens=%zu append_contents=%zu input_tokens=%zu, skip vision Prepare",
+                  last_tokens_ids.size(),
+                  history.size() - append_start,
+                  new_tokens.size() - last_tokens_ids.size());
+        }
+
+        if (!used_cached_text_turn && vision && vision->enabled())
         {
             // If caller provides media, we will fill num_media/num_media_tokens and build injection state.
             if (!media_inputs.empty())
@@ -3324,7 +3574,7 @@ struct LLM::Impl {
                 new_tokens = tokenizer->encode(history);
             }
         }
-        else
+        else if (!used_cached_text_turn)
         {
             new_tokens = tokenizer->encode(history);
         }
@@ -3332,17 +3582,72 @@ struct LLM::Impl {
         int offset = 0;
         auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
         bool not_append = !(offset == (int)last_tokens_ids.size() && (int)new_tokens.size() >= (int)last_tokens_ids.size());
-        if (not_append) { ALOGW("history not append (rollback/modify). force ResetKVCache and recompute."); ResetKVCache(); tokens_diff = new_tokens; offset = 0; }
+        if (not_append)
+        {
+            if (used_cached_text_turn)
+            {
+                set_last_error("KV 复用失败，已拒绝重新编码历史。请 /reset 后重新开始。");
+                ALOGE("cached text-only turn token prefix mismatch: offset=%d cached_tokens=%zu new_tokens=%zu; refuse full recompute",
+                      offset,
+                      last_tokens_ids.size(),
+                      new_tokens.size());
+                return history;
+            }
+            ALOGW("history not append (rollback/modify). force ResetKVCache and recompute.");
+            ResetKVCache();
+            tokens_diff = new_tokens;
+            offset = 0;
+        }
         if (tokens_diff.empty())
         {
-            if (!new_tokens.empty()) { precompute_len = (int)new_tokens.size() - 1; tokens_diff = {new_tokens.back()}; }
+            if (used_cached_text_turn)
+            {
+                set_last_error("KV 复用失败：当前追问没有新增 token。已拒绝重新编码历史。");
+                ALOGE("cached text-only turn has empty token diff; refuse full recompute");
+                return history;
+            }
+            if (!new_tokens.empty()) { precompute_len = (int)new_tokens.size() - 1; offset = precompute_len; tokens_diff = {new_tokens.back()}; }
             else { ResetKVCache(); precompute_len = 0; }
+        }
+        if (!not_append && offset != precompute_len && precompute_len > 0)
+        {
+            if (used_cached_text_turn)
+            {
+                set_last_error("KV 复用失败：token 前缀长度与 KV 长度不一致。已拒绝重新编码历史。");
+                ALOGE("cached text-only turn token/KV mismatch: token_offset=%d precompute_len=%d; refuse full recompute",
+                      offset,
+                      precompute_len);
+                return history;
+            }
+            ALOGW("token prefix/KV length mismatch: token_offset=%d precompute_len=%d, recompute full history",
+                  offset,
+                  precompute_len);
+            ResetKVCache();
+            tokens_diff = new_tokens;
+            offset = 0;
         }
         const int kv_ret = SetKVCache(k_caches, v_caches, precompute_len, (int)tokens_diff.size());
         if (kv_ret != 0)
         {
             ALOGE("SetKVCache failed");
             return history;
+        }
+        active_token_pos_start = offset;
+        active_prefill_pos_start = -1;
+        if (has_vision_state && !vision_state.position_ids.empty() && offset != precompute_len)
+        {
+            ALOGI("VLM token/KV offset mismatch: token_offset=%d dense_kv_start=%d input_tokens=%zu",
+                  offset,
+                  precompute_len,
+                  tokens_diff.size());
+        }
+        if (!(has_vision_state && !vision_state.position_ids.empty()) && cached_mrope_next_pos >= 0 && precompute_len > 0)
+        {
+            active_prefill_pos_start = cached_mrope_next_pos;
+            ALOGI("VLM cached mRoPE positions: prefill_rope_start=%d dense_kv_start=%d input_tokens=%zu",
+                  active_prefill_pos_start,
+                  precompute_len,
+                  tokens_diff.size());
         }
         std::vector<unsigned short> out_embed(tokens_diff.size() * _attr.tokens_embed_size);
         for (size_t i = 0; i < tokens_diff.size(); i++)
@@ -3361,6 +3666,19 @@ struct LLM::Impl {
             }
             embed_selector.getByIndex(tokens_diff[i], out_embed.data() + i * _attr.tokens_embed_size);
         }
+        std::vector<int> cached_prefix_tokens;
+        if (precompute_len > 0)
+        {
+            const size_t prefix_len = std::min((size_t)precompute_len, last_tokens_ids.size());
+            cached_prefix_tokens.assign(last_tokens_ids.begin(), last_tokens_ids.begin() + prefix_len);
+            if ((int)cached_prefix_tokens.size() != precompute_len)
+            {
+                ALOGW("cached token prefix size mismatch before run: tokens=%zu precompute_len=%d",
+                      cached_prefix_tokens.size(),
+                      precompute_len);
+            }
+        }
+        last_run_generated_token_ids.clear();
         run_input_token_ids = tokens_diff;
         auto reply = Run(out_embed, output_max_token);
         run_input_token_ids.clear();
@@ -3370,9 +3688,18 @@ struct LLM::Impl {
         }
         history.push_back({ASSISTANT, TEXT, reply});
         last_history_snapshot = history;
-        last_tokens_ids = tokenizer->encode(history);
-        if (last_tokens_ids.size() >= 2) last_tokens_ids.erase(last_tokens_ids.end() - 2, last_tokens_ids.end());
+        last_tokens_ids = std::move(cached_prefix_tokens);
+        last_tokens_ids.insert(last_tokens_ids.end(), tokens_diff.begin(), tokens_diff.end());
+        last_tokens_ids.insert(last_tokens_ids.end(), last_run_generated_token_ids.begin(), last_run_generated_token_ids.end());
         GetKVCache(k_caches, v_caches, precompute_len);
+        if ((int)last_tokens_ids.size() != precompute_len)
+        {
+            ALOGW("exact cached token prefix length differs from KV: tokens=%zu precompute_len=%d generated=%zu input=%zu",
+                  last_tokens_ids.size(),
+                  precompute_len,
+                  last_run_generated_token_ids.size(),
+                  tokens_diff.size());
+        }
 
         has_vision_state = false;
         vision_state = {};
