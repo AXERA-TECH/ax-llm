@@ -178,6 +178,7 @@ docker run --rm --network host --privileged \
   - 直接回车：本轮仅文本对话
   - 输入图片路径：图文对话
   - 输入 `video:<frames_dir>`：视频/多帧对话（按文件名排序读取帧）
+  - 输入 `video:<video_file>[:<fps>]`：单个视频文件按采样 FPS 均匀抽帧，默认 `fps=2`，显式 `fps` 支持正整数或正小数
 
 VLM 模型的 `config.json` 需包含（或等价字段）：
 
