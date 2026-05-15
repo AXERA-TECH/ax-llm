@@ -743,7 +743,7 @@ int run_interactive_mode(ModelConfig &config)
     printf("Ctrl+C: 停止当前生成\n");
     if (config.attr.vlm_type != VLMType::None)
     {
-        printf("VLM enabled: after each prompt, input media path (empty = text-only). Use \"video:<frames_dir>\" for video, \"audio:<file>\" for audio.\n");
+        printf("VLM enabled: after each prompt, input media path (empty = text-only). Use \"video:<frames_dir>\" or \"video:<video_file>[:<fps>]\" for video (default fps=2), \"audio:<file>\" for audio.\n");
     }
     printf("----------------------------------------\n");
 

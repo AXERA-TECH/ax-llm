@@ -2,12 +2,15 @@
 
 #include <cctype>
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <regex>
 #include <numeric>
 #include <sstream>
@@ -40,6 +43,8 @@ static inline void v_d2h(void *dst, const void *vir_src, size_t n, int /*devid*/
 namespace vision {
 
 namespace {
+
+constexpr double kDefaultRawVideoSampleFps = 2.0;
 
 struct AudioEncoderRuntime {
     ax_runner_t encoder;
@@ -139,6 +144,88 @@ static bool command_exists(const char* name)
     return false;
 }
 
+static bool parse_positive_finite_double(const std::string& text, double& value)
+{
+    if (text.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    const double parsed = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || !end) return false;
+    while (*end != '\0') {
+        if (!std::isspace((unsigned char)*end)) return false;
+        ++end;
+    }
+    if (errno == ERANGE || !std::isfinite(parsed) || parsed <= 0.0) return false;
+    value = parsed;
+    return true;
+}
+
+static bool split_raw_video_fps_suffix(const std::string& uri,
+                                       std::string& video_path,
+                                       double& sample_fps,
+                                       bool& has_sample_fps,
+                                       std::string& err)
+{
+    video_path = uri;
+    sample_fps = 0.0;
+    has_sample_fps = false;
+
+    const size_t pos = uri.rfind(':');
+    if (pos == std::string::npos || pos == 0) return true;
+
+    const std::string candidate_path = uri.substr(0, pos);
+    if (!is_file(candidate_path) || is_supported_frame_file(candidate_path)) return true;
+
+    const std::string fps_text = uri.substr(pos + 1);
+    if (!parse_positive_finite_double(fps_text, sample_fps)) {
+        err = "invalid video fps suffix: " + fps_text + " (must be a positive finite number)";
+        return false;
+    }
+
+    video_path = candidate_path;
+    has_sample_fps = true;
+    return true;
+}
+
+static bool read_video_duration_ffprobe(const std::string& video_path,
+                                        double& duration_sec,
+                                        std::string& err)
+{
+    duration_sec = 0.0;
+    if (!command_exists("ffprobe")) {
+        err = "ffprobe is not available in PATH, so video fps sampling cannot determine duration";
+        return false;
+    }
+
+    const std::string cmd =
+        "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 " +
+        shell_quote(video_path) + " 2>/dev/null";
+
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        err = "failed to run ffprobe for video duration: " + video_path;
+        return false;
+    }
+
+    std::string output;
+    char buf[256];
+    while (fgets(buf, sizeof(buf), pipe)) output += buf;
+    const int status = pclose(pipe);
+    if (status != 0) {
+        err = "ffprobe failed to read video duration: " + video_path;
+        return false;
+    }
+
+    double parsed = 0.0;
+    if (!parse_positive_finite_double(output, parsed)) {
+        err = "ffprobe returned invalid video duration for: " + video_path;
+        return false;
+    }
+
+    duration_sec = parsed;
+    return true;
+}
+
 static bool make_temp_dir(const std::string& prefix, std::string& out_dir, std::string& err)
 {
     std::filesystem::path root;
@@ -209,6 +296,15 @@ static bool extract_video_frames_ffmpeg(const std::string& video_path,
     return true;
 }
 
+static std::vector<std::string> sample_frame_paths(const std::vector<std::string>& frame_files,
+                                                   int target_count,
+                                                   bool do_sample_frames);
+
+static bool apply_video_fps_sampling(const std::string& video_path,
+                                     double sample_fps,
+                                     std::vector<std::string>& frame_files,
+                                     std::string& err);
+
 static bool collect_video_frame_paths(const std::vector<std::string>& uris,
                                       std::vector<std::string>& frame_files,
                                       ScopedTempDirs* temp_dirs,
@@ -230,17 +326,34 @@ static bool collect_video_frame_paths(const std::vector<std::string>& uris,
             }
             return true;
         }
-        if (!is_file(uri)) {
+
+        std::string video_path;
+        double sample_fps = 0.0;
+        bool has_sample_fps = false;
+        if (!split_raw_video_fps_suffix(uri, video_path, sample_fps, has_sample_fps, err)) return false;
+
+        if (!is_file(video_path)) {
             err = "invalid video uri: " + uri;
             return false;
         }
-        if (is_supported_frame_file(uri)) {
-            frame_files.push_back(uri);
+        if (is_supported_frame_file(video_path)) {
+            if (has_sample_fps) {
+                err = "video fps suffix is only supported for raw video files: " + uri;
+                return false;
+            }
+            frame_files.push_back(video_path);
             return true;
         }
 
+        if (!has_sample_fps) sample_fps = kDefaultRawVideoSampleFps;
+
         std::string temp_dir;
-        if (!extract_video_frames_ffmpeg(uri, frame_files, temp_dir, err)) return false;
+        if (!extract_video_frames_ffmpeg(video_path, frame_files, temp_dir, err)) return false;
+        if (!apply_video_fps_sampling(video_path, sample_fps, frame_files, err)) {
+            std::error_code ec;
+            std::filesystem::remove_all(temp_dir, ec);
+            return false;
+        }
         if (temp_dirs) temp_dirs->add(temp_dir);
         return true;
     }
@@ -281,6 +394,36 @@ static std::vector<std::string> sample_frame_paths(const std::vector<std::string
         sampled.push_back(frame_files[std::min(idx, n - 1)]);
     }
     return sampled;
+}
+
+static bool apply_video_fps_sampling(const std::string& video_path,
+                                     double sample_fps,
+                                     std::vector<std::string>& frame_files,
+                                     std::string& err)
+{
+    if (frame_files.empty()) return true;
+
+    double duration_sec = 0.0;
+    if (!read_video_duration_ffprobe(video_path, duration_sec, err)) return false;
+
+    const double target_frames = duration_sec * sample_fps;
+    int target_count = 1;
+    if (target_frames > (double)std::numeric_limits<int>::max()) {
+        target_count = std::numeric_limits<int>::max();
+    } else {
+        target_count = std::max(1, (int)std::llround(target_frames));
+    }
+
+    const size_t decoded_count = frame_files.size();
+    frame_files = sample_frame_paths(frame_files, target_count, true);
+    ALOGI("Video fps sampling: path=%s fps=%.6g duration=%.3fs target_frames=%d selected=%zu/%zu",
+          video_path.c_str(),
+          sample_fps,
+          duration_sec,
+          target_count,
+          frame_files.size(),
+          decoded_count);
+    return !frame_files.empty();
 }
 
 static int count_appended_tokens(const std::vector<int>& prev_tokens,

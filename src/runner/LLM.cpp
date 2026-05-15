@@ -1051,11 +1051,11 @@ struct LLM::Impl {
                                           bool sync_prefill_groups)
     {
         if (valid_tokens <= 0) return;
-        ALOGI("sync KV cache from decode: src_gid=%d dst_gid=%d valid_tokens=%d sync_prefill=%d",
-              src_decode_grpid,
-              dst_decode_grpid,
-              valid_tokens,
-              sync_prefill_groups ? 1 : 0);
+        // ALOGI("sync KV cache from decode: src_gid=%d dst_gid=%d valid_tokens=%d sync_prefill=%d",
+        //       src_decode_grpid,
+        //       dst_decode_grpid,
+        //       valid_tokens,
+        //       sync_prefill_groups ? 1 : 0);
         for (int m = 0; m < _attr.axmodel_num; ++m)
         {
             auto &lyr = llama_layers[(size_t)m];
@@ -3085,7 +3085,7 @@ struct LLM::Impl {
                 const int want_gid = choose_decode_gid((int)kv_slot + 1);
                 if (want_gid != decode_grpid)
                 {
-                    ALOGI("switch decode_grpid: %d -> %d (kv_ctx=%u rope_pos=%u)", decode_grpid, want_gid, kv_slot + 1, decode_pos);
+                    // ALOGI("switch decode_grpid: %d -> %d (kv_ctx=%u rope_pos=%u)", decode_grpid, want_gid, kv_slot + 1, decode_pos);
                     sync_device_kv_cache_from_decode(decode_grpid, want_gid, (int)kv_slot, false);
                     decode_grpid = want_gid;
                 }
