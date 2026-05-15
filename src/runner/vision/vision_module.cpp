@@ -226,6 +226,22 @@ static bool read_video_duration_ffprobe(const std::string& video_path,
     return true;
 }
 
+static int video_fps_target_count(double duration_sec, double sample_fps)
+{
+    const double target_frames = duration_sec * sample_fps;
+    if (target_frames > (double)std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    return std::max(1, (int)std::llround(target_frames));
+}
+
+static std::string format_ffmpeg_double(double value)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.17g", value);
+    return std::string(buf);
+}
+
 static bool make_temp_dir(const std::string& prefix, std::string& out_dir, std::string& err)
 {
     std::filesystem::path root;
@@ -258,6 +274,7 @@ static bool make_temp_dir(const std::string& prefix, std::string& out_dir, std::
 static bool extract_video_frames_ffmpeg(const std::string& video_path,
                                         std::vector<std::string>& frame_files,
                                         std::string& temp_dir_out,
+                                        double output_fps,
                                         std::string& err)
 {
     frame_files.clear();
@@ -271,11 +288,18 @@ static bool extract_video_frames_ffmpeg(const std::string& video_path,
     if (!make_temp_dir("video", temp_dir_out, err)) return false;
 
     const auto pattern = (std::filesystem::path(temp_dir_out) / "frame_%06d.jpg").string();
+    std::string filter_arg;
+    if (output_fps > 0.0) {
+        filter_arg = " -vf " + shell_quote("fps=fps=" + format_ffmpeg_double(output_fps));
+    }
     const std::string cmd =
         "ffmpeg -hide_banner -loglevel error -y -i " + shell_quote(video_path) +
-        " -vsync 0 " + shell_quote(pattern) + " >/dev/null 2>&1";
+        filter_arg + " -vsync 0 " + shell_quote(pattern) + " >/dev/null 2>&1";
 
-    ALOGI("Extracting raw video container to frames: %s -> %s", video_path.c_str(), temp_dir_out.c_str());
+    ALOGI("Extracting raw video container to frames: %s -> %s%s",
+          video_path.c_str(),
+          temp_dir_out.c_str(),
+          output_fps > 0.0 ? (" fps=" + format_ffmpeg_double(output_fps)).c_str() : "");
     if (std::system(cmd.c_str()) != 0) {
         std::error_code ec;
         std::filesystem::remove_all(temp_dir_out, ec);
@@ -299,11 +323,6 @@ static bool extract_video_frames_ffmpeg(const std::string& video_path,
 static std::vector<std::string> sample_frame_paths(const std::vector<std::string>& frame_files,
                                                    int target_count,
                                                    bool do_sample_frames);
-
-static bool apply_video_fps_sampling(const std::string& video_path,
-                                     double sample_fps,
-                                     std::vector<std::string>& frame_files,
-                                     std::string& err);
 
 static bool collect_video_frame_paths(const std::vector<std::string>& uris,
                                       std::vector<std::string>& frame_files,
@@ -347,11 +366,26 @@ static bool collect_video_frame_paths(const std::vector<std::string>& uris,
 
         if (!has_sample_fps) sample_fps = kDefaultRawVideoSampleFps;
 
+        double duration_sec = 0.0;
+        if (!read_video_duration_ffprobe(video_path, duration_sec, err)) return false;
+        const int target_count = video_fps_target_count(duration_sec, sample_fps);
+        const double output_fps = (duration_sec > 0.0) ? ((double)target_count / duration_sec) : sample_fps;
+
         std::string temp_dir;
-        if (!extract_video_frames_ffmpeg(video_path, frame_files, temp_dir, err)) return false;
-        if (!apply_video_fps_sampling(video_path, sample_fps, frame_files, err)) {
+        if (!extract_video_frames_ffmpeg(video_path, frame_files, temp_dir, output_fps, err)) return false;
+        if ((int)frame_files.size() > target_count) {
+            frame_files = sample_frame_paths(frame_files, target_count, true);
+        }
+        ALOGI("Video fps sampling: path=%s fps=%.6g duration=%.3fs target_frames=%d selected=%zu",
+              video_path.c_str(),
+              sample_fps,
+              duration_sec,
+              target_count,
+              frame_files.size());
+        if (frame_files.empty()) {
             std::error_code ec;
             std::filesystem::remove_all(temp_dir, ec);
+            err = "video fps sampling produced no frames: " + video_path;
             return false;
         }
         if (temp_dirs) temp_dirs->add(temp_dir);
@@ -394,36 +428,6 @@ static std::vector<std::string> sample_frame_paths(const std::vector<std::string
         sampled.push_back(frame_files[std::min(idx, n - 1)]);
     }
     return sampled;
-}
-
-static bool apply_video_fps_sampling(const std::string& video_path,
-                                     double sample_fps,
-                                     std::vector<std::string>& frame_files,
-                                     std::string& err)
-{
-    if (frame_files.empty()) return true;
-
-    double duration_sec = 0.0;
-    if (!read_video_duration_ffprobe(video_path, duration_sec, err)) return false;
-
-    const double target_frames = duration_sec * sample_fps;
-    int target_count = 1;
-    if (target_frames > (double)std::numeric_limits<int>::max()) {
-        target_count = std::numeric_limits<int>::max();
-    } else {
-        target_count = std::max(1, (int)std::llround(target_frames));
-    }
-
-    const size_t decoded_count = frame_files.size();
-    frame_files = sample_frame_paths(frame_files, target_count, true);
-    ALOGI("Video fps sampling: path=%s fps=%.6g duration=%.3fs target_frames=%d selected=%zu/%zu",
-          video_path.c_str(),
-          sample_fps,
-          duration_sec,
-          target_count,
-          frame_files.size(),
-          decoded_count);
-    return !frame_files.empty();
 }
 
 static int count_appended_tokens(const std::vector<int>& prev_tokens,
