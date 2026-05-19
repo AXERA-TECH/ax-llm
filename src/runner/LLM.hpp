@@ -115,6 +115,7 @@ public:
     void SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p);
     void ClearRequestSamplingOverride();
     std::string GetLastError() const;
+    std::vector<Content> GetLastHistorySnapshot() const;
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
     bool Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding);

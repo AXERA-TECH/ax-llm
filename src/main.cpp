@@ -11,6 +11,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <optional>
+#include <mutex>
+#include <memory>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -128,6 +130,126 @@ static inline std::vector<Content> make_initial_history(const LLMAttrType &attr)
         history.push_back({SYSTEM, TEXT, system_prompt});
     }
     return history;
+}
+
+static inline bool has_system_message(const nlohmann::json &messages)
+{
+    if (!messages.is_array()) return false;
+    for (const auto &item : messages)
+    {
+        if (item.is_object() && item.contains("role") && item["role"].is_string() &&
+            item["role"].get<std::string>() == "system")
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool chat_request_has_temperature(const openai_api::ChatRequest &req)
+{
+    return req.raw.contains("temperature");
+}
+
+static inline bool chat_request_has_top_p(const openai_api::ChatRequest &req)
+{
+    return req.raw.contains("top_p");
+}
+
+static inline bool request_content_matches_cached_session(const Content &request,
+                                                          const Content &cached)
+{
+    if (request.role != cached.role || request.type != cached.type)
+        return false;
+
+    if (cached.role == ASSISTANT)
+        return true;
+
+    return request.data == cached.data;
+}
+
+static bool request_history_consumes_cached_session(const std::vector<Content> &cached,
+                                                    const std::vector<Content> &history,
+                                                    size_t &request_prefix_len)
+{
+    if (cached.empty() || history.empty())
+        return false;
+
+    size_t history_index = 0;
+    for (size_t cached_index = 0; cached_index < cached.size(); ++cached_index)
+    {
+        if (history_index < history.size() &&
+            request_content_matches_cached_session(history[history_index], cached[cached_index]))
+        {
+            ++history_index;
+            continue;
+        }
+
+        if (cached[cached_index].role == ASSISTANT)
+            continue;
+
+        return false;
+    }
+
+    if (history_index >= history.size())
+        return false;
+
+    request_prefix_len = history_index;
+    return true;
+}
+
+static inline bool history_tail_is_valid_user_continuation(const std::vector<Content> &history,
+                                                           size_t request_prefix_len)
+{
+    if (request_prefix_len >= history.size())
+        return false;
+
+    for (size_t i = request_prefix_len; i < history.size(); ++i)
+    {
+        if (history[i].role != USER)
+            return false;
+    }
+
+    return true;
+}
+
+static std::vector<MediaInputs> remap_media_inputs(const std::vector<MediaInputs> &media_inputs,
+                                                   size_t src_prefix_len,
+                                                   size_t dst_prefix_len)
+{
+    std::vector<MediaInputs> remapped;
+    remapped.reserve(media_inputs.size());
+    for (const auto &media : media_inputs)
+    {
+        if (media.content_index < src_prefix_len)
+            continue;
+        remapped.push_back({dst_prefix_len + media.content_index - src_prefix_len, media.uris});
+    }
+    return remapped;
+}
+
+static bool align_api_history_with_cached_session(const std::vector<Content> &cached_history,
+                                                  std::vector<Content> &history,
+                                                  std::vector<MediaInputs> &media_inputs)
+{
+    size_t request_prefix_len = 0;
+    if (!request_history_consumes_cached_session(cached_history, history, request_prefix_len))
+        return false;
+    if (!history_tail_is_valid_user_continuation(history, request_prefix_len))
+        return false;
+
+    const size_t request_history_size = history.size();
+    std::vector<Content> aligned_history = cached_history;
+    aligned_history.insert(aligned_history.end(), history.begin() + request_prefix_len, history.end());
+    media_inputs = remap_media_inputs(media_inputs, request_prefix_len, cached_history.size());
+    history = std::move(aligned_history);
+    ALOGI("aligned API history with cached run-session history: cached=%zu request_prefix=%zu request=%zu aligned=%zu media_inputs=%zu",
+          cached_history.size(),
+          request_prefix_len,
+          request_history_size,
+          history.size(),
+          media_inputs.size());
+    return true;
 }
 
 // Config structure for JSON configuration
@@ -1421,13 +1543,18 @@ int run_server_mode(const ModelConfig &config, int port)
         options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
         options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
 
-        g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
-                                                 std::shared_ptr<openai_api::BaseDataProvider> provider)
+        g_server.setMaxConcurrency(1);
+        auto chat_mutex = std::make_shared<std::mutex>();
+
+        g_server.registerChat(model_name, [&llm, initial_attr = config.attr, chat_mutex](const openai_api::ChatRequest &req,
+                                                                                         std::shared_ptr<openai_api::BaseDataProvider> provider)
                               {
         if (!provider->is_writable()) {
             ALOGE("provider not writable");
             return;
         }
+
+        std::lock_guard<std::mutex> chat_lock(*chat_mutex);
 
         ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f messages=%zu stop=%zu",
               req.model.c_str(),
@@ -1444,7 +1571,12 @@ int run_server_mode(const ModelConfig &config, int port)
             LLM &llm;
             SamplingOverrideGuard(LLM &llm, const openai_api::ChatRequest &req) : llm(llm)
             {
-                llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
+                const bool has_temperature = chat_request_has_temperature(req);
+                const bool has_top_p = chat_request_has_top_p(req);
+                if (has_temperature || has_top_p)
+                {
+                    llm.SetRequestSamplingOverride(has_temperature, req.temperature, has_top_p, req.top_p);
+                }
             }
             ~SamplingOverrideGuard()
             {
@@ -1453,6 +1585,10 @@ int run_server_mode(const ModelConfig &config, int port)
         } sampling_guard(llm, req);
 
         std::vector<Content> history;
+        if (!has_system_message(req.messages))
+        {
+            history = make_initial_history(initial_attr);
+        }
         std::vector<MediaInputs> media_inputs;
         std::vector<std::string> temp_files;
         if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files)) {
@@ -1461,6 +1597,12 @@ int run_server_mode(const ModelConfig &config, int port)
             provider->end();
             return;
         }
+
+        const auto cached_history = llm.GetLastHistorySnapshot();
+        align_api_history_with_cached_session(cached_history, history, media_inputs);
+
+        const bool has_max_tokens = req.raw.contains("max_tokens");
+        const int output_max_tokens = has_max_tokens ? req.max_tokens : -1;
 
         if (req.stream) {
             bool streamed_any = false;
@@ -1477,8 +1619,8 @@ int run_server_mode(const ModelConfig &config, int port)
             };
 
             llm.getAttr()->runing_callback = callback;
-            if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
-            else llm.Run(history, req.max_tokens);
+            if (!media_inputs.empty()) llm.Run(history, media_inputs, output_max_tokens);
+            else llm.Run(history, output_max_tokens);
             const std::string llm_error = llm.GetLastError();
             if (!llm_error.empty() && !streamed_any) {
                 ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
@@ -1487,7 +1629,7 @@ int run_server_mode(const ModelConfig &config, int port)
             }
         } else {
             llm.getAttr()->runing_callback = nullptr;
-            auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, req.max_tokens) : llm.Run(history, req.max_tokens);
+            auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, output_max_tokens) : llm.Run(history, output_max_tokens);
             std::string final_text;
             if (!out_history.empty() && out_history.back().role == ASSISTANT) {
                 final_text = out_history.back().data;
@@ -1506,7 +1648,7 @@ int run_server_mode(const ModelConfig &config, int port)
         }
 
         cleanup_temp_files(temp_files);
-        provider->end(); });
+        provider->end(); }, options);
 
         if (has_audio_encoder)
         {

@@ -3734,6 +3734,7 @@ LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
 void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p); }
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
+std::vector<Content> LLM::GetLastHistorySnapshot() const { return impl_->last_history_snapshot; }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
 bool LLM::Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding) { return impl_->EmbedHistory(history, media_inputs, out_embedding); }
