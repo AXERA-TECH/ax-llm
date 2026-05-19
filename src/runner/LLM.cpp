@@ -1914,6 +1914,7 @@ struct LLM::Impl {
                               _attr.vision_tokens_per_second,
                               _attr.vision_num_frames,
                               _attr.vision_do_sample_frames,
+                              _attr.serve_video_frame_max,
                               _attr.filename_audio_encoder_axmodel_5s,
                               _attr.filename_audio_encoder_axmodel_30s,
                               verr))

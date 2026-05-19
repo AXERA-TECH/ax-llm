@@ -324,10 +324,19 @@ static std::vector<std::string> sample_frame_paths(const std::vector<std::string
                                                    int target_count,
                                                    bool do_sample_frames);
 
+static int cap_frame_count(int frame_count, int frame_cap)
+{
+    if (frame_cap <= 0) return frame_count;
+    if (frame_count <= 0) return 0;
+    return std::min(frame_count, frame_cap);
+}
+
 static bool collect_video_frame_paths(const std::vector<std::string>& uris,
                                       std::vector<std::string>& frame_files,
                                       ScopedTempDirs* temp_dirs,
-                                      std::string& err)
+                                      std::string& err,
+                                      int frame_cap,
+                                      bool do_sample_frames)
 {
     frame_files.clear();
     if (uris.empty()) {
@@ -342,6 +351,10 @@ static bool collect_video_frame_paths(const std::vector<std::string>& uris,
             if (frame_files.empty()) {
                 err = "no video frames loaded";
                 return false;
+            }
+            const int capped_count = cap_frame_count((int)frame_files.size(), frame_cap);
+            if (capped_count < (int)frame_files.size()) {
+                frame_files = sample_frame_paths(frame_files, capped_count, do_sample_frames);
             }
             return true;
         }
@@ -368,7 +381,7 @@ static bool collect_video_frame_paths(const std::vector<std::string>& uris,
 
         double duration_sec = 0.0;
         if (!read_video_duration_ffprobe(video_path, duration_sec, err)) return false;
-        const int target_count = video_fps_target_count(duration_sec, sample_fps);
+        const int target_count = cap_frame_count(video_fps_target_count(duration_sec, sample_fps), frame_cap);
         const double output_fps = (duration_sec > 0.0) ? ((double)target_count / duration_sec) : sample_fps;
 
         std::string temp_dir;
@@ -407,6 +420,10 @@ static bool collect_video_frame_paths(const std::vector<std::string>& uris,
             return false;
         }
         frame_files.push_back(uri);
+    }
+    const int capped_count = cap_frame_count((int)frame_files.size(), frame_cap);
+    if (capped_count < (int)frame_files.size()) {
+        frame_files = sample_frame_paths(frame_files, capped_count, do_sample_frames);
     }
     return true;
 }
@@ -1009,6 +1026,7 @@ void VisionModule::Deinit()
     image_cache_lru_.clear();
     image_cache_lru_pos_.clear();
     image_cache_max_entries_ = 8;
+    serve_video_frame_max_ = 0;
 }
 
 bool VisionModule::Init(VLMType type,
@@ -1026,6 +1044,7 @@ bool VisionModule::Init(VLMType type,
                         int tokens_per_second,
                         int video_num_frames,
                         bool video_do_sample_frames,
+                        int serve_video_frame_max,
                         const std::string& audio_encoder_axmodel_5s,
                         const std::string& audio_encoder_axmodel_30s,
                         std::string& err)
@@ -1063,6 +1082,7 @@ bool VisionModule::Init(VLMType type,
     tokens_per_second_ = tokens_per_second;
     video_num_frames_ = video_num_frames;
     video_do_sample_frames_ = video_do_sample_frames;
+    serve_video_frame_max_ = serve_video_frame_max;
 
     // Load encoder axmodel (all supported VLM types in this repo need it).
     if (encoder_axmodel.empty()) {
@@ -1321,9 +1341,10 @@ bool VisionModule::Init(VLMType type,
         if (!impl_->audio_5s.encoder_inited && !impl_->audio_30s.encoder_inited) {
             ALOGW("Gemma4 audio encoders are not configured or missing; AUDIO inputs will be rejected.");
         }
-        ALOGI("Gemma4 video config: num_frames=%d do_sample_frames=%d",
+        ALOGI("Gemma4 video config: num_frames=%d do_sample_frames=%d serve_video_frame_max=%d",
               video_num_frames_,
-              video_do_sample_frames_ ? 1 : 0);
+              video_do_sample_frames_ ? 1 : 0,
+              serve_video_frame_max_);
     }
 
     cache_key_prefix_ = "vlm=" + std::string(VLMTypeName(type_)) + "|enc=" + normalize_path_for_key(encoder_axmodel) +
@@ -2026,7 +2047,7 @@ bool VisionModule::EncodeForContent(const Content& content,
     // - N uris: an ordered list of image frame files (useful for base64 uploads)
     ScopedTempDirs temp_dirs;
     std::vector<std::string> frame_files;
-    if (!collect_video_frame_paths(media.uris, frame_files, &temp_dirs, err)) return false;
+    if (!collect_video_frame_paths(media.uris, frame_files, &temp_dirs, err, serve_video_frame_max_, video_do_sample_frames_)) return false;
 
     std::vector<axcv::Mat> frames;
     frames.reserve(frame_files.size());
@@ -2216,11 +2237,12 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
             if (media_it != media_inputs.end()) {
                 Gemma4VideoPlan plan;
                 std::vector<std::string> all_frame_files;
-                if (!collect_video_frame_paths(media_it->uris, all_frame_files, &planned_temp_dirs, err)) return false;
+                if (!collect_video_frame_paths(media_it->uris, all_frame_files, &planned_temp_dirs, err, serve_video_frame_max_, video_do_sample_frames_)) return false;
 
-                const int frame_cap = (video_num_frames_ > 0)
-                                          ? std::min((int)all_frame_files.size(), video_num_frames_)
-                                          : (int)all_frame_files.size();
+                const int frame_cap = cap_frame_count((video_num_frames_ > 0)
+                                                          ? std::min((int)all_frame_files.size(), video_num_frames_)
+                                                          : (int)all_frame_files.size(),
+                                                      serve_video_frame_max_);
                 if (frame_cap <= 0) {
                     err = "Gemma4 video has no usable frames";
                     return false;
@@ -2337,11 +2359,12 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                       plan_it->second.precompute_len);
             } else {
                 std::vector<std::string> all_frame_files;
-                if (!collect_video_frame_paths(it->second.uris, all_frame_files, &temp_dirs, err)) return false;
+                if (!collect_video_frame_paths(it->second.uris, all_frame_files, &temp_dirs, err, serve_video_frame_max_, video_do_sample_frames_)) return false;
 
-                int frame_cap = (video_num_frames_ > 0)
-                                    ? std::min((int)all_frame_files.size(), video_num_frames_)
-                                    : (int)all_frame_files.size();
+                int frame_cap = cap_frame_count((video_num_frames_ > 0)
+                                                     ? std::min((int)all_frame_files.size(), video_num_frames_)
+                                                     : (int)all_frame_files.size(),
+                                                 serve_video_frame_max_);
                 if (frame_cap <= 0) {
                     err = "Gemma4 video has no usable frames";
                     return false;

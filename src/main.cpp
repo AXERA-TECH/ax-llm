@@ -1343,8 +1343,45 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                         part_type = AUDIO;
                         raw_url = extract_media_url(c, "audio_url", "audio");
                     }
+
                     if (!raw_url.empty())
                     {
+                        auto strip_scheme = [](std::string &url, const char *scheme) {
+                            if (url.rfind(scheme, 0) == 0)
+                            {
+                                url.erase(0, 6);
+                                return true;
+                            }
+                            return false;
+                        };
+
+                        if (part_type == IMAGE)
+                        {
+                            if (strip_scheme(raw_url, "video:") || strip_scheme(raw_url, "VIDEO:"))
+                            {
+                                part_type = VIDEO;
+                            }
+                            else if (strip_scheme(raw_url, "audio:") || strip_scheme(raw_url, "AUDIO:"))
+                            {
+                                part_type = AUDIO;
+                            }
+                        }
+                        else if (part_type == VIDEO)
+                        {
+                            strip_scheme(raw_url, "video:");
+                            strip_scheme(raw_url, "VIDEO:");
+                        }
+                        else if (part_type == AUDIO)
+                        {
+                            strip_scheme(raw_url, "audio:");
+                            strip_scheme(raw_url, "AUDIO:");
+                        }
+
+                        if (raw_url.empty())
+                        {
+                            continue;
+                        }
+
                         if (media_type != TEXT && media_type != part_type)
                         {
                             ALOGE("mixed media types in a single message are not supported yet");
@@ -1389,6 +1426,8 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
 int run_server_mode(const ModelConfig &config, int port)
 {
     g_exit_on_sigint.store(true, std::memory_order_relaxed);
+    LLMAttrType serve_attr = config.attr;
+    serve_attr.serve_video_frame_max = 14;
 
     // Check whether port is available.
     const char *port_error = "unknown";
@@ -1419,7 +1458,7 @@ int run_server_mode(const ModelConfig &config, int port)
     }
 #endif
 
-    if (!llm.Init(config.attr))
+    if (!llm.Init(serve_attr))
     {
         ALOGE("LLM.Init failed");
 #if USE_AXCL
@@ -1534,19 +1573,19 @@ int run_server_mode(const ModelConfig &config, int port)
     else
     {
         const bool has_audio_encoder =
-            config.attr.vlm_type == VLMType::Gemma4VL &&
-            (file_exist(config.attr.filename_audio_encoder_axmodel_5s) ||
-             file_exist(config.attr.filename_audio_encoder_axmodel_30s));
+            serve_attr.vlm_type == VLMType::Gemma4VL &&
+            (file_exist(serve_attr.filename_audio_encoder_axmodel_5s) ||
+             file_exist(serve_attr.filename_audio_encoder_axmodel_30s));
 
         openai_api::ChatModelOptions options;
-        options.supports_vision = config.attr.vlm_type != VLMType::None;
+        options.supports_vision = serve_attr.vlm_type != VLMType::None;
         options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
         options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
 
         g_server.setMaxConcurrency(1);
         auto chat_mutex = std::make_shared<std::mutex>();
 
-        g_server.registerChat(model_name, [&llm, initial_attr = config.attr, chat_mutex](const openai_api::ChatRequest &req,
+        g_server.registerChat(model_name, [&llm, initial_attr = serve_attr, chat_mutex](const openai_api::ChatRequest &req,
                                                                                          std::shared_ptr<openai_api::BaseDataProvider> provider)
                               {
         if (!provider->is_writable()) {
