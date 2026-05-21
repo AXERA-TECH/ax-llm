@@ -1108,9 +1108,10 @@ static std::string resolve_media_uri(const std::string &uri, std::vector<std::st
     if (parse_base64_data_uri(uri, ext, payload))
     {
         std::string path = save_base64_to_tempfile(ext, payload);
-        if (!path.empty())
+        if (!path.empty()) temp_files.push_back(path);
+        else
         {
-            temp_files.push_back(path);
+            ALOGE("failed to decode base64 media: mime_ext=%s payload_chars=%zu", ext.c_str(), payload.size());
         }
         return path;
     }
@@ -1319,12 +1320,24 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
 
                         if (temp_files)
                         {
-                            media_uris.push_back(resolve_media_uri(raw_url, *temp_files));
+                            std::string resolved = resolve_media_uri(raw_url, *temp_files);
+                            if (resolved.empty())
+                            {
+                                ALOGE("failed to resolve media uri for message");
+                                return false;
+                            }
+                            media_uris.push_back(std::move(resolved));
                         }
                         else
                         {
                             std::vector<std::string> dummy;
-                            media_uris.push_back(resolve_media_uri(raw_url, dummy));
+                            std::string resolved = resolve_media_uri(raw_url, dummy);
+                            if (resolved.empty())
+                            {
+                                ALOGE("failed to resolve media uri for message");
+                                return false;
+                            }
+                            media_uris.push_back(std::move(resolved));
                         }
                     }
                 }
@@ -1348,6 +1361,34 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     }
 
     return true;
+}
+
+static void keep_latest_media_turn_for_single_image_ocr(std::vector<Content> &history,
+                                                        std::vector<MediaInputs> &media_inputs)
+{
+    if (media_inputs.size() <= 1) return;
+
+    const MediaInputs latest_media = media_inputs.back();
+    if (latest_media.content_index >= history.size()) return;
+
+    std::vector<Content> pruned;
+    pruned.reserve(history.size());
+    for (const auto &content : history)
+    {
+        if (content.role == SYSTEM) pruned.push_back(content);
+    }
+
+    const size_t new_media_index = pruned.size();
+    pruned.push_back(history[latest_media.content_index]);
+
+    ALOGI("PaddleOCR-VL request contains %zu media turns; keep latest media turn only (old_index=%zu new_index=%zu)",
+          media_inputs.size(),
+          latest_media.content_index,
+          new_media_index);
+
+    history = std::move(pruned);
+    media_inputs.clear();
+    media_inputs.push_back({new_media_index, latest_media.uris});
 }
 
 // Run server mode
@@ -1644,8 +1685,9 @@ int run_server_mode(const ModelConfig &config, int port)
             options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
 
-            g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
-                                                     std::shared_ptr<openai_api::BaseDataProvider> provider)
+            const bool single_image_ocr_mode = config.attr.vlm_type == VLMType::PaddleOCRVL;
+            g_server.registerChat(model_name, [&llm, single_image_ocr_mode](const openai_api::ChatRequest &req,
+                                                                            std::shared_ptr<openai_api::BaseDataProvider> provider)
                                   {
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
@@ -1683,6 +1725,9 @@ int run_server_mode(const ModelConfig &config, int port)
                     cleanup_temp_files(temp_files);
                     provider->end();
                     return;
+                }
+                if (single_image_ocr_mode) {
+                    keep_latest_media_turn_for_single_image_ocr(history, media_inputs);
                 }
 
                 if (req.stream) {

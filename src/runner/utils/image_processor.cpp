@@ -224,6 +224,103 @@ static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<un
     return true;
 }
 
+static bool pillow_resize_rgb_u8(const std::vector<unsigned char>& src_rgb,
+                                 int src_w,
+                                 int src_h,
+                                 std::vector<unsigned char>& output_rgb,
+                                 int dst_w,
+                                 int dst_h)
+{
+    if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 ||
+        src_rgb.size() < (size_t)src_w * (size_t)src_h * 3) {
+        return false;
+    }
+
+    if (src_w == dst_w && src_h == dst_h)
+    {
+        output_rgb = src_rgb;
+        return true;
+    }
+
+    const int src_step = src_w * 4;
+    std::vector<uint8_t> src_rgbx((size_t)src_h * (size_t)src_step);
+    for (int y = 0; y < src_h; ++y)
+    {
+        const uint8_t* sp = src_rgb.data() + (size_t)y * (size_t)src_w * 3;
+        uint8_t* dp = src_rgbx.data() + (size_t)y * (size_t)src_step;
+        for (int x = 0; x < src_w; ++x)
+        {
+            dp[4 * x + 0] = sp[3 * x + 0];
+            dp[4 * x + 1] = sp[3 * x + 1];
+            dp[4 * x + 2] = sp[3 * x + 2];
+            dp[4 * x + 3] = 0;
+        }
+    }
+
+    PillowAxisCoeffs xcoeff, ycoeff;
+    if (!pillow_precompute_axis_coeffs(src_w, dst_w, xcoeff)) return false;
+    if (!pillow_precompute_axis_coeffs(src_h, dst_h, ycoeff)) return false;
+
+    const int tmp_step = dst_w * 4;
+    std::vector<uint8_t> tmp_rgbx((size_t)src_h * (size_t)tmp_step, 0);
+    for (int yy = 0; yy < src_h; ++yy)
+    {
+        const uint8_t* row = src_rgbx.data() + (size_t)yy * (size_t)src_step;
+        uint8_t* out_row = tmp_rgbx.data() + (size_t)yy * (size_t)tmp_step;
+        for (int xx = 0; xx < dst_w; ++xx)
+        {
+            const int xmin = xcoeff.bounds[(size_t)xx * 2 + 0];
+            const int xmax = xcoeff.bounds[(size_t)xx * 2 + 1];
+            const int32_t* k = xcoeff.coeffs_int.data() + (size_t)xx * (size_t)xcoeff.ksize;
+
+            int ss0 = 1 << (kPillowPrecisionBits - 1);
+            int ss1 = 1 << (kPillowPrecisionBits - 1);
+            int ss2 = 1 << (kPillowPrecisionBits - 1);
+            for (int x = 0; x < xmax; ++x)
+            {
+                const uint8_t* px = row + (size_t)(x + xmin) * 4;
+                const int32_t kw = k[x];
+                ss0 += (int)px[0] * kw;
+                ss1 += (int)px[1] * kw;
+                ss2 += (int)px[2] * kw;
+            }
+            out_row[4 * xx + 0] = pillow_clip8(ss0);
+            out_row[4 * xx + 1] = pillow_clip8(ss1);
+            out_row[4 * xx + 2] = pillow_clip8(ss2);
+            out_row[4 * xx + 3] = 0;
+        }
+    }
+
+    output_rgb.resize((size_t)dst_h * (size_t)dst_w * 3);
+    for (int yy = 0; yy < dst_h; ++yy)
+    {
+        const int ymin = ycoeff.bounds[(size_t)yy * 2 + 0];
+        const int ymax = ycoeff.bounds[(size_t)yy * 2 + 1];
+        const int32_t* k = ycoeff.coeffs_int.data() + (size_t)yy * (size_t)ycoeff.ksize;
+
+        uint8_t* out_row = output_rgb.data() + (size_t)yy * (size_t)dst_w * 3;
+        for (int xx = 0; xx < dst_w; ++xx)
+        {
+            int ss0 = 1 << (kPillowPrecisionBits - 1);
+            int ss1 = 1 << (kPillowPrecisionBits - 1);
+            int ss2 = 1 << (kPillowPrecisionBits - 1);
+            for (int y = 0; y < ymax; ++y)
+            {
+                const uint8_t* px = tmp_rgbx.data() + (size_t)(y + ymin) * (size_t)tmp_step + (size_t)xx * 4;
+                const int32_t kw = k[y];
+                ss0 += (int)px[0] * kw;
+                ss1 += (int)px[1] * kw;
+                ss2 += (int)px[2] * kw;
+            }
+            out_row[3 * xx + 0] = pillow_clip8(ss0);
+            out_row[3 * xx + 1] = pillow_clip8(ss1);
+            out_row[3 * xx + 2] = pillow_clip8(ss2);
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 std::vector<axcv::Mat> ReadImages(const std::string& path) {
@@ -342,11 +439,15 @@ int PaddleOCRVLImageProcessor(axcv::Mat& src,
                               std::vector<unsigned char>& output,
                               int tgt_h, int tgt_w,
                               int patch_size) {
-    // Match the Python reference preprocessing as closely as possible:
-    // resize with Pillow-compatible bicubic and convert BGR -> RGB before
-    // patchifying to [N, C, pH, pW].
+    // Match python/infer_axmodel.py: first resize the user image to 768x576,
+    // then let the PaddleOCR processor resize to the compiled 756x588 grid.
+    std::vector<unsigned char> base_rgb;
+    if (!pillow_resize_bgr_to_rgb_u8(src, base_rgb, 768, 576)) {
+        return -1;
+    }
+
     std::vector<unsigned char> rgb;
-    if (!pillow_resize_bgr_to_rgb_u8(src, rgb, tgt_w, tgt_h)) {
+    if (!pillow_resize_rgb_u8(base_rgb, 768, 576, rgb, tgt_w, tgt_h)) {
         return -1;
     }
 

@@ -1816,6 +1816,8 @@ struct LLM::Impl {
             llama_layers[i].filename = axmodel_path;
             int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), -1);
             if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
+            llama_layers[i].layer.set_auto_sync_before_inference(true);
+            llama_layers[i].layer.set_auto_sync_after_inference(true);
             int remain_cmm = get_remaining_cmm_size();
             sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
             update_cqdm(&cqdm, i + 1, "count", axmodel_path);
@@ -1823,6 +1825,8 @@ struct LLM::Impl {
         {
             int ret = llama_post.init(attr.filename_post_axmodel.c_str(), -1);
             if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
+            llama_post.set_auto_sync_before_inference(true);
+            llama_post.set_auto_sync_after_inference(true);
             int remain_cmm = get_remaining_cmm_size();
             sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
             update_cqdm(&cqdm, attr.axmodel_num + 1, "count", axmodel_path);
