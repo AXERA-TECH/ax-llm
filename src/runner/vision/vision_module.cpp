@@ -1337,8 +1337,10 @@ bool VisionModule::Init(VLMType type,
                         "|ps=" + std::to_string(patch_size_) +
                         "|fps=" + std::to_string(fps_) +
                         "|tps=" + std::to_string(tokens_per_second_);
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) {
+    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
         cache_key_prefix_ += "|resize=pillow_bicubic";
+    } else if (type_ == VLMType::PaddleOCRVL) {
+        cache_key_prefix_ += "|resize=pillow_bicubic|patch=nchw_v2";
     }
     cache_key_prefix_ += "|bf16=rn_even";
 
@@ -2407,8 +2409,9 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
     input_ids_out = tokenizer_->encode(history_out);
     if (!BuildInjectionState(input_ids_out, all_blocks, all_deepstack, state_out, err)) return false;
 
-    // Optional: mRoPE (Qwen-VL)
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) {
+    // Optional: mRoPE (Qwen-VL). PaddleOCR-VL axmodels are exported with
+    // sequential position ids, matching python/infer_axmodel.py.
+    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
         mrope::Config cfg;
         cfg.vision_config.temporal_patch_size = temporal_patch_size_;
         cfg.vision_config.tokens_per_second = tokens_per_second_;
@@ -2421,7 +2424,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
         cfg.video_token_id = video_pad_id_;
         cfg.vision_start_token_id = vision_start_id_;
 
-        if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::PaddleOCRVL) {
+        if (type_ == VLMType::Qwen2_5VL) {
             std::vector<double> second_per_grid_ts;
             second_per_grid_ts.reserve(video_grid_thw.size());
             for (size_t i = 0; i < video_grid_thw.size(); ++i) {

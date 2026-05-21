@@ -342,15 +342,13 @@ int PaddleOCRVLImageProcessor(axcv::Mat& src,
                               std::vector<unsigned char>& output,
                               int tgt_h, int tgt_w,
                               int patch_size) {
-    // Resize to target size and convert BGR->RGB.
-    axcv::Mat img_rs;
-    if (axcv::width(src) != tgt_w || axcv::height(src) != tgt_h) {
-        axcv::resize(src, img_rs, tgt_w, tgt_h);
-    } else {
-        img_rs = src;
+    // Match the Python reference preprocessing as closely as possible:
+    // resize with Pillow-compatible bicubic and convert BGR -> RGB before
+    // patchifying to [N, C, pH, pW].
+    std::vector<unsigned char> rgb;
+    if (!pillow_resize_bgr_to_rgb_u8(src, rgb, tgt_w, tgt_h)) {
+        return -1;
     }
-    axcv::Mat rgb;
-    axcv::cvtColorBGR2RGB(img_rs, rgb);
 
     const int grid_h = tgt_h / patch_size;
     const int grid_w = tgt_w / patch_size;
@@ -367,7 +365,7 @@ int PaddleOCRVLImageProcessor(axcv::Mat& src,
         for (int c = 0; c < C; c++) {
             for (int ph = 0; ph < patch_size; ph++) {
                 const int row = gh * patch_size + ph;
-                const uint8_t* row_ptr = axcv::row_ptr(rgb, row);
+                const uint8_t* row_ptr = rgb.data() + (size_t)row * (size_t)tgt_w * (size_t)C;
                 for (int pw = 0; pw < patch_size; pw++) {
                     const int col = gw * patch_size + pw;
                     output[idx++] = row_ptr[col * C + c];

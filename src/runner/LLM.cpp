@@ -2745,8 +2745,7 @@ struct LLM::Impl {
         for (int p = 0; p < prefill_split_num; ++p) {
             const int history_len = precompute_len + p * _attr.prefill_token_num;
             const int chunk_tokens = (p == prefill_split_num - 1) ? (input_embed_num - p * _attr.prefill_token_num) : _attr.prefill_token_num;
-            const bool prefer_symbolic_group = has_vision_state && history_len > 0;
-            int g = select_prefill_group(history_len, chunk_tokens, prefer_symbolic_group);
+            int g = select_prefill_group(history_len, chunk_tokens, false);
             if (g <= 0)
             {
                 ALOGE("failed to select prefill group for history_len=%d chunk_tokens=%d", history_len, chunk_tokens);
