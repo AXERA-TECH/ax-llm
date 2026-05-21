@@ -153,6 +153,10 @@ set(COMMON_SOURCES
     src/runner/utils/logger.cpp
     src/runner/utils/net_utils.cpp
     src/runner/LLM.cpp
+    src/runner/Qwen3TTSCodePredictor.cpp
+    src/runner/Qwen3TTS.cpp
+    src/runner/Qwen3TTSSpeechTokenizer.cpp
+    src/runner/Qwen3TTSTalker.cpp
     src/runner/utils/files.cpp
     src/runner/utils/image_processor.cpp
     src/runner/utils/mrope.cpp

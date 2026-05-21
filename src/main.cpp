@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <optional>
+#include <stdexcept>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -20,6 +21,7 @@
 #endif
 
 #include "runner/LLM.hpp"
+#include "runner/Qwen3TTS.hpp"
 #include "openai_api/server.hpp"
 #include "runner/utils/memory_utils.hpp"
 #include "runner/utils/net_utils.hpp"
@@ -1594,18 +1596,260 @@ int run_server_mode(const ModelConfig &config, int port)
     return 0;
 }
 
+void print_usage(const char *program_name);
+
+static bool get_option_value(int argc, char *argv[], int &i, const std::string &arg, std::string &value)
+{
+    if (i + 1 >= argc)
+    {
+        ALOGE("Option requires a value: %s", arg.c_str());
+        return false;
+    }
+    value = argv[++i];
+    return true;
+}
+
+static bool parse_tts_voice_clone_options(int argc,
+                                          char *argv[],
+                                          Qwen3TTSGenerateOptions &options,
+                                          bool &show_help)
+{
+    show_help = false;
+    try
+    {
+        for (int i = 3; i < argc; ++i)
+        {
+            const std::string arg = argv[i];
+            std::string value;
+
+            if (arg == "--help" || arg == "-h")
+            {
+                show_help = true;
+                return true;
+            }
+            else if (arg == "--text")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.text = value;
+            }
+            else if (arg == "--ref_audio" || arg == "--ref-audio")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.ref_audio = value;
+            }
+            else if (arg == "--ref_text" || arg == "--ref-text")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.ref_text = value;
+            }
+            else if (arg == "--output" || arg == "--output_wav" || arg == "--output-wav")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.output_wav = value;
+            }
+            else if (arg == "--language")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.language = value;
+            }
+            else if (arg == "--max_new_tokens" || arg == "--max-new-tokens")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.max_new_tokens = std::stoi(value);
+            }
+            else if (arg == "--top_k" || arg == "--top-k")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.top_k = std::stoi(value);
+            }
+            else if (arg == "--top_p" || arg == "--top-p")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.top_p = std::stof(value);
+            }
+            else if (arg == "--temperature")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.temperature = std::stof(value);
+            }
+            else if (arg == "--subtalker_top_k" || arg == "--subtalker-top-k")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.subtalker_top_k = std::stoi(value);
+            }
+            else if (arg == "--subtalker_top_p" || arg == "--subtalker-top-p")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.subtalker_top_p = std::stof(value);
+            }
+            else if (arg == "--subtalker_temperature" || arg == "--subtalker-temperature")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.subtalker_temperature = std::stof(value);
+            }
+            else if (arg == "--repetition_penalty" || arg == "--repetition-penalty")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.repetition_penalty = std::stof(value);
+            }
+            else if (arg == "--seed")
+            {
+                if (!get_option_value(argc, argv, i, arg, value)) return false;
+                options.seed = static_cast<unsigned int>(std::stoul(value));
+            }
+            else if (arg == "--x_vector_only_mode" || arg == "--x-vector-only-mode")
+            {
+                options.x_vector_only_mode = true;
+            }
+            else if (arg == "--non_streaming_mode" || arg == "--non-streaming-mode")
+            {
+                options.non_streaming_mode = true;
+            }
+            else if (arg == "--do_sample" || arg == "--do-sample")
+            {
+                options.do_sample = true;
+            }
+            else if (arg == "--no-do_sample" || arg == "--no-do-sample")
+            {
+                options.do_sample = false;
+            }
+            else if (arg == "--subtalker_do_sample" || arg == "--subtalker-do-sample")
+            {
+                options.subtalker_do_sample = true;
+            }
+            else if (arg == "--no-subtalker_do_sample" || arg == "--no-subtalker-do-sample")
+            {
+                options.subtalker_do_sample = false;
+            }
+            else
+            {
+                ALOGE("Unknown tts_voice_clone option: %s", arg.c_str());
+                return false;
+            }
+        }
+    }
+    catch (const std::exception &e)
+    {
+        ALOGE("Invalid tts_voice_clone option value: %s", e.what());
+        return false;
+    }
+
+    if (options.text.empty())
+    {
+        ALOGE("tts_voice_clone requires --text");
+        return false;
+    }
+    if (options.ref_audio.empty())
+    {
+        ALOGE("tts_voice_clone requires --ref_audio");
+        return false;
+    }
+    if (!options.x_vector_only_mode && options.ref_text.empty())
+    {
+        ALOGE("tts_voice_clone ICL mode requires --ref_text; use --x_vector_only_mode to skip reference text/audio-code prompt");
+        return false;
+    }
+    if (options.max_new_tokens <= 0)
+    {
+        ALOGE("--max_new_tokens must be positive");
+        return false;
+    }
+    return true;
+}
+
+int run_tts_voice_clone_mode(const std::string &model_path, int argc, char *argv[])
+{
+    Qwen3TTSGenerateOptions options;
+    bool show_help = false;
+    if (!parse_tts_voice_clone_options(argc, argv, options, show_help))
+    {
+        return -1;
+    }
+    if (show_help)
+    {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    g_exit_on_sigint.store(true, std::memory_order_relaxed);
+
+#if USE_AXCL
+    auto ret = axclInit(nullptr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#else
+    AX_ENGINE_NPU_ATTR_T npu_attr;
+    memset(&npu_attr, 0, sizeof(npu_attr));
+    npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    AX_SYS_Init();
+    auto ret = AX_ENGINE_Init(&npu_attr);
+    if (0 != ret)
+    {
+        return ret;
+    }
+#endif
+
+    int status = 0;
+    Qwen3TTS tts;
+    std::vector<float> wav;
+    int sample_rate = 0;
+
+    if (!tts.Init(model_path))
+    {
+        ALOGE("Qwen3TTS.Init failed");
+        status = -1;
+    }
+    else if (!tts.GenerateVoiceClone(options, wav, sample_rate))
+    {
+        ALOGE("Qwen3TTS.GenerateVoiceClone failed");
+        status = -1;
+    }
+    else if (!Qwen3TTS::SaveWavFloat32(options.output_wav, wav, sample_rate))
+    {
+        ALOGE("failed to save wav: %s", options.output_wav.c_str());
+        status = -1;
+    }
+    else
+    {
+        ALOGI("Qwen3-TTS voice clone wav saved: %s sample_rate=%d samples=%zu",
+              options.output_wav.c_str(), sample_rate, wav.size());
+    }
+
+    tts.Deinit();
+
+#if USE_AXCL
+    axclFinalize();
+#else
+    AX_ENGINE_Deinit();
+    AX_SYS_Deinit();
+#endif
+
+    return status;
+}
+
 // Print usage
 void print_usage(const char *program_name)
 {
     printf("Usage:\n");
     printf("  %s run <model_path> [options]    Run interactive chat mode\n", program_name);
     printf("  %s serve <model_path> [options]  Run HTTP API server mode\n", program_name);
+    printf("  %s tts_voice_clone <model_path> --ref_audio <wav> --ref_text <text> --text <text> --output <wav>\n", program_name);
     printf("\n");
     printf("Arguments:\n");
-    printf("  model_path    Path to model directory containing config.json and model files\n");
+    printf("  model_path    Path to model directory. For tts_voice_clone, use the Qwen3-TTS AX650 export root.\n");
     printf("\n");
     printf("Serve options:\n");
     printf("  --port <port> Server port (default: 8000)\n");
+    printf("\n");
+    printf("TTS voice clone options:\n");
+    printf("  --language <name>              Language hint, default: Chinese\n");
+    printf("  --max_new_tokens <n>           Max generated codec frames, default: 4096\n");
+    printf("  --no-do_sample                 Greedy first-code generation\n");
+    printf("  --no-subtalker_do_sample       Greedy sub-code generation\n");
+    printf("  --x_vector_only_mode           Use speaker embedding only, without reference text/audio codes\n");
+    printf("  --non_streaming_mode           Match non-streaming prompt packing\n");
     printf("\n");
     printf("Embedding model config:\n");
     printf("  Set \"is_embedding\": true in config.json to enable /v1/embeddings.\n");
@@ -1644,6 +1888,11 @@ int main(int argc, char *argv[])
     {
         ALOGE("Model path does not exist: %s", model_path.c_str());
         return -1;
+    }
+
+    if (mode == "tts_voice_clone")
+    {
+        return run_tts_voice_clone_mode(model_path, argc, argv);
     }
 
     // Load config from model directory
