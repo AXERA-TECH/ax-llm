@@ -415,39 +415,55 @@ bool Qwen3TTS::GenerateVoiceClone(const Qwen3TTSGenerateOptions &options,
 {
     try
     {
+        ALOGI("Qwen3-TTS GenerateVoiceClone start: text_len=%zu ref_text_len=%zu ref_audio=%s language=%s x_vector_only=%d non_streaming=%d max_new_tokens=%d seed=%u",
+              options.text.size(), options.ref_text.size(), options.ref_audio.c_str(), options.language.c_str(),
+              options.x_vector_only_mode ? 1 : 0, options.non_streaming_mode ? 1 : 0,
+              options.max_new_tokens, options.seed);
         if (options.text.empty()) throw std::runtime_error("text is empty");
         if (options.ref_audio.empty()) throw std::runtime_error("ref_audio is empty");
         if (!options.x_vector_only_mode && options.ref_text.empty()) throw std::runtime_error("ref_text is required for ICL mode");
 
         int lang_id = language_id(options.language);
         if (lang_id == -2) throw std::runtime_error("unsupported language: " + options.language);
+        ALOGI("Qwen3-TTS language resolved: language=%s lang_id=%d", options.language.c_str(), lang_id);
 
         std::vector<float> ref_wav;
         int ref_sr = 0;
         std::string err;
         if (!read_wav_mono_f32(options.ref_audio, ref_wav, ref_sr, err)) throw std::runtime_error(err);
         std::vector<float> ref_wav24 = resample_linear(ref_wav, ref_sr, kSampleRate);
+        ALOGI("Qwen3-TTS ref audio loaded: sr=%d samples=%zu resampled_sr=%d resampled_samples=%zu",
+              ref_sr, ref_wav.size(), kSampleRate, ref_wav24.size());
 
         std::vector<std::array<int, kCodeGroups>> ref_codes;
         if (!options.x_vector_only_mode)
+        {
+            ALOGI("Qwen3-TTS speech tokenizer encode begin");
             ref_codes = impl_->speech_tokenizer.encode(ref_wav24);
+            ALOGI("Qwen3-TTS speech tokenizer encode end: ref_code_len=%zu", ref_codes.size());
+        }
+        ALOGI("Qwen3-TTS speaker encoder begin");
         auto spk_embed = impl_->speaker_encoder.run(ref_wav24);
+        ALOGI("Qwen3-TTS speaker encoder end: embedding_elems=%zu", spk_embed.size());
 
         const auto input_ids = impl_->tokenizer->encode(build_assistant_text(options.text));
         std::vector<int> ref_ids;
         if (!options.x_vector_only_mode)
             ref_ids = impl_->tokenizer->encode(build_ref_text(options.ref_text));
+        ALOGI("Qwen3-TTS tokenizer done: input_ids=%zu ref_ids=%zu", input_ids.size(), ref_ids.size());
 
         auto tts_special = impl_->project_ids({kTtsBosTokenId, kTtsEosTokenId, kTtsPadTokenId});
         auto tts_bos = slice_bf16_rows(tts_special, 0, 1, kTalkerHidden);
         auto tts_eos = slice_bf16_rows(tts_special, 1, 1, kTalkerHidden);
         auto tts_pad = slice_bf16_rows(tts_special, 2, 1, kTalkerHidden);
+        ALOGI("Qwen3-TTS special embeddings projected: elems=%zu", tts_special.size());
 
         std::vector<int> codec_prefill;
         if (lang_id < 0)
             codec_prefill = {kCodecNoThinkId, kCodecThinkBosId, kCodecThinkEosId};
         else
             codec_prefill = {kCodecThinkId, kCodecThinkBosId, lang_id, kCodecThinkEosId};
+        ALOGI("Qwen3-TTS codec prefill ids=%zu", codec_prefill.size());
 
         std::vector<std::vector<unsigned short>> codec_items;
         for (int id : codec_prefill) codec_items.push_back(impl_->codec_embedding(id));
@@ -478,6 +494,7 @@ bool Qwen3TTS::GenerateVoiceClone(const Qwen3TTSGenerateOptions &options,
             auto text_embed = impl_->project_ids(icl_text_ids);
             append_bf16(text_embed, tts_eos);
             const int text_lens = (int)text_embed.size() / kTalkerHidden;
+            ALOGI("Qwen3-TTS ICL text prompt: icl_text_ids=%zu text_lens=%d", icl_text_ids.size(), text_lens);
 
             std::vector<unsigned short> codec_embed_seq;
             append_bf16(codec_embed_seq, impl_->codec_embedding(kCodecBosId));
@@ -490,9 +507,11 @@ bool Qwen3TTS::GenerateVoiceClone(const Qwen3TTSGenerateOptions &options,
                 append_bf16(codec_embed_seq, sum_bf16_embeddings(parts));
             }
             const int codec_lens = (int)codec_embed_seq.size() / kTalkerHidden;
+            ALOGI("Qwen3-TTS ICL codec prompt: ref_codes=%zu codec_lens=%d", ref_codes.size(), codec_lens);
 
             if (options.non_streaming_mode)
             {
+                ALOGI("Qwen3-TTS prompt pack mode: non_streaming ICL");
                 for (int i = 0; i < text_lens; ++i)
                 {
                     std::vector<float> s = bf16_to_fp32_vec(text_embed.data() + (size_t)i * kTalkerHidden, kTalkerHidden);
@@ -509,6 +528,7 @@ bool Qwen3TTS::GenerateVoiceClone(const Qwen3TTSGenerateOptions &options,
             }
             else
             {
+                ALOGI("Qwen3-TTS prompt pack mode: streaming ICL");
                 const int common = std::min(text_lens, codec_lens);
                 for (int i = 0; i < common; ++i)
                 {
@@ -535,6 +555,7 @@ bool Qwen3TTS::GenerateVoiceClone(const Qwen3TTSGenerateOptions &options,
         else
         {
             if (input_ids.size() < 8) throw std::runtime_error("tokenized text is unexpectedly short");
+            ALOGI("Qwen3-TTS prompt pack mode: x_vector_only");
             auto first_text = impl_->project_ids({input_ids[3]});
             std::vector<float> s = bf16_to_fp32_vec(first_text.data(), kTalkerHidden);
             add_bf16_to_float(codec_items.back().data(), s.data(), s.size());
@@ -575,20 +596,37 @@ bool Qwen3TTS::GenerateVoiceClone(const Qwen3TTSGenerateOptions &options,
         std::vector<int> first_code_history;
         std::vector<std::array<int, kCodeGroups>> generated_codes;
 
+        ALOGI("Qwen3-TTS talker prefill call begin");
         auto raw_hidden = impl_->talker.prefill(prompt, prompt_len);
+        ALOGI("Qwen3-TTS talker prefill call end: raw_hidden_elems=%zu", raw_hidden.size());
+        ALOGI("Qwen3-TTS talker post after prefill begin");
         auto talker_post = impl_->talker.post(raw_hidden);
+        ALOGI("Qwen3-TTS talker post after prefill end: logits=%zu hidden_norm=%zu",
+              talker_post.logits.size(), talker_post.hidden_norm.size());
         auto norm_hidden = talker_post.hidden_norm;
         auto logits = talker_post.logits;
         apply_talker_processors(logits, first_code_history, 0, options.repetition_penalty);
         int next_first = select_from_logits(logits, options.do_sample, options.top_k, options.top_p, options.temperature, rng);
+        ALOGI("Qwen3-TTS first code sampled: next_first=%d", next_first);
 
         for (int step = 0; step < options.max_new_tokens; ++step)
         {
             if (next_first == kCodecEosId && step >= 2) break;
             first_code_history.push_back(next_first);
+            ALOGI("Qwen3-TTS generation step=%d begin: first_code=%d history=%zu",
+                  step, next_first, first_code_history.size());
 
             auto first_embed = impl_->codec_embedding(next_first);
+            ALOGI("Qwen3-TTS code predictor call begin: step=%d first_embed_elems=%zu", step, first_embed.size());
             auto sub_codes = impl_->code_predictor.generate(norm_hidden, first_embed, options, rng);
+            std::string sub_code_text;
+            for (size_t i = 0; i < sub_codes.size(); ++i)
+            {
+                if (i > 0) sub_code_text += ",";
+                sub_code_text += std::to_string(sub_codes[i]);
+            }
+            ALOGI("Qwen3-TTS code predictor call end: step=%d sub_codes=[%s]",
+                  step, sub_code_text.c_str());
             std::array<int, kCodeGroups> frame{};
             frame[0] = next_first;
             for (int i = 0; i < kNumSubCodes; ++i) frame[(size_t)i + 1] = sub_codes[(size_t)i];
@@ -609,19 +647,30 @@ bool Qwen3TTS::GenerateVoiceClone(const Qwen3TTSGenerateOptions &options,
 
             std::vector<float> decode_embed = bf16_to_fp32_vec(codec_sum.data(), codec_sum.size());
             add_bf16_to_float(text_add.data(), decode_embed.data(), decode_embed.size());
+            ALOGI("Qwen3-TTS talker decode call begin: step=%d trailing_len=%d text_add_elems=%zu",
+                  step, trailing_len, text_add.size());
             raw_hidden = impl_->talker.decode_one(fp32_to_bf16_vec(decode_embed));
+            ALOGI("Qwen3-TTS talker decode call end: step=%d raw_hidden_elems=%zu", step, raw_hidden.size());
+            ALOGI("Qwen3-TTS talker post after decode begin: step=%d", step);
             talker_post = impl_->talker.post(raw_hidden);
+            ALOGI("Qwen3-TTS talker post after decode end: step=%d logits=%zu hidden_norm=%zu",
+                  step, talker_post.logits.size(), talker_post.hidden_norm.size());
             norm_hidden = talker_post.hidden_norm;
             logits = talker_post.logits;
             apply_talker_processors(logits, first_code_history, (int)generated_codes.size(), options.repetition_penalty);
             next_first = select_from_logits(logits, options.do_sample, options.top_k, options.top_p, options.temperature, rng);
+            ALOGI("Qwen3-TTS generation step=%d end: generated=%zu next_first=%d",
+                  step, generated_codes.size(), next_first);
         }
 
         std::vector<std::array<int, kCodeGroups>> decode_codes;
         decode_codes.reserve(ref_codes.size() + generated_codes.size());
         decode_codes.insert(decode_codes.end(), ref_codes.begin(), ref_codes.end());
         decode_codes.insert(decode_codes.end(), generated_codes.begin(), generated_codes.end());
+        ALOGI("Qwen3-TTS speech tokenizer decode begin: ref_codes=%zu generated_codes=%zu total_codes=%zu",
+              ref_codes.size(), generated_codes.size(), decode_codes.size());
         auto wav_all = impl_->speech_tokenizer.decode(decode_codes);
+        ALOGI("Qwen3-TTS speech tokenizer decode end: wav_all_samples=%zu", wav_all.size());
 
         if (!ref_codes.empty())
         {
@@ -629,10 +678,13 @@ bool Qwen3TTS::GenerateVoiceClone(const Qwen3TTSGenerateOptions &options,
             const int total_len = (int)decode_codes.size();
             const size_t cut = (size_t)((double)ref_len / std::max(1, total_len) * (double)wav_all.size());
             wav.assign(wav_all.begin() + (ptrdiff_t)std::min(cut, wav_all.size()), wav_all.end());
+            ALOGI("Qwen3-TTS ref audio cut: ref_len=%d total_len=%d cut_samples=%zu output_samples=%zu",
+                  ref_len, total_len, cut, wav.size());
         }
         else
         {
             wav = std::move(wav_all);
+            ALOGI("Qwen3-TTS output without ref cut: output_samples=%zu", wav.size());
         }
         sample_rate = kSampleRate;
         ALOGI("Qwen3-TTS generated_frames=%zu output_samples=%zu", generated_codes.size(), wav.size());

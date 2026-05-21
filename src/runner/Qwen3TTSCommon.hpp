@@ -70,6 +70,19 @@ inline size_t shape_elems(const std::vector<unsigned int> &shape)
     return n;
 }
 
+inline std::string shape_to_string(const std::vector<unsigned int> &shape)
+{
+    if (shape.empty()) return "[]";
+    std::string s = "[";
+    for (size_t i = 0; i < shape.size(); ++i)
+    {
+        if (i > 0) s += "x";
+        s += std::to_string(shape[i]);
+    }
+    s += "]";
+    return s;
+}
+
 inline std::vector<unsigned short> fp32_to_bf16_vec(const std::vector<float> &src)
 {
     std::vector<unsigned short> dst(src.size());
@@ -198,6 +211,8 @@ inline const ax_runner_tensor_t &output_tensor(AxRunner &runner, int gid, const 
 inline void write_tensor(AxRunner &runner, const ax_runner_tensor_t &t, const void *data, size_t bytes)
 {
     if (bytes > (size_t)t.nSize) throw std::runtime_error("input tensor overflow: " + t.sName);
+    if ((size_t)t.nSize > 0 && tensor_write_addr(t) == nullptr)
+        throw std::runtime_error("input tensor has null buffer: " + t.sName);
     if ((size_t)t.nSize > bytes)
     {
         std::vector<unsigned char> zeros((size_t)t.nSize, 0);
@@ -213,6 +228,8 @@ inline void write_tensor(AxRunner &runner, const ax_runner_tensor_t &t, const vo
 inline void read_tensor(AxRunner &runner, const ax_runner_tensor_t &t, void *dst, size_t bytes)
 {
     if (bytes > (size_t)t.nSize) throw std::runtime_error("output tensor overflow: " + t.sName);
+    if (bytes > 0 && tensor_read_addr(t) == nullptr)
+        throw std::runtime_error("output tensor has null buffer: " + t.sName);
     tts_d2h(dst, tensor_read_addr(t), bytes, runner.get_devid());
 }
 

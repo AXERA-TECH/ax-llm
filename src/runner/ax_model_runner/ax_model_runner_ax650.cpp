@@ -251,8 +251,11 @@ int ax_runner_ax650::sub_init()
         if (ret != 0) return ret;
     }
 
-    // 2. 处理中间 Group 的内存共享逻辑 (原有逻辑的 Hack)
-    if (io_count > 2)
+    // 2. 处理 Group 间的内存共享逻辑。
+    // Last Group 的 K_cache/V_cache 在 prepare_io_with_alloc 中被跳过分配，需要
+    // 显式复用 Group 0 中已经分配并按最大 group size 扩容过的 KV buffer。
+    // 这也覆盖只有 decode/prefill 两个 group 的模型，例如 Qwen3-TTS code_predictor。
+    if (io_count >= 2)
     {
         auto &first_io_data = m_handle->io_data[0];
         auto &first_io_info = m_handle->io_info[0];
@@ -291,65 +294,68 @@ int ax_runner_ax650::sub_init()
             }
         }
 
-        for (size_t grpid = 1; grpid < io_count - 1; grpid++)
+        if (io_count > 2)
         {
-            auto &io_info = m_handle->io_info[grpid];
-            auto &io_data = m_handle->io_data[grpid];
-
-            // Gemma4 prefill groups do not guarantee identical tensor ordering across groups.
-            // Reuse buffers by tensor name instead of index to avoid wrong buffer aliasing.
-            for (size_t i = 0; i < io_info->nInputSize; i++)
+            for (size_t grpid = 1; grpid < io_count - 1; grpid++)
             {
-                const char *tensor_name = io_info->pInputs[i].pName;
-                if (!tensor_name)
-                    continue;
+                auto &io_info = m_handle->io_info[grpid];
+                auto &io_data = m_handle->io_data[grpid];
 
-                AX_ENGINE_IO_BUFFER_T *shared = find_input_buffer_by_name(last_io_info, &last_io_data, tensor_name);
-                if (!shared)
+                // Gemma4 prefill groups do not guarantee identical tensor ordering across groups.
+                // Reuse buffers by tensor name instead of index to avoid wrong buffer aliasing.
+                for (size_t i = 0; i < io_info->nInputSize; i++)
                 {
-                    ALOGE("failed to find shared input buffer for group %zu tensor %s", grpid, tensor_name);
-                    return -1;
+                    const char *tensor_name = io_info->pInputs[i].pName;
+                    if (!tensor_name)
+                        continue;
+
+                    AX_ENGINE_IO_BUFFER_T *shared = find_input_buffer_by_name(last_io_info, &last_io_data, tensor_name);
+                    if (!shared)
+                    {
+                        ALOGE("failed to find shared input buffer for group %zu tensor %s", grpid, tensor_name);
+                        return -1;
+                    }
+
+                    if (shared->nSize < io_data.pInputs[i].nSize)
+                    {
+                        ALOGE("shared input buffer too small for group %zu tensor %s: src=%u dst=%u",
+                              grpid,
+                              tensor_name,
+                              shared->nSize,
+                              io_data.pInputs[i].nSize);
+                        return -1;
+                    }
+
+                    io_data.pInputs[i].phyAddr = shared->phyAddr;
+                    io_data.pInputs[i].pVirAddr = shared->pVirAddr;
                 }
 
-                if (shared->nSize < io_data.pInputs[i].nSize)
+                for (size_t i = 0; i < io_info->nOutputSize; i++)
                 {
-                    ALOGE("shared input buffer too small for group %zu tensor %s: src=%u dst=%u",
-                          grpid,
-                          tensor_name,
-                          shared->nSize,
-                          io_data.pInputs[i].nSize);
-                    return -1;
+                    const char *tensor_name = io_info->pOutputs[i].pName;
+                    if (!tensor_name)
+                        continue;
+
+                    AX_ENGINE_IO_BUFFER_T *shared = find_output_buffer_by_name(last_io_info, &last_io_data, tensor_name);
+                    if (!shared)
+                    {
+                        ALOGE("failed to find shared output buffer for group %zu tensor %s", grpid, tensor_name);
+                        return -1;
+                    }
+
+                    if (shared->nSize < io_data.pOutputs[i].nSize)
+                    {
+                        ALOGE("shared output buffer too small for group %zu tensor %s: src=%u dst=%u",
+                              grpid,
+                              tensor_name,
+                              shared->nSize,
+                              io_data.pOutputs[i].nSize);
+                        return -1;
+                    }
+
+                    io_data.pOutputs[i].phyAddr = shared->phyAddr;
+                    io_data.pOutputs[i].pVirAddr = shared->pVirAddr;
                 }
-
-                io_data.pInputs[i].phyAddr = shared->phyAddr;
-                io_data.pInputs[i].pVirAddr = shared->pVirAddr;
-            }
-
-            for (size_t i = 0; i < io_info->nOutputSize; i++)
-            {
-                const char *tensor_name = io_info->pOutputs[i].pName;
-                if (!tensor_name)
-                    continue;
-
-                AX_ENGINE_IO_BUFFER_T *shared = find_output_buffer_by_name(last_io_info, &last_io_data, tensor_name);
-                if (!shared)
-                {
-                    ALOGE("failed to find shared output buffer for group %zu tensor %s", grpid, tensor_name);
-                    return -1;
-                }
-
-                if (shared->nSize < io_data.pOutputs[i].nSize)
-                {
-                    ALOGE("shared output buffer too small for group %zu tensor %s: src=%u dst=%u",
-                          grpid,
-                          tensor_name,
-                          shared->nSize,
-                          io_data.pOutputs[i].nSize);
-                    return -1;
-                }
-
-                io_data.pOutputs[i].phyAddr = shared->phyAddr;
-                io_data.pOutputs[i].pVirAddr = shared->pVirAddr;
             }
         }
     }

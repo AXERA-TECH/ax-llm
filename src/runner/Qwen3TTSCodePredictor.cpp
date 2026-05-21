@@ -55,6 +55,8 @@ std::vector<int> CodePredictorRunner::generate(const std::vector<unsigned short>
                                                const Qwen3TTSGenerateOptions &opt,
                                                std::mt19937 &rng)
 {
+    ALOGI("code predictor generate start: hidden_norm_elems=%zu first_code_embed_elems=%zu",
+          talker_hidden_norm.size(), first_code_embed.size());
     std::vector<unsigned short> data((size_t)64 * kTalkerHidden, 0);
     std::memcpy(data.data(), talker_hidden_norm.data(), (size_t)kTalkerHidden * sizeof(unsigned short));
     std::memcpy(data.data() + kTalkerHidden, first_code_embed.data(), (size_t)kTalkerHidden * sizeof(unsigned short));
@@ -74,17 +76,41 @@ std::vector<int> CodePredictorRunner::generate(const std::vector<unsigned short>
     for (int layer = 0; layer < kCodePredictorLayers; ++layer)
     {
         auto &runner = layers_[(size_t)layer]->get();
-        write_tensor(runner, input_tensor(runner, 1, "indices"), indices.data(), indices.size() * sizeof(unsigned int));
-        write_tensor(runner, input_tensor(runner, 1, "input"), data.data(), data.size() * sizeof(unsigned short));
-        write_tensor(runner, input_tensor(runner, 1, "mask"), mask.data(), mask.size() * sizeof(unsigned short));
-        std::vector<unsigned short> zeros_k((size_t)input_tensor(runner, 1, "K_cache").nSize / sizeof(unsigned short), 0);
-        std::vector<unsigned short> zeros_v((size_t)input_tensor(runner, 1, "V_cache").nSize / sizeof(unsigned short), 0);
-        write_tensor(runner, input_tensor(runner, 1, "K_cache"), zeros_k.data(), zeros_k.size() * sizeof(unsigned short));
-        write_tensor(runner, input_tensor(runner, 1, "V_cache"), zeros_v.data(), zeros_v.size() * sizeof(unsigned short));
-        if (runner.inference(1) != 0) throw std::runtime_error("code predictor prefill inference failed");
-        read_tensor(runner, output_tensor(runner, 1, "K_cache_out"), k_cache_[(size_t)layer].data(), (size_t)64 * kTalkerHidden * sizeof(unsigned short));
-        read_tensor(runner, output_tensor(runner, 1, "V_cache_out"), v_cache_[(size_t)layer].data(), (size_t)64 * kTalkerHidden * sizeof(unsigned short));
-        read_tensor(runner, output_tensor(runner, 1, "output"), data.data(), (size_t)64 * kTalkerHidden * sizeof(unsigned short));
+        ALOGI("code predictor prefill layer=%d/%d write inputs", layer, kCodePredictorLayers);
+        const auto &t_idx = input_tensor(runner, 1, "indices");
+        const auto &t_in = input_tensor(runner, 1, "input");
+        const auto &t_mask = input_tensor(runner, 1, "mask");
+        const auto &t_k = input_tensor(runner, 1, "K_cache");
+        const auto &t_v = input_tensor(runner, 1, "V_cache");
+        ALOGI("code predictor prefill tensors: layer=%d idx=%s/%s/%d input=%s/%s/%d mask=%s/%s/%d K=%s/%s/%d V=%s/%s/%d",
+              layer,
+              t_idx.sName.c_str(), shape_to_string(t_idx.vShape).c_str(), t_idx.nSize,
+              t_in.sName.c_str(), shape_to_string(t_in.vShape).c_str(), t_in.nSize,
+              t_mask.sName.c_str(), shape_to_string(t_mask.vShape).c_str(), t_mask.nSize,
+              t_k.sName.c_str(), shape_to_string(t_k.vShape).c_str(), t_k.nSize,
+              t_v.sName.c_str(), shape_to_string(t_v.vShape).c_str(), t_v.nSize);
+        write_tensor(runner, t_idx, indices.data(), indices.size() * sizeof(unsigned int));
+        write_tensor(runner, t_in, data.data(), data.size() * sizeof(unsigned short));
+        write_tensor(runner, t_mask, mask.data(), mask.size() * sizeof(unsigned short));
+        std::vector<unsigned short> zeros_k((size_t)t_k.nSize / sizeof(unsigned short), 0);
+        std::vector<unsigned short> zeros_v((size_t)t_v.nSize / sizeof(unsigned short), 0);
+        write_tensor(runner, t_k, zeros_k.data(), zeros_k.size() * sizeof(unsigned short));
+        write_tensor(runner, t_v, zeros_v.data(), zeros_v.size() * sizeof(unsigned short));
+        ALOGI("code predictor prefill inference begin: layer=%d gid=1", layer);
+        const int ret = runner.inference(1);
+        ALOGI("code predictor prefill inference end: layer=%d gid=1 ret=%d", layer, ret);
+        if (ret != 0) throw std::runtime_error("code predictor prefill inference failed");
+        const auto &out_k = output_tensor(runner, 1, "K_cache_out");
+        const auto &out_v = output_tensor(runner, 1, "V_cache_out");
+        const auto &out_h = output_tensor(runner, 1, "output");
+        ALOGI("code predictor prefill read outputs: layer=%d K=%s/%s/%d V=%s/%s/%d H=%s/%s/%d",
+              layer,
+              out_k.sName.c_str(), shape_to_string(out_k.vShape).c_str(), out_k.nSize,
+              out_v.sName.c_str(), shape_to_string(out_v.vShape).c_str(), out_v.nSize,
+              out_h.sName.c_str(), shape_to_string(out_h.vShape).c_str(), out_h.nSize);
+        read_tensor(runner, out_k, k_cache_[(size_t)layer].data(), (size_t)64 * kTalkerHidden * sizeof(unsigned short));
+        read_tensor(runner, out_v, v_cache_[(size_t)layer].data(), (size_t)64 * kTalkerHidden * sizeof(unsigned short));
+        read_tensor(runner, out_h, data.data(), (size_t)64 * kTalkerHidden * sizeof(unsigned short));
     }
 
     std::vector<unsigned short> last_hidden(data.begin() + kTalkerHidden, data.begin() + (size_t)2 * kTalkerHidden);
@@ -92,6 +118,7 @@ std::vector<int> CodePredictorRunner::generate(const std::vector<unsigned short>
     int current_len = 2;
     for (int step = 0; step < kNumSubCodes; ++step)
     {
+        ALOGI("code predictor subcode step=%d current_len=%d begin", step, current_len);
         if (step > 0)
         {
             auto prev_embed = embed(step - 1, ids.back());
@@ -102,12 +129,15 @@ std::vector<int> CodePredictorRunner::generate(const std::vector<unsigned short>
         auto logits = run_lm_head(step, hidden_norm);
         ids.push_back(select_from_logits(logits, opt.subtalker_do_sample, opt.subtalker_top_k,
                                          opt.subtalker_top_p, opt.subtalker_temperature, rng));
+        ALOGI("code predictor subcode step=%d sampled=%d", step, ids.back());
     }
+    ALOGI("code predictor generate done: ids=%zu", ids.size());
     return ids;
 }
 
 std::vector<unsigned short> CodePredictorRunner::decode_one(const std::vector<unsigned short> &embed, int current_len)
 {
+    ALOGI("code predictor decode_one start: current_len=%d embed_elems=%zu", current_len, embed.size());
     std::vector<unsigned short> data = embed;
     std::vector<unsigned short> mask(129, bfloat16(-65536.0f).data);
     for (int i = 0; i < current_len; ++i) mask[(size_t)i] = 0;
@@ -116,33 +146,56 @@ std::vector<unsigned short> CodePredictorRunner::decode_one(const std::vector<un
     for (int layer = 0; layer < kCodePredictorLayers; ++layer)
     {
         auto &runner = layers_[(size_t)layer]->get();
+        ALOGI("code predictor decode_one layer=%d/%d write inputs idx=%u", layer, kCodePredictorLayers, idx);
         write_tensor(runner, input_tensor(runner, 0, "K_cache"), k_cache_[(size_t)layer].data(), k_cache_[(size_t)layer].size() * sizeof(unsigned short));
         write_tensor(runner, input_tensor(runner, 0, "V_cache"), v_cache_[(size_t)layer].data(), v_cache_[(size_t)layer].size() * sizeof(unsigned short));
         write_tensor(runner, input_tensor(runner, 0, "indices"), &idx, sizeof(idx));
         write_tensor(runner, input_tensor(runner, 0, "input"), data.data(), data.size() * sizeof(unsigned short));
         write_tensor(runner, input_tensor(runner, 0, "mask"), mask.data(), mask.size() * sizeof(unsigned short));
-        if (runner.inference(0) != 0) throw std::runtime_error("code predictor decode inference failed");
+        ALOGI("code predictor decode_one inference begin: layer=%d gid=0", layer);
+        const int ret = runner.inference(0);
+        ALOGI("code predictor decode_one inference end: layer=%d gid=0 ret=%d", layer, ret);
+        if (ret != 0) throw std::runtime_error("code predictor decode inference failed");
         read_tensor(runner, output_tensor(runner, 0, "K_cache_out"), k_cache_[(size_t)layer].data() + (size_t)current_len * kTalkerHidden, (size_t)kTalkerHidden * sizeof(unsigned short));
         read_tensor(runner, output_tensor(runner, 0, "V_cache_out"), v_cache_[(size_t)layer].data() + (size_t)current_len * kTalkerHidden, (size_t)kTalkerHidden * sizeof(unsigned short));
         read_tensor(runner, output_tensor(runner, 0, "output"), data.data(), data.size() * sizeof(unsigned short));
     }
+    ALOGI("code predictor decode_one done: current_len=%d", current_len);
     return data;
 }
 
 std::vector<float> CodePredictorRunner::run_post_norm(const std::vector<unsigned short> &hidden)
 {
     auto &runner = post_.get();
-    write_tensor(runner, runner.get_input("input"), hidden.data(), hidden.size() * sizeof(unsigned short));
-    if (runner.inference() != 0) throw std::runtime_error("code predictor post inference failed");
-    return tensor_to_float(runner, runner.get_output("output_norm"), kTalkerHidden);
+    const auto &input = runner.get_input("input");
+    ALOGI("code predictor post_norm write input: elems=%zu tensor=%s shape=%s nSize=%d",
+          hidden.size(), input.sName.c_str(), shape_to_string(input.vShape).c_str(), input.nSize);
+    write_tensor(runner, input, hidden.data(), hidden.size() * sizeof(unsigned short));
+    ALOGI("code predictor post_norm inference begin");
+    const int ret = runner.inference();
+    ALOGI("code predictor post_norm inference end ret=%d", ret);
+    if (ret != 0) throw std::runtime_error("code predictor post inference failed");
+    const auto &output = runner.get_output("output_norm");
+    ALOGI("code predictor post_norm read output: tensor=%s shape=%s nSize=%d",
+          output.sName.c_str(), shape_to_string(output.vShape).c_str(), output.nSize);
+    return tensor_to_float(runner, output, kTalkerHidden);
 }
 
 std::vector<float> CodePredictorRunner::run_lm_head(int step, const std::vector<float> &hidden)
 {
     auto &runner = lm_heads_[(size_t)step]->get();
-    write_tensor(runner, runner.get_input("input"), hidden.data(), hidden.size() * sizeof(float));
-    if (runner.inference() != 0) throw std::runtime_error("code predictor lm head inference failed");
-    return tensor_to_float(runner, runner.get_output("output"), kCodecVocab);
+    const auto &input = runner.get_input("input");
+    ALOGI("code predictor lm_head write input: step=%d elems=%zu tensor=%s shape=%s nSize=%d",
+          step, hidden.size(), input.sName.c_str(), shape_to_string(input.vShape).c_str(), input.nSize);
+    write_tensor(runner, input, hidden.data(), hidden.size() * sizeof(float));
+    ALOGI("code predictor lm_head inference begin: step=%d", step);
+    const int ret = runner.inference();
+    ALOGI("code predictor lm_head inference end: step=%d ret=%d", step, ret);
+    if (ret != 0) throw std::runtime_error("code predictor lm head inference failed");
+    const auto &output = runner.get_output("output");
+    ALOGI("code predictor lm_head read output: step=%d tensor=%s shape=%s nSize=%d",
+          step, output.sName.c_str(), shape_to_string(output.vShape).c_str(), output.nSize);
+    return tensor_to_float(runner, output, kCodecVocab);
 }
 
 } // namespace qwen3_tts
