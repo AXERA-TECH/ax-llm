@@ -239,22 +239,35 @@ jobs:
 
           mkdir -p dist
 
-          # NOTE: upload-artifact stores paths relative to the uploaded root, so the downloaded
-          # artifact directory itself is the install root (bin/include/lib/...).
-          tar -C artifacts/axcl-x86-artifacts -czf dist/axllm-axcl-linux-amd64.tar.gz .
-          tar -C artifacts/axcl-aarch64-artifacts -czf dist/axllm-axcl-linux-arm64.tar.gz .
-          tar -C artifacts/ax650-aarch64-artifacts -czf dist/axllm-ax650-linux-arm64.tar.gz .
-          tar -C artifacts/axcl-riscv64-artifacts -czf dist/axllm-axcl-linux-riscv64.tar.gz .
+          find_install_root() {
+            local artifact_dir="$1"
+            local axllm_path=""
+            axllm_path="$(find "${artifact_dir}" -type f -path '*/bin/axllm' -print -quit)"
+            if [[ -z "${axllm_path}" ]]; then
+              echo "Cannot locate axllm binary under ${artifact_dir}" >&2
+              find "${artifact_dir}" -maxdepth 4 -type f | head -n 200 >&2 || true
+              return 1
+            fi
+            dirname "$(dirname "${axllm_path}")"
+          }
 
-          # Also publish standalone binaries for convenience.
-          cp -a artifacts/axcl-x86-artifacts/bin/axllm dist/axllm-axcl-linux-amd64
-          cp -a artifacts/axcl-aarch64-artifacts/bin/axllm dist/axllm-axcl-linux-arm64
-          cp -a artifacts/ax650-aarch64-artifacts/bin/axllm dist/axllm-ax650-linux-arm64
-          cp -a artifacts/axcl-riscv64-artifacts/bin/axllm dist/axllm-axcl-linux-riscv64
+          pkg_one() {
+            local artifact_dir="$1"
+            local out_prefix="$2"
+            local install_root
+            install_root="$(find_install_root "${artifact_dir}")"
+            tar -C "${install_root}" -czf "dist/${out_prefix}.tar.gz" .
+            cp -a "${install_root}/bin/axllm" "dist/${out_prefix}"
+          }
+
+          pkg_one artifacts/axcl-x86-artifacts axllm-axcl-linux-amd64
+          pkg_one artifacts/axcl-aarch64-artifacts axllm-axcl-linux-arm64
+          pkg_one artifacts/ax650-aarch64-artifacts axllm-ax650-linux-arm64
+          pkg_one artifacts/axcl-riscv64-artifacts axllm-axcl-linux-riscv64
 
           mkdir -p dist/windows
-          cp -a artifacts/axcl-windows-mingw64-artifacts/build_mingw64/axllm.exe dist/windows/
-          cp -a artifacts/axcl-windows-mingw64-artifacts/build_mingw64/tokenizer_smoke.exe dist/windows/
+          cp -a artifacts/axcl-windows-mingw64-artifacts/axllm.exe dist/windows/
+          cp -a artifacts/axcl-windows-mingw64-artifacts/tokenizer_smoke.exe dist/windows/
           (cd dist/windows && zip -r ../axllm-axcl-windows-mingw64.zip .)
           rm -rf dist/windows
 
