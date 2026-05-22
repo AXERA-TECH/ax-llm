@@ -239,16 +239,18 @@ jobs:
 
           mkdir -p dist
 
-          tar -C artifacts/axcl-x86-artifacts/build_x86/install -czf dist/axllm-axcl-linux-amd64.tar.gz .
-          tar -C artifacts/axcl-aarch64-artifacts/build_aarch64/install -czf dist/axllm-axcl-linux-arm64.tar.gz .
-          tar -C artifacts/ax650-aarch64-artifacts/build/install -czf dist/axllm-ax650-linux-arm64.tar.gz .
-          tar -C artifacts/axcl-riscv64-artifacts/build_riscv64/install -czf dist/axllm-axcl-linux-riscv64.tar.gz .
+          # NOTE: upload-artifact stores paths relative to the uploaded root, so the downloaded
+          # artifact directory itself is the install root (bin/include/lib/...).
+          tar -C artifacts/axcl-x86-artifacts -czf dist/axllm-axcl-linux-amd64.tar.gz .
+          tar -C artifacts/axcl-aarch64-artifacts -czf dist/axllm-axcl-linux-arm64.tar.gz .
+          tar -C artifacts/ax650-aarch64-artifacts -czf dist/axllm-ax650-linux-arm64.tar.gz .
+          tar -C artifacts/axcl-riscv64-artifacts -czf dist/axllm-axcl-linux-riscv64.tar.gz .
 
           # Also publish standalone binaries for convenience.
-          cp -a artifacts/axcl-x86-artifacts/build_x86/install/bin/axllm dist/axllm-axcl-linux-amd64
-          cp -a artifacts/axcl-aarch64-artifacts/build_aarch64/install/bin/axllm dist/axllm-axcl-linux-arm64
-          cp -a artifacts/ax650-aarch64-artifacts/build/install/bin/axllm dist/axllm-ax650-linux-arm64
-          cp -a artifacts/axcl-riscv64-artifacts/build_riscv64/install/bin/axllm dist/axllm-axcl-linux-riscv64
+          cp -a artifacts/axcl-x86-artifacts/bin/axllm dist/axllm-axcl-linux-amd64
+          cp -a artifacts/axcl-aarch64-artifacts/bin/axllm dist/axllm-axcl-linux-arm64
+          cp -a artifacts/ax650-aarch64-artifacts/bin/axllm dist/axllm-ax650-linux-arm64
+          cp -a artifacts/axcl-riscv64-artifacts/bin/axllm dist/axllm-axcl-linux-riscv64
 
           mkdir -p dist/windows
           cp -a artifacts/axcl-windows-mingw64-artifacts/build_mingw64/axllm.exe dist/windows/
