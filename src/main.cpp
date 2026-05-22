@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <optional>
+#include <ctime>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -20,6 +21,7 @@
 #endif
 
 #include "runner/LLM.hpp"
+#include "runner/image/sd15_image_generator.hpp"
 #include "openai_api/server.hpp"
 #include "runner/utils/memory_utils.hpp"
 #include "runner/utils/net_utils.hpp"
@@ -139,8 +141,11 @@ struct ModelConfig
     int port = 8000;
     int server_timeout_ms = 300000; // 5 minutes
     bool is_embedding = false;
+    bool is_image_generation = false;
+    std::string image_model_dir = ".";
 
     bool is_embedding_model() const { return is_embedding; }
+    bool is_image_generation_model() const { return is_image_generation; }
 
     static std::optional<nlohmann::json> load_json_file(const std::filesystem::path &path)
     {
@@ -244,6 +249,31 @@ struct ModelConfig
             std::ifstream f(config_path);
             nlohmann::json j;
             f >> j;
+
+            is_image_generation = false;
+            if (j.contains("model_type") && j["model_type"].is_string())
+            {
+                is_image_generation = j["model_type"].get<std::string>() == "image_generation";
+            }
+            else if (j.contains("task_type") && j["task_type"].is_string())
+            {
+                is_image_generation = j["task_type"].get<std::string>() == "image_generation";
+            }
+            else if (j.contains("is_image_generation"))
+            {
+                is_image_generation = j["is_image_generation"].get<bool>();
+            }
+
+            if (is_image_generation)
+            {
+                is_embedding = false;
+                if (j.contains("model_name")) model_name = j["model_name"].get<std::string>();
+                if (j.contains("port")) port = j["port"].get<int>();
+                if (j.contains("server_timeout_ms")) server_timeout_ms = j["server_timeout_ms"].get<int>();
+                if (j.contains("image_model_dir")) image_model_dir = j["image_model_dir"].get<std::string>();
+                attr.post_config_path.clear();
+                return true;
+            }
 #define check_key(key)                   \
     if (!j.contains(key))                \
     {                                    \
@@ -499,6 +529,12 @@ static inline bool is_url(const std::string &p)
 
 void resolve_config_paths(ModelConfig &config, const std::string &model_path)
 {
+    if (config.is_image_generation_model())
+    {
+        config.image_model_dir = resolve_path(model_path, config.image_model_dir);
+        return;
+    }
+
     config.attr.template_filename_axmodel = resolve_path(model_path, config.attr.template_filename_axmodel);
     config.attr.filename_post_axmodel = resolve_path(model_path, config.attr.filename_post_axmodel);
     if (!is_url(config.attr.url_tokenizer_model))
@@ -923,6 +959,46 @@ static std::vector<uint8_t> base64_decode_bytes(const std::string &encoded)
     return out;
 }
 
+static std::string base64_encode_bytes(const std::vector<uint8_t> &data)
+{
+    std::string out;
+    out.reserve(((data.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 2 < data.size())
+    {
+        const uint32_t chunk =
+            (static_cast<uint32_t>(data[i]) << 16) |
+            (static_cast<uint32_t>(data[i + 1]) << 8) |
+            static_cast<uint32_t>(data[i + 2]);
+        out.push_back(g_base64_chars[(chunk >> 18) & 0x3f]);
+        out.push_back(g_base64_chars[(chunk >> 12) & 0x3f]);
+        out.push_back(g_base64_chars[(chunk >> 6) & 0x3f]);
+        out.push_back(g_base64_chars[chunk & 0x3f]);
+        i += 3;
+    }
+
+    const size_t rem = data.size() - i;
+    if (rem == 1)
+    {
+        const uint32_t chunk = static_cast<uint32_t>(data[i]) << 16;
+        out.push_back(g_base64_chars[(chunk >> 18) & 0x3f]);
+        out.push_back(g_base64_chars[(chunk >> 12) & 0x3f]);
+        out.push_back('=');
+        out.push_back('=');
+    }
+    else if (rem == 2)
+    {
+        const uint32_t chunk =
+            (static_cast<uint32_t>(data[i]) << 16) |
+            (static_cast<uint32_t>(data[i + 1]) << 8);
+        out.push_back(g_base64_chars[(chunk >> 18) & 0x3f]);
+        out.push_back(g_base64_chars[(chunk >> 12) & 0x3f]);
+        out.push_back(g_base64_chars[(chunk >> 6) & 0x3f]);
+        out.push_back('=');
+    }
+    return out;
+}
+
 static std::string normalize_extension(std::string ext, const std::string &fallback = "bin")
 {
     if (!ext.empty() && ext[0] == '.')
@@ -967,6 +1043,17 @@ static std::string write_bytes_to_tempfile(const std::string &ext, const std::ve
     ofs.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
     ofs.close();
     return path.string();
+}
+
+static std::string sanitize_filename_component(std::string s)
+{
+    for (char &c : s)
+    {
+        const bool ok = std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.';
+        if (!ok) c = '_';
+    }
+    if (s.empty()) s = "image";
+    return s;
 }
 
 // Detect "data:<mime>/<ext>;base64,<payload>" and return the extension + payload.
@@ -1297,249 +1384,107 @@ int run_server_mode(const ModelConfig &config, int port)
     }
 #endif
 
-    if (!llm.Init(config.attr))
-    {
-        ALOGE("LLM.Init failed");
-#if USE_AXCL
-        axclFinalize();
-#else
-        AX_ENGINE_Deinit();
-        AX_SYS_Deinit();
-#endif
-        return -1;
-    }
-
     g_server.setMaxConcurrency(1);
 
     std::string model_name = config.model_name;
 
-    if (config.is_embedding_model())
+    if (config.is_image_generation_model())
     {
-        g_server.registerEmbedding(model_name, [&llm](const openai_api::EmbeddingRequest &req,
-                                                           std::shared_ptr<openai_api::BaseDataProvider> provider)
-                                   {
-            if (!provider->is_writable()) {
-                ALOGE("provider not writable");
-                return;
-            }
-
-            if (!req.encoding_format.empty() && req.encoding_format != "float") {
-                ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
-            }
-
-            // vLLM-style extension: allow `messages` (including multimodal image/video parts) for embeddings.
-            // When `messages` is provided, it takes precedence over `input`.
-            if (req.raw.contains("messages") && req.raw["messages"].is_array())
-            {
-                std::vector<Content> history;
-                std::vector<MediaInputs> media_inputs;
-                std::vector<std::string> temp_files;
-                if (!handle_api_messages(req.raw["messages"], history, &media_inputs, &temp_files))
-                {
-                    ALOGE("handle_api_messages failed for embeddings messages");
-                    cleanup_temp_files(temp_files);
-                    provider->end();
-                    return;
-                }
-
-                std::vector<float> embedding;
-                if (!llm.Embed(history, media_inputs, embedding))
-                {
-                    ALOGE("Embed(messages) failed");
-                    cleanup_temp_files(temp_files);
-                    provider->end();
-                    return;
-                }
-                cleanup_temp_files(temp_files);
-
-                std::vector<std::vector<float>> embeds;
-                embeds.push_back(std::move(embedding));
-                auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
-                provider->push(chunk);
-                provider->end();
-                return;
-            }
-
-            std::vector<std::vector<float>> embeds;
-            if (!llm.EmbedBatch(req.inputs, embeds)) {
-                ALOGE("EmbedBatch failed");
-                provider->end();
-                return;
-            }
-
-            auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
-            provider->push(chunk);
-            provider->end(); });
-
-        printf("Starting server on port %d with embedding model '%s'...\n", port, model_name.c_str());
+        auto generator_uptr = sd15::create_image_generator();
+        std::shared_ptr<sd15::ImageGenerator> generator = std::move(generator_uptr);
+        std::string err;
+        if (!generator || !generator->init(config.image_model_dir, err))
         {
-            std::vector<std::string> hosts = {"127.0.0.1"};
-            for (const auto &ip : axllm::get_local_ipv4_addresses())
-            {
-                bool exists = false;
-                for (const auto &h : hosts)
-                {
-                    if (h == ip)
-                    {
-                        exists = true;
-                        break;
-                    }
-                }
-                if (!exists) hosts.push_back(ip);
-            }
-
-            printf("API URLs:\n");
-            for (const auto &host : hosts)
-            {
-                const std::string base = "http://" + host + ":" + std::to_string(port);
-                printf("  GET  %s/health\n", base.c_str());
-                printf("  GET  %s/v1/models\n", base.c_str());
-                printf("  POST %s/v1/embeddings\n", base.c_str());
-                printf("  POST %s/embedding\n", base.c_str());
-                printf("  POST %s/embeddings\n", base.c_str());
-            }
-            printf("Aliases:\n");
-            for (const auto &host : hosts)
-            {
-                const std::string base = "http://" + host + ":" + std::to_string(port);
-                printf("  GET  %s/models\n", base.c_str());
-            }
-        }
-        g_server.run(port);
-
-        llm.Deinit();
-    }
-    else
-    {
-        const bool has_audio_encoder =
-            config.attr.vlm_type == VLMType::Gemma4VL &&
-            (file_exist(config.attr.filename_audio_encoder_axmodel_5s) ||
-             file_exist(config.attr.filename_audio_encoder_axmodel_30s));
-
-        openai_api::ChatModelOptions options;
-        options.supports_vision = config.attr.vlm_type != VLMType::None;
-        options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
-        options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
-
-        g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
-                                                 std::shared_ptr<openai_api::BaseDataProvider> provider)
-                              {
-        if (!provider->is_writable()) {
-            ALOGE("provider not writable");
-            return;
+            ALOGE("image generator init failed: %s", err.c_str());
+#if USE_AXCL
+            axclFinalize();
+#else
+            AX_ENGINE_Deinit();
+            AX_SYS_Deinit();
+#endif
+            return -1;
         }
 
-        ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f messages=%zu stop=%zu",
-              req.model.c_str(),
-              req.stream ? 1 : 0,
-              req.max_tokens,
-              req.has_temperature ? 1 : 0,
-              req.temperature,
-              req.has_top_p ? 1 : 0,
-              req.top_p,
-              req.parsed_messages.size(),
-              req.stop.size());
-
-        struct SamplingOverrideGuard {
-            LLM &llm;
-            SamplingOverrideGuard(LLM &llm, const openai_api::ChatRequest &req) : llm(llm)
-            {
-                llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
-            }
-            ~SamplingOverrideGuard()
-            {
-                llm.ClearRequestSamplingOverride();
-            }
-        } sampling_guard(llm, req);
-
-        std::vector<Content> history;
-        std::vector<MediaInputs> media_inputs;
-        std::vector<std::string> temp_files;
-        if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files)) {
-            ALOGE("handle_body failed");
-            cleanup_temp_files(temp_files);
-            provider->end();
-            return;
-        }
-
-        if (req.stream) {
-            bool streamed_any = false;
-            auto callback = [provider, model_id = req.model, &streamed_any](std::string str, float token_per_sec, void *reserve) {
-                if (!provider->is_writable()) {
-                    ALOGE("provider not writable");
-                    return;
-                }
-                if (!str.empty()) streamed_any = true;
-                auto chunk = openai_api::OutputChunk::TextDelta(str, model_id);
-                provider->push(chunk);
-                fprintf(stdout, "%s", str.c_str());
-                fflush(stdout);
-            };
-
-            llm.getAttr()->runing_callback = callback;
-            if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
-            else llm.Run(history, req.max_tokens);
-            const std::string llm_error = llm.GetLastError();
-            if (!llm_error.empty() && !streamed_any) {
-                ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
-                provider->push(openai_api::OutputChunk::TextDelta(llm_error, req.model));
-                provider->push(openai_api::OutputChunk::FinalText("", req.model));
-            }
-        } else {
-            llm.getAttr()->runing_callback = nullptr;
-            auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, req.max_tokens) : llm.Run(history, req.max_tokens);
-            std::string final_text;
-            if (!out_history.empty() && out_history.back().role == ASSISTANT) {
-                final_text = out_history.back().data;
-            }
-            if (final_text.empty()) {
-                const std::string llm_error = llm.GetLastError();
-                if (!llm_error.empty()) {
-                    ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
-                    final_text = llm_error;
-                }
-            }
-            auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
-            fprintf(stdout, "%s", final_text.c_str());
-            fflush(stdout);
-            provider->push(chunk);
-        }
-
-        cleanup_temp_files(temp_files);
-        provider->end(); });
-
-        if (has_audio_encoder)
+        const auto variants = generator->variants();
+        if (variants.empty())
         {
-            g_server.registerASR(model_name, [&llm](const openai_api::ASRRequest &req,
-                                                    std::shared_ptr<openai_api::BaseDataProvider> provider)
-                                 {
+            ALOGE("no image model variants found under %s", config.image_model_dir.c_str());
+#if USE_AXCL
+            axclFinalize();
+#else
+            AX_ENGINE_Deinit();
+            AX_SYS_Deinit();
+#endif
+            return -1;
+        }
+
+        g_server.setImageGenerationOutputDir((std::filesystem::path(config.image_model_dir) / ".axllm_generated").string());
+
+        const std::filesystem::path generated_dir =
+            std::filesystem::path(config.image_model_dir) / ".axllm_generated";
+
+        for (const auto &variant : variants)
+        {
+            g_server.registerImageGeneration(variant.model_id, [generator, generated_dir](const openai_api::ImageGenRequest &req,
+                                                                                           std::shared_ptr<openai_api::BaseDataProvider> provider)
+                                             {
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
                 }
 
-                std::string final_text;
+                std::vector<std::vector<uint8_t>> png_images;
                 std::string err;
-                if (!run_audio_api_request(llm, req, final_text, err)) {
-                    provider->push(openai_api::OutputChunk::Error("audio_request_error", err));
+                if (!generator->generate(req, png_images, err)) {
+                    provider->push(openai_api::OutputChunk::Error("image_request_error", err));
                     provider->end();
                     return;
                 }
 
-                const std::string response_format = lower_copy(req.response_format.empty() ? "json" : req.response_format);
-                if (response_format == "json" || response_format == "verbose_json") {
-                    provider->push(openai_api::OutputChunk::Json({
-                        {"text", final_text},
-                        {"model", req.model},
-                    }, req.model));
-                } else {
-                    provider->push(openai_api::OutputChunk::FinalText(
-                        format_audio_task_text(final_text, response_format), req.model));
+                nlohmann::json response;
+                response["created"] = std::time(nullptr);
+                response["data"] = nlohmann::json::array();
+                const std::string response_format = req.response_format.empty() ? "url" : req.response_format;
+
+                for (size_t idx = 0; idx < png_images.size(); ++idx)
+                {
+                    const auto &png = png_images[idx];
+                    nlohmann::json item;
+                    if (response_format == "b64_json")
+                    {
+                        item["b64_json"] = base64_encode_bytes(png);
+                    }
+                    else
+                    {
+                        std::error_code ec;
+                        std::filesystem::create_directories(generated_dir, ec);
+                        const std::string base_name =
+                            sanitize_filename_component(req.model.empty() ? "image" : req.model) + "-" +
+                            std::to_string(response["created"].get<long long>()) + "-" + std::to_string(idx) + ".png";
+                        const std::filesystem::path out_path = generated_dir / base_name;
+                        std::ofstream ofs(out_path, std::ios::binary);
+                        if (!ofs.is_open())
+                        {
+                            provider->push(openai_api::OutputChunk::Error("image_request_error",
+                                                                          "failed to write generated image: " + out_path.string()));
+                            provider->end();
+                            return;
+                        }
+                        ofs.write(reinterpret_cast<const char *>(png.data()), static_cast<std::streamsize>(png.size()));
+                        ofs.close();
+                        const std::string base_url = req.request_base_url.empty() ? "" : req.request_base_url;
+                        item["url"] = base_url + "/images/generated/" + base_name;
+                    }
+                    item["revised_prompt"] = "";
+                    response["data"].push_back(std::move(item));
                 }
-                provider->end(); });
+                response["model"] = req.model;
+                provider->push(openai_api::OutputChunk::Json(response, req.model));
+                provider->end();
+            });
         }
 
-        printf("Starting server on port %d with model '%s'...\n", port, model_name.c_str());
+        printf("Starting server on port %d with image model '%s'...\n", port, model_name.c_str());
         {
             std::vector<std::string> hosts = {"127.0.0.1"};
             for (const auto &ip : axllm::get_local_ipv4_addresses())
@@ -1562,14 +1507,14 @@ int run_server_mode(const ModelConfig &config, int port)
                 const std::string base = "http://" + host + ":" + std::to_string(port);
                 printf("  GET  %s/health\n", base.c_str());
                 printf("  GET  %s/v1/models\n", base.c_str());
-                printf("  POST %s/v1/chat/completions\n", base.c_str());
+                printf("  POST %s/v1/images/generations\n", base.c_str());
+                printf("  POST %s/v1/images/edits\n", base.c_str());
             }
             printf("Aliases:\n");
             for (const auto &host : hosts)
             {
                 const std::string base = "http://" + host + ":" + std::to_string(port);
                 printf("  GET  %s/models\n", base.c_str());
-                printf("  POST %s/chat/completions\n", base.c_str());
             }
         }
         int timeout_ms = config.server_timeout_ms;
@@ -1580,7 +1525,285 @@ int run_server_mode(const ModelConfig &config, int port)
         }
         g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
         g_server.run(port);
+    }
+    else
+    {
+        if (!llm.Init(config.attr))
+        {
+            ALOGE("LLM.Init failed");
+#if USE_AXCL
+            axclFinalize();
+#else
+            AX_ENGINE_Deinit();
+            AX_SYS_Deinit();
+#endif
+            return -1;
+        }
 
+        if (config.is_embedding_model())
+        {
+            g_server.registerEmbedding(model_name, [&llm](const openai_api::EmbeddingRequest &req,
+                                                               std::shared_ptr<openai_api::BaseDataProvider> provider)
+                                       {
+                if (!provider->is_writable()) {
+                    ALOGE("provider not writable");
+                    return;
+                }
+
+                if (!req.encoding_format.empty() && req.encoding_format != "float") {
+                    ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
+                }
+
+                if (req.raw.contains("messages") && req.raw["messages"].is_array())
+                {
+                    std::vector<Content> history;
+                    std::vector<MediaInputs> media_inputs;
+                    std::vector<std::string> temp_files;
+                    if (!handle_api_messages(req.raw["messages"], history, &media_inputs, &temp_files))
+                    {
+                        ALOGE("handle_api_messages failed for embeddings messages");
+                        cleanup_temp_files(temp_files);
+                        provider->end();
+                        return;
+                    }
+
+                    std::vector<float> embedding;
+                    if (!llm.Embed(history, media_inputs, embedding))
+                    {
+                        ALOGE("Embed(messages) failed");
+                        cleanup_temp_files(temp_files);
+                        provider->end();
+                        return;
+                    }
+                    cleanup_temp_files(temp_files);
+
+                    std::vector<std::vector<float>> embeds;
+                    embeds.push_back(std::move(embedding));
+                    auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
+                    provider->push(chunk);
+                    provider->end();
+                    return;
+                }
+
+                std::vector<std::vector<float>> embeds;
+                if (!llm.EmbedBatch(req.inputs, embeds)) {
+                    ALOGE("EmbedBatch failed");
+                    provider->end();
+                    return;
+                }
+
+                auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
+                provider->push(chunk);
+                provider->end(); });
+
+            printf("Starting server on port %d with embedding model '%s'...\n", port, model_name.c_str());
+            {
+                std::vector<std::string> hosts = {"127.0.0.1"};
+                for (const auto &ip : axllm::get_local_ipv4_addresses())
+                {
+                    bool exists = false;
+                    for (const auto &h : hosts)
+                    {
+                        if (h == ip)
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) hosts.push_back(ip);
+                }
+
+                printf("API URLs:\n");
+                for (const auto &host : hosts)
+                {
+                    const std::string base = "http://" + host + ":" + std::to_string(port);
+                    printf("  GET  %s/health\n", base.c_str());
+                    printf("  GET  %s/v1/models\n", base.c_str());
+                    printf("  POST %s/v1/embeddings\n", base.c_str());
+                    printf("  POST %s/embedding\n", base.c_str());
+                    printf("  POST %s/embeddings\n", base.c_str());
+                }
+                printf("Aliases:\n");
+                for (const auto &host : hosts)
+                {
+                    const std::string base = "http://" + host + ":" + std::to_string(port);
+                    printf("  GET  %s/models\n", base.c_str());
+                }
+            }
+            g_server.run(port);
+        }
+        else
+        {
+            const bool has_audio_encoder =
+                config.attr.vlm_type == VLMType::Gemma4VL &&
+                (file_exist(config.attr.filename_audio_encoder_axmodel_5s) ||
+                 file_exist(config.attr.filename_audio_encoder_axmodel_30s));
+
+            openai_api::ChatModelOptions options;
+            options.supports_vision = config.attr.vlm_type != VLMType::None;
+            options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
+            options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+
+            g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
+                                                     std::shared_ptr<openai_api::BaseDataProvider> provider)
+                                  {
+                if (!provider->is_writable()) {
+                    ALOGE("provider not writable");
+                    return;
+                }
+
+                ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f messages=%zu stop=%zu",
+                      req.model.c_str(),
+                      req.stream ? 1 : 0,
+                      req.max_tokens,
+                      req.has_temperature ? 1 : 0,
+                      req.temperature,
+                      req.has_top_p ? 1 : 0,
+                      req.top_p,
+                      req.parsed_messages.size(),
+                      req.stop.size());
+
+                struct SamplingOverrideGuard {
+                    LLM &llm;
+                    SamplingOverrideGuard(LLM &llm, const openai_api::ChatRequest &req) : llm(llm)
+                    {
+                        llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
+                    }
+                    ~SamplingOverrideGuard()
+                    {
+                        llm.ClearRequestSamplingOverride();
+                    }
+                } sampling_guard(llm, req);
+
+                std::vector<Content> history;
+                std::vector<MediaInputs> media_inputs;
+                std::vector<std::string> temp_files;
+                if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files)) {
+                    ALOGE("handle_body failed");
+                    cleanup_temp_files(temp_files);
+                    provider->end();
+                    return;
+                }
+
+                if (req.stream) {
+                    bool streamed_any = false;
+                    auto callback = [provider, model_id = req.model, &streamed_any](std::string str, float token_per_sec, void *reserve) {
+                        if (!provider->is_writable()) {
+                            ALOGE("provider not writable");
+                            return;
+                        }
+                        if (!str.empty()) streamed_any = true;
+                        auto chunk = openai_api::OutputChunk::TextDelta(str, model_id);
+                        provider->push(chunk);
+                        fprintf(stdout, "%s", str.c_str());
+                        fflush(stdout);
+                    };
+
+                    llm.getAttr()->runing_callback = callback;
+                    if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
+                    else llm.Run(history, req.max_tokens);
+                    const std::string llm_error = llm.GetLastError();
+                    if (!llm_error.empty() && !streamed_any) {
+                        ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
+                        provider->push(openai_api::OutputChunk::TextDelta(llm_error, req.model));
+                        provider->push(openai_api::OutputChunk::FinalText("", req.model));
+                    }
+                } else {
+                    llm.getAttr()->runing_callback = nullptr;
+                    auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, req.max_tokens) : llm.Run(history, req.max_tokens);
+                    std::string final_text;
+                    if (!out_history.empty() && out_history.back().role == ASSISTANT) {
+                        final_text = out_history.back().data;
+                    }
+                    if (final_text.empty()) {
+                        const std::string llm_error = llm.GetLastError();
+                        if (!llm_error.empty()) {
+                            ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
+                            final_text = llm_error;
+                        }
+                    }
+                    auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
+                    fprintf(stdout, "%s", final_text.c_str());
+                    fflush(stdout);
+                    provider->push(chunk);
+                }
+
+                cleanup_temp_files(temp_files);
+                provider->end(); });
+
+            if (has_audio_encoder)
+            {
+                g_server.registerASR(model_name, [&llm](const openai_api::ASRRequest &req,
+                                                        std::shared_ptr<openai_api::BaseDataProvider> provider)
+                                     {
+                    if (!provider->is_writable()) {
+                        ALOGE("provider not writable");
+                        return;
+                    }
+
+                    std::string final_text;
+                    std::string err;
+                    if (!run_audio_api_request(llm, req, final_text, err)) {
+                        provider->push(openai_api::OutputChunk::Error("audio_request_error", err));
+                        provider->end();
+                        return;
+                    }
+
+                    const std::string response_format = lower_copy(req.response_format.empty() ? "json" : req.response_format);
+                    if (response_format == "json" || response_format == "verbose_json") {
+                        provider->push(openai_api::OutputChunk::Json({
+                            {"text", final_text},
+                            {"model", req.model},
+                        }, req.model));
+                    } else {
+                        provider->push(openai_api::OutputChunk::FinalText(
+                            format_audio_task_text(final_text, response_format), req.model));
+                    }
+                    provider->end(); });
+            }
+
+            printf("Starting server on port %d with model '%s'...\n", port, model_name.c_str());
+            {
+                std::vector<std::string> hosts = {"127.0.0.1"};
+                for (const auto &ip : axllm::get_local_ipv4_addresses())
+                {
+                    bool exists = false;
+                    for (const auto &h : hosts)
+                    {
+                        if (h == ip)
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) hosts.push_back(ip);
+                }
+
+                printf("API URLs:\n");
+                for (const auto &host : hosts)
+                {
+                    const std::string base = "http://" + host + ":" + std::to_string(port);
+                    printf("  GET  %s/health\n", base.c_str());
+                    printf("  GET  %s/v1/models\n", base.c_str());
+                    printf("  POST %s/v1/chat/completions\n", base.c_str());
+                }
+                printf("Aliases:\n");
+                for (const auto &host : hosts)
+                {
+                    const std::string base = "http://" + host + ":" + std::to_string(port);
+                    printf("  GET  %s/models\n", base.c_str());
+                    printf("  POST %s/chat/completions\n", base.c_str());
+                }
+            }
+            int timeout_ms = config.server_timeout_ms;
+            if (timeout_ms <= 0)
+            {
+                ALOGW("invalid server_timeout_ms=%d, fallback to default 300000ms", timeout_ms);
+                timeout_ms = 300000;
+            }
+            g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+            g_server.run(port);
+        }
         llm.Deinit();
     }
 

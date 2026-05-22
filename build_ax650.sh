@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "${SCRIPT_DIR}"
 
@@ -7,7 +9,7 @@ cd "${SCRIPT_DIR}"
 # 绝对路径 绝对路径 绝对路径 
 
 # build_dir 修改为自己想要的编译目录名称
-build_dir=build
+build_dir="${AXLLM_BUILD_DIR:-build}"
 echo "build dir: ${build_dir}"
 mkdir -p ${build_dir}
 cd ${build_dir}
@@ -22,15 +24,31 @@ download_file() {
         wget -O "$out" "$url"
     fi
 }
-if [ ! -d "msp_3.6.2" ]; then
-    echo "Downloading bsp from ${bsp_url}"
-    if [ ! -f "msp_3.6.2.zip" ]; then
-        download_file "${bsp_url}" "msp_3.6.2.zip"
+
+resolve_abs_dir() {
+    local dir="$1"
+    (
+        cd "$dir" >/dev/null 2>&1
+        pwd
+    )
+}
+
+reuse_build_dir="${AXLLM_REUSE_BUILD_ASSETS_FROM:-}"
+if [ -n "${AXLLM_BSP_MSP_DIR:-}" ]; then
+    BSP_MSP_DIR="$(resolve_abs_dir "${AXLLM_BSP_MSP_DIR}")"
+elif [ -n "${reuse_build_dir}" ] && [ -d "${reuse_build_dir}/msp_3.6.2/out" ]; then
+    BSP_MSP_DIR="$(resolve_abs_dir "${reuse_build_dir}/msp_3.6.2/out")"
+else
+    if [ ! -d "msp_3.6.2" ]; then
+        echo "Downloading bsp from ${bsp_url}"
+        if [ ! -f "msp_3.6.2.zip" ]; then
+            download_file "${bsp_url}" "msp_3.6.2.zip"
+        fi
+        unzip -o msp_3.6.2.zip
     fi
-    unzip msp_3.6.2.zip
+    BSP_MSP_DIR="$PWD/msp_3.6.2/out"
 fi
 
-BSP_MSP_DIR=$PWD/msp_3.6.2/out/
 echo "bsp dir: ${BSP_MSP_DIR}"
 # 下面会简单判断 BSP 路径是否正确
 if [ ! -d "${BSP_MSP_DIR}" ]; then
@@ -56,21 +74,31 @@ URL="https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/
 FOLDER="gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu"
 
 if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
-    # Check if the file exists
-    if [ ! -f "$FOLDER.tar.xz" ]; then
-        # Download the file
-        echo "Downloading $URL"
-        download_file "$URL" "$FOLDER.tar.xz"
+    toolchain_bin_dir=""
+    if [ -n "${AXLLM_TOOLCHAIN_BIN_DIR:-}" ] && [ -d "${AXLLM_TOOLCHAIN_BIN_DIR}" ]; then
+        toolchain_bin_dir="$(resolve_abs_dir "${AXLLM_TOOLCHAIN_BIN_DIR}")"
+    elif [ -n "${AXLLM_TOOLCHAIN_ROOT:-}" ] && [ -d "${AXLLM_TOOLCHAIN_ROOT}/bin" ]; then
+        toolchain_bin_dir="$(resolve_abs_dir "${AXLLM_TOOLCHAIN_ROOT}/bin")"
+    elif [ -n "${reuse_build_dir}" ] && [ -d "${reuse_build_dir}/${FOLDER}/bin" ]; then
+        toolchain_bin_dir="$(resolve_abs_dir "${reuse_build_dir}/${FOLDER}/bin")"
+    else
+        # Check if the file exists
+        if [ ! -f "$FOLDER.tar.xz" ]; then
+            # Download the file
+            echo "Downloading $URL"
+            download_file "$URL" "$FOLDER.tar.xz"
+        fi
+
+        # Check if the folder exists
+        if [ ! -d "$FOLDER" ]; then
+            # Extract the file
+            echo "Extracting $FOLDER.tar.xz"
+            tar -xf "$FOLDER.tar.xz"
+        fi
+        toolchain_bin_dir="$PWD/$FOLDER/bin"
     fi
 
-    # Check if the folder exists
-    if [ ! -d "$FOLDER" ]; then
-        # Extract the file
-        echo "Extracting $FOLDER.tar.xz"
-        tar -xf "$FOLDER.tar.xz"
-    fi
-
-    export PATH=$PATH:$PWD/$FOLDER/bin/
+    export PATH="${toolchain_bin_dir}:$PATH"
     if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
         echo "Error: aarch64-none-linux-gnu-gcc not found"
         exit 1

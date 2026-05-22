@@ -15,6 +15,9 @@ scripts/windows_axcl_mingw_validate.sh
 
 # Local-only work files (keep repo clean)
 device.md
+artifacts/
+install/
+tmp/
 scripts/__pycache__/
 scripts/cert.pem
 scripts/key.pem

@@ -143,14 +143,7 @@ int ax_runner_ax650::sub_init()
     if (!m_handle)
         return -1;
 
-    int ret = AX_ENGINE_CreateContext(m_handle->handle);
-    if (ret != 0)
-        return ret;
-
-    ret = AX_ENGINE_CreateContextV2(m_handle->handle, &m_handle->context);
-    if (ret != 0)
-        return ret;
-
+    int ret = 0;
     AX_U32 io_count = 0;
     ret = AX_ENGINE_GetGroupIOInfoCount(m_handle->handle, &io_count);
     if (ret != 0)
@@ -166,15 +159,30 @@ int ax_runner_ax650::sub_init()
     for (size_t grpid = 0; grpid < io_count; grpid++)
     {
         AX_ENGINE_IO_INFO_T *io_info = nullptr;
-        ret = AX_ENGINE_GetGroupIOInfo(m_handle->handle, grpid, &io_info);
+        if (io_count == 1)
+        {
+            ret = AX_ENGINE_GetIOInfo(m_handle->handle, &io_info);
+        }
+        else
+        {
+            ret = AX_ENGINE_GetGroupIOInfo(m_handle->handle, grpid, &io_info);
+        }
         if (ret != 0)
             return ret;
         m_handle->io_info[grpid] = io_info;
 
-        // 原有逻辑保持不变：Group 0 和 Last Group 分配物理内存，中间 Group 不分配
-        if (grpid == 0)
+        if (io_count == 1)
         {
-            ret = prepare_io_with_alloc(io_info, &m_handle->io_data[grpid], {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED});
+            ret = prepare_io_with_alloc(io_info,
+                                        &m_handle->io_data[grpid],
+                                        {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED});
+        }
+        // Keep the original AX650 multi-group behavior for KV-cache sharing.
+        else if (grpid == 0)
+        {
+            ret = prepare_io_with_alloc(io_info,
+                                        &m_handle->io_data[grpid],
+                                        {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED});
         }
         else if (grpid == io_count - 1)
         {
@@ -406,13 +414,18 @@ int ax_runner_ax650::sub_init()
 
 int ax_runner_ax650::init(const char *model_file, int /*devid*/)
 {
+    if (m_handle)
+        deinit();
+
     MMap model_buffer;
     if (!model_buffer.open_file(model_file))
     {
         ALOGE("model file(%s) open failed", model_file);
         return -1;
     }
-    auto ret = init((char *)model_buffer.data(), model_buffer.size(), -1);
+    m_model_buffer.assign(reinterpret_cast<const char *>(model_buffer.data()),
+                          reinterpret_cast<const char *>(model_buffer.data()) + model_buffer.size());
+    auto ret = init(m_model_buffer.data(), m_model_buffer.size(), -1);
     return ret;
 }
 
@@ -420,14 +433,39 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
 {
     if (m_handle)
         deinit(); // 防止多次 init 导致泄漏
+
+    if (m_model_buffer.data() != model_buffer || m_model_buffer.size() != model_size)
+    {
+        m_model_buffer.assign(model_buffer, model_buffer + model_size);
+    }
+
     m_handle = new ax_runner_ax650_handle_t;
-    int ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer, model_size);
+    AX_ENGINE_HANDLE_EXTRA_T extra{};
+    extra.pName = (AX_S8 *)(AX_CMM_SESSION_NAME);
+    int ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &extra);
+    if (0 != ret)
+    {
+        ret = AX_ENGINE_CreateHandle(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size());
+    }
     if (0 != ret)
     {
         ALOGE("AX_ENGINE_CreateHandle failed: 0x%x", ret);
         delete m_handle;
         m_handle = nullptr;
         return ret;
+    }
+    ret = AX_ENGINE_CreateContextV2(m_handle->handle, &m_handle->context);
+    if (ret != 0)
+    {
+        ALOGW("AX_ENGINE_CreateContextV2 failed: 0x%x, fallback to AX_ENGINE_CreateContext", ret);
+        ret = AX_ENGINE_CreateContext(m_handle->handle);
+        if (ret != 0)
+        {
+            ALOGE("AX_ENGINE_CreateContext failed: 0x%x", ret);
+            deinit();
+            return ret;
+        }
+        m_handle->context = 0;
     }
     return sub_init();
 }
@@ -493,6 +531,8 @@ void ax_runner_ax650::deinit()
 
     delete m_handle;
     m_handle = nullptr;
+    m_model_buffer.clear();
+    m_model_buffer.shrink_to_fit();
 
     // 清空容器
     moutput_tensors.clear();
@@ -509,21 +549,61 @@ int ax_runner_ax650::inference()
 {
     if (!m_handle)
         return -1;
-    // 刷 Cache 保证数据一致性
-    for (size_t i = 0; i < get_num_inputs(); i++)
+
+    if (_auto_sync_before_inference)
     {
-        auto &tensor = get_input(i);
-        AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+        for (size_t i = 0; i < get_num_inputs(); i++)
+        {
+            auto &tensor = get_input(i);
+            int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+            if (sync_ret != 0)
+            {
+                ALOGE("AX_SYS_MflushCache(input[%zu]) failed: 0x%x", i, sync_ret);
+                return sync_ret;
+            }
+        }
     }
 
-    int ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[0]);
-
-    for (size_t i = 0; i < get_num_outputs(); i++)
+    int ret = 0;
+    if (m_handle->io_data.size() == 1)
     {
-        auto &tensor = get_output(i);
-        AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+        // Some single-group AX650 models, including the SD1.5 text encoder, are
+        // stable with the legacy RunSync path but can fail with 0x8006008a when
+        // driven through RunSyncV2. Keep V2 contexts for multi-group models and
+        // always use RunSync for single-group execution.
+        ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[0]);
     }
-    return ret;
+    else
+    {
+        if (m_handle->context != 0)
+        {
+            ret = AX_ENGINE_RunGroupIOSync(m_handle->handle, m_handle->context, 0, &m_handle->io_data[0]);
+        }
+        else
+        {
+            ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[0]);
+        }
+    }
+    if (ret != 0)
+    {
+        ALOGE("AX_ENGINE_RunSync failed: 0x%x", ret);
+        return ret;
+    }
+
+    if (_auto_sync_after_inference)
+    {
+        for (size_t i = 0; i < get_num_outputs(); i++)
+        {
+            auto &tensor = get_output(i);
+            int sync_ret = AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+            if (sync_ret != 0)
+            {
+                ALOGE("AX_SYS_MinvalidateCache(output[%zu]) failed: 0x%x", i, sync_ret);
+                return sync_ret;
+            }
+        }
+    }
+    return 0;
 }
 
 int ax_runner_ax650::inference(int grpid)
@@ -533,20 +613,54 @@ int ax_runner_ax650::inference(int grpid)
     if (grpid < 0 || grpid >= (int)m_handle->io_data.size())
         return -1;
 
-    // 刷 Cache (Input)
-    for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
+    if (_auto_sync_before_inference)
     {
-        auto &tensor = mgroup_input_tensors[grpid][i];
-        AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+        for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
+        {
+            auto &tensor = mgroup_input_tensors[grpid][i];
+            int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+            if (sync_ret != 0)
+            {
+                ALOGE("AX_SYS_MflushCache(group=%d input[%zu]) failed: 0x%x", grpid, i, sync_ret);
+                return sync_ret;
+            }
+        }
     }
 
-    int ret = AX_ENGINE_RunGroupIOSync(m_handle->handle, m_handle->context, grpid, &m_handle->io_data[grpid]);
-
-    // 刷 Cache (Output)
-    for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
+    int ret = 0;
+    if (m_handle->io_data.size() == 1)
     {
-        auto &tensor = mgroup_output_tensors[grpid][i];
-        AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+        ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[0]);
     }
-    return ret;
+    else
+    {
+        if (m_handle->context != 0)
+        {
+            ret = AX_ENGINE_RunGroupIOSync(m_handle->handle, m_handle->context, grpid, &m_handle->io_data[grpid]);
+        }
+        else
+        {
+            ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[grpid]);
+        }
+    }
+    if (ret != 0)
+    {
+        ALOGE("AX_ENGINE_Run%s failed: 0x%x", m_handle->io_data.size() == 1 ? "Sync" : "GroupIOSync", ret);
+        return ret;
+    }
+
+    if (_auto_sync_after_inference)
+    {
+        for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
+        {
+            auto &tensor = mgroup_output_tensors[grpid][i];
+            int sync_ret = AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+            if (sync_ret != 0)
+            {
+                ALOGE("AX_SYS_MinvalidateCache(group=%d output[%zu]) failed: 0x%x", grpid, i, sync_ret);
+                return sync_ret;
+            }
+        }
+    }
+    return 0;
 }

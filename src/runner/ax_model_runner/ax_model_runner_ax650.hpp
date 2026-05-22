@@ -1,5 +1,6 @@
 #pragma once
 #include "ax_model_runner.hpp"
+#include <vector>
 
 struct ax_runner_ax650_handle_t;
 
@@ -7,6 +8,7 @@ class ax_runner_ax650 : public ax_runner_base
 {
 protected:
     struct ax_runner_ax650_handle_t *m_handle = nullptr;
+    std::vector<char> m_model_buffer;
     int sub_init();
 
 public:
