@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <regex>
 #include <numeric>
@@ -99,6 +100,32 @@ static bool is_supported_frame_file(const std::string& path)
 {
     const std::string ext = lower_ext(path);
     return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".webp";
+}
+
+static std::string file_probe_summary(const std::string& path)
+{
+    std::ostringstream oss;
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec);
+    oss << "exists=" << (exists ? 1 : 0);
+    if (exists) {
+        const auto size = std::filesystem::file_size(path, ec);
+        if (!ec) oss << " size=" << size;
+    }
+
+    std::ifstream ifs(path, std::ios::binary);
+    if (ifs) {
+        unsigned char head[16] = {0};
+        ifs.read(reinterpret_cast<char*>(head), sizeof(head));
+        const std::streamsize n = ifs.gcount();
+        oss << " head=";
+        static const char* hex = "0123456789abcdef";
+        for (std::streamsize i = 0; i < n; ++i) {
+            if (i) oss << ' ';
+            oss << hex[(head[i] >> 4) & 0xf] << hex[head[i] & 0xf];
+        }
+    }
+    return oss.str();
 }
 
 static std::vector<std::string> filter_supported_frame_files(const std::vector<std::string>& files)
@@ -1911,7 +1938,10 @@ bool VisionModule::EncodeForContent(const Content& content,
             }
 
             axcv::Mat img = axcv::imread(file, axcv::IMREAD_COLOR);
-            if (axcv::empty(img)) { err = "failed to read image: " + file; return false; }
+            if (axcv::empty(img)) {
+                err = "failed to read image: " + file + " (" + file_probe_summary(file) + ")";
+                return false;
+            }
 
             std::vector<std::vector<unsigned short>> blocks_for_one;
             std::vector<std::vector<float>> deepstack_for_one;

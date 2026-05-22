@@ -938,16 +938,75 @@ static const std::string g_base64_chars =
     "abcdefghijklmnopqrstuvwxyz"
     "0123456789+/";
 
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static std::string percent_decode_copy(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] == '%' && i + 2 < s.size())
+        {
+            const int hi = hex_value(s[i + 1]);
+            const int lo = hex_value(s[i + 2]);
+            if (hi >= 0 && lo >= 0)
+            {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
 static std::vector<uint8_t> base64_decode_bytes(const std::string &encoded)
 {
     std::vector<uint8_t> out;
     out.reserve(encoded.size() * 3 / 4);
     int val = 0, valb = -8;
-    for (unsigned char c : encoded)
+    bool saw_space = false;
+    bool saw_urlsafe = false;
+
+    for (unsigned char raw : encoded)
     {
+        unsigned char c = raw;
+        if (c == ' ')
+        {
+            c = '+';
+            saw_space = true;
+        }
+        else if (std::isspace(c))
+        {
+            saw_space = true;
+            continue;
+        }
+        if (c == '-')
+        {
+            c = '+';
+            saw_urlsafe = true;
+        }
+        else if (c == '_')
+        {
+            c = '/';
+            saw_urlsafe = true;
+        }
         if (c == '=') break;
         auto pos = g_base64_chars.find(c);
-        if (pos == std::string::npos) continue; // skip whitespace / invalid
+        if (pos == std::string::npos)
+        {
+            ALOGE("invalid base64 character 0x%02x", (unsigned int)c);
+            out.clear();
+            return out;
+        }
         val = (val << 6) + (int)pos;
         valb += 6;
         if (valb >= 0)
@@ -956,6 +1015,8 @@ static std::vector<uint8_t> base64_decode_bytes(const std::string &encoded)
             valb -= 8;
         }
     }
+    if (saw_urlsafe) ALOGI("decoded url-safe base64 media payload");
+    if (saw_space) ALOGI("decoded base64 media payload containing whitespace");
     return out;
 }
 
@@ -1107,6 +1168,7 @@ static std::string resolve_media_uri(const std::string &uri, std::vector<std::st
     std::string ext, payload;
     if (parse_base64_data_uri(uri, ext, payload))
     {
+        payload = percent_decode_copy(payload);
         std::string path = save_base64_to_tempfile(ext, payload);
         if (!path.empty()) temp_files.push_back(path);
         else
@@ -1366,7 +1428,16 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
 static void keep_latest_media_turn_for_single_image_ocr(std::vector<Content> &history,
                                                         std::vector<MediaInputs> &media_inputs)
 {
-    if (media_inputs.size() <= 1) return;
+    if (media_inputs.empty()) return;
+    if (media_inputs.size() == 1)
+    {
+        const auto &media = media_inputs.front();
+        if (media.content_index < history.size())
+        {
+            history[media.content_index].data = "OCR:";
+        }
+        return;
+    }
 
     const MediaInputs latest_media = media_inputs.back();
     if (latest_media.content_index >= history.size()) return;
@@ -1380,6 +1451,7 @@ static void keep_latest_media_turn_for_single_image_ocr(std::vector<Content> &hi
 
     const size_t new_media_index = pruned.size();
     pruned.push_back(history[latest_media.content_index]);
+    pruned.back().data = "OCR:";
 
     ALOGI("PaddleOCR-VL request contains %zu media turns; keep latest media turn only (old_index=%zu new_index=%zu)",
           media_inputs.size(),
