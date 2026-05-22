@@ -1076,11 +1076,50 @@ static std::string normalize_extension(std::string ext, const std::string &fallb
     return ext.empty() ? fallback : ext;
 }
 
+static std::string detect_image_extension_from_bytes(const std::vector<uint8_t> &bytes)
+{
+    if (bytes.size() >= 12 &&
+        bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F' &&
+        bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' && bytes[11] == 'P')
+    {
+        return "webp";
+    }
+    if (bytes.size() >= 8 &&
+        bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G' &&
+        bytes[4] == '\r' && bytes[5] == '\n' && bytes[6] == 0x1a && bytes[7] == '\n')
+    {
+        return "png";
+    }
+    if (bytes.size() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff)
+    {
+        return "jpg";
+    }
+    if (bytes.size() >= 2 && bytes[0] == 'B' && bytes[1] == 'M')
+    {
+        return "bmp";
+    }
+    return {};
+}
+
+static bool equivalent_image_extensions(const std::string &a, const std::string &b)
+{
+    if (a == b) return true;
+    return (a == "jpg" && b == "jpeg") || (a == "jpeg" && b == "jpg");
+}
+
 static std::string write_bytes_to_tempfile(const std::string &ext, const std::vector<uint8_t> &bytes)
 {
     if (bytes.empty()) return {};
 
-    const std::string safe_ext = normalize_extension(ext);
+    std::string safe_ext = normalize_extension(ext);
+    const std::string detected_ext = detect_image_extension_from_bytes(bytes);
+    if (!detected_ext.empty() && !equivalent_image_extensions(detected_ext, safe_ext))
+    {
+        ALOGW("media extension mismatch: requested=%s detected=%s; using detected extension",
+              safe_ext.c_str(),
+              detected_ext.c_str());
+        safe_ext = detected_ext;
+    }
     // Detect "data:<mime>/<ext>;base64,<payload>" and return the extension + payload.
     // Uses simple string operations instead of regex to avoid stack overflow on large payloads.
     std::filesystem::path tmpdir;
