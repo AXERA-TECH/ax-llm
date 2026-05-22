@@ -250,6 +250,83 @@ jobs:
           (cd dist/windows && zip -r ../axllm-axcl-windows-mingw64.zip .)
           rm -rf dist/windows
 
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > release_body.md <<'EOF'
+          This is a rolling release for branch `axllm`. Assets in this release are overwritten on each push to `axllm`.
+
+          ## Fixed download links
+
+          All assets can be downloaded via:
+
+          - `https://github.com/AXERA-TECH/ax-llm/releases/latest/download/<asset_name>`
+
+          ## Docker images (offline)
+
+          Images are exported as **both**:
+
+          - `.tar` (no gzip required on target devices)
+          - `.tar.gz` (smaller)
+
+          Assets:
+
+          - `axllm-axcl-amd64.tar` / `axllm-axcl-amd64.tar.gz`
+          - `axllm-axcl-arm64.tar` / `axllm-axcl-arm64.tar.gz`
+          - `axllm-ax650-arm64.tar` / `axllm-ax650-arm64.tar.gz`
+
+          Load:
+
+          ```bash
+          docker load -i axllm-axcl-amd64.tar
+          # or
+          docker load -i axllm-axcl-amd64.tar.gz
+          ```
+
+          Run (AXCL / PCIe):
+
+          - Host must have AXCL driver installed and device nodes present.
+          - Quick start (simplest): use `--privileged`.
+          - If you prefer not to use `--privileged`, map devices explicitly:
+            - `--device=/dev/axcl_host`
+            - `--device=/dev/ax_mmb_dev`
+
+          ```bash
+          docker run --rm --network host \
+            --device=/dev/axcl_host \
+            --device=/dev/ax_mmb_dev \
+            -v /path/to/models:/models \
+            <loaded-image-tag> serve /models/<model_dir> --port 8000
+          ```
+
+          Run (AX650 board):
+
+          ```bash
+          docker run --rm --network host --privileged \
+            -v /soc:/soc:ro \
+            -e LD_LIBRARY_PATH=/soc/lib:$LD_LIBRARY_PATH \
+            -v /path/to/models:/models \
+            <loaded-image-tag> serve /models/<model_dir> --port 8000
+          ```
+
+          ## Native build artifacts
+
+          - `axllm-axcl-linux-amd64.tar.gz`
+          - `axllm-axcl-linux-arm64.tar.gz`
+          - `axllm-ax650-linux-arm64.tar.gz`
+          - `axllm-axcl-linux-riscv64.tar.gz`
+          - `axllm-axcl-windows-mingw64.zip`
+
+          Example:
+
+          ```bash
+          tar -xf axllm-axcl-linux-amd64.tar.gz
+          ./bin/axllm --help
+          ```
+          EOF
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
@@ -257,6 +334,7 @@ jobs:
           name: latest
           make_latest: true
           overwrite_files: true
+          body_path: release_body.md
           files: |
             dist/axllm-axcl-linux-amd64.tar.gz
             dist/axllm-axcl-linux-arm64.tar.gz
