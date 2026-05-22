@@ -42,7 +42,7 @@ jobs:
           bash -euxo pipefail ./scripts/docker/build_axcl_image.sh \
             --arch amd64 \
             --tag axllm-axcl-amd64:${GITHUB_SHA} \
-            --output dist/axllm-axcl-amd64.tar.gz
+            --output dist/axllm-docker-axcl-amd64.tar.gz
 
       - name: Push to GHCR (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_ghcr == 'true' }}
@@ -56,8 +56,8 @@ jobs:
         with:
           name: docker-axcl-amd64
           path: |
-            dist/axllm-axcl-amd64.tar
-            dist/axllm-axcl-amd64.tar.gz
+            dist/axllm-docker-axcl-amd64.tar
+            dist/axllm-docker-axcl-amd64.tar.gz
 
   docker-axcl-arm64:
     name: Docker (AXCL arm64)
@@ -92,7 +92,7 @@ jobs:
           bash -euxo pipefail ./scripts/docker/build_axcl_image.sh \
             --arch arm64 \
             --tag axllm-axcl-arm64:${GITHUB_SHA} \
-            --output dist/axllm-axcl-arm64.tar.gz
+            --output dist/axllm-docker-axcl-arm64.tar.gz
 
       - name: Push to GHCR (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_ghcr == 'true' }}
@@ -106,8 +106,8 @@ jobs:
         with:
           name: docker-axcl-arm64
           path: |
-            dist/axllm-axcl-arm64.tar
-            dist/axllm-axcl-arm64.tar.gz
+            dist/axllm-docker-axcl-arm64.tar
+            dist/axllm-docker-axcl-arm64.tar.gz
 
   docker-ax650-arm64:
     name: Docker (AX650 arm64)
@@ -141,7 +141,7 @@ jobs:
           mkdir -p dist
           bash -euxo pipefail ./scripts/docker/build_ax650_image.sh \
             --tag axllm-ax650-arm64:${GITHUB_SHA} \
-            --output dist/axllm-ax650-arm64.tar.gz
+            --output dist/axllm-docker-ax650-arm64.tar.gz
 
       - name: Push to GHCR (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_ghcr == 'true' }}
@@ -155,8 +155,8 @@ jobs:
         with:
           name: docker-ax650-arm64
           path: |
-            dist/axllm-ax650-arm64.tar
-            dist/axllm-ax650-arm64.tar.gz
+            dist/axllm-docker-ax650-arm64.tar
+            dist/axllm-docker-ax650-arm64.tar.gz
 
   publish-latest:
     name: Publish Docker images to Release (latest)
@@ -177,9 +177,9 @@ jobs:
           make_latest: true
           overwrite_files: true
           files: |
-            dist/**/axllm-axcl-amd64.tar
-            dist/**/axllm-axcl-amd64.tar.gz
-            dist/**/axllm-axcl-arm64.tar
-            dist/**/axllm-axcl-arm64.tar.gz
-            dist/**/axllm-ax650-arm64.tar
-            dist/**/axllm-ax650-arm64.tar.gz
+            dist/**/axllm-docker-axcl-amd64.tar
+            dist/**/axllm-docker-axcl-amd64.tar.gz
+            dist/**/axllm-docker-axcl-arm64.tar
+            dist/**/axllm-docker-axcl-arm64.tar.gz
+            dist/**/axllm-docker-ax650-arm64.tar
+            dist/**/axllm-docker-ax650-arm64.tar.gz

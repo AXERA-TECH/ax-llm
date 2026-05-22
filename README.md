@@ -147,18 +147,18 @@ axllm
 下载 artifact 后加载镜像：
 
 ```shell
-docker load -i axllm-axcl-amd64.tar
-docker load -i axllm-axcl-amd64.tar.gz
+docker load -i axllm-docker-axcl-amd64.tar
+docker load -i axllm-docker-axcl-amd64.tar.gz
 ```
 
 也可以从固定链接下载（始终指向最新一次 `axllm` 分支构建产物）：
 
 ```shell
 # Docker 镜像
-curl -L -o axllm-axcl-amd64.tar https://github.com/AXERA-TECH/ax-llm/releases/latest/download/axllm-axcl-amd64.tar
+curl -L -o axllm-docker-axcl-amd64.tar https://github.com/AXERA-TECH/ax-llm/releases/latest/download/axllm-docker-axcl-amd64.tar
 
 # 编译产物（非 Docker）
-curl -L -o axllm-axcl-linux-amd64.tar.gz https://github.com/AXERA-TECH/ax-llm/releases/latest/download/axllm-axcl-linux-amd64.tar.gz
+curl -L -o axllm-axcl-linux-amd64 https://github.com/AXERA-TECH/ax-llm/releases/latest/download/axllm-axcl-linux-amd64
 ```
 
 如需将镜像推送到 GHCR，可在 Actions 手动触发 `Docker Images` 并将 `publish_ghcr=true`，随后可通过 `ghcr.io/<owner>/` 拉取：

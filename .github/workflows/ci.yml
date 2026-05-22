@@ -256,7 +256,6 @@ jobs:
             local out_prefix="$2"
             local install_root
             install_root="$(find_install_root "${artifact_dir}")"
-            tar -C "${install_root}" -czf "dist/${out_prefix}.tar.gz" .
             cp -a "${install_root}/bin/axllm" "dist/${out_prefix}"
           }
 
@@ -294,16 +293,16 @@ jobs:
 
           Assets:
 
-          - `axllm-axcl-amd64.tar` / `axllm-axcl-amd64.tar.gz`
-          - `axllm-axcl-arm64.tar` / `axllm-axcl-arm64.tar.gz`
-          - `axllm-ax650-arm64.tar` / `axllm-ax650-arm64.tar.gz`
+          - `axllm-docker-axcl-amd64.tar` / `axllm-docker-axcl-amd64.tar.gz`
+          - `axllm-docker-axcl-arm64.tar` / `axllm-docker-axcl-arm64.tar.gz`
+          - `axllm-docker-ax650-arm64.tar` / `axllm-docker-ax650-arm64.tar.gz`
 
           Load:
 
           ```bash
-          docker load -i axllm-axcl-amd64.tar
+          docker load -i axllm-docker-axcl-amd64.tar
           # or
-          docker load -i axllm-axcl-amd64.tar.gz
+          docker load -i axllm-docker-axcl-amd64.tar.gz
           ```
 
           Run (AXCL / PCIe):
@@ -334,21 +333,17 @@ jobs:
 
           ## Native build artifacts
 
-          - `axllm-axcl-linux-amd64.tar.gz`
           - `axllm-axcl-linux-amd64` (standalone binary)
-          - `axllm-axcl-linux-arm64.tar.gz`
           - `axllm-axcl-linux-arm64` (standalone binary)
-          - `axllm-ax650-linux-arm64.tar.gz`
           - `axllm-ax650-linux-arm64` (standalone binary)
-          - `axllm-axcl-linux-riscv64.tar.gz`
           - `axllm-axcl-linux-riscv64` (standalone binary)
           - `axllm-axcl-windows-mingw64.zip`
 
           Example:
 
           ```bash
-          tar -xf axllm-axcl-linux-amd64.tar.gz
-          ./bin/axllm --help
+          chmod +x axllm-axcl-linux-amd64
+          ./axllm-axcl-linux-amd64 --help
           ```
           EOF
 
@@ -361,12 +356,8 @@ jobs:
           overwrite_files: true
           body_path: release_body.md
           files: |
-            dist/axllm-axcl-linux-amd64.tar.gz
             dist/axllm-axcl-linux-amd64
-            dist/axllm-axcl-linux-arm64.tar.gz
             dist/axllm-axcl-linux-arm64
-            dist/axllm-ax650-linux-arm64.tar.gz
             dist/axllm-ax650-linux-arm64
-            dist/axllm-axcl-linux-riscv64.tar.gz
             dist/axllm-axcl-linux-riscv64
             dist/axllm-axcl-windows-mingw64.zip
