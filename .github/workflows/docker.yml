@@ -11,7 +11,7 @@ on:
     branches: [axllm]
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -55,7 +55,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: docker-axcl-amd64
-          path: dist/axllm-axcl-amd64.tar.gz
+          path: |
+            dist/axllm-axcl-amd64.tar
+            dist/axllm-axcl-amd64.tar.gz
 
   docker-axcl-arm64:
     name: Docker (AXCL arm64)
@@ -103,7 +105,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: docker-axcl-arm64
-          path: dist/axllm-axcl-arm64.tar.gz
+          path: |
+            dist/axllm-axcl-arm64.tar
+            dist/axllm-axcl-arm64.tar.gz
 
   docker-ax650-arm64:
     name: Docker (AX650 arm64)
@@ -150,4 +154,32 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: docker-ax650-arm64
-          path: dist/axllm-ax650-arm64.tar.gz
+          path: |
+            dist/axllm-ax650-arm64.tar
+            dist/axllm-ax650-arm64.tar.gz
+
+  publish-latest:
+    name: Publish Docker images to Release (latest)
+    needs: [docker-axcl-amd64, docker-axcl-arm64, docker-ax650-arm64]
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/axllm' && github.repository == 'AXERA-TECH/ax-llm' }}
+    steps:
+      - name: Download docker artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest
+          make_latest: true
+          overwrite_files: true
+          files: |
+            dist/**/axllm-axcl-amd64.tar
+            dist/**/axllm-axcl-amd64.tar.gz
+            dist/**/axllm-axcl-arm64.tar
+            dist/**/axllm-axcl-arm64.tar.gz
+            dist/**/axllm-ax650-arm64.tar
+            dist/**/axllm-ax650-arm64.tar.gz

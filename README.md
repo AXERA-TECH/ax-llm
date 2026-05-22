@@ -135,7 +135,10 @@ axllm
 
 ### Docker（CI 导出镜像）
 
-本仓库提供 GitHub Actions 工作流 `Docker Images` 用于构建并导出 Docker 镜像（按后端/架构拆分），产物为 `.tar.gz`：
+本仓库提供 GitHub Actions 工作流 `Docker Images` 用于构建并导出 Docker 镜像（按后端/架构拆分），产物同时提供：
+
+- `.tar`（未压缩，适合目标设备没有 gzip 的场景）
+- `.tar.gz`（压缩包，体积更小）
 
 - `docker-axcl-amd64`：AXCL（PCIe）x86_64 Host
 - `docker-axcl-arm64`：AXCL（PCIe）aarch64 Host
@@ -144,7 +147,18 @@ axllm
 下载 artifact 后加载镜像：
 
 ```shell
+docker load -i axllm-axcl-amd64.tar
 docker load -i axllm-axcl-amd64.tar.gz
+```
+
+也可以从固定链接下载（始终指向最新一次 `axllm` 分支构建产物）：
+
+```shell
+# Docker 镜像
+curl -L -o axllm-axcl-amd64.tar https://github.com/AXERA-TECH/ax-llm/releases/latest/download/axllm-axcl-amd64.tar
+
+# 编译产物（非 Docker）
+curl -L -o axllm-axcl-linux-amd64.tar.gz https://github.com/AXERA-TECH/ax-llm/releases/latest/download/axllm-axcl-linux-amd64.tar.gz
 ```
 
 如需将镜像推送到 GHCR，可在 Actions 手动触发 `Docker Images` 并将 `publish_ghcr=true`，随后可通过 `ghcr.io/<owner>/` 拉取：

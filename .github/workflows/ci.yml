@@ -88,6 +88,14 @@ jobs:
         run: |
           ./build_mingw64/tokenizer_smoke.exe
 
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: axcl-windows-mingw64-artifacts
+          path: |
+            build_mingw64/axllm.exe
+            build_mingw64/tokenizer_smoke.exe
+
   build-ax650-aarch64:
     name: AX650 aarch64 cross-build
     runs-on: ubuntu-latest
@@ -200,3 +208,58 @@ jobs:
           name: axcl-riscv64-artifacts
           path: |
             build_riscv64/install/**
+
+  publish-latest-release:
+    name: Publish build artifacts to Release (latest)
+    needs:
+      - build-axcl-x86
+      - build-axcl-windows-mingw64
+      - build-ax650-aarch64
+      - build-axcl-aarch64
+      - build-axcl-riscv64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/axllm' && github.repository == 'AXERA-TECH/ax-llm' }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p dist
+
+          tar -C artifacts/axcl-x86-artifacts/build_x86/install -czf dist/axllm-axcl-linux-amd64.tar.gz .
+          tar -C artifacts/axcl-aarch64-artifacts/build_aarch64/install -czf dist/axllm-axcl-linux-arm64.tar.gz .
+          tar -C artifacts/ax650-aarch64-artifacts/build/install -czf dist/axllm-ax650-linux-arm64.tar.gz .
+          tar -C artifacts/axcl-riscv64-artifacts/build_riscv64/install -czf dist/axllm-axcl-linux-riscv64.tar.gz .
+
+          mkdir -p dist/windows
+          cp -a artifacts/axcl-windows-mingw64-artifacts/build_mingw64/axllm.exe dist/windows/
+          cp -a artifacts/axcl-windows-mingw64-artifacts/build_mingw64/tokenizer_smoke.exe dist/windows/
+          (cd dist/windows && zip -r ../axllm-axcl-windows-mingw64.zip .)
+          rm -rf dist/windows
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest
+          make_latest: true
+          overwrite_files: true
+          files: |
+            dist/axllm-axcl-linux-amd64.tar.gz
+            dist/axllm-axcl-linux-arm64.tar.gz
+            dist/axllm-ax650-linux-arm64.tar.gz
+            dist/axllm-axcl-linux-riscv64.tar.gz
+            dist/axllm-axcl-windows-mingw64.zip

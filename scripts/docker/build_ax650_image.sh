@@ -4,10 +4,12 @@ set -euo pipefail
 build_dir="build"
 tag="axllm-ax650:local"
 output=""
+output_tar=""
+output_targz=""
 
 usage() {
   cat <<EOF
-Usage: $0 [--build-dir DIR] [--tag TAG] [--output image.tar.gz]
+Usage: $0 [--build-dir DIR] [--tag TAG] [--output image.tar|image.tar.gz]
 
 Build an AX650 Docker image from local build outputs.
 
@@ -60,9 +62,31 @@ cp -a docker/ax650/Dockerfile "$ctx/Dockerfile"
 docker buildx build --builder default --platform linux/arm64 -t "$tag" --load "$ctx"
 
 if [[ -n "$output" ]]; then
-  mkdir -p "$(dirname "$output")"
-  docker save "$tag" | gzip -c > "$output"
-  echo "Saved: $output"
+  case "$output" in
+    *.tar.gz)
+      output_targz="$output"
+      output_tar="${output%.gz}"
+      ;;
+    *.tgz)
+      output_targz="$output"
+      output_tar="${output%.tgz}.tar"
+      ;;
+    *.tar)
+      output_tar="$output"
+      output_targz="${output}.gz"
+      ;;
+    *)
+      output_tar="${output}.tar"
+      output_targz="${output}.tar.gz"
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$output_tar")"
+  docker save -o "$output_tar" "$tag"
+  echo "Saved: $output_tar"
+
+  docker save "$tag" | gzip -c > "$output_targz"
+  echo "Saved: $output_targz"
 fi
 
 echo "Built image: $tag"

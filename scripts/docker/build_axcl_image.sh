@@ -5,10 +5,12 @@ arch="amd64"
 build_dir=""
 tag="axllm-axcl:local"
 output=""
+output_tar=""
+output_targz=""
 
 usage() {
   cat <<EOF
-Usage: $0 [--arch amd64|arm64] [--build-dir DIR] [--tag TAG] [--output image.tar.gz]
+Usage: $0 [--arch amd64|arm64] [--build-dir DIR] [--tag TAG] [--output image.tar|image.tar.gz]
 
 Build an AXCL Docker image from local build outputs.
 
@@ -83,9 +85,31 @@ else
 fi
 
 if [[ -n "$output" ]]; then
-  mkdir -p "$(dirname "$output")"
-  docker save "$tag" | gzip -c > "$output"
-  echo "Saved: $output"
+  case "$output" in
+    *.tar.gz)
+      output_targz="$output"
+      output_tar="${output%.gz}"
+      ;;
+    *.tgz)
+      output_targz="$output"
+      output_tar="${output%.tgz}.tar"
+      ;;
+    *.tar)
+      output_tar="$output"
+      output_targz="${output}.gz"
+      ;;
+    *)
+      output_tar="${output}.tar"
+      output_targz="${output}.tar.gz"
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$output_tar")"
+  docker save -o "$output_tar" "$tag"
+  echo "Saved: $output_tar"
+
+  docker save "$tag" | gzip -c > "$output_targz"
+  echo "Saved: $output_targz"
 fi
 
 echo "Built image: $tag"
