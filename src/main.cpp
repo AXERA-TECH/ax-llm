@@ -1464,42 +1464,49 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     return true;
 }
 
-static void keep_latest_media_turn_for_single_image_ocr(std::vector<Content> &history,
-                                                        std::vector<MediaInputs> &media_inputs)
+static bool normalize_single_image_ocr_request(std::vector<Content> &history,
+                                               std::vector<MediaInputs> &media_inputs,
+                                               std::string &err)
 {
-    if (media_inputs.empty()) return;
-    if (media_inputs.size() == 1)
+    if (media_inputs.empty())
     {
-        const auto &media = media_inputs.front();
-        if (media.content_index < history.size())
+        err = "PaddleOCR-VL requires one image input.";
+        return false;
+    }
+
+    const MediaInputs *latest_image_media = nullptr;
+    for (auto it = media_inputs.rbegin(); it != media_inputs.rend(); ++it)
+    {
+        if (it->content_index < history.size() &&
+            history[it->content_index].type == IMAGE &&
+            !it->uris.empty())
         {
-            history[media.content_index].data = "OCR:";
+            latest_image_media = &(*it);
+            break;
         }
-        return;
     }
 
-    const MediaInputs latest_media = media_inputs.back();
-    if (latest_media.content_index >= history.size()) return;
-
-    std::vector<Content> pruned;
-    pruned.reserve(history.size());
-    for (const auto &content : history)
+    if (latest_image_media == nullptr)
     {
-        if (content.role == SYSTEM) pruned.push_back(content);
+        err = "PaddleOCR-VL requires an image input; audio/video/text-only requests are not supported.";
+        return false;
     }
 
-    const size_t new_media_index = pruned.size();
-    pruned.push_back(history[latest_media.content_index]);
-    pruned.back().data = "OCR:";
+    std::vector<std::string> latest_uri;
+    latest_uri.push_back(latest_image_media->uris.back());
 
-    ALOGI("PaddleOCR-VL request contains %zu media turns; keep latest media turn only (old_index=%zu new_index=%zu)",
+    Content ocr_turn{USER, IMAGE, "OCR:"};
+
+    ALOGI("PaddleOCR-VL request normalized to latest single image: media_turns=%zu old_index=%zu uris_in_turn=%zu",
           media_inputs.size(),
-          latest_media.content_index,
-          new_media_index);
+          latest_image_media->content_index,
+          latest_image_media->uris.size());
 
-    history = std::move(pruned);
+    history.clear();
+    history.push_back(std::move(ocr_turn));
     media_inputs.clear();
-    media_inputs.push_back({new_media_index, latest_media.uris});
+    media_inputs.push_back({0, std::move(latest_uri)});
+    return true;
 }
 
 // Run server mode
@@ -1818,15 +1825,23 @@ int run_server_mode(const ModelConfig &config, int port)
 
                 struct SamplingOverrideGuard {
                     LLM &llm;
-                    SamplingOverrideGuard(LLM &llm, const openai_api::ChatRequest &req) : llm(llm)
+                    SamplingOverrideGuard(LLM &llm, const openai_api::ChatRequest &req, bool enabled) : llm(llm)
                     {
-                        llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
+                        if (enabled)
+                        {
+                            llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
+                        }
                     }
                     ~SamplingOverrideGuard()
                     {
                         llm.ClearRequestSamplingOverride();
                     }
-                } sampling_guard(llm, req);
+                } sampling_guard(llm, req, !single_image_ocr_mode);
+
+                auto push_chat_error = [&](const std::string &code, const std::string &message) {
+                    provider->push(openai_api::OutputChunk::Error(code, message));
+                    provider->end();
+                };
 
                 std::vector<Content> history;
                 std::vector<MediaInputs> media_inputs;
@@ -1834,11 +1849,27 @@ int run_server_mode(const ModelConfig &config, int port)
                 if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files)) {
                     ALOGE("handle_body failed");
                     cleanup_temp_files(temp_files);
-                    provider->end();
+                    push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
                 }
+                int output_max_tokens = req.max_tokens;
                 if (single_image_ocr_mode) {
-                    keep_latest_media_turn_for_single_image_ocr(history, media_inputs);
+                    std::string ocr_err;
+                    if (!normalize_single_image_ocr_request(history, media_inputs, ocr_err)) {
+                        ALOGW("Reject PaddleOCR-VL request: %s", ocr_err.c_str());
+                        cleanup_temp_files(temp_files);
+                        push_chat_error("invalid_request_error", ocr_err);
+                        return;
+                    }
+
+                    constexpr int kPaddleOcrMaxOutputTokens = 128;
+                    if (output_max_tokens <= 0 || output_max_tokens > kPaddleOcrMaxOutputTokens)
+                    {
+                        ALOGI("Clamp PaddleOCR-VL max_tokens from %d to %d", output_max_tokens, kPaddleOcrMaxOutputTokens);
+                        output_max_tokens = kPaddleOcrMaxOutputTokens;
+                    }
+
+                    llm.ResetKVCache();
                 }
 
                 if (req.stream) {
@@ -1856,27 +1887,40 @@ int run_server_mode(const ModelConfig &config, int port)
                     };
 
                     llm.getAttr()->runing_callback = callback;
-                    if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
-                    else llm.Run(history, req.max_tokens);
+                    if (!media_inputs.empty()) llm.Run(history, media_inputs, output_max_tokens);
+                    else llm.Run(history, output_max_tokens);
                     const std::string llm_error = llm.GetLastError();
-                    if (!llm_error.empty() && !streamed_any) {
+                    if (!llm_error.empty()) {
                         ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
-                        provider->push(openai_api::OutputChunk::TextDelta(llm_error, req.model));
+                        llm.ResetKVCache();
+                        if (!streamed_any) {
+                            provider->push(openai_api::OutputChunk::Error("model_error", llm_error));
+                        }
+                    }
+                    if (streamed_any) {
                         provider->push(openai_api::OutputChunk::FinalText("", req.model));
                     }
                 } else {
                     llm.getAttr()->runing_callback = nullptr;
-                    auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, req.max_tokens) : llm.Run(history, req.max_tokens);
+                    auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, output_max_tokens) : llm.Run(history, output_max_tokens);
                     std::string final_text;
                     if (!out_history.empty() && out_history.back().role == ASSISTANT) {
                         final_text = out_history.back().data;
                     }
+                    const std::string llm_error = llm.GetLastError();
+                    if (!llm_error.empty()) {
+                        ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
+                        llm.ResetKVCache();
+                        cleanup_temp_files(temp_files);
+                        push_chat_error("model_error", llm_error);
+                        return;
+                    }
                     if (final_text.empty()) {
-                        const std::string llm_error = llm.GetLastError();
-                        if (!llm_error.empty()) {
-                            ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
-                            final_text = llm_error;
-                        }
+                        ALOGW("Returning user-facing chat error: empty model response");
+                        if (single_image_ocr_mode) llm.ResetKVCache();
+                        cleanup_temp_files(temp_files);
+                        push_chat_error("model_error", "模型运行失败，请重新尝试。");
+                        return;
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
                     fprintf(stdout, "%s", final_text.c_str());
