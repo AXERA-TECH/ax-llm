@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <regex>
 #include <numeric>
@@ -99,6 +100,92 @@ static bool is_supported_frame_file(const std::string& path)
 {
     const std::string ext = lower_ext(path);
     return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".webp";
+}
+
+static std::string shell_quote(const std::string& value);
+
+static std::string file_probe_summary(const std::string& path)
+{
+    std::ostringstream oss;
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec);
+    oss << "exists=" << (exists ? 1 : 0);
+    if (exists) {
+        const auto size = std::filesystem::file_size(path, ec);
+        if (!ec) oss << " size=" << size;
+    }
+
+    std::ifstream ifs(path, std::ios::binary);
+    if (ifs) {
+        unsigned char head[16] = {0};
+        ifs.read(reinterpret_cast<char*>(head), sizeof(head));
+        const std::streamsize n = ifs.gcount();
+        oss << " head=";
+        static const char* hex = "0123456789abcdef";
+        for (std::streamsize i = 0; i < n; ++i) {
+            if (i) oss << ' ';
+            oss << hex[(head[i] >> 4) & 0xf] << hex[head[i] & 0xf];
+        }
+    }
+    return oss.str();
+}
+
+static bool is_webp_file(const std::string& path)
+{
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) return false;
+    unsigned char head[12] = {0};
+    ifs.read(reinterpret_cast<char*>(head), sizeof(head));
+    if (ifs.gcount() < 12) return false;
+    return head[0] == 'R' && head[1] == 'I' && head[2] == 'F' && head[3] == 'F' &&
+           head[8] == 'W' && head[9] == 'E' && head[10] == 'B' && head[11] == 'P';
+}
+
+static std::string make_temp_png_path()
+{
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec || dir.empty()) dir = std::filesystem::current_path(ec);
+    if (ec || dir.empty()) dir = ".";
+    dir /= "axllm_media";
+    std::filesystem::create_directories(dir, ec);
+
+    static uint64_t seq = 0;
+    const auto now = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+    return (dir / ("decoded_" + std::to_string(now) + "_" + std::to_string(seq++) + ".png")).string();
+}
+
+static axcv::Mat imread_with_webp_fallback(const std::string& file, int flags, std::string* err_detail = nullptr)
+{
+    axcv::Mat img = axcv::imread(file, flags);
+    if (!axcv::empty(img)) return img;
+
+    if (!is_webp_file(file)) return img;
+
+    const std::string out_png = make_temp_png_path();
+    const std::string cmd = "ffmpeg -nostdin -hide_banner -loglevel error -y -i " +
+                            shell_quote(file) + " -frames:v 1 " + shell_quote(out_png);
+    const int ret = std::system(cmd.c_str());
+    if (ret != 0)
+    {
+        if (err_detail) *err_detail = "webp fallback ffmpeg failed ret=" + std::to_string(ret);
+        std::error_code ec;
+        std::filesystem::remove(out_png, ec);
+        return img;
+    }
+
+    img = axcv::imread(out_png, flags);
+    if (axcv::empty(img))
+    {
+        if (err_detail) *err_detail = "webp fallback produced unreadable png: " + out_png;
+    }
+    else
+    {
+        ALOGI("decoded WebP via ffmpeg fallback: %s -> %s", file.c_str(), out_png.c_str());
+    }
+    std::error_code ec;
+    std::filesystem::remove(out_png, ec);
+    return img;
 }
 
 static std::vector<std::string> filter_supported_frame_files(const std::vector<std::string>& files)
@@ -1910,8 +1997,13 @@ bool VisionModule::EncodeForContent(const Content& content,
                 }
             }
 
-            axcv::Mat img = axcv::imread(file, axcv::IMREAD_COLOR);
-            if (axcv::empty(img)) { err = "failed to read image: " + file; return false; }
+            std::string decode_detail;
+            axcv::Mat img = imread_with_webp_fallback(file, axcv::IMREAD_COLOR, &decode_detail);
+            if (axcv::empty(img)) {
+                err = "failed to read image: " + file + " (" + file_probe_summary(file) + ")";
+                if (!decode_detail.empty()) err += " " + decode_detail;
+                return false;
+            }
 
             std::vector<std::vector<unsigned short>> blocks_for_one;
             std::vector<std::vector<float>> deepstack_for_one;
@@ -2033,9 +2125,11 @@ bool VisionModule::EncodeForContent(const Content& content,
     std::vector<axcv::Mat> frames;
     frames.reserve(frame_files.size());
     for (const auto& file : frame_files) {
-        axcv::Mat img = axcv::imread(file, axcv::IMREAD_COLOR);
+        std::string decode_detail;
+        axcv::Mat img = imread_with_webp_fallback(file, axcv::IMREAD_COLOR, &decode_detail);
         if (axcv::empty(img)) {
-            err = "failed to read video frame: " + file;
+            err = "failed to read video frame: " + file + " (" + file_probe_summary(file) + ")";
+            if (!decode_detail.empty()) err += " " + decode_detail;
             return false;
         }
         frames.push_back(img);

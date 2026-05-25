@@ -938,16 +938,75 @@ static const std::string g_base64_chars =
     "abcdefghijklmnopqrstuvwxyz"
     "0123456789+/";
 
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static std::string percent_decode_copy(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] == '%' && i + 2 < s.size())
+        {
+            const int hi = hex_value(s[i + 1]);
+            const int lo = hex_value(s[i + 2]);
+            if (hi >= 0 && lo >= 0)
+            {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
 static std::vector<uint8_t> base64_decode_bytes(const std::string &encoded)
 {
     std::vector<uint8_t> out;
     out.reserve(encoded.size() * 3 / 4);
     int val = 0, valb = -8;
-    for (unsigned char c : encoded)
+    bool saw_space = false;
+    bool saw_urlsafe = false;
+
+    for (unsigned char raw : encoded)
     {
+        unsigned char c = raw;
+        if (c == ' ')
+        {
+            c = '+';
+            saw_space = true;
+        }
+        else if (std::isspace(c))
+        {
+            saw_space = true;
+            continue;
+        }
+        if (c == '-')
+        {
+            c = '+';
+            saw_urlsafe = true;
+        }
+        else if (c == '_')
+        {
+            c = '/';
+            saw_urlsafe = true;
+        }
         if (c == '=') break;
         auto pos = g_base64_chars.find(c);
-        if (pos == std::string::npos) continue; // skip whitespace / invalid
+        if (pos == std::string::npos)
+        {
+            ALOGE("invalid base64 character 0x%02x", (unsigned int)c);
+            out.clear();
+            return out;
+        }
         val = (val << 6) + (int)pos;
         valb += 6;
         if (valb >= 0)
@@ -956,6 +1015,8 @@ static std::vector<uint8_t> base64_decode_bytes(const std::string &encoded)
             valb -= 8;
         }
     }
+    if (saw_urlsafe) ALOGI("decoded url-safe base64 media payload");
+    if (saw_space) ALOGI("decoded base64 media payload containing whitespace");
     return out;
 }
 
@@ -1015,11 +1076,50 @@ static std::string normalize_extension(std::string ext, const std::string &fallb
     return ext.empty() ? fallback : ext;
 }
 
+static std::string detect_image_extension_from_bytes(const std::vector<uint8_t> &bytes)
+{
+    if (bytes.size() >= 12 &&
+        bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F' &&
+        bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' && bytes[11] == 'P')
+    {
+        return "webp";
+    }
+    if (bytes.size() >= 8 &&
+        bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G' &&
+        bytes[4] == '\r' && bytes[5] == '\n' && bytes[6] == 0x1a && bytes[7] == '\n')
+    {
+        return "png";
+    }
+    if (bytes.size() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff)
+    {
+        return "jpg";
+    }
+    if (bytes.size() >= 2 && bytes[0] == 'B' && bytes[1] == 'M')
+    {
+        return "bmp";
+    }
+    return {};
+}
+
+static bool equivalent_image_extensions(const std::string &a, const std::string &b)
+{
+    if (a == b) return true;
+    return (a == "jpg" && b == "jpeg") || (a == "jpeg" && b == "jpg");
+}
+
 static std::string write_bytes_to_tempfile(const std::string &ext, const std::vector<uint8_t> &bytes)
 {
     if (bytes.empty()) return {};
 
-    const std::string safe_ext = normalize_extension(ext);
+    std::string safe_ext = normalize_extension(ext);
+    const std::string detected_ext = detect_image_extension_from_bytes(bytes);
+    if (!detected_ext.empty() && !equivalent_image_extensions(detected_ext, safe_ext))
+    {
+        ALOGW("media extension mismatch: requested=%s detected=%s; using detected extension",
+              safe_ext.c_str(),
+              detected_ext.c_str());
+        safe_ext = detected_ext;
+    }
     // Detect "data:<mime>/<ext>;base64,<payload>" and return the extension + payload.
     // Uses simple string operations instead of regex to avoid stack overflow on large payloads.
     std::filesystem::path tmpdir;
@@ -1107,10 +1207,12 @@ static std::string resolve_media_uri(const std::string &uri, std::vector<std::st
     std::string ext, payload;
     if (parse_base64_data_uri(uri, ext, payload))
     {
+        payload = percent_decode_copy(payload);
         std::string path = save_base64_to_tempfile(ext, payload);
-        if (!path.empty())
+        if (!path.empty()) temp_files.push_back(path);
+        else
         {
-            temp_files.push_back(path);
+            ALOGE("failed to decode base64 media: mime_ext=%s payload_chars=%zu", ext.c_str(), payload.size());
         }
         return path;
     }
@@ -1319,12 +1421,24 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
 
                         if (temp_files)
                         {
-                            media_uris.push_back(resolve_media_uri(raw_url, *temp_files));
+                            std::string resolved = resolve_media_uri(raw_url, *temp_files);
+                            if (resolved.empty())
+                            {
+                                ALOGE("failed to resolve media uri for message");
+                                return false;
+                            }
+                            media_uris.push_back(std::move(resolved));
                         }
                         else
                         {
                             std::vector<std::string> dummy;
-                            media_uris.push_back(resolve_media_uri(raw_url, dummy));
+                            std::string resolved = resolve_media_uri(raw_url, dummy);
+                            if (resolved.empty())
+                            {
+                                ALOGE("failed to resolve media uri for message");
+                                return false;
+                            }
+                            media_uris.push_back(std::move(resolved));
                         }
                     }
                 }
@@ -1347,6 +1461,51 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         history.push_back(content);
     }
 
+    return true;
+}
+
+static bool normalize_single_image_ocr_request(std::vector<Content> &history,
+                                               std::vector<MediaInputs> &media_inputs,
+                                               std::string &err)
+{
+    if (media_inputs.empty())
+    {
+        err = "PaddleOCR-VL requires one image input.";
+        return false;
+    }
+
+    const MediaInputs *latest_image_media = nullptr;
+    for (auto it = media_inputs.rbegin(); it != media_inputs.rend(); ++it)
+    {
+        if (it->content_index < history.size() &&
+            history[it->content_index].type == IMAGE &&
+            !it->uris.empty())
+        {
+            latest_image_media = &(*it);
+            break;
+        }
+    }
+
+    if (latest_image_media == nullptr)
+    {
+        err = "PaddleOCR-VL requires an image input; audio/video/text-only requests are not supported.";
+        return false;
+    }
+
+    std::vector<std::string> latest_uri;
+    latest_uri.push_back(latest_image_media->uris.back());
+
+    Content ocr_turn{USER, IMAGE, "OCR:"};
+
+    ALOGI("PaddleOCR-VL request normalized to latest single image: media_turns=%zu old_index=%zu uris_in_turn=%zu",
+          media_inputs.size(),
+          latest_image_media->content_index,
+          latest_image_media->uris.size());
+
+    history.clear();
+    history.push_back(std::move(ocr_turn));
+    media_inputs.clear();
+    media_inputs.push_back({0, std::move(latest_uri)});
     return true;
 }
 
@@ -1644,8 +1803,9 @@ int run_server_mode(const ModelConfig &config, int port)
             options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
 
-            g_server.registerChat(model_name, [&llm](const openai_api::ChatRequest &req,
-                                                     std::shared_ptr<openai_api::BaseDataProvider> provider)
+            const bool single_image_ocr_mode = config.attr.vlm_type == VLMType::PaddleOCRVL;
+            g_server.registerChat(model_name, [&llm, single_image_ocr_mode](const openai_api::ChatRequest &req,
+                                                                            std::shared_ptr<openai_api::BaseDataProvider> provider)
                                   {
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
@@ -1665,15 +1825,23 @@ int run_server_mode(const ModelConfig &config, int port)
 
                 struct SamplingOverrideGuard {
                     LLM &llm;
-                    SamplingOverrideGuard(LLM &llm, const openai_api::ChatRequest &req) : llm(llm)
+                    SamplingOverrideGuard(LLM &llm, const openai_api::ChatRequest &req, bool enabled) : llm(llm)
                     {
-                        llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
+                        if (enabled)
+                        {
+                            llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
+                        }
                     }
                     ~SamplingOverrideGuard()
                     {
                         llm.ClearRequestSamplingOverride();
                     }
-                } sampling_guard(llm, req);
+                } sampling_guard(llm, req, !single_image_ocr_mode);
+
+                auto push_chat_error = [&](const std::string &code, const std::string &message) {
+                    provider->push(openai_api::OutputChunk::Error(code, message));
+                    provider->end();
+                };
 
                 std::vector<Content> history;
                 std::vector<MediaInputs> media_inputs;
@@ -1681,8 +1849,27 @@ int run_server_mode(const ModelConfig &config, int port)
                 if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files)) {
                     ALOGE("handle_body failed");
                     cleanup_temp_files(temp_files);
-                    provider->end();
+                    push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
+                }
+                int output_max_tokens = req.max_tokens;
+                if (single_image_ocr_mode) {
+                    std::string ocr_err;
+                    if (!normalize_single_image_ocr_request(history, media_inputs, ocr_err)) {
+                        ALOGW("Reject PaddleOCR-VL request: %s", ocr_err.c_str());
+                        cleanup_temp_files(temp_files);
+                        push_chat_error("invalid_request_error", ocr_err);
+                        return;
+                    }
+
+                    constexpr int kPaddleOcrMaxOutputTokens = 128;
+                    if (output_max_tokens <= 0 || output_max_tokens > kPaddleOcrMaxOutputTokens)
+                    {
+                        ALOGI("Clamp PaddleOCR-VL max_tokens from %d to %d", output_max_tokens, kPaddleOcrMaxOutputTokens);
+                        output_max_tokens = kPaddleOcrMaxOutputTokens;
+                    }
+
+                    llm.ResetKVCache();
                 }
 
                 if (req.stream) {
@@ -1700,27 +1887,40 @@ int run_server_mode(const ModelConfig &config, int port)
                     };
 
                     llm.getAttr()->runing_callback = callback;
-                    if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
-                    else llm.Run(history, req.max_tokens);
+                    if (!media_inputs.empty()) llm.Run(history, media_inputs, output_max_tokens);
+                    else llm.Run(history, output_max_tokens);
                     const std::string llm_error = llm.GetLastError();
-                    if (!llm_error.empty() && !streamed_any) {
+                    if (!llm_error.empty()) {
                         ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
-                        provider->push(openai_api::OutputChunk::TextDelta(llm_error, req.model));
+                        llm.ResetKVCache();
+                        if (!streamed_any) {
+                            provider->push(openai_api::OutputChunk::Error("model_error", llm_error));
+                        }
+                    }
+                    if (streamed_any) {
                         provider->push(openai_api::OutputChunk::FinalText("", req.model));
                     }
                 } else {
                     llm.getAttr()->runing_callback = nullptr;
-                    auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, req.max_tokens) : llm.Run(history, req.max_tokens);
+                    auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, output_max_tokens) : llm.Run(history, output_max_tokens);
                     std::string final_text;
                     if (!out_history.empty() && out_history.back().role == ASSISTANT) {
                         final_text = out_history.back().data;
                     }
+                    const std::string llm_error = llm.GetLastError();
+                    if (!llm_error.empty()) {
+                        ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
+                        llm.ResetKVCache();
+                        cleanup_temp_files(temp_files);
+                        push_chat_error("model_error", llm_error);
+                        return;
+                    }
                     if (final_text.empty()) {
-                        const std::string llm_error = llm.GetLastError();
-                        if (!llm_error.empty()) {
-                            ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
-                            final_text = llm_error;
-                        }
+                        ALOGW("Returning user-facing chat error: empty model response");
+                        if (single_image_ocr_mode) llm.ResetKVCache();
+                        cleanup_temp_files(temp_files);
+                        push_chat_error("model_error", "模型运行失败，请重新尝试。");
+                        return;
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
                     fprintf(stdout, "%s", final_text.c_str());
