@@ -1408,33 +1408,15 @@ static bool raw_string_value(const nlohmann::json &j, const char *key, std::stri
     return true;
 }
 
-static std::string infer_hymt_target_language(const openai_api::ChatRequest &req,
-                                              const std::string &source_text)
+static bool get_hymt_target_language(const openai_api::ChatRequest &req,
+                                     std::string &target_language)
 {
-    std::string target_language;
     if (raw_string_value(req.raw, "target_language", target_language) && !trim_copy(target_language).empty())
     {
-        return trim_copy(target_language);
+        target_language = trim_copy(target_language);
+        return true;
     }
-
-    const std::string lower_text = lower_copy(source_text);
-    if ((source_text.find("翻译") != std::string::npos || lower_text.find("translate") != std::string::npos) &&
-        (source_text.find("中文") != std::string::npos ||
-         source_text.find("汉语") != std::string::npos ||
-         source_text.find("漢語") != std::string::npos ||
-         lower_text.find("chinese") != std::string::npos ||
-         lower_text.find("zh") != std::string::npos))
-    {
-        return "Chinese";
-    }
-    if ((source_text.find("翻译") != std::string::npos || lower_text.find("translate") != std::string::npos) &&
-        (source_text.find("英文") != std::string::npos ||
-         source_text.find("英语") != std::string::npos ||
-         lower_text.find("english") != std::string::npos))
-    {
-        return "English";
-    }
-    return "English";
+    return false;
 }
 
 static std::string strip_hymt_translation_instruction(const std::string &source_text)
@@ -1489,23 +1471,31 @@ static bool normalize_hymt_translation_request(const openai_api::ChatRequest &re
         return false;
     }
 
-    const std::string target_language = infer_hymt_target_language(req, source_text);
-    source_text = strip_hymt_translation_instruction(source_text);
-    if (source_text.empty())
+    std::string target_language;
+    const bool has_explicit_target_language = get_hymt_target_language(req, target_language);
+    if (has_explicit_target_language)
     {
-        err = "HY-MT translation requires source text after the translation instruction.";
-        return false;
+        source_text = strip_hymt_translation_instruction(source_text);
+        if (source_text.empty())
+        {
+            err = "HY-MT translation requires source text after the translation instruction.";
+            return false;
+        }
+
+        bool use_zh_template = contains_cjk_text(source_text) || is_chinese_target_language(target_language);
+        ModelConfig::json_bool_value(req.raw, "use_zh_template", use_zh_template);
+
+        history.clear();
+        history.push_back({
+            USER,
+            TEXT,
+            build_hymt_translation_prompt(source_text, target_language, use_zh_template),
+        });
+        return true;
     }
 
-    bool use_zh_template = contains_cjk_text(source_text) || is_chinese_target_language(target_language);
-    ModelConfig::json_bool_value(req.raw, "use_zh_template", use_zh_template);
-
     history.clear();
-    history.push_back({
-        USER,
-        TEXT,
-        build_hymt_translation_prompt(source_text, target_language.empty() ? "English" : target_language, use_zh_template),
-    });
+    history.push_back({USER, TEXT, source_text});
     return true;
 }
 
