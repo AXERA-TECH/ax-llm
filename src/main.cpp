@@ -1380,6 +1380,96 @@ static bool is_chinese_target_language(const std::string &target_language)
            target_language.find("漢語") != std::string::npos;
 }
 
+static std::string latest_user_text(const openai_api::ChatRequest &req)
+{
+    for (auto it = req.parsed_messages.rbegin(); it != req.parsed_messages.rend(); ++it)
+    {
+        if (!it->role.empty() && it->role != "user") continue;
+
+        std::string text;
+        for (const auto &part : it->content_parts)
+        {
+            if (part.is_text() && !part.text.empty())
+            {
+                if (!text.empty()) text += "\n";
+                text += part.text;
+            }
+        }
+        text = trim_copy(text);
+        if (!text.empty()) return text;
+    }
+    return trim_copy(req.flattened_text());
+}
+
+static bool raw_string_value(const nlohmann::json &j, const char *key, std::string &out)
+{
+    if (!j.contains(key) || !j[key].is_string()) return false;
+    out = j[key].get<std::string>();
+    return true;
+}
+
+static std::string infer_hymt_target_language(const openai_api::ChatRequest &req,
+                                              const std::string &source_text)
+{
+    std::string target_language;
+    if (raw_string_value(req.raw, "target_language", target_language) && !trim_copy(target_language).empty())
+    {
+        return trim_copy(target_language);
+    }
+
+    const std::string lower_text = lower_copy(source_text);
+    if ((source_text.find("翻译") != std::string::npos || lower_text.find("translate") != std::string::npos) &&
+        (source_text.find("中文") != std::string::npos ||
+         source_text.find("汉语") != std::string::npos ||
+         source_text.find("漢語") != std::string::npos ||
+         lower_text.find("chinese") != std::string::npos ||
+         lower_text.find("zh") != std::string::npos))
+    {
+        return "Chinese";
+    }
+    if ((source_text.find("翻译") != std::string::npos || lower_text.find("translate") != std::string::npos) &&
+        (source_text.find("英文") != std::string::npos ||
+         source_text.find("英语") != std::string::npos ||
+         lower_text.find("english") != std::string::npos))
+    {
+        return "English";
+    }
+    return "English";
+}
+
+static std::string strip_hymt_translation_instruction(const std::string &source_text)
+{
+    std::string text = trim_copy(source_text);
+    const std::string lower_text = lower_copy(text);
+    const bool has_translation_instruction =
+        text.find("翻译") != std::string::npos || lower_text.find("translate") != std::string::npos;
+    if (!has_translation_instruction) return text;
+
+    size_t split = text.find("\n\n");
+    if (split != std::string::npos)
+    {
+        const std::string head = text.substr(0, split);
+        const std::string lower_head = lower_copy(head);
+        if (head.find("翻译") != std::string::npos || lower_head.find("translate") != std::string::npos)
+        {
+            return trim_copy(text.substr(split + 2));
+        }
+    }
+
+    split = text.find("：");
+    if (split == std::string::npos) split = text.find(":");
+    if (split != std::string::npos && split < 256)
+    {
+        const std::string head = text.substr(0, split);
+        const std::string lower_head = lower_copy(head);
+        if (head.find("翻译") != std::string::npos || lower_head.find("translate") != std::string::npos)
+        {
+            return trim_copy(text.substr(split + 1));
+        }
+    }
+    return text;
+}
+
 static bool normalize_hymt_translation_request(const openai_api::ChatRequest &req,
                                                std::vector<Content> &history,
                                                std::vector<MediaInputs> &media_inputs,
@@ -1387,18 +1477,26 @@ static bool normalize_hymt_translation_request(const openai_api::ChatRequest &re
 {
     if (!media_inputs.empty() || req.has_image_inputs())
     {
-        err = "HY-MT translation only supports text input.";
-        return false;
+        ALOGW("HY-MT translation ignores %zu media turn(s); only the latest user text is used.",
+              media_inputs.size());
+        media_inputs.clear();
     }
 
-    std::string source_text = trim_copy(req.flattened_text());
+    std::string source_text = latest_user_text(req);
     if (source_text.empty())
     {
         err = "HY-MT translation requires non-empty text input.";
         return false;
     }
 
-    const std::string target_language = req.raw.value("target_language", "English");
+    const std::string target_language = infer_hymt_target_language(req, source_text);
+    source_text = strip_hymt_translation_instruction(source_text);
+    if (source_text.empty())
+    {
+        err = "HY-MT translation requires source text after the translation instruction.";
+        return false;
+    }
+
     bool use_zh_template = contains_cjk_text(source_text) || is_chinese_target_language(target_language);
     ModelConfig::json_bool_value(req.raw, "use_zh_template", use_zh_template);
 
