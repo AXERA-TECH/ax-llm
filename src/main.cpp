@@ -173,6 +173,23 @@ struct ModelConfig
         return std::nullopt;
     }
 
+    static bool json_bool_value(const nlohmann::json &j, const char *key, bool &out)
+    {
+        if (!j.contains(key)) return false;
+        const auto &v = j[key];
+        if (v.is_boolean())
+        {
+            out = v.get<bool>();
+            return true;
+        }
+        if (v.is_number_integer())
+        {
+            out = v.get<int>() != 0;
+            return true;
+        }
+        return false;
+    }
+
     static std::optional<std::vector<std::string>> json_string_list_value(const nlohmann::json &j, const char *key)
     {
         if (j.contains(key) && j[key].is_array())
@@ -379,6 +396,19 @@ struct ModelConfig
             {
                 attr.b_use_mmap_load_embed = j["use_mmap_load_embed"].get<bool>();
             }
+            json_bool_value(j, "bos", attr.b_bos);
+            json_bool_value(j, "eos", attr.b_eos);
+
+#ifndef USE_AXCL
+            if (j.contains("b_use_mmap_load_layer"))
+            {
+                attr.b_use_mmap_load_layer = j["b_use_mmap_load_layer"].get<bool>();
+            }
+            else if (j.contains("use_mmap_load_layer"))
+            {
+                attr.b_use_mmap_load_layer = j["use_mmap_load_layer"].get<bool>();
+            }
+#endif
 
             // Optional: embedding mode switch (serve mode only).
             // Prefer a simple bool; model family is specified via `tokenizer_type`.
@@ -1275,6 +1305,112 @@ static std::string format_audio_task_text(const std::string &text, const std::st
     return text;
 }
 
+static bool is_hymt_translation_model(const ModelConfig &config)
+{
+    return config.attr.tokenizer_type == "HunYuan" &&
+           lower_copy(config.model_name).find("hy-mt") != std::string::npos;
+}
+
+static std::string build_hymt_translation_prompt(const std::string &source_text,
+                                                 const std::string &target_language,
+                                                 bool use_zh_template)
+{
+    if (use_zh_template)
+    {
+        return "将以下文本翻译为" + target_language + "，注意只需要输出翻译后的结果，不要额外解释：\n" +
+               source_text;
+    }
+    return "Translate the following segment into " + target_language +
+           ", without additional explanation.\n\n" + source_text;
+}
+
+static bool contains_cjk_text(const std::string &text)
+{
+    for (size_t i = 0; i < text.size();)
+    {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        uint32_t cp = 0;
+        size_t len = 0;
+        if (c < 0x80)
+        {
+            cp = c;
+            len = 1;
+        }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < text.size())
+        {
+            cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(text[i + 1]) & 0x3F);
+            len = 2;
+        }
+        else if ((c & 0xF0) == 0xE0 && i + 2 < text.size())
+        {
+            cp = ((c & 0x0F) << 12) |
+                 ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(text[i + 2]) & 0x3F);
+            len = 3;
+        }
+        else if ((c & 0xF8) == 0xF0 && i + 3 < text.size())
+        {
+            cp = ((c & 0x07) << 18) |
+                 ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 12) |
+                 ((static_cast<unsigned char>(text[i + 2]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(text[i + 3]) & 0x3F);
+            len = 4;
+        }
+        else
+        {
+            ++i;
+            continue;
+        }
+
+        if ((cp >= 0x3400 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF))
+        {
+            return true;
+        }
+        i += len;
+    }
+    return false;
+}
+
+static bool is_chinese_target_language(const std::string &target_language)
+{
+    const std::string lang = lower_copy(target_language);
+    return lang == "chinese" || lang == "zh" || lang == "zh-cn" || lang == "zh-hans" ||
+           target_language.find("中文") != std::string::npos ||
+           target_language.find("汉语") != std::string::npos ||
+           target_language.find("漢語") != std::string::npos;
+}
+
+static bool normalize_hymt_translation_request(const openai_api::ChatRequest &req,
+                                               std::vector<Content> &history,
+                                               std::vector<MediaInputs> &media_inputs,
+                                               std::string &err)
+{
+    if (!media_inputs.empty() || req.has_image_inputs())
+    {
+        err = "HY-MT translation only supports text input.";
+        return false;
+    }
+
+    std::string source_text = trim_copy(req.flattened_text());
+    if (source_text.empty())
+    {
+        err = "HY-MT translation requires non-empty text input.";
+        return false;
+    }
+
+    const std::string target_language = req.raw.value("target_language", "English");
+    bool use_zh_template = contains_cjk_text(source_text) || is_chinese_target_language(target_language);
+    ModelConfig::json_bool_value(req.raw, "use_zh_template", use_zh_template);
+
+    history.clear();
+    history.push_back({
+        USER,
+        TEXT,
+        build_hymt_translation_prompt(source_text, target_language.empty() ? "English" : target_language, use_zh_template),
+    });
+    return true;
+}
+
 static bool run_audio_api_request(LLM &llm,
                                   const openai_api::ASRRequest &req,
                                   std::string &final_text,
@@ -1804,8 +1940,9 @@ int run_server_mode(const ModelConfig &config, int port)
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
 
             const bool single_image_ocr_mode = config.attr.vlm_type == VLMType::PaddleOCRVL;
-            g_server.registerChat(model_name, [&llm, single_image_ocr_mode](const openai_api::ChatRequest &req,
-                                                                            std::shared_ptr<openai_api::BaseDataProvider> provider)
+            const bool hymt_translation_mode = is_hymt_translation_model(config);
+            g_server.registerChat(model_name, [&llm, single_image_ocr_mode, hymt_translation_mode](const openai_api::ChatRequest &req,
+                                                                                                   std::shared_ptr<openai_api::BaseDataProvider> provider)
                                   {
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
@@ -1853,6 +1990,17 @@ int run_server_mode(const ModelConfig &config, int port)
                     return;
                 }
                 int output_max_tokens = req.max_tokens;
+                if (hymt_translation_mode) {
+                    std::string hymt_err;
+                    if (!normalize_hymt_translation_request(req, history, media_inputs, hymt_err)) {
+                        ALOGW("Reject HY-MT translation request: %s", hymt_err.c_str());
+                        cleanup_temp_files(temp_files);
+                        push_chat_error("invalid_request_error", hymt_err);
+                        return;
+                    }
+                    llm.ResetKVCache();
+                }
+
                 if (single_image_ocr_mode) {
                     std::string ocr_err;
                     if (!normalize_single_image_ocr_request(history, media_inputs, ocr_err)) {
