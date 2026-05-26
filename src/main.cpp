@@ -2158,9 +2158,10 @@ int run_server_mode(const ModelConfig &config, int port)
                         return;
                     }
 
+                    constexpr int kPaddleOcrMaxOutputTokens = 1152;
                     const int paddle_ocr_output_cap = config.server_max_output_tokens > 0
                                                           ? config.server_max_output_tokens
-                                                          : 1152;
+                                                          : kPaddleOcrMaxOutputTokens;
                     if (output_max_tokens <= 0 || output_max_tokens > paddle_ocr_output_cap)
                     {
                         ALOGI("Clamp PaddleOCR-VL max_tokens from %d to %d", output_max_tokens, paddle_ocr_output_cap);
