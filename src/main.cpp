@@ -140,6 +140,9 @@ struct ModelConfig
     LLMAttrType attr;
     int port = 8000;
     int server_timeout_ms = 300000; // 5 minutes
+    int server_default_max_tokens = 0;
+    int server_max_output_tokens = 0;
+    std::string server_forced_prompt_text;
     bool is_embedding = false;
     bool is_image_generation = false;
     std::string image_model_dir = ".";
@@ -287,6 +290,9 @@ struct ModelConfig
                 if (j.contains("model_name")) model_name = j["model_name"].get<std::string>();
                 if (j.contains("port")) port = j["port"].get<int>();
                 if (j.contains("server_timeout_ms")) server_timeout_ms = j["server_timeout_ms"].get<int>();
+                if (j.contains("server_default_max_tokens")) server_default_max_tokens = j["server_default_max_tokens"].get<int>();
+                if (j.contains("server_max_output_tokens")) server_max_output_tokens = j["server_max_output_tokens"].get<int>();
+                if (j.contains("server_forced_prompt_text")) server_forced_prompt_text = j["server_forced_prompt_text"].get<std::string>();
                 if (j.contains("image_model_dir")) image_model_dir = j["image_model_dir"].get<std::string>();
                 attr.post_config_path.clear();
                 return true;
@@ -521,6 +527,18 @@ struct ModelConfig
             if (j.contains("server_timeout_ms"))
             {
                 server_timeout_ms = j["server_timeout_ms"].get<int>();
+            }
+            if (j.contains("server_default_max_tokens"))
+            {
+                server_default_max_tokens = j["server_default_max_tokens"].get<int>();
+            }
+            if (j.contains("server_max_output_tokens"))
+            {
+                server_max_output_tokens = j["server_max_output_tokens"].get<int>();
+            }
+            if (j.contains("server_forced_prompt_text"))
+            {
+                server_forced_prompt_text = j["server_forced_prompt_text"].get<std::string>();
             }
 
             return true;
@@ -1311,6 +1329,43 @@ static bool is_hymt_translation_model(const ModelConfig &config)
            lower_copy(config.model_name).find("hy-mt") != std::string::npos;
 }
 
+static int effective_server_default_max_tokens(const ModelConfig &config)
+{
+    if (config.server_default_max_tokens > 0) return config.server_default_max_tokens;
+    return config.server_max_output_tokens;
+}
+
+static int resolve_chat_output_max_tokens(const ModelConfig &config,
+                                          const openai_api::ChatRequest &req,
+                                          int runtime_max_token_len)
+{
+    const bool has_request_max_tokens = req.raw.is_object() && req.raw.contains("max_tokens");
+    const int server_default_max_tokens = effective_server_default_max_tokens(config);
+
+    int output_max_tokens = req.max_tokens;
+    if (!has_request_max_tokens && server_default_max_tokens > 0)
+    {
+        output_max_tokens = server_default_max_tokens;
+    }
+
+    if (output_max_tokens <= 0)
+    {
+        const int fallback_tokens = server_default_max_tokens > 0
+                                        ? server_default_max_tokens
+                                        : std::max(1, runtime_max_token_len);
+        ALOGW("invalid request max_tokens=%d, fallback to %d", output_max_tokens, fallback_tokens);
+        output_max_tokens = fallback_tokens;
+    }
+
+    if (config.server_max_output_tokens > 0 && output_max_tokens > config.server_max_output_tokens)
+    {
+        ALOGI("Clamp max_tokens from %d to %d by config", output_max_tokens, config.server_max_output_tokens);
+        output_max_tokens = config.server_max_output_tokens;
+    }
+
+    return output_max_tokens;
+}
+
 static std::string build_hymt_translation_prompt(const std::string &source_text,
                                                  const std::string &target_language,
                                                  bool use_zh_template)
@@ -1688,7 +1743,8 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     return true;
 }
 
-static bool normalize_single_image_ocr_request(std::vector<Content> &history,
+static bool normalize_single_image_ocr_request(const ModelConfig &config,
+                                               std::vector<Content> &history,
                                                std::vector<MediaInputs> &media_inputs,
                                                std::string &err)
 {
@@ -1719,7 +1775,10 @@ static bool normalize_single_image_ocr_request(std::vector<Content> &history,
     std::vector<std::string> latest_uri;
     latest_uri.push_back(latest_image_media->uris.back());
 
-    Content ocr_turn{USER, IMAGE, "OCR:"};
+    const std::string prompt_text = config.server_forced_prompt_text.empty()
+                                        ? "OCR:"
+                                        : config.server_forced_prompt_text;
+    Content ocr_turn{USER, IMAGE, prompt_text};
 
     ALOGI("PaddleOCR-VL request normalized to latest single image: media_turns=%zu old_index=%zu uris_in_turn=%zu",
           media_inputs.size(),
@@ -2026,11 +2085,12 @@ int run_server_mode(const ModelConfig &config, int port)
             options.supports_vision = config.attr.vlm_type != VLMType::None;
             options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+            if (config.server_max_output_tokens > 0) options.extra_fields["server_max_output_tokens"] = config.server_max_output_tokens;
 
             const bool single_image_ocr_mode = config.attr.vlm_type == VLMType::PaddleOCRVL;
             const bool hymt_translation_mode = is_hymt_translation_model(config);
-            g_server.registerChat(model_name, [&llm, single_image_ocr_mode, hymt_translation_mode](const openai_api::ChatRequest &req,
-                                                                                                   std::shared_ptr<openai_api::BaseDataProvider> provider)
+            g_server.registerChat(model_name, [&llm, config, single_image_ocr_mode, hymt_translation_mode](const openai_api::ChatRequest &req,
+                                                                                                            std::shared_ptr<openai_api::BaseDataProvider> provider)
                                   {
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
@@ -2077,7 +2137,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
                 }
-                int output_max_tokens = req.max_tokens;
+                int output_max_tokens = resolve_chat_output_max_tokens(config, req, llm.getAttr()->max_token_len);
                 if (hymt_translation_mode) {
                     std::string hymt_err;
                     if (!normalize_hymt_translation_request(req, history, media_inputs, hymt_err)) {
@@ -2091,18 +2151,20 @@ int run_server_mode(const ModelConfig &config, int port)
 
                 if (single_image_ocr_mode) {
                     std::string ocr_err;
-                    if (!normalize_single_image_ocr_request(history, media_inputs, ocr_err)) {
+                    if (!normalize_single_image_ocr_request(config, history, media_inputs, ocr_err)) {
                         ALOGW("Reject PaddleOCR-VL request: %s", ocr_err.c_str());
                         cleanup_temp_files(temp_files);
                         push_chat_error("invalid_request_error", ocr_err);
                         return;
                     }
 
-                    constexpr int kPaddleOcrMaxOutputTokens = 1152;
-                    if (output_max_tokens <= 0 || output_max_tokens > kPaddleOcrMaxOutputTokens)
+                    const int paddle_ocr_output_cap = config.server_max_output_tokens > 0
+                                                          ? config.server_max_output_tokens
+                                                          : 1152;
+                    if (output_max_tokens <= 0 || output_max_tokens > paddle_ocr_output_cap)
                     {
-                        ALOGI("Clamp PaddleOCR-VL max_tokens from %d to %d", output_max_tokens, kPaddleOcrMaxOutputTokens);
-                        output_max_tokens = kPaddleOcrMaxOutputTokens;
+                        ALOGI("Clamp PaddleOCR-VL max_tokens from %d to %d", output_max_tokens, paddle_ocr_output_cap);
+                        output_max_tokens = paddle_ocr_output_cap;
                     }
 
                     llm.ResetKVCache();
