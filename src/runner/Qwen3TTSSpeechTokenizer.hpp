@@ -31,6 +31,15 @@ private:
     std::vector<std::unique_ptr<Runner>> layers_;
     Runner post_;
     Runner decode_post_;
+    int transformer_prefill_len_ = 0;
+    int transformer_kv_cache_len_ = 0;
+    int transformer_hidden_size_ = 0;
+    int transformer_kv_dim_ = 0;
+    int transformer_decode_mask_len_ = 0;
+    int decode_pre_code_len_ = 0;
+    int decode_post_len_ = 0;
+    int decode_post_hidden_size_ = 0;
+    size_t decode_post_output_samples_ = 0;
 };
 
 } // namespace qwen3_tts

@@ -35,6 +35,10 @@ private:
     std::vector<std::unique_ptr<LLaMaEmbedSelector>> embeddings_;
     std::vector<std::vector<unsigned short>> k_cache_;
     std::vector<std::vector<unsigned short>> v_cache_;
+    int prefill_len_ = 0;
+    int kv_cache_len_ = 0;
+    int kv_stride_ = 0;
+    int decode_mask_len_ = 0;
 };
 
 } // namespace qwen3_tts

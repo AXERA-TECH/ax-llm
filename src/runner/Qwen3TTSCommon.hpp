@@ -10,6 +10,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bfloat16.hpp"
@@ -62,6 +63,51 @@ inline std::string join_path(const std::string &a, const std::string &b)
     return (std::filesystem::path(a) / b).lexically_normal().string();
 }
 
+inline bool string_starts_with(const std::string &s, const std::string &prefix)
+{
+    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+inline bool string_ends_with(const std::string &s, const std::string &suffix)
+{
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+inline std::string find_numbered_model_path(const std::string &dir,
+                                            const std::string &prefix,
+                                            const std::string &suffix)
+{
+    std::vector<std::pair<int, std::string>> matches;
+    const std::filesystem::path root(dir);
+    if (!std::filesystem::is_directory(root)) return {};
+
+    for (const auto &entry : std::filesystem::directory_iterator(root))
+    {
+        if (!entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        if (!string_starts_with(name, prefix) || !string_ends_with(name, suffix)) continue;
+
+        const size_t number_begin = prefix.size();
+        const size_t number_end = name.size() - suffix.size();
+        if (number_end <= number_begin) continue;
+        const std::string number_text = name.substr(number_begin, number_end - number_begin);
+
+        try
+        {
+            matches.emplace_back(std::stoi(number_text), entry.path().string());
+        }
+        catch (...)
+        {
+        }
+    }
+
+    if (matches.empty()) return {};
+    std::sort(matches.begin(), matches.end(), [](const auto &a, const auto &b) {
+        return a.first > b.first;
+    });
+    return matches.front().second;
+}
+
 inline size_t shape_elems(const std::vector<unsigned int> &shape)
 {
     if (shape.empty()) return 0;
@@ -81,6 +127,20 @@ inline std::string shape_to_string(const std::vector<unsigned int> &shape)
     }
     s += "]";
     return s;
+}
+
+inline int tensor_dim(const ax_runner_tensor_t &t, size_t dim, const std::string &what)
+{
+    if (t.vShape.size() <= dim)
+        throw std::runtime_error(what + " tensor rank is too small: " + shape_to_string(t.vShape));
+    return (int)t.vShape[dim];
+}
+
+inline int tensor_elems_bf16(const ax_runner_tensor_t &t)
+{
+    const size_t shaped = shape_elems(t.vShape);
+    if (shaped != 0) return (int)shaped;
+    return (int)((size_t)t.nSize / sizeof(unsigned short));
 }
 
 inline std::vector<unsigned short> fp32_to_bf16_vec(const std::vector<float> &src)

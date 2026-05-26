@@ -15,10 +15,62 @@ bool SpeechTokenizerRunner::init(const std::string &dir)
     for (int i = 0; i < kSpeechDecoderLayers; ++i)
     {
         layers_.emplace_back(std::make_unique<Runner>());
-        if (!layers_.back()->init(join_path(dir, "decoder/qwen3_tts_tokenizer_12hz_p64_l" + std::to_string(i) + "_together.axmodel"))) return false;
+        const auto path = find_numbered_model_path(
+            join_path(dir, "decoder"),
+            "qwen3_tts_tokenizer_12hz_p",
+            "_l" + std::to_string(i) + "_together.axmodel");
+        if (path.empty())
+        {
+            ALOGE("speech tokenizer decoder layer axmodel not found: dir=%s layer=%d", join_path(dir, "decoder").c_str(), i);
+            return false;
+        }
+        if (!layers_.back()->init(path)) return false;
     }
     if (!post_.init(join_path(dir, "decoder/qwen3_tts_tokenizer_12hz_post.axmodel"))) return false;
-    if (!decode_post_.init(join_path(dir, "speech_tokenizer_decode_post_t64.axmodel"))) return false;
+    const auto decode_post_path = find_numbered_model_path(dir, "speech_tokenizer_decode_post_t", ".axmodel");
+    if (decode_post_path.empty())
+    {
+        ALOGE("speech tokenizer decode_post axmodel not found: dir=%s", dir.c_str());
+        return false;
+    }
+    if (!decode_post_.init(decode_post_path)) return false;
+    try
+    {
+        const auto &decode_pre_input = decode_pre_.get().get_input("codes");
+        decode_pre_code_len_ = tensor_dim(decode_pre_input, 2, "speech tokenizer decode_pre codes");
+
+        auto &first = layers_.front()->get();
+        const auto &prefill_input = input_tensor(first, 1, "input");
+        const auto &decode_k = input_tensor(first, 0, "K_cache");
+        const auto &decode_mask = input_tensor(first, 0, "mask");
+        const auto &decode_k_out = output_tensor(first, 0, "K_cache_out");
+
+        transformer_prefill_len_ = tensor_dim(prefill_input, 1, "speech tokenizer transformer prefill input");
+        transformer_hidden_size_ = tensor_dim(prefill_input, 2, "speech tokenizer transformer prefill input");
+        transformer_kv_cache_len_ = tensor_dim(decode_k, 1, "speech tokenizer transformer decode K_cache");
+        transformer_kv_dim_ = tensor_elems_bf16(decode_k_out);
+        transformer_decode_mask_len_ = tensor_elems_bf16(decode_mask);
+
+        const auto &decode_post_input = decode_post_.get().get_input("hidden");
+        decode_post_len_ = tensor_dim(decode_post_input, 1, "speech tokenizer decode_post hidden");
+        decode_post_hidden_size_ = tensor_dim(decode_post_input, 2, "speech tokenizer decode_post hidden");
+        decode_post_output_samples_ = shape_elems(decode_post_.get().get_output("wav").vShape);
+
+        if (decode_pre_code_len_ <= 0 || transformer_prefill_len_ <= 0 ||
+            transformer_hidden_size_ <= 0 || transformer_kv_cache_len_ <= 0 ||
+            transformer_kv_dim_ <= 0 || transformer_decode_mask_len_ <= 1 ||
+            decode_post_len_ <= 0 || decode_post_hidden_size_ <= 0)
+            throw std::runtime_error("invalid speech tokenizer inferred shape");
+        ALOGI("speech tokenizer inferred shapes: decode_pre_len=%d transformer_prefill=%d hidden=%d kv_cache=%d kv_dim=%d decode_mask=%d decode_post_len=%d decode_post_hidden=%d",
+              decode_pre_code_len_, transformer_prefill_len_, transformer_hidden_size_,
+              transformer_kv_cache_len_, transformer_kv_dim_, transformer_decode_mask_len_,
+              decode_post_len_, decode_post_hidden_size_);
+    }
+    catch (const std::exception &e)
+    {
+        ALOGE("failed to infer speech tokenizer shapes: %s", e.what());
+        return false;
+    }
     return true;
 }
 
@@ -74,7 +126,7 @@ std::vector<float> SpeechTokenizerRunner::decode(const std::vector<std::array<in
     }
     ALOGI("speech tokenizer decode valid code_len=%d", code_len);
     if (code_len <= 0) return {};
-    if (code_len > 127) throw std::runtime_error("speech tokenizer decoder code_len exceeds compiled kv cache");
+    if (code_len > transformer_kv_cache_len_) throw std::runtime_error("speech tokenizer decoder code_len exceeds compiled kv cache");
 
     ALOGI("speech tokenizer decode_pre begin");
     std::vector<float> hidden512 = decode_pre(codes, code_len);
@@ -94,10 +146,11 @@ std::vector<float> SpeechTokenizerRunner::decode(const std::vector<std::array<in
 std::vector<float> SpeechTokenizerRunner::decode_pre(const std::vector<std::array<int, kCodeGroups>> &codes, int code_len)
 {
     ALOGI("speech tokenizer decode_pre start: code_len=%d", code_len);
-    std::vector<int32_t> feed((size_t)kCodeGroups * 325, 0);
+    if (code_len > decode_pre_code_len_) throw std::runtime_error("speech tokenizer decode_pre code_len exceeds compiled input length");
+    std::vector<int32_t> feed((size_t)kCodeGroups * (size_t)decode_pre_code_len_, 0);
     for (int t = 0; t < code_len; ++t)
         for (int q = 0; q < kCodeGroups; ++q)
-            feed[(size_t)q * 325 + t] = (int32_t)codes[(size_t)t][(size_t)q];
+            feed[(size_t)q * (size_t)decode_pre_code_len_ + (size_t)t] = (int32_t)codes[(size_t)t][(size_t)q];
     auto &runner = decode_pre_.get();
     const auto &input = runner.get_input("codes");
     ALOGI("speech tokenizer decode_pre write input: tensor=%s shape=%s nSize=%d bytes=%zu",
@@ -111,8 +164,8 @@ std::vector<float> SpeechTokenizerRunner::decode_pre(const std::vector<std::arra
     const auto &output = runner.get_output("hidden_512");
     ALOGI("speech tokenizer decode_pre read output: tensor=%s shape=%s nSize=%d",
           output.sName.c_str(), shape_to_string(output.vShape).c_str(), output.nSize);
-    auto out = tensor_to_float(runner, output, (size_t)325 * 512);
-    out.resize((size_t)code_len * 512);
+    auto out = tensor_to_float(runner, output, (size_t)decode_pre_code_len_ * (size_t)transformer_hidden_size_);
+    out.resize((size_t)code_len * (size_t)transformer_hidden_size_);
     ALOGI("speech tokenizer decode_pre done: output_elems=%zu", out.size());
     return out;
 }
@@ -120,23 +173,31 @@ std::vector<float> SpeechTokenizerRunner::decode_pre(const std::vector<std::arra
 std::vector<unsigned short> SpeechTokenizerRunner::run_transformer(const std::vector<float> &hidden512, int code_len)
 {
     ALOGI("speech tokenizer transformer start: code_len=%d hidden512=%zu", code_len, hidden512.size());
-    const int prefill_len = 64;
+    const int prefill_len = transformer_prefill_len_;
     const int valid_prefill = std::min(code_len, prefill_len);
-    std::vector<unsigned short> data((size_t)prefill_len * 512, 0);
+    if (hidden512.size() < (size_t)code_len * (size_t)transformer_hidden_size_)
+        throw std::runtime_error("speech tokenizer transformer hidden input is too small");
+    std::vector<unsigned short> data((size_t)prefill_len * (size_t)transformer_hidden_size_, 0);
     auto hbf = fp32_to_bf16_vec(hidden512);
-    std::memcpy(data.data(), hbf.data(), (size_t)valid_prefill * 512 * sizeof(unsigned short));
+    std::memcpy(data.data(), hbf.data(), (size_t)valid_prefill * (size_t)transformer_hidden_size_ * sizeof(unsigned short));
 
-    std::vector<unsigned int> indices(64);
+    std::vector<unsigned int> indices((size_t)prefill_len);
     std::iota(indices.begin(), indices.end(), 0);
-    std::vector<unsigned short> mask((size_t)64 * 64, bfloat16(-65536.0f).data);
-    for (int r = 0; r < 64; ++r)
+    const auto &first_mask = input_tensor(layers_.front()->get(), 1, "mask");
+    const int prefill_mask_elems = tensor_elems_bf16(first_mask);
+    const int prefill_mask_cols = prefill_mask_elems / prefill_len;
+    const int prefill_history_len = std::max(0, prefill_mask_cols - prefill_len);
+    std::vector<unsigned short> mask((size_t)prefill_mask_elems, bfloat16(-65536.0f).data);
+    for (int r = 0; r < prefill_len; ++r)
     {
-        const int left = std::max(0, r - 72 + 1);
-        for (int c = left; c <= r; ++c) mask[(size_t)r * 64 + c] = 0;
+        const int abs_q = prefill_history_len + r;
+        const int left = std::max(0, abs_q - 72 + 1);
+        const int right = std::min(abs_q, prefill_mask_cols - 1);
+        for (int c = left; c <= right; ++c) mask[(size_t)r * (size_t)prefill_mask_cols + (size_t)c] = 0;
     }
 
-    std::vector<std::vector<unsigned short>> kc(kSpeechDecoderLayers, std::vector<unsigned short>((size_t)127 * 1024, 0));
-    std::vector<std::vector<unsigned short>> vc(kSpeechDecoderLayers, std::vector<unsigned short>((size_t)127 * 1024, 0));
+    std::vector<std::vector<unsigned short>> kc(kSpeechDecoderLayers, std::vector<unsigned short>((size_t)transformer_kv_cache_len_ * (size_t)transformer_kv_dim_, 0));
+    std::vector<std::vector<unsigned short>> vc(kSpeechDecoderLayers, std::vector<unsigned short>((size_t)transformer_kv_cache_len_ * (size_t)transformer_kv_dim_, 0));
     for (int layer = 0; layer < kSpeechDecoderLayers; ++layer)
     {
         auto &runner = layers_[(size_t)layer]->get();
@@ -152,22 +213,24 @@ std::vector<unsigned short> SpeechTokenizerRunner::run_transformer(const std::ve
         const int ret = runner.inference(1);
         ALOGI("speech tokenizer transformer prefill inference end: layer=%d gid=1 ret=%d", layer, ret);
         if (ret != 0) throw std::runtime_error("speech tokenizer transformer prefill failed");
-        read_tensor(runner, output_tensor(runner, 1, "K_cache_out"), kc[(size_t)layer].data(), (size_t)64 * 1024 * sizeof(unsigned short));
-        read_tensor(runner, output_tensor(runner, 1, "V_cache_out"), vc[(size_t)layer].data(), (size_t)64 * 1024 * sizeof(unsigned short));
+        const auto &out_k = output_tensor(runner, 1, "K_cache_out");
+        const auto &out_v = output_tensor(runner, 1, "V_cache_out");
+        read_tensor(runner, out_k, kc[(size_t)layer].data(), std::min((size_t)out_k.nSize, kc[(size_t)layer].size() * sizeof(unsigned short)));
+        read_tensor(runner, out_v, vc[(size_t)layer].data(), std::min((size_t)out_v.nSize, vc[(size_t)layer].size() * sizeof(unsigned short)));
         read_tensor(runner, output_tensor(runner, 1, "output"), data.data(), data.size() * sizeof(unsigned short));
         ALOGI("speech tokenizer transformer prefill layer=%d/%d end", layer, kSpeechDecoderLayers);
     }
 
     std::vector<unsigned short> all;
-    all.insert(all.end(), data.begin(), data.begin() + (ptrdiff_t)((size_t)valid_prefill * 512));
-    for (int pos = 64; pos < code_len; ++pos)
+    all.insert(all.end(), data.begin(), data.begin() + (ptrdiff_t)((size_t)valid_prefill * (size_t)transformer_hidden_size_));
+    for (int pos = prefill_len; pos < code_len; ++pos)
     {
-        std::vector<unsigned short> tok(512);
-        std::memcpy(tok.data(), hbf.data() + (size_t)pos * 512, (size_t)512 * sizeof(unsigned short));
+        std::vector<unsigned short> tok((size_t)transformer_hidden_size_);
+        std::memcpy(tok.data(), hbf.data() + (size_t)pos * (size_t)transformer_hidden_size_, (size_t)transformer_hidden_size_ * sizeof(unsigned short));
         std::vector<unsigned short> d = tok;
-        std::vector<unsigned short> dmask(128, bfloat16(-65536.0f).data);
+        std::vector<unsigned short> dmask((size_t)transformer_decode_mask_len_, bfloat16(-65536.0f).data);
         const int left = std::max(0, pos - 72 + 1);
-        for (int i = left; i < pos; ++i) dmask[(size_t)i] = 0;
+        for (int i = left; i < pos && i + 1 < transformer_decode_mask_len_; ++i) dmask[(size_t)i] = 0;
         dmask.back() = 0;
         const unsigned int idx = (unsigned int)pos;
         for (int layer = 0; layer < kSpeechDecoderLayers; ++layer)
@@ -183,8 +246,8 @@ std::vector<unsigned short> SpeechTokenizerRunner::run_transformer(const std::ve
             const int ret = runner.inference(0);
             ALOGI("speech tokenizer transformer decode inference end: pos=%d layer=%d gid=0 ret=%d", pos, layer, ret);
             if (ret != 0) throw std::runtime_error("speech tokenizer transformer decode failed");
-            read_tensor(runner, output_tensor(runner, 0, "K_cache_out"), kc[(size_t)layer].data() + (size_t)pos * 1024, (size_t)1024 * sizeof(unsigned short));
-            read_tensor(runner, output_tensor(runner, 0, "V_cache_out"), vc[(size_t)layer].data() + (size_t)pos * 1024, (size_t)1024 * sizeof(unsigned short));
+            read_tensor(runner, output_tensor(runner, 0, "K_cache_out"), kc[(size_t)layer].data() + (size_t)pos * (size_t)transformer_kv_dim_, (size_t)transformer_kv_dim_ * sizeof(unsigned short));
+            read_tensor(runner, output_tensor(runner, 0, "V_cache_out"), vc[(size_t)layer].data() + (size_t)pos * (size_t)transformer_kv_dim_, (size_t)transformer_kv_dim_ * sizeof(unsigned short));
             read_tensor(runner, output_tensor(runner, 0, "output"), d.data(), d.size() * sizeof(unsigned short));
             ALOGI("speech tokenizer transformer decode pos=%d layer=%d/%d end", pos, layer, kSpeechDecoderLayers);
         }
@@ -197,17 +260,17 @@ std::vector<unsigned short> SpeechTokenizerRunner::run_transformer(const std::ve
 std::vector<float> SpeechTokenizerRunner::run_post(const std::vector<unsigned short> &hidden512, int code_len)
 {
     ALOGI("speech tokenizer post start: code_len=%d hidden512=%zu", code_len, hidden512.size());
-    std::vector<float> hidden1024((size_t)code_len * 1024, 0.0f);
+    std::vector<float> hidden1024((size_t)code_len * (size_t)decode_post_hidden_size_, 0.0f);
     auto &runner = post_.get();
     for (int i = 0; i < code_len; ++i)
     {
         ALOGI("speech tokenizer post frame=%d/%d begin", i, code_len);
-        write_tensor(runner, runner.get_input("input"), hidden512.data() + (size_t)i * 512, (size_t)512 * sizeof(unsigned short));
+        write_tensor(runner, runner.get_input("input"), hidden512.data() + (size_t)i * (size_t)transformer_hidden_size_, (size_t)transformer_hidden_size_ * sizeof(unsigned short));
         const int ret = runner.inference();
         ALOGI("speech tokenizer post frame=%d/%d inference ret=%d", i, code_len, ret);
         if (ret != 0) throw std::runtime_error("speech tokenizer post inference failed");
-        auto out = tensor_to_float(runner, runner.get_output("output"), 1024);
-        std::memcpy(hidden1024.data() + (size_t)i * 1024, out.data(), (size_t)1024 * sizeof(float));
+        auto out = tensor_to_float(runner, runner.get_output("output"), (size_t)decode_post_hidden_size_);
+        std::memcpy(hidden1024.data() + (size_t)i * (size_t)decode_post_hidden_size_, out.data(), (size_t)decode_post_hidden_size_ * sizeof(float));
     }
     ALOGI("speech tokenizer post done: hidden1024=%zu", hidden1024.size());
     return hidden1024;
@@ -216,15 +279,15 @@ std::vector<float> SpeechTokenizerRunner::run_post(const std::vector<unsigned sh
 std::vector<float> SpeechTokenizerRunner::run_decode_post_chunk(const float *hidden, int valid_len)
 {
     ALOGI("speech tokenizer vocoder chunk start: valid_len=%d", valid_len);
-    std::vector<float> feed((size_t)64 * 1024, 0.0f);
-    std::memcpy(feed.data(), hidden, (size_t)valid_len * 1024 * sizeof(float));
+    std::vector<float> feed((size_t)decode_post_len_ * (size_t)decode_post_hidden_size_, 0.0f);
+    std::memcpy(feed.data(), hidden, (size_t)valid_len * (size_t)decode_post_hidden_size_ * sizeof(float));
     auto &runner = decode_post_.get();
     write_tensor(runner, runner.get_input("hidden"), feed.data(), feed.size() * sizeof(float));
     ALOGI("speech tokenizer vocoder inference begin: valid_len=%d", valid_len);
     const int ret = runner.inference();
     ALOGI("speech tokenizer vocoder inference end: valid_len=%d ret=%d", valid_len, ret);
     if (ret != 0) throw std::runtime_error("speech tokenizer vocoder inference failed");
-    auto wav = tensor_to_float(runner, runner.get_output("wav"), 122325);
+    auto wav = tensor_to_float(runner, runner.get_output("wav"), decode_post_output_samples_);
     ALOGI("speech tokenizer vocoder chunk done: wav_samples=%zu", wav.size());
     return wav;
 }
@@ -232,17 +295,16 @@ std::vector<float> SpeechTokenizerRunner::run_decode_post_chunk(const float *hid
 std::vector<float> SpeechTokenizerRunner::run_decode_post(const std::vector<float> &hidden1024, int code_len)
 {
     ALOGI("speech tokenizer decode_post start: code_len=%d hidden1024=%zu", code_len, hidden1024.size());
-    const int decode_post_len = 64;
     const int left_context = 25;
     std::vector<float> wav_all;
     int start = 0;
     while (start < code_len)
     {
         const int context = std::min(left_context, start);
-        const int capacity = decode_post_len - context;
+        const int capacity = decode_post_len_ - context;
         const int end = std::min(code_len, start + capacity);
         ALOGI("speech tokenizer decode_post chunk: start=%d end=%d context=%d", start, end, context);
-        auto wav = run_decode_post_chunk(hidden1024.data() + (size_t)(start - context) * 1024, end - start + context);
+        auto wav = run_decode_post_chunk(hidden1024.data() + (size_t)(start - context) * (size_t)decode_post_hidden_size_, end - start + context);
         const int skip = context * kSpeechDecodeUpsample;
         const int take = (end - start) * kSpeechDecodeUpsample;
         if ((int)wav.size() > skip)
