@@ -140,6 +140,9 @@ struct ModelConfig
     LLMAttrType attr;
     int port = 8000;
     int server_timeout_ms = 300000; // 5 minutes
+    int server_default_max_tokens = 0;
+    int server_max_output_tokens = 0;
+    std::string server_forced_prompt_text;
     bool is_embedding = false;
     bool is_image_generation = false;
     std::string image_model_dir = ".";
@@ -171,6 +174,23 @@ struct ModelConfig
         if (j.contains("text_config") && j["text_config"].contains(key) && j["text_config"][key].is_number_integer())
             return j["text_config"][key].get<int>();
         return std::nullopt;
+    }
+
+    static bool json_bool_value(const nlohmann::json &j, const char *key, bool &out)
+    {
+        if (!j.contains(key)) return false;
+        const auto &v = j[key];
+        if (v.is_boolean())
+        {
+            out = v.get<bool>();
+            return true;
+        }
+        if (v.is_number_integer())
+        {
+            out = v.get<int>() != 0;
+            return true;
+        }
+        return false;
     }
 
     static std::optional<std::vector<std::string>> json_string_list_value(const nlohmann::json &j, const char *key)
@@ -270,6 +290,9 @@ struct ModelConfig
                 if (j.contains("model_name")) model_name = j["model_name"].get<std::string>();
                 if (j.contains("port")) port = j["port"].get<int>();
                 if (j.contains("server_timeout_ms")) server_timeout_ms = j["server_timeout_ms"].get<int>();
+                if (j.contains("server_default_max_tokens")) server_default_max_tokens = j["server_default_max_tokens"].get<int>();
+                if (j.contains("server_max_output_tokens")) server_max_output_tokens = j["server_max_output_tokens"].get<int>();
+                if (j.contains("server_forced_prompt_text")) server_forced_prompt_text = j["server_forced_prompt_text"].get<std::string>();
                 if (j.contains("image_model_dir")) image_model_dir = j["image_model_dir"].get<std::string>();
                 attr.post_config_path.clear();
                 return true;
@@ -379,6 +402,19 @@ struct ModelConfig
             {
                 attr.b_use_mmap_load_embed = j["use_mmap_load_embed"].get<bool>();
             }
+            json_bool_value(j, "bos", attr.b_bos);
+            json_bool_value(j, "eos", attr.b_eos);
+
+#ifndef USE_AXCL
+            if (j.contains("b_use_mmap_load_layer"))
+            {
+                attr.b_use_mmap_load_layer = j["b_use_mmap_load_layer"].get<bool>();
+            }
+            else if (j.contains("use_mmap_load_layer"))
+            {
+                attr.b_use_mmap_load_layer = j["use_mmap_load_layer"].get<bool>();
+            }
+#endif
 
             // Optional: embedding mode switch (serve mode only).
             // Prefer a simple bool; model family is specified via `tokenizer_type`.
@@ -491,6 +527,18 @@ struct ModelConfig
             if (j.contains("server_timeout_ms"))
             {
                 server_timeout_ms = j["server_timeout_ms"].get<int>();
+            }
+            if (j.contains("server_default_max_tokens"))
+            {
+                server_default_max_tokens = j["server_default_max_tokens"].get<int>();
+            }
+            if (j.contains("server_max_output_tokens"))
+            {
+                server_max_output_tokens = j["server_max_output_tokens"].get<int>();
+            }
+            if (j.contains("server_forced_prompt_text"))
+            {
+                server_forced_prompt_text = j["server_forced_prompt_text"].get<std::string>();
             }
 
             return true;
@@ -1275,6 +1323,237 @@ static std::string format_audio_task_text(const std::string &text, const std::st
     return text;
 }
 
+static bool is_hymt_translation_model(const ModelConfig &config)
+{
+    return config.attr.tokenizer_type == "HunYuan" &&
+           lower_copy(config.model_name).find("hy-mt") != std::string::npos;
+}
+
+static int effective_server_default_max_tokens(const ModelConfig &config)
+{
+    if (config.server_default_max_tokens > 0) return config.server_default_max_tokens;
+    return config.server_max_output_tokens;
+}
+
+static int resolve_chat_output_max_tokens(const ModelConfig &config,
+                                          const openai_api::ChatRequest &req,
+                                          int runtime_max_token_len)
+{
+    const bool has_request_max_tokens = req.raw.is_object() && req.raw.contains("max_tokens");
+    const int server_default_max_tokens = effective_server_default_max_tokens(config);
+
+    int output_max_tokens = req.max_tokens;
+    if (!has_request_max_tokens && server_default_max_tokens > 0)
+    {
+        output_max_tokens = server_default_max_tokens;
+    }
+
+    if (output_max_tokens <= 0)
+    {
+        const int fallback_tokens = server_default_max_tokens > 0
+                                        ? server_default_max_tokens
+                                        : std::max(1, runtime_max_token_len);
+        ALOGW("invalid request max_tokens=%d, fallback to %d", output_max_tokens, fallback_tokens);
+        output_max_tokens = fallback_tokens;
+    }
+
+    if (config.server_max_output_tokens > 0 && output_max_tokens > config.server_max_output_tokens)
+    {
+        ALOGI("Clamp max_tokens from %d to %d by config", output_max_tokens, config.server_max_output_tokens);
+        output_max_tokens = config.server_max_output_tokens;
+    }
+
+    return output_max_tokens;
+}
+
+static std::string build_hymt_translation_prompt(const std::string &source_text,
+                                                 const std::string &target_language,
+                                                 bool use_zh_template)
+{
+    if (use_zh_template)
+    {
+        return "将以下文本翻译为" + target_language + "，注意只需要输出翻译后的结果，不要额外解释：\n" +
+               source_text;
+    }
+    return "Translate the following segment into " + target_language +
+           ", without additional explanation.\n\n" + source_text;
+}
+
+static bool contains_cjk_text(const std::string &text)
+{
+    for (size_t i = 0; i < text.size();)
+    {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        uint32_t cp = 0;
+        size_t len = 0;
+        if (c < 0x80)
+        {
+            cp = c;
+            len = 1;
+        }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < text.size())
+        {
+            cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(text[i + 1]) & 0x3F);
+            len = 2;
+        }
+        else if ((c & 0xF0) == 0xE0 && i + 2 < text.size())
+        {
+            cp = ((c & 0x0F) << 12) |
+                 ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(text[i + 2]) & 0x3F);
+            len = 3;
+        }
+        else if ((c & 0xF8) == 0xF0 && i + 3 < text.size())
+        {
+            cp = ((c & 0x07) << 18) |
+                 ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 12) |
+                 ((static_cast<unsigned char>(text[i + 2]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(text[i + 3]) & 0x3F);
+            len = 4;
+        }
+        else
+        {
+            ++i;
+            continue;
+        }
+
+        if ((cp >= 0x3400 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF))
+        {
+            return true;
+        }
+        i += len;
+    }
+    return false;
+}
+
+static bool is_chinese_target_language(const std::string &target_language)
+{
+    const std::string lang = lower_copy(target_language);
+    return lang == "chinese" || lang == "zh" || lang == "zh-cn" || lang == "zh-hans" ||
+           target_language.find("中文") != std::string::npos ||
+           target_language.find("汉语") != std::string::npos ||
+           target_language.find("漢語") != std::string::npos;
+}
+
+static std::string latest_user_text(const openai_api::ChatRequest &req)
+{
+    for (auto it = req.parsed_messages.rbegin(); it != req.parsed_messages.rend(); ++it)
+    {
+        if (!it->role.empty() && it->role != "user") continue;
+
+        std::string text;
+        for (const auto &part : it->content_parts)
+        {
+            if (part.is_text() && !part.text.empty())
+            {
+                if (!text.empty()) text += "\n";
+                text += part.text;
+            }
+        }
+        text = trim_copy(text);
+        if (!text.empty()) return text;
+    }
+    return trim_copy(req.flattened_text());
+}
+
+static bool raw_string_value(const nlohmann::json &j, const char *key, std::string &out)
+{
+    if (!j.contains(key) || !j[key].is_string()) return false;
+    out = j[key].get<std::string>();
+    return true;
+}
+
+static bool get_hymt_target_language(const openai_api::ChatRequest &req,
+                                     std::string &target_language)
+{
+    if (raw_string_value(req.raw, "target_language", target_language) && !trim_copy(target_language).empty())
+    {
+        target_language = trim_copy(target_language);
+        return true;
+    }
+    return false;
+}
+
+static std::string strip_hymt_translation_instruction(const std::string &source_text)
+{
+    std::string text = trim_copy(source_text);
+    const std::string lower_text = lower_copy(text);
+    const bool has_translation_instruction =
+        text.find("翻译") != std::string::npos || lower_text.find("translate") != std::string::npos;
+    if (!has_translation_instruction) return text;
+
+    size_t split = text.find("\n\n");
+    if (split != std::string::npos)
+    {
+        const std::string head = text.substr(0, split);
+        const std::string lower_head = lower_copy(head);
+        if (head.find("翻译") != std::string::npos || lower_head.find("translate") != std::string::npos)
+        {
+            return trim_copy(text.substr(split + 2));
+        }
+    }
+
+    split = text.find("：");
+    if (split == std::string::npos) split = text.find(":");
+    if (split != std::string::npos && split < 256)
+    {
+        const std::string head = text.substr(0, split);
+        const std::string lower_head = lower_copy(head);
+        if (head.find("翻译") != std::string::npos || lower_head.find("translate") != std::string::npos)
+        {
+            return trim_copy(text.substr(split + 1));
+        }
+    }
+    return text;
+}
+
+static bool normalize_hymt_translation_request(const openai_api::ChatRequest &req,
+                                               std::vector<Content> &history,
+                                               std::vector<MediaInputs> &media_inputs,
+                                               std::string &err)
+{
+    if (!media_inputs.empty() || req.has_image_inputs())
+    {
+        ALOGW("HY-MT translation ignores %zu media turn(s); only the latest user text is used.",
+              media_inputs.size());
+        media_inputs.clear();
+    }
+
+    std::string source_text = latest_user_text(req);
+    if (source_text.empty())
+    {
+        err = "HY-MT translation requires non-empty text input.";
+        return false;
+    }
+
+    std::string target_language;
+    const bool has_explicit_target_language = get_hymt_target_language(req, target_language);
+    if (has_explicit_target_language)
+    {
+        source_text = strip_hymt_translation_instruction(source_text);
+        if (source_text.empty())
+        {
+            err = "HY-MT translation requires source text after the translation instruction.";
+            return false;
+        }
+
+        bool use_zh_template = contains_cjk_text(source_text) || is_chinese_target_language(target_language);
+        ModelConfig::json_bool_value(req.raw, "use_zh_template", use_zh_template);
+
+        history.clear();
+        history.push_back({
+            USER,
+            TEXT,
+            build_hymt_translation_prompt(source_text, target_language, use_zh_template),
+        });
+        return true;
+    }
+
+    history.clear();
+    history.push_back({USER, TEXT, source_text});
+    return true;
+}
+
 static bool run_audio_api_request(LLM &llm,
                                   const openai_api::ASRRequest &req,
                                   std::string &final_text,
@@ -1464,7 +1743,8 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     return true;
 }
 
-static bool normalize_single_image_ocr_request(std::vector<Content> &history,
+static bool normalize_single_image_ocr_request(const ModelConfig &config,
+                                               std::vector<Content> &history,
                                                std::vector<MediaInputs> &media_inputs,
                                                std::string &err)
 {
@@ -1495,7 +1775,10 @@ static bool normalize_single_image_ocr_request(std::vector<Content> &history,
     std::vector<std::string> latest_uri;
     latest_uri.push_back(latest_image_media->uris.back());
 
-    Content ocr_turn{USER, IMAGE, "OCR:"};
+    const std::string prompt_text = config.server_forced_prompt_text.empty()
+                                        ? "OCR:"
+                                        : config.server_forced_prompt_text;
+    Content ocr_turn{USER, IMAGE, prompt_text};
 
     ALOGI("PaddleOCR-VL request normalized to latest single image: media_turns=%zu old_index=%zu uris_in_turn=%zu",
           media_inputs.size(),
@@ -1802,10 +2085,12 @@ int run_server_mode(const ModelConfig &config, int port)
             options.supports_vision = config.attr.vlm_type != VLMType::None;
             options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+            if (config.server_max_output_tokens > 0) options.extra_fields["server_max_output_tokens"] = config.server_max_output_tokens;
 
             const bool single_image_ocr_mode = config.attr.vlm_type == VLMType::PaddleOCRVL;
-            g_server.registerChat(model_name, [&llm, single_image_ocr_mode](const openai_api::ChatRequest &req,
-                                                                            std::shared_ptr<openai_api::BaseDataProvider> provider)
+            const bool hymt_translation_mode = is_hymt_translation_model(config);
+            g_server.registerChat(model_name, [&llm, config, single_image_ocr_mode, hymt_translation_mode](const openai_api::ChatRequest &req,
+                                                                                                            std::shared_ptr<openai_api::BaseDataProvider> provider)
                                   {
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
@@ -1852,10 +2137,21 @@ int run_server_mode(const ModelConfig &config, int port)
                     push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
                 }
-                int output_max_tokens = req.max_tokens;
+                int output_max_tokens = resolve_chat_output_max_tokens(config, req, llm.getAttr()->max_token_len);
+                if (hymt_translation_mode) {
+                    std::string hymt_err;
+                    if (!normalize_hymt_translation_request(req, history, media_inputs, hymt_err)) {
+                        ALOGW("Reject HY-MT translation request: %s", hymt_err.c_str());
+                        cleanup_temp_files(temp_files);
+                        push_chat_error("invalid_request_error", hymt_err);
+                        return;
+                    }
+                    llm.ResetKVCache();
+                }
+
                 if (single_image_ocr_mode) {
                     std::string ocr_err;
-                    if (!normalize_single_image_ocr_request(history, media_inputs, ocr_err)) {
+                    if (!normalize_single_image_ocr_request(config, history, media_inputs, ocr_err)) {
                         ALOGW("Reject PaddleOCR-VL request: %s", ocr_err.c_str());
                         cleanup_temp_files(temp_files);
                         push_chat_error("invalid_request_error", ocr_err);
@@ -1863,10 +2159,13 @@ int run_server_mode(const ModelConfig &config, int port)
                     }
 
                     constexpr int kPaddleOcrMaxOutputTokens = 1152;
-                    if (output_max_tokens <= 0 || output_max_tokens > kPaddleOcrMaxOutputTokens)
+                    const int paddle_ocr_output_cap = config.server_max_output_tokens > 0
+                                                          ? config.server_max_output_tokens
+                                                          : kPaddleOcrMaxOutputTokens;
+                    if (output_max_tokens <= 0 || output_max_tokens > paddle_ocr_output_cap)
                     {
-                        ALOGI("Clamp PaddleOCR-VL max_tokens from %d to %d", output_max_tokens, kPaddleOcrMaxOutputTokens);
-                        output_max_tokens = kPaddleOcrMaxOutputTokens;
+                        ALOGI("Clamp PaddleOCR-VL max_tokens from %d to %d", output_max_tokens, paddle_ocr_output_cap);
+                        output_max_tokens = paddle_ocr_output_cap;
                     }
 
                     llm.ResetKVCache();
