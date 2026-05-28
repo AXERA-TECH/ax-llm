@@ -158,6 +158,7 @@ set(COMMON_SOURCES
     src/runner/utils/image_processor.cpp
     src/runner/utils/mrope.cpp
     src/runner/vision/vision_module.cpp
+    src/runner/robot/SmolVLARunner.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -172,8 +173,13 @@ if(BUILD_AX650)
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_ax650.cpp
     )
+    add_executable(smolvla_infer tools/smolvla_infer.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+    )
     target_include_directories(axllm PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(llm_smoke PRIVATE ${BSP_MSP_DIR}/include)
+    target_include_directories(smolvla_infer PRIVATE ${BSP_MSP_DIR}/include)
     # link_directories 是全局的，用 target 属性更干净；CMake < 3.13 没有
     # target_link_directories，改用 set_target_properties 设置 LINK_FLAGS 或
     # 直接传绝对路径库目录给 target_link_libraries 的 -L 形式：
@@ -189,12 +195,20 @@ if(BUILD_AX650)
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
+    target_link_libraries(smolvla_infer
+        -L${BSP_MSP_DIR}/lib
+        ax_engine ax_interpreter ax_sys
+        pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
     if(OpenMP_CXX_FOUND)
         target_link_libraries(axllm OpenMP::OpenMP_CXX)
         target_link_libraries(llm_smoke OpenMP::OpenMP_CXX)
+        target_link_libraries(smolvla_infer OpenMP::OpenMP_CXX)
     endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
+    install(TARGETS smolvla_infer DESTINATION bin)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -247,18 +261,31 @@ if(BUILD_AXCL)
         src/runner/ax_model_runner/ax_model_runner_axcl.cpp
         src/runner/utils/axcl_manager.cpp
     )
+    add_executable(smolvla_infer tools/smolvla_infer.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_axcl.cpp
+        src/runner/utils/axcl_manager.cpp
+    )
     target_include_directories(llm_smoke PRIVATE ${AXCL_INCLUDE_DIRS})
+    target_include_directories(smolvla_infer PRIVATE ${AXCL_INCLUDE_DIRS})
     target_compile_definitions(llm_smoke PRIVATE USE_AXCL)
+    target_compile_definitions(smolvla_infer PRIVATE USE_AXCL)
     target_link_libraries(llm_smoke
+        ${AXCL_LINK_LIBS}
+        ${AXLLM_VISION_LIBS}
+    )
+    target_link_libraries(smolvla_infer
         ${AXCL_LINK_LIBS}
         ${AXLLM_VISION_LIBS}
     )
     if(NOT WIN32)
         set_target_properties(axllm PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
         set_target_properties(llm_smoke PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
+        set_target_properties(smolvla_infer PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
     endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
+    install(TARGETS smolvla_infer DESTINATION bin)
 endif()
 
 # ---------------------------------------------------------------------------
