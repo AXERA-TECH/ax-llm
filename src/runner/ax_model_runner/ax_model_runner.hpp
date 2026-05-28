@@ -97,6 +97,8 @@ public:
     int get_num_outputs() { return (int)moutput_tensors.size(); }
     int get_num_input_groups() { return (int)mgroup_input_tensors.size(); }
     int get_num_output_groups() { return (int)mgroup_output_tensors.size(); }
+    int get_num_inputs(int grpid) { return (int)mgroup_input_tensors[grpid].size(); }
+    int get_num_outputs(int grpid) { return (int)mgroup_output_tensors[grpid].size(); }
 
     // ---- 无 group 的 tensor 访问 ----
     const ax_runner_tensor_t &get_input(int idx) { return minput_tensors[idx]; }

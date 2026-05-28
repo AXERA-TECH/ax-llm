@@ -517,6 +517,47 @@ int Gemma4ImageProcessor(axcv::Mat& src,
     return 0;
 }
 
+int MiniCPMV46ImageProcessor(axcv::Mat& src,
+                             std::vector<unsigned char>& output,
+                             int tgt_h,
+                             int tgt_w,
+                             int patch_size) {
+    std::vector<unsigned char> rgb;
+    if (!pillow_resize_bgr_to_rgb_u8(src, rgb, tgt_w, tgt_h)) {
+        return -1;
+    }
+
+    if (patch_size <= 0 || tgt_h % patch_size != 0 || tgt_w % patch_size != 0) {
+        return -1;
+    }
+
+    const int channels = 3;
+    const int grid_h = tgt_h / patch_size;
+    const int grid_w = tgt_w / patch_size;
+
+    // Match transformers MiniCPMV4_6ImageProcessor.reshape_by_patch:
+    // unfold [C,H,W] -> [C, patch_h, num_patches, patch_w] -> [C, patch_h, -1].
+    output.resize((size_t)channels * (size_t)patch_size * (size_t)grid_h *
+                  (size_t)grid_w * (size_t)patch_size);
+
+    size_t idx = 0;
+    for (int c = 0; c < channels; ++c) {
+        for (int ph = 0; ph < patch_size; ++ph) {
+            for (int gh = 0; gh < grid_h; ++gh) {
+                for (int gw = 0; gw < grid_w; ++gw) {
+                    for (int pw = 0; pw < patch_size; ++pw) {
+                        const int y = gh * patch_size + ph;
+                        const int x = gw * patch_size + pw;
+                        output[idx++] = rgb[((size_t)y * (size_t)tgt_w + (size_t)x) * 3 + c];
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 static std::vector<axcv::Mat> splitImageSafe(axcv::Mat src, int rows, int cols, int tile_w, int tile_h) {
     std::vector<axcv::Mat> subImages;
 

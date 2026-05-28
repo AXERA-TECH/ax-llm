@@ -1364,6 +1364,17 @@ bool VisionModule::Init(VLMType type,
                 tokens_per_block_ = tpb;
                 picked = true;
             }
+        } else if (type_ == VLMType::MiniCPMV46VL) {
+            int out_is_bf16 = -1, tpb = 0;
+            if (try_pick_by_bytes(4, out_is_bf16, tpb)) {
+                impl_->encoder_output_is_bf16 = out_is_bf16;
+                tokens_per_block_ = tpb;
+                picked = true;
+            } else if (try_pick_by_bytes(2, out_is_bf16, tpb)) {
+                impl_->encoder_output_is_bf16 = out_is_bf16;
+                tokens_per_block_ = tpb;
+                picked = true;
+            }
         }
 
         if (!picked) {
@@ -1486,6 +1497,14 @@ bool VisionModule::Init(VLMType type,
         if (!get_single_token_id(tokenizer_, "<|audio|>", audio_pad_id_, err)) return false;
         vision_start_id_ = -1;
         ALOGI("Gemma4-VL token ids: image_pad=%d video_pad=%d audio_pad=%d", image_pad_id_, video_pad_id_, audio_pad_id_);
+        break;
+    case VLMType::MiniCPMV46VL:
+        if (!get_single_token_id(tokenizer_, "<|image_pad|>", image_pad_id_, err)) return false;
+        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) {
+            video_pad_id_ = image_pad_id_;
+        }
+        vision_start_id_ = -1;
+        ALOGI("MiniCPM-V-4.6 token ids: image_pad=%d video_pad=%d", image_pad_id_, video_pad_id_);
         break;
     default:
         break;
@@ -2045,6 +2064,26 @@ bool VisionModule::EncodeForContent(const Content& content,
                 std::vector<unsigned short> emb;
                 if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
                                                   pv, emb, 0.0f, 1.0f,
+                                                  0, nullptr, err))
+                    return false;
+                blocks_for_one.push_back(std::move(emb));
+            }
+            else if (type_ == VLMType::MiniCPMV46VL) {
+                std::vector<unsigned char> pv;
+                if (MiniCPMV46ImageProcessor(img, pv, vision_height_, vision_width_, patch_size_) != 0) {
+                    err = "MiniCPM-V-4.6 image preprocessing failed";
+                    return false;
+                }
+                {
+                    unsigned char mn = 255, mx = 0;
+                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
+                    ALOGI("MiniCPM-V-4.6 pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
+                          pv.size(), (unsigned)mn, (unsigned)mx,
+                          vision_width_, vision_height_, patch_size_);
+                }
+                std::vector<unsigned short> emb;
+                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                                  pv, emb, 0.5f, 0.5f,
                                                   0, nullptr, err))
                     return false;
                 blocks_for_one.push_back(std::move(emb));
