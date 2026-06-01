@@ -3680,8 +3680,10 @@ struct LLM::Impl {
                                                 no_new_media_input &&
                                                 history.size() > append_start &&
                                                 appended_history_is_text_only_user_turn(history, append_start);
-        const bool raw_history_not_append = !last_history_snapshot.empty() && !is_history_prefix(last_history_snapshot, history);
-        if (raw_history_not_append)
+        const bool raw_history_appended = !last_history_snapshot.empty() && is_history_prefix(last_history_snapshot, history);
+        const bool raw_history_rollback = !last_history_snapshot.empty() && is_history_prefix(history, last_history_snapshot);
+        const bool raw_history_modified = !last_history_snapshot.empty() && !raw_history_appended && !raw_history_rollback;
+        if (raw_history_modified)
         {
             if (cached_text_turn_requested)
             {
@@ -3689,13 +3691,17 @@ struct LLM::Impl {
                 ALOGE("text-only VLM turn cannot reuse KV because history is not append; refuse full recompute");
                 return history;
             }
-            ALOGW("raw history not append. force ResetKVCache before request processing.");
+            ALOGW("raw history modified (not append / not rollback). force ResetKVCache before request processing.");
             ResetKVCache();
         }
+        else if (raw_history_rollback)
+        {
+            ALOGI("raw history rollback detected: prev_contents=%zu new_contents=%zu, try KV reuse",
+                  last_history_snapshot.size(),
+                  history.size());
+        }
 
-        const bool history_appended = !last_history_snapshot.empty() &&
-                                      is_history_prefix(last_history_snapshot, history) &&
-                                      history.size() > append_start;
+        const bool history_appended = raw_history_appended && history.size() > append_start;
 
         if (cached_text_turn_requested)
         {
@@ -3794,7 +3800,9 @@ struct LLM::Impl {
 
         int offset = 0;
         auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
-        bool not_append = !(offset == (int)last_tokens_ids.size() && (int)new_tokens.size() >= (int)last_tokens_ids.size());
+        const bool token_appended = (offset == (int)last_tokens_ids.size() && (int)new_tokens.size() >= (int)last_tokens_ids.size());
+        const bool token_rollback = (offset == (int)new_tokens.size() && (int)new_tokens.size() <= (int)last_tokens_ids.size());
+        bool not_append = !(token_appended || token_rollback);
         if (not_append)
         {
             if (used_cached_text_turn)
@@ -3810,6 +3818,30 @@ struct LLM::Impl {
             ResetKVCache();
             tokens_diff = new_tokens;
             offset = 0;
+        }
+        else if (token_rollback)
+        {
+            const int new_len = (int)new_tokens.size();
+            const int prev_tokens = (int)last_tokens_ids.size();
+            const int prev_kv = precompute_len;
+
+            if (prev_tokens != new_len)
+            {
+                last_tokens_ids.resize((size_t)new_len);
+            }
+            if (precompute_len > new_len)
+            {
+                precompute_len = new_len;
+            }
+            if (cached_mrope_next_pos >= new_len)
+            {
+                cached_mrope_next_pos = -1;
+            }
+
+            ALOGI("token rollback: reuse KV prefix tokens=%d (prev_tokens=%d prev_kv=%d)",
+                  new_len,
+                  prev_tokens,
+                  prev_kv);
         }
         if (tokens_diff.empty())
         {
