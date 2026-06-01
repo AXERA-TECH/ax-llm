@@ -21,6 +21,10 @@ public:
 
     void deinit() override;
 
+    bool has_handle_loaded() const;
+    int load_handle_reuse_io(const char *model_file, int devid = -1);
+    void unload_handle_keep_io();
+
     int inference() override;
     int inference(int grpid) override;
 };

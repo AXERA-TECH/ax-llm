@@ -198,6 +198,28 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 
 - `vlm_type`
 - `filename_image_encoder_axmodel`
+
+### 动态加载（降低 CMM 占用）
+
+在 **CMM 较小** 的设备上，可开启“动态加载”以降低模型常驻 CMM 的占用：运行时仅保持少量 layer 的句柄/权重常驻，其他 layer 按需加载并在池满时释放。
+
+在模型目录 `config.json` 中配置：
+
+```json
+{
+  "dynamic_load_enable": true,
+  "dynamic_load_pool_size": 2
+}
+```
+
+- `dynamic_load_enable`：是否开启动态加载（默认 `false`）。
+- `dynamic_load_pool_size`：动态加载池大小（默认 `2`，仅在 enable 时生效）。
+
+注意：
+
+- 动态加载的目标是 **省 CMM**，通常会显著降低 token/s（尤其在 `pool_size` 远小于 layer 数量时）。
+- 当 `pool_size` 接近模型 layer 数量时，可恢复接近常规模式的性能，但此时 CMM 节省效果会变弱。
+- 当前 AXCL 后端开启动态加载时仅支持 **单卡**（多卡场景会拒绝开启）。
 - `vision_patch_size`
 
 可选字段（建议保留，未配置时会自动从视觉编码模型输入形状推断）：

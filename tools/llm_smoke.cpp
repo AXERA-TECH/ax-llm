@@ -23,7 +23,7 @@ static std::string resolve_path(const std::string &base, const std::string &p) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: llm_smoke <model_dir> [max_tokens] [--image <path>] [--video <frames_dir>] [--audio <path>] [--prompt <text>] [--repeat <N>] [--quiet]\n";
+        std::cerr << "Usage: llm_smoke <model_dir> [max_tokens] [--image <path>] [--video <frames_dir>] [--audio <path>] [--prompt <text>] [--repeat <N>] [--quiet] [--dynamic-load|--no-dynamic-load] [--dynamic-pool <N>] [--devices <csv>]\n";
         return 1;
     }
     std::string model_dir = argv[1];
@@ -34,6 +34,9 @@ int main(int argc, char** argv) {
     std::string prompt = "Describe the image.";
     int repeat = 1;
     bool quiet = false;
+    std::optional<bool> dynamic_load_override;
+    std::optional<int> dynamic_pool_override;
+    std::optional<std::vector<int>> devices_override;
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--image" && i + 1 < argc) image_path = argv[++i];
@@ -42,6 +45,28 @@ int main(int argc, char** argv) {
         else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
         else if (a == "--repeat" && i + 1 < argc) repeat = std::max(1, std::atoi(argv[++i]));
         else if (a == "--quiet") quiet = true;
+        else if (a == "--dynamic-load") dynamic_load_override = true;
+        else if (a == "--no-dynamic-load") dynamic_load_override = false;
+        else if (a == "--dynamic-pool" && i + 1 < argc) dynamic_pool_override = std::atoi(argv[++i]);
+        else if (a == "--devices" && i + 1 < argc)
+        {
+            std::string s = argv[++i];
+            std::vector<int> devs;
+            std::string cur;
+            for (char c : s)
+            {
+                if (c == ',' || c == ';' || c == ' ')
+                {
+                    if (!cur.empty()) { devs.push_back(std::atoi(cur.c_str())); cur.clear(); }
+                }
+                else
+                {
+                    cur.push_back(c);
+                }
+            }
+            if (!cur.empty()) devs.push_back(std::atoi(cur.c_str()));
+            if (!devs.empty()) devices_override = std::move(devs);
+        }
     }
     if (repeat > 1)
     {
@@ -67,6 +92,11 @@ int main(int argc, char** argv) {
     attr.filename_tokens_embed     = resolve_path(model_dir, j["filename_tokens_embed"].get<std::string>());
     attr.post_config_path          = resolve_path(model_dir, j["post_config_path"].get<std::string>());
     attr.axmodel_num               = j["axmodel_num"].get<int>();
+    if (j.contains("dynamic_load_enable")) attr.dynamic_load_enable = j["dynamic_load_enable"].get<bool>();
+    if (j.contains("dynamic_load_pool_size")) attr.dynamic_load_pool_size = j["dynamic_load_pool_size"].get<int>();
+    if (dynamic_load_override.has_value()) attr.dynamic_load_enable = *dynamic_load_override;
+    if (dynamic_pool_override.has_value()) attr.dynamic_load_pool_size = *dynamic_pool_override;
+    if (attr.dynamic_load_enable && attr.dynamic_load_pool_size <= 0) attr.dynamic_load_pool_size = 2;
     attr.full_attention_interval   = 0;
     if (j.contains("full_attention_interval")) {
         attr.full_attention_interval = j["full_attention_interval"].get<int>();
@@ -88,6 +118,13 @@ int main(int argc, char** argv) {
         attr.filename_per_layer_projection_norm = resolve_path(model_dir, j["filename_per_layer_projection_norm"].get<std::string>());
     }
     if (j.contains("b_use_mmap_load_embed")) attr.b_use_mmap_load_embed = j["b_use_mmap_load_embed"].get<bool>();
+
+#ifdef USE_AXCL
+    if (j.contains("devices")) attr.dev_ids = j["devices"].get<std::vector<int>>();
+    if (devices_override.has_value()) attr.dev_ids = *devices_override;
+#else
+    (void)devices_override;
+#endif
 
     // Optional VLM config (match src/main.cpp behavior).
     if (j.contains("vlm_type") || j.contains("VLM_TYPE")) {
