@@ -470,6 +470,89 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
     return sub_init();
 }
 
+bool ax_runner_ax650::has_handle_loaded() const
+{
+    return m_handle && m_handle->handle != nullptr;
+}
+
+int ax_runner_ax650::load_handle_reuse_io(const char *model_file, int /*devid*/)
+{
+    if (has_handle_loaded())
+        return 0;
+
+    // No prepared IO buffers yet → fall back to full init (allocates IO buffers).
+    if (!m_handle || m_handle->io_data.empty() || mgroup_input_tensors.empty() || mgroup_output_tensors.empty())
+    {
+        return init(model_file, -1);
+    }
+
+    if (m_model_buffer.empty())
+    {
+        if (!model_file || !model_file[0])
+        {
+            ALOGE("load_handle_reuse_io: model buffer empty and model_file is empty");
+            return -1;
+        }
+
+        MMap model_buffer;
+        if (!model_buffer.open_file(model_file))
+        {
+            ALOGE("model file(%s) open failed", model_file);
+            return -1;
+        }
+        m_model_buffer.assign(reinterpret_cast<const char *>(model_buffer.data()),
+                              reinterpret_cast<const char *>(model_buffer.data()) + model_buffer.size());
+    }
+
+    AX_ENGINE_HANDLE_EXTRA_T extra{};
+    extra.pName = (AX_S8 *)(AX_CMM_SESSION_NAME);
+
+    int ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &extra);
+    if (ret != 0)
+    {
+        ret = AX_ENGINE_CreateHandle(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size());
+    }
+    if (ret != 0)
+    {
+        ALOGE("AX_ENGINE_CreateHandle failed: 0x%x", ret);
+        m_handle->handle = nullptr;
+        return ret;
+    }
+
+    ret = AX_ENGINE_CreateContextV2(m_handle->handle, &m_handle->context);
+    if (ret != 0)
+    {
+        ALOGW("AX_ENGINE_CreateContextV2 failed: 0x%x, fallback to AX_ENGINE_CreateContext", ret);
+        ret = AX_ENGINE_CreateContext(m_handle->handle);
+        if (ret != 0)
+        {
+            ALOGE("AX_ENGINE_CreateContext failed: 0x%x", ret);
+            AX_ENGINE_DestroyHandle(m_handle->handle);
+            m_handle->handle = nullptr;
+            m_handle->context = 0;
+            return ret;
+        }
+        m_handle->context = 0;
+    }
+
+    // Keep existing io_data + buffers. Clear io_info pointers to avoid dangling refs
+    // from the previous handle instance (they are owned by the engine).
+    for (auto &p : m_handle->io_info) p = nullptr;
+
+    return 0;
+}
+
+void ax_runner_ax650::unload_handle_keep_io()
+{
+    if (!has_handle_loaded())
+        return;
+
+    AX_ENGINE_DestroyHandle(m_handle->handle);
+    m_handle->handle = nullptr;
+    m_handle->context = 0;
+    for (auto &p : m_handle->io_info) p = nullptr;
+}
+
 void ax_runner_ax650::deinit()
 {
     if (!m_handle)
@@ -547,7 +630,7 @@ void ax_runner_ax650::deinit()
 
 int ax_runner_ax650::inference()
 {
-    if (!m_handle)
+    if (!has_handle_loaded())
         return -1;
 
     if (_auto_sync_before_inference)
@@ -608,7 +691,7 @@ int ax_runner_ax650::inference()
 
 int ax_runner_ax650::inference(int grpid)
 {
-    if (!m_handle)
+    if (!has_handle_loaded())
         return -1;
     if (grpid < 0 || grpid >= (int)m_handle->io_data.size())
         return -1;

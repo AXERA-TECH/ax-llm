@@ -333,6 +333,18 @@ struct ModelConfig
             check_key("axmodel_num");
             attr.axmodel_num = j["axmodel_num"].get<int>();
 
+            attr.dynamic_load_enable = false;
+            json_bool_value(j, "dynamic_load_enable", attr.dynamic_load_enable);
+            attr.dynamic_load_pool_size = 0;
+            if (auto v = json_int_value(j, "dynamic_load_pool_size"); v.has_value())
+            {
+                attr.dynamic_load_pool_size = *v;
+            }
+            if (attr.dynamic_load_enable && attr.dynamic_load_pool_size <= 0)
+            {
+                attr.dynamic_load_pool_size = 2;
+            }
+
             // Optional: models with mixed linear/full attention layers (e.g., Qwen3.5).
             // Keep config minimal: only an interval is needed (layer count comes from `axmodel_num`).
             attr.full_attention_interval = 0;

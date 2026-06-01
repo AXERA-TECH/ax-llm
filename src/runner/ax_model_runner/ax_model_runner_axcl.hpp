@@ -9,12 +9,17 @@ protected:
     bool _parepare_io = false;
 
     int sub_init();
+    int sub_init_reuse_io();
 
 public:
     int init(const char *model_file, int devid) override;
     int init(char *model_buffer, size_t model_size, int devid) override;
 
     void deinit() override;
+
+    bool has_handle_loaded() const;
+    int load_handle_reuse_io(const char *model_file, int devid);
+    void unload_handle_keep_io();
 
     int get_algo_width() override;
     int get_algo_height() override;

@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <mutex>
 #include <numeric>
@@ -282,6 +283,12 @@ struct LLM::Impl {
     int cache_ref_full_layer_idx = 0;
     ax_runner_t llama_post;
 
+    bool dynamic_layer_load_enabled_ = false;
+    int dynamic_layer_pool_size_ = 0;
+    std::vector<int> dynamic_layer_devids_;
+    std::vector<unsigned char> dynamic_layer_loaded_;
+    std::deque<int> dynamic_layer_lru_;
+
     int decode_grpid = 0;
     std::vector<int> decode_grpids_;             // sorted by decode capacity (ascending)
     std::vector<int> decode_max_token_len_grp_;  // same length as decode_grpids_
@@ -293,6 +300,105 @@ struct LLM::Impl {
     std::atomic<bool> b_stop{false};
     LLMPostprocess postprocess;
     std::string last_error_message;
+
+    bool dynamic_layer_load_enabled() const
+    {
+        return dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ > 0;
+    }
+
+    int layer_devid_for(int layer_idx) const
+    {
+#ifdef USE_AXCL
+        if (layer_idx >= 0 && layer_idx < (int)dynamic_layer_devids_.size())
+            return dynamic_layer_devids_[(size_t)layer_idx];
+        if (!_attr.dev_ids.empty()) return _attr.dev_ids.front();
+        return 0;
+#else
+        (void)layer_idx;
+        return -1;
+#endif
+    }
+
+    void dynamic_layer_touch(int layer_idx)
+    {
+        if (!dynamic_layer_load_enabled()) return;
+        if (layer_idx < 0 || layer_idx >= (int)dynamic_layer_loaded_.size()) return;
+        if (!dynamic_layer_loaded_[(size_t)layer_idx]) return;
+
+        for (auto it = dynamic_layer_lru_.begin(); it != dynamic_layer_lru_.end(); ++it)
+        {
+            if (*it == layer_idx)
+            {
+                dynamic_layer_lru_.erase(it);
+                break;
+            }
+        }
+        dynamic_layer_lru_.push_back(layer_idx);
+    }
+
+    bool ensure_layer_loaded_no_prefetch(int layer_idx)
+    {
+        if (!dynamic_layer_load_enabled()) return true;
+        if (layer_idx < 0 || layer_idx >= _attr.axmodel_num) return false;
+        if ((int)dynamic_layer_loaded_.size() != _attr.axmodel_num) return false;
+
+        if (dynamic_layer_loaded_[(size_t)layer_idx])
+        {
+            dynamic_layer_touch(layer_idx);
+            return true;
+        }
+
+        while ((int)dynamic_layer_lru_.size() >= dynamic_layer_pool_size_)
+        {
+            const int evict_idx = dynamic_layer_lru_.front();
+            dynamic_layer_lru_.pop_front();
+            if (evict_idx < 0 || evict_idx >= _attr.axmodel_num) continue;
+            if (!dynamic_layer_loaded_[(size_t)evict_idx]) continue;
+            llama_layers[(size_t)evict_idx].layer.unload_handle_keep_io();
+            dynamic_layer_loaded_[(size_t)evict_idx] = 0;
+        }
+
+        auto &lyr = llama_layers[(size_t)layer_idx];
+        const int devid = layer_devid_for(layer_idx);
+        const int ret = lyr.layer.load_handle_reuse_io(lyr.filename.c_str(), devid);
+        if (ret != 0)
+        {
+            ALOGE("dynamic load layer %d failed: %s", layer_idx, lyr.filename.c_str());
+            return false;
+        }
+        dynamic_layer_loaded_[(size_t)layer_idx] = 1;
+        dynamic_layer_touch(layer_idx);
+        return true;
+    }
+
+    bool ensure_layer_loaded(int layer_idx)
+    {
+        if (!dynamic_layer_load_enabled()) return true;
+
+        if (!ensure_layer_loaded_no_prefetch(layer_idx))
+            return false;
+
+        // Implicit prefetch: keep the next layer's handle resident when pool_size>1.
+        // This avoids a hard handle-load stall when we advance to the next layer.
+        if (dynamic_layer_pool_size_ > 1)
+        {
+            const int next = layer_idx + 1;
+            if (next >= 0 && next < _attr.axmodel_num)
+            {
+                if (!dynamic_layer_loaded_[(size_t)next])
+                {
+                    const bool ok = ensure_layer_loaded_no_prefetch(next);
+                    if (!ok)
+                    {
+                        // Prefetch failures are non-fatal; we'll retry when the layer is actually needed.
+                        ALOGW("dynamic prefetch next layer %d failed", next);
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
 
     static std::string context_limit_user_message()
     {
@@ -1657,6 +1763,15 @@ struct LLM::Impl {
     {
         ALOGI("LLM init start");
         this->_attr = attr;
+        dynamic_layer_load_enabled_ = _attr.dynamic_load_enable;
+        dynamic_layer_pool_size_ = _attr.dynamic_load_pool_size;
+        if (dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ <= 0)
+            dynamic_layer_pool_size_ = 2;
+        if (dynamic_layer_pool_size_ > 0)
+            dynamic_layer_pool_size_ = std::min(dynamic_layer_pool_size_, std::max(1, _attr.axmodel_num));
+        dynamic_layer_loaded_.assign((size_t)std::max(0, _attr.axmodel_num), 0);
+        dynamic_layer_lru_.clear();
+        dynamic_layer_devids_.clear();
         embedding_profile_for_tokenizer(_attr.tokenizer_type, embedding_append_eos, embedding_eos_token_id);
         init_layer_types();
         init_shared_kv_source_layers();
@@ -1717,7 +1832,8 @@ struct LLM::Impl {
 #ifdef USE_AXCL
         llama_layers.resize(attr.axmodel_num);
         auto dev_assign = distributeModels((int)_attr.dev_ids.size(), attr.axmodel_num);
-        std::vector<int> rets(attr.axmodel_num, 0);
+        std::vector<int> rets(dynamic_layer_load_enabled() ? 0 : attr.axmodel_num, 0);
+        dynamic_layer_devids_.assign((size_t)attr.axmodel_num, _attr.dev_ids.empty() ? 0 : _attr.dev_ids.front());
 
         // Prepare filenames first (thread-safe, no I/O).
         for (int i = 0; i < attr.axmodel_num; i++)
@@ -1725,8 +1841,53 @@ struct LLM::Impl {
             char path[1024];
             std::snprintf(path, sizeof(path), attr.template_filename_axmodel.c_str(), i);
             llama_layers[i].filename = path;
+            const int dev_idx = (dev_assign.empty() ? 0 : dev_assign[i]);
+            if (dev_idx >= 0 && (size_t)dev_idx < _attr.dev_ids.size())
+                dynamic_layer_devids_[(size_t)i] = _attr.dev_ids[(size_t)dev_idx];
         }
 
+        if (dynamic_layer_load_enabled())
+        {
+            if (_attr.dev_ids.empty())
+            {
+                ALOGE("dynamic layer loading requires at least one AXCL device");
+                return false;
+            }
+            if (_attr.dev_ids.size() != 1)
+            {
+                ALOGE("dynamic layer loading only supports single AXCL device for now (dev_ids=%zu)", _attr.dev_ids.size());
+                return false;
+            }
+
+            const int devid = _attr.dev_ids.front();
+            for (int i = 0; i < attr.axmodel_num; i++)
+            {
+                const int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
+                if (ret != 0)
+                {
+                    ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
+                    return false;
+                }
+                // Keep IO (KV etc), but unload weights/handle to save CMM.
+                llama_layers[i].layer.unload_handle_keep_io();
+
+                char path[256];
+                std::snprintf(path, sizeof(path), "init %d axmodel io ok,remain_cmm(%d MB)", i, axcl_GetCMMRemain(devid));
+                update_cqdm(&cqdm, i + 1, "count", path);
+            }
+
+            // Start with an empty residency pool (handles will be loaded on-demand).
+            std::fill(dynamic_layer_loaded_.begin(), dynamic_layer_loaded_.end(), 0);
+            dynamic_layer_lru_.clear();
+
+            int ret = llama_post.init(attr.filename_post_axmodel.c_str(), devid);
+            if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
+            char path[1024];
+            sprintf(path, "init post axmodel ok,remain_cmm(%d MB)", axcl_GetCMMRemain(devid));
+            update_cqdm(&cqdm, attr.axmodel_num + 1, "count", path);
+        }
+        else
+        {
         // Load models in parallel across devices (per-device sequential), while the main thread updates progress.
         struct LoadResult {
             int idx = -1;
@@ -1807,6 +1968,7 @@ struct LLM::Impl {
             sprintf(path, "init post axmodel ok,remain_cmm(%d MB)", axcl_GetCMMRemain(post_devid));
             update_cqdm(&cqdm, attr.axmodel_num + 1, "count", path);
         }
+        }
 #else
         llama_layers.resize(attr.axmodel_num);
         char axmodel_path[1024];
@@ -1814,15 +1976,25 @@ struct LLM::Impl {
         {
             sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
             llama_layers[i].filename = axmodel_path;
-            int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), -1);
-            if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
-            llama_layers[i].layer.set_auto_sync_before_inference(true);
-            llama_layers[i].layer.set_auto_sync_after_inference(true);
-            int remain_cmm = get_remaining_cmm_size();
-            sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
-            update_cqdm(&cqdm, i + 1, "count", axmodel_path);
         }
+        if (dynamic_layer_load_enabled())
         {
+            for (int i = 0; i < attr.axmodel_num; i++)
+            {
+                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), -1);
+                if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
+                llama_layers[i].layer.set_auto_sync_before_inference(true);
+                llama_layers[i].layer.set_auto_sync_after_inference(true);
+                llama_layers[i].layer.unload_handle_keep_io();
+                int remain_cmm = get_remaining_cmm_size();
+                sprintf(axmodel_path, "init %d axmodel io ok,remain_cmm(%d MB)", i, remain_cmm);
+                update_cqdm(&cqdm, i + 1, "count", axmodel_path);
+            }
+
+            // Start with an empty residency pool (handles will be loaded on-demand).
+            std::fill(dynamic_layer_loaded_.begin(), dynamic_layer_loaded_.end(), 0);
+            dynamic_layer_lru_.clear();
+
             int ret = llama_post.init(attr.filename_post_axmodel.c_str(), -1);
             if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
             llama_post.set_auto_sync_before_inference(true);
@@ -1830,6 +2002,28 @@ struct LLM::Impl {
             int remain_cmm = get_remaining_cmm_size();
             sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
             update_cqdm(&cqdm, attr.axmodel_num + 1, "count", axmodel_path);
+        }
+        else
+        {
+            for (int i = 0; i < attr.axmodel_num; i++)
+            {
+                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), -1);
+                if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
+                llama_layers[i].layer.set_auto_sync_before_inference(true);
+                llama_layers[i].layer.set_auto_sync_after_inference(true);
+                int remain_cmm = get_remaining_cmm_size();
+                sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
+                update_cqdm(&cqdm, i + 1, "count", axmodel_path);
+            }
+            {
+                int ret = llama_post.init(attr.filename_post_axmodel.c_str(), -1);
+                if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
+                llama_post.set_auto_sync_before_inference(true);
+                llama_post.set_auto_sync_after_inference(true);
+                int remain_cmm = get_remaining_cmm_size();
+                sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
+                update_cqdm(&cqdm, attr.axmodel_num + 1, "count", axmodel_path);
+            }
         }
 #endif
         axllm::Logger::finish_inplace_line();
@@ -2128,6 +2322,7 @@ struct LLM::Impl {
                 llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
 
                 // inference
+                if (!ensure_layer_loaded(m)) return false;
                 lyr.layer.inference(layer_prefill_grpid);
 
                 // KV cache update
@@ -2423,6 +2618,7 @@ struct LLM::Impl {
                     llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
                 }
                 auto &t_in = lyr.layer.get_input(layer_prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
+                if (!ensure_layer_loaded(m)) return -1;
                 lyr.layer.inference(layer_prefill_grpid);
                 auto &out_k  = lyr.layer.get_output(layer_prefill_grpid, "K_cache_out");
                 auto &out_v  = lyr.layer.get_output(layer_prefill_grpid, "V_cache_out");
@@ -2954,6 +3150,7 @@ struct LLM::Impl {
                             std::min((size_t)t_per_layer->nSize, per_layer_tmp.size() * sizeof(unsigned short)),
                             devid);
                 }
+                if (!ensure_layer_loaded(m)) return final_out;
                 lyr.layer.inference(layer_prefill_grpid);
                 auto &out_k = lyr.layer.get_output(layer_prefill_grpid, "K_cache_out");
                 auto &out_v = lyr.layer.get_output(layer_prefill_grpid, "V_cache_out");
@@ -3188,6 +3385,7 @@ struct LLM::Impl {
                             std::min((size_t)t_per_layer->nSize, (size_t)per_layer_hidden * sizeof(unsigned short)),
                             devid);
                 }
+                if (!ensure_layer_loaded(m)) return final_out;
                 lyr.layer.inference(layer_decode_grpid);
                 auto &out_k = lyr.layer.get_output(layer_decode_grpid, "K_cache_out"); auto &out_v = lyr.layer.get_output(layer_decode_grpid, "V_cache_out");
                 if (is_linear_layer(m))
@@ -3324,6 +3522,7 @@ struct LLM::Impl {
                 if (decode_profile_enabled)
                     decode_profile.prep_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - prep_t0).count();
                 const auto infer_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
+                if (!ensure_layer_loaded(m)) return final_out;
                 lyr.layer.inference(layer_decode_grpid);
                 if (decode_profile_enabled)
                     decode_profile.inference_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - infer_t0).count();

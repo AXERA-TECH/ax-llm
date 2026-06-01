@@ -377,6 +377,107 @@ int ax_runner_axcl::sub_init()
     return ret;
 }
 
+int ax_runner_axcl::sub_init_reuse_io()
+{
+    int created_ios = 0;
+    // create context
+    int ret = axcl_EngineCreateContext(m_handle->handle, &m_handle->context, dev_id);
+    if (ret != 0)
+    {
+        ALOGE("AX_ENGINE_CreateContext");
+        return ret;
+    }
+
+    // get io info
+    ret = axcl_EngineGetIOInfo(m_handle->handle, &m_handle->io_info, dev_id);
+    if (ret != 0)
+    {
+        ALOGE("AX_ENGINE_GetIOInfo");
+        return ret;
+    }
+
+    ret = axcl_EngineGetShapeGroupsCount(m_handle->io_info, &group_count, dev_id);
+    if (ret != 0)
+    {
+        ALOGE("axcl_EngineGetShapeGroupsCount failed, ret=%d", ret);
+        goto fail;
+    }
+
+    if ((int)mgroup_input_tensors.size() != group_count || (int)mgroup_output_tensors.size() != group_count)
+    {
+        ALOGE("reuse_io group_count mismatch: want=%d have_in=%zu have_out=%zu",
+              group_count, mgroup_input_tensors.size(), mgroup_output_tensors.size());
+        ret = -1;
+        goto fail;
+    }
+
+    m_handle->ios.resize(group_count);
+    for (int grpid = 0; grpid < group_count; ++grpid)
+    {
+        ret = axcl_EngineCreateIO(m_handle->io_info, &m_handle->ios[(size_t)grpid], dev_id);
+        if (ret != 0)
+        {
+            ALOGE("axcl_EngineCreateIO(group=%d) failed, ret=%d", grpid, ret);
+            goto fail;
+        }
+        created_ios = grpid + 1;
+
+        for (const auto &tensor : mgroup_input_tensors[(size_t)grpid])
+        {
+            ret = axcl_EngineSetInputBufferByIndex(m_handle->ios[(size_t)grpid],
+                                                  tensor.nIdx,
+                                                  (void *)tensor.phyAddr,
+                                                  tensor.nSize,
+                                                  dev_id);
+            if (ret != 0)
+            {
+                ALOGE("axcl_EngineSetInputBufferByIndex(group=%d idx=%u name=%s) failed, ret=%d",
+                      grpid, tensor.nIdx, tensor.sName.c_str(), ret);
+                goto fail;
+            }
+        }
+
+        for (const auto &tensor : mgroup_output_tensors[(size_t)grpid])
+        {
+            ret = axcl_EngineSetOutputBufferByIndex(m_handle->ios[(size_t)grpid],
+                                                   tensor.nIdx,
+                                                   (void *)tensor.phyAddr,
+                                                   tensor.nSize,
+                                                   dev_id);
+            if (ret != 0)
+            {
+                ALOGE("axcl_EngineSetOutputBufferByIndex(group=%d idx=%u name=%s) failed, ret=%d",
+                      grpid, tensor.nIdx, tensor.sName.c_str(), ret);
+                goto fail;
+            }
+        }
+    }
+
+    if (!mgroup_output_tensors.empty())
+        moutput_tensors = mgroup_output_tensors[0];
+    if (!mgroup_input_tensors.empty())
+        minput_tensors = mgroup_input_tensors[0];
+
+    build_tensor_maps();
+    return 0;
+
+fail:
+    for (int i = 0; i < (int)m_handle->ios.size(); ++i)
+    {
+        // Destroy what we created so far (EngineDestroyIO is safe for valid handles only).
+        if (i < created_ios)
+            axcl_EngineDestroyIO(m_handle->ios[(size_t)i], dev_id);
+    }
+    m_handle->ios.clear();
+    if (m_handle->io_info)
+    {
+        axcl_EngineDestroyIOInfo(m_handle->io_info, dev_id);
+        m_handle->io_info = 0;
+    }
+    m_handle->context = 0;
+    return ret;
+}
+
 int ax_runner_axcl::init(const char *model_file, int devid)
 {
     if (!m_handle)
@@ -393,6 +494,73 @@ int ax_runner_axcl::init(const char *model_file, int devid)
         return ret;
     }
     return sub_init();
+}
+
+bool ax_runner_axcl::has_handle_loaded() const
+{
+    return m_handle && m_handle->handle != 0;
+}
+
+int ax_runner_axcl::load_handle_reuse_io(const char *model_file, int devid)
+{
+    if (has_handle_loaded())
+        return 0;
+
+    // No prepared IO buffers yet → fall back to full init.
+    if (mgroup_input_tensors.empty() || mgroup_output_tensors.empty() || group_count <= 0)
+    {
+        return init(model_file, devid);
+    }
+
+    if (!m_handle)
+    {
+        m_handle = new ax_joint_runner_ax650_handle_t;
+    }
+    // Only reset handle fields; keep IO buffers in mgroup_* vectors.
+    m_handle->handle = 0;
+    m_handle->context = 0;
+    m_handle->io_info = 0;
+    m_handle->ios.clear();
+
+    this->dev_id = devid;
+
+    int ret = axcl_EngineLoadFromFile(model_file, &m_handle->handle, dev_id);
+    if (ret != 0)
+    {
+        ALOGE("AX_ENGINE_CreateHandle");
+        return ret;
+    }
+
+    ret = sub_init_reuse_io();
+    if (ret != 0)
+    {
+        axcl_EngineUnload(m_handle->handle, dev_id);
+        m_handle->handle = 0;
+        return ret;
+    }
+    return 0;
+}
+
+void ax_runner_axcl::unload_handle_keep_io()
+{
+    if (!has_handle_loaded())
+        return;
+
+    for (size_t grpid = 0; grpid < m_handle->ios.size(); ++grpid)
+    {
+        axcl_EngineDestroyIO(m_handle->ios[grpid], dev_id);
+    }
+    m_handle->ios.clear();
+
+    if (m_handle->io_info)
+    {
+        axcl_EngineDestroyIOInfo(m_handle->io_info, dev_id);
+        m_handle->io_info = 0;
+    }
+
+    axcl_EngineUnload(m_handle->handle, dev_id);
+    m_handle->handle = 0;
+    m_handle->context = 0;
 }
 
 int ax_runner_axcl::init(char *model_buffer, size_t model_size, int devid)
@@ -422,47 +590,74 @@ int ax_runner_axcl::init(char *model_buffer, size_t model_size, int devid)
 
 void ax_runner_axcl::deinit()
 {
-    if (m_handle && m_handle->handle)
+    if (m_handle)
     {
         std::vector<unsigned long long> free_phy_addr;
         std::vector<void *> free_vir_addr;
-        for (int grpid = 0; grpid < group_count; grpid++)
+
+        // Always free IO buffers if they were prepared, even when the model handle
+        // has been dynamically unloaded (handle==0).
+        const int grps = (group_count > 0) ? group_count : (int)mgroup_input_tensors.size();
+        for (int grpid = 0; grpid < grps; grpid++)
         {
-            for (auto &tensor : mgroup_output_tensors[grpid])
+            if ((size_t)grpid < mgroup_output_tensors.size())
             {
-                if (free_phy_addr.end() == std::find(free_phy_addr.begin(), free_phy_addr.end(), tensor.phyAddr))
+                for (auto &tensor : mgroup_output_tensors[(size_t)grpid])
                 {
-                    axcl_Free((void *)tensor.phyAddr, dev_id);
-                    free_phy_addr.push_back(tensor.phyAddr);
-                }
-                if (free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
-                {
-                    free(tensor.pVirAddr);
-                    free_vir_addr.push_back(tensor.pVirAddr);
+                    if (tensor.phyAddr &&
+                        free_phy_addr.end() == std::find(free_phy_addr.begin(), free_phy_addr.end(), tensor.phyAddr))
+                    {
+                        axcl_Free((void *)tensor.phyAddr, dev_id);
+                        free_phy_addr.push_back(tensor.phyAddr);
+                    }
+                    if (tensor.pVirAddr &&
+                        free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
+                    {
+                        free(tensor.pVirAddr);
+                        free_vir_addr.push_back(tensor.pVirAddr);
+                    }
                 }
             }
-            for (auto &tensor : mgroup_input_tensors[grpid])
+
+            if ((size_t)grpid < mgroup_input_tensors.size())
             {
-                if (free_phy_addr.end() == std::find(free_phy_addr.begin(), free_phy_addr.end(), tensor.phyAddr))
+                for (auto &tensor : mgroup_input_tensors[(size_t)grpid])
                 {
-                    axcl_Free((void *)tensor.phyAddr, dev_id);
-                    free_phy_addr.push_back(tensor.phyAddr);
-                }
-                if (free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
-                {
-                    free(tensor.pVirAddr);
-                    free_vir_addr.push_back(tensor.pVirAddr);
+                    if (tensor.phyAddr &&
+                        free_phy_addr.end() == std::find(free_phy_addr.begin(), free_phy_addr.end(), tensor.phyAddr))
+                    {
+                        axcl_Free((void *)tensor.phyAddr, dev_id);
+                        free_phy_addr.push_back(tensor.phyAddr);
+                    }
+                    if (tensor.pVirAddr &&
+                        free_vir_addr.end() == std::find(free_vir_addr.begin(), free_vir_addr.end(), tensor.pVirAddr))
+                    {
+                        free(tensor.pVirAddr);
+                        free_vir_addr.push_back(tensor.pVirAddr);
+                    }
                 }
             }
-            axcl_EngineDestroyIO(m_handle->ios[grpid], dev_id);
         }
 
-        axcl_EngineUnload(m_handle->handle, dev_id);
-        m_handle->handle = 0;
-    }
+        for (size_t grpid = 0; grpid < m_handle->ios.size(); ++grpid)
+        {
+            axcl_EngineDestroyIO(m_handle->ios[grpid], dev_id);
+        }
+        m_handle->ios.clear();
 
-    if (m_handle)
-    {
+        if (m_handle->io_info)
+        {
+            axcl_EngineDestroyIOInfo(m_handle->io_info, dev_id);
+            m_handle->io_info = 0;
+        }
+
+        if (m_handle->handle)
+        {
+            axcl_EngineUnload(m_handle->handle, dev_id);
+            m_handle->handle = 0;
+        }
+        m_handle->context = 0;
+
         delete m_handle;
         m_handle = nullptr;
     }
@@ -546,6 +741,9 @@ int ax_runner_axcl::inference()
 
 int ax_runner_axcl::inference(int grpid)
 {
+    if (!has_handle_loaded())
+        return -1;
+
     if (_auto_sync_before_inference)
         for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
             axcl_Memcpy((void *)mgroup_input_tensors[grpid][i].phyAddr, mgroup_input_tensors[grpid][i].pVirAddr, mgroup_input_tensors[grpid][i].nSize, AXCL_MEMCPY_HOST_TO_DEVICE, dev_id);
