@@ -3691,8 +3691,9 @@ struct LLM::Impl {
                 ALOGE("text-only VLM turn cannot reuse KV because history is not append; refuse full recompute");
                 return history;
             }
-            ALOGW("raw history modified (not append / not rollback). force ResetKVCache before request processing.");
-            ResetKVCache();
+            // Non-append histories can still share a long common token prefix (e.g. same system prompt but
+            // different user question). Leave KV intact here and let token-level prefix reuse decide later.
+            ALOGI("raw history modified (not append / not rollback). try token-level KV prefix reuse.");
         }
         else if (raw_history_rollback)
         {
@@ -3802,7 +3803,11 @@ struct LLM::Impl {
         auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
         const bool token_appended = (offset == (int)last_tokens_ids.size() && (int)new_tokens.size() >= (int)last_tokens_ids.size());
         const bool token_rollback = (offset == (int)new_tokens.size() && (int)new_tokens.size() <= (int)last_tokens_ids.size());
-        bool not_append = !(token_appended || token_rollback);
+        const bool token_prefix_reuse = (!token_appended && !token_rollback &&
+                                         offset > 0 &&
+                                         precompute_len > 0 &&
+                                         offset <= precompute_len);
+        bool not_append = !(token_appended || token_rollback || token_prefix_reuse);
         if (not_append)
         {
             if (used_cached_text_turn)
@@ -3814,7 +3819,7 @@ struct LLM::Impl {
                       new_tokens.size());
                 return history;
             }
-            ALOGW("history not append (rollback/modify). force ResetKVCache and recompute.");
+            ALOGW("history diverged with no reusable prefix. force ResetKVCache and recompute.");
             ResetKVCache();
             tokens_diff = new_tokens;
             offset = 0;
@@ -3842,6 +3847,31 @@ struct LLM::Impl {
                   new_len,
                   prev_tokens,
                   prev_kv);
+        }
+        else if (token_prefix_reuse)
+        {
+            const int keep = offset;
+            const int prev_tokens = (int)last_tokens_ids.size();
+            const int prev_kv = precompute_len;
+
+            if (prev_tokens != keep)
+            {
+                last_tokens_ids.resize((size_t)keep);
+            }
+            if (precompute_len > keep)
+            {
+                precompute_len = keep;
+            }
+            if (cached_mrope_next_pos >= keep)
+            {
+                cached_mrope_next_pos = -1;
+            }
+
+            ALOGI("token prefix reuse: reuse KV prefix tokens=%d (prev_tokens=%d prev_kv=%d) recompute_suffix=%zu",
+                  keep,
+                  prev_tokens,
+                  prev_kv,
+                  tokens_diff.size());
         }
         if (tokens_diff.empty())
         {
