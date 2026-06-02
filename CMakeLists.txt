@@ -117,6 +117,30 @@ include_directories(src/runner)
 include_directories(src/runner/utils)
 
 # ---------------------------------------------------------------------------
+# Optional ONNX Runtime backend for SmolVLA non-LLM modules
+# ---------------------------------------------------------------------------
+set(ONNXRUNTIME_DIR "${CMAKE_SOURCE_DIR}/onnxruntime-linux-aarch64-1.26.0" CACHE PATH "ONNX Runtime root")
+option(AXLLM_USE_ONNXRUNTIME "Use ONNX Runtime for optional SmolVLA non-LLM modules" ON)
+set(AXLLM_ONNXRUNTIME_LIBS "")
+if(AXLLM_USE_ONNXRUNTIME)
+    if(EXISTS "${ONNXRUNTIME_DIR}/include/onnxruntime_cxx_api.h"
+       AND EXISTS "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so")
+        message(STATUS "ONNX Runtime found: ${ONNXRUNTIME_DIR}")
+        add_compile_definitions(AXLLM_USE_ONNXRUNTIME)
+        include_directories("${ONNXRUNTIME_DIR}/include")
+        add_library(onnxruntime SHARED IMPORTED GLOBAL)
+        set_target_properties(onnxruntime PROPERTIES
+            IMPORTED_LOCATION "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so"
+            INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_DIR}/include"
+            INTERFACE_LINK_LIBRARIES "stdc++;gcc_s;pthread;dl;m"
+        )
+        set(AXLLM_ONNXRUNTIME_LIBS onnxruntime)
+    else()
+        message(FATAL_ERROR "AXLLM_USE_ONNXRUNTIME=ON but ONNX Runtime was not found at ${ONNXRUNTIME_DIR}")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Vision preprocessing (OpenCV)
 # ---------------------------------------------------------------------------
 set(AXLLM_VISION_LIBS "")
@@ -188,23 +212,35 @@ if(BUILD_AX650)
         ax_engine ax_interpreter ax_sys
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
+        ${AXLLM_ONNXRUNTIME_LIBS}
     )
     target_link_libraries(llm_smoke
         -L${BSP_MSP_DIR}/lib
         ax_engine ax_interpreter ax_sys
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
+        ${AXLLM_ONNXRUNTIME_LIBS}
     )
     target_link_libraries(smolvla_infer
         -L${BSP_MSP_DIR}/lib
         ax_engine ax_interpreter ax_sys
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
+        ${AXLLM_ONNXRUNTIME_LIBS}
     )
     if(OpenMP_CXX_FOUND)
         target_link_libraries(axllm OpenMP::OpenMP_CXX)
         target_link_libraries(llm_smoke OpenMP::OpenMP_CXX)
         target_link_libraries(smolvla_infer OpenMP::OpenMP_CXX)
+    endif()
+    if(NOT WIN32)
+        set_target_properties(axllm PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
+        set_target_properties(llm_smoke PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
+        set_target_properties(smolvla_infer PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
+        set_target_properties(axllm llm_smoke smolvla_infer PROPERTIES
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH "\$ORIGIN/../lib"
+        )
     endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
@@ -254,6 +290,7 @@ if(BUILD_AXCL)
     target_link_libraries(axllm
         ${AXCL_LINK_LIBS}
         ${AXLLM_VISION_LIBS}
+        ${AXLLM_ONNXRUNTIME_LIBS}
     )
     # AXCL smoke test
     add_executable(llm_smoke tools/llm_smoke.cpp
@@ -273,10 +310,12 @@ if(BUILD_AXCL)
     target_link_libraries(llm_smoke
         ${AXCL_LINK_LIBS}
         ${AXLLM_VISION_LIBS}
+        ${AXLLM_ONNXRUNTIME_LIBS}
     )
     target_link_libraries(smolvla_infer
         ${AXCL_LINK_LIBS}
         ${AXLLM_VISION_LIBS}
+        ${AXLLM_ONNXRUNTIME_LIBS}
     )
     if(NOT WIN32)
         set_target_properties(axllm PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")

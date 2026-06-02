@@ -11,6 +11,10 @@ struct Config {
     std::string state_proj_axmodel;
     std::string action_embed_axmodel;
     std::string action_out_axmodel;
+    std::string image_encoder_onnx;
+    std::string state_proj_onnx;
+    std::string action_embed_onnx;
+    std::string action_out_onnx;
     std::string llm_template_axmodel;
     std::string llm_post_axmodel;
     std::string tokens_embed;
@@ -33,6 +37,7 @@ struct Config {
     int num_steps = 10;
     int seed = 0;
     bool use_mmap_embed = false;
+    bool use_onnx_non_llm = false;
     std::vector<float> action_mean;
     std::vector<float> action_std;
 };

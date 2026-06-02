@@ -60,6 +60,10 @@ static void resolve_smolvla_config_paths(smolvla::Config& cfg, const std::string
     cfg.state_proj_axmodel = resolve_path(base, cfg.state_proj_axmodel);
     cfg.action_embed_axmodel = resolve_path(base, cfg.action_embed_axmodel);
     cfg.action_out_axmodel = resolve_path(base, cfg.action_out_axmodel);
+    cfg.image_encoder_onnx = resolve_path(base, cfg.image_encoder_onnx);
+    cfg.state_proj_onnx = resolve_path(base, cfg.state_proj_onnx);
+    cfg.action_embed_onnx = resolve_path(base, cfg.action_embed_onnx);
+    cfg.action_out_onnx = resolve_path(base, cfg.action_out_onnx);
     cfg.llm_template_axmodel = resolve_path(base, cfg.llm_template_axmodel);
     cfg.llm_post_axmodel = resolve_path(base, cfg.llm_post_axmodel);
     cfg.tokens_embed = resolve_path(base, cfg.tokens_embed);
