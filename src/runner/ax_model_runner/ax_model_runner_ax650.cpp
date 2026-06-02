@@ -1,9 +1,12 @@
 #include "ax_model_runner_ax650.hpp"
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <algorithm>
 #include <memory>
 #include <unordered_set> // 用于去重释放物理内存
+#include <string>
+#include <unistd.h>
 #include <ax_sys_api.h>
 #include <ax_ivps_api.h>
 #include <ax_engine_api.h>
@@ -13,6 +16,12 @@
 
 #define AX_CMM_ALIGN_SIZE 128
 const char *AX_CMM_SESSION_NAME = "npu";
+
+static void ax650_trace(const std::string &msg)
+{
+    const std::string line = "[ax_runner_ax650] " + msg + "\n";
+    ::write(2, line.data(), line.size());
+}
 
 typedef enum
 {
@@ -259,8 +268,9 @@ int ax_runner_ax650::sub_init()
         if (ret != 0) return ret;
     }
 
-    // 2. 处理中间 Group 的内存共享逻辑 (原有逻辑的 Hack)
-    if (io_count > 2)
+    // 2. 处理多 Group 的内存共享逻辑。两组模型也需要把 last
+    // group 的 K_cache/V_cache 绑定到 group0，否则 prefill group 会拿到空指针。
+    if (io_count > 1)
     {
         auto &first_io_data = m_handle->io_data[0];
         auto &first_io_info = m_handle->io_info[0];
@@ -417,15 +427,18 @@ int ax_runner_ax650::init(const char *model_file, int /*devid*/)
     if (m_handle)
         deinit();
 
+    ax650_trace(std::string("init file begin: ") + model_file);
     MMap model_buffer;
     if (!model_buffer.open_file(model_file))
     {
         ALOGE("model file(%s) open failed", model_file);
         return -1;
     }
+    ax650_trace("mmap ok size=" + std::to_string((size_t)model_buffer.size()));
     m_model_buffer.assign(reinterpret_cast<const char *>(model_buffer.data()),
                           reinterpret_cast<const char *>(model_buffer.data()) + model_buffer.size());
     auto ret = init(m_model_buffer.data(), m_model_buffer.size(), -1);
+    ax650_trace("init file ret=" + std::to_string(ret));
     return ret;
 }
 
@@ -440,12 +453,27 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
     }
 
     m_handle = new ax_runner_ax650_handle_t;
-    AX_ENGINE_HANDLE_EXTRA_T extra{};
-    extra.pName = (AX_S8 *)(AX_CMM_SESSION_NAME);
-    int ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &extra);
-    if (0 != ret)
+    int ret = 0;
+    const char *use_v2 = std::getenv("AX_RUNNER_USE_CREATE_HANDLE_V2");
+    if (use_v2 && std::string(use_v2) == "1")
     {
+        AX_ENGINE_HANDLE_EXTRA_T extra{};
+        extra.pName = (AX_S8 *)(AX_CMM_SESSION_NAME);
+        ax650_trace("AX_ENGINE_CreateHandleV2 begin size=" + std::to_string(m_model_buffer.size()));
+        ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &extra);
+        ax650_trace("AX_ENGINE_CreateHandleV2 ret=0x" + std::to_string(ret));
+        if (0 != ret)
+        {
+            ax650_trace("AX_ENGINE_CreateHandle fallback begin");
+            ret = AX_ENGINE_CreateHandle(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size());
+            ax650_trace("AX_ENGINE_CreateHandle fallback ret=0x" + std::to_string(ret));
+        }
+    }
+    else
+    {
+        ax650_trace("AX_ENGINE_CreateHandle begin size=" + std::to_string(m_model_buffer.size()));
         ret = AX_ENGINE_CreateHandle(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size());
+        ax650_trace("AX_ENGINE_CreateHandle ret=0x" + std::to_string(ret));
     }
     if (0 != ret)
     {
@@ -454,11 +482,15 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
         m_handle = nullptr;
         return ret;
     }
+    ax650_trace("AX_ENGINE_CreateContextV2 begin");
     ret = AX_ENGINE_CreateContextV2(m_handle->handle, &m_handle->context);
+    ax650_trace("AX_ENGINE_CreateContextV2 ret=0x" + std::to_string(ret));
     if (ret != 0)
     {
         ALOGW("AX_ENGINE_CreateContextV2 failed: 0x%x, fallback to AX_ENGINE_CreateContext", ret);
+        ax650_trace("AX_ENGINE_CreateContext fallback begin");
         ret = AX_ENGINE_CreateContext(m_handle->handle);
+        ax650_trace("AX_ENGINE_CreateContext fallback ret=0x" + std::to_string(ret));
         if (ret != 0)
         {
             ALOGE("AX_ENGINE_CreateContext failed: 0x%x", ret);
@@ -467,7 +499,10 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
         }
         m_handle->context = 0;
     }
-    return sub_init();
+    ax650_trace("sub_init begin");
+    ret = sub_init();
+    ax650_trace("sub_init ret=" + std::to_string(ret));
+    return ret;
 }
 
 void ax_runner_ax650::deinit()

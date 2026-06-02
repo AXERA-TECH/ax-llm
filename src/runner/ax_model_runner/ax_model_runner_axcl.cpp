@@ -307,7 +307,7 @@ int ax_runner_axcl::sub_init()
         if (ret != 0) return ret;
     }
 
-    if (group_count > 2)
+    if (group_count > 1)
     {
         auto &first_input = mgroup_input_tensors[0];
         auto &last_input = mgroup_input_tensors[group_count - 1];

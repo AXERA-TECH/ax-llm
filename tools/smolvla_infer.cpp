@@ -1,11 +1,13 @@
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #ifdef USE_AXCL
 #include <axcl.h>
@@ -46,6 +48,12 @@ static bool read_f32_bin(const std::string& path, std::vector<float>& out)
     return true;
 }
 
+static void trace(const std::string& msg)
+{
+    const std::string line = "[smolvla_infer] " + msg + "\n";
+    ::write(2, line.data(), line.size());
+}
+
 static void resolve_smolvla_config_paths(smolvla::Config& cfg, const std::string& base)
 {
     cfg.image_encoder_axmodel = resolve_path(base, cfg.image_encoder_axmodel);
@@ -59,6 +67,7 @@ static void resolve_smolvla_config_paths(smolvla::Config& cfg, const std::string
 
 int main(int argc, char** argv)
 {
+    trace("main enter");
     if (argc < 3) {
         std::cerr << "Usage: smolvla_infer <smolvla_config.json> <input.json>\n";
         std::cerr << "input.json keys: image_bin, state, state_bin, language_tokens, language_mask, noise_bin\n";
@@ -67,6 +76,8 @@ int main(int argc, char** argv)
 
     const std::string config_path = argv[1];
     const std::string input_path = argv[2];
+    trace("config_path=" + config_path);
+    trace("input_path=" + input_path);
 
     smolvla::Config cfg;
     std::string err;
@@ -76,6 +87,7 @@ int main(int argc, char** argv)
     }
     const std::string config_dir = dirname_of(config_path);
     resolve_smolvla_config_paths(cfg, config_dir);
+    trace("config loaded");
 
     std::ifstream fin(input_path);
     if (!fin.is_open()) {
@@ -112,31 +124,45 @@ int main(int argc, char** argv)
             return 2;
         }
     }
+    trace("input loaded images=" + std::to_string(in.images.size()) +
+          " state=" + std::to_string(in.state.size()) +
+          " lang=" + std::to_string(in.language_tokens.size()) +
+          " mask=" + std::to_string(in.language_mask.size()) +
+          " noise=" + std::to_string(in.noise.size()));
 
 #ifdef USE_AXCL
+    trace("axclInit begin");
     auto ret = axclInit(nullptr);
     if (ret != 0) {
         std::cerr << "axclInit failed: " << ret << "\n";
         return ret;
     }
+    trace("axclInit ok");
+    trace("axcl_Init begin");
     if (axcl_Init(0) != 0) {
         std::cerr << "axcl_Init(0) failed\n";
         axclFinalize();
         return 3;
     }
+    trace("axcl_Init ok");
 #else
     AX_ENGINE_NPU_ATTR_T npu_attr;
     std::memset(&npu_attr, 0, sizeof(npu_attr));
     npu_attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    trace("AX_SYS_Init begin");
     AX_SYS_Init();
+    trace("AX_SYS_Init done");
+    trace("AX_ENGINE_Init begin");
     auto ret = AX_ENGINE_Init(&npu_attr);
     if (ret != 0) {
         std::cerr << "AX_ENGINE_Init failed: " << ret << "\n";
         return ret;
     }
+    trace("AX_ENGINE_Init ok");
 #endif
 
     smolvla::Runner runner;
+    trace("Runner.Init begin");
     if (!runner.Init(cfg,
 #ifdef USE_AXCL
                      0
@@ -154,8 +180,10 @@ int main(int argc, char** argv)
 #endif
         return 3;
     }
+    trace("Runner.Init ok");
 
     std::vector<float> actions;
+    trace("Runner.Predict begin");
     if (!runner.Predict(in, actions)) {
         std::cerr << "SmolVLA predict failed: " << runner.LastError() << "\n";
         runner.Deinit();
@@ -168,7 +196,9 @@ int main(int argc, char** argv)
 #endif
         return 4;
     }
+    trace("Runner.Predict ok actions=" + std::to_string(actions.size()));
 
+    std::cerr << "SmolVLA predict ok: actions=" << actions.size() << "\n";
     std::cout << "{";
     std::cout << "\"chunk_size\":" << cfg.chunk_size << ",";
     std::cout << "\"action_dim\":" << (cfg.output_action_dim > 0 ? cfg.output_action_dim : cfg.action_dim) << ",";
@@ -177,7 +207,9 @@ int main(int argc, char** argv)
         if (i) std::cout << ",";
         std::cout << actions[i];
     }
-    std::cout << "]}\n";
+    std::cout << "]}" << std::endl;
+    std::cout.flush();
+    std::fflush(stdout);
 
     runner.Deinit();
 #ifdef USE_AXCL

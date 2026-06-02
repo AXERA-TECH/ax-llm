@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <unistd.h>
 
 #include "LLMEmbedSelector.hpp"
 #include "utils/bfloat16.hpp"
@@ -40,6 +43,73 @@ namespace smolvla {
 namespace {
 
 static constexpr float kMaskNeg = -65536.0f;
+
+void trace(const std::string& msg)
+{
+    const std::string line = "[SmolVLARunner] " + msg + "\n";
+    ::write(2, line.data(), line.size());
+}
+
+std::string dump_root()
+{
+    const char* env = std::getenv("SMOLVLA_DUMP_DIR");
+    if (!env || !env[0]) return {};
+    return std::string(env);
+}
+
+void ensure_dump_root(const std::string& root)
+{
+    static std::string created_root;
+    if (root.empty() || created_root == root) return;
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    if (!ec) created_root = root;
+}
+
+std::string dump_path(const std::string& name)
+{
+    const std::string root = dump_root();
+    if (root.empty()) return {};
+    ensure_dump_root(root);
+    return (std::filesystem::path(root) / name).string();
+}
+
+void dump_f32(const std::string& name, const float* data, size_t elems)
+{
+    const std::string path = dump_path(name);
+    if (path.empty() || data == nullptr) return;
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        trace("dump open failed: " + path);
+        return;
+    }
+    f.write(reinterpret_cast<const char*>(data), (std::streamsize)(elems * sizeof(float)));
+    if (!f.good()) {
+        trace("dump write failed: " + path);
+        return;
+    }
+    trace("dump f32 " + name + " elems=" + std::to_string(elems));
+}
+
+void dump_f32(const std::string& name, const std::vector<float>& data)
+{
+    dump_f32(name, data.data(), data.size());
+}
+
+std::vector<float> bf16_to_fp32(const std::vector<uint16_t>& data)
+{
+    std::vector<float> out(data.size());
+    for (size_t i = 0; i < data.size(); ++i) out[i] = bfloat16(data[i]).fp32();
+    return out;
+}
+
+void dump_bf16_as_f32(const std::string& name, const std::vector<uint16_t>& data)
+{
+    const std::string path = dump_path(name);
+    if (path.empty()) return;
+    auto fp32 = bf16_to_fp32(data);
+    dump_f32(name, fp32);
+}
 
 const ax_runner_tensor_t& input_by_name_or_index(ax_runner_t& r, const std::string& name, int idx)
 {
@@ -248,7 +318,10 @@ struct Runner::Impl {
                 err = std::string(name) + " path is empty";
                 return false;
             }
-            if (r.init(path.c_str(), devid) != 0) {
+            trace(std::string("init begin ") + name + ": " + path);
+            const int rc = r.init(path.c_str(), devid);
+            trace(std::string("init ret ") + name + "=" + std::to_string(rc));
+            if (rc != 0) {
                 err = std::string("init failed for ") + name + ": " + path;
                 return false;
             }
@@ -259,10 +332,12 @@ struct Runner::Impl {
             return true;
         };
 
+        trace("embed init begin: " + cfg.tokens_embed);
         if (!embed_selector.Init(cfg.tokens_embed, (unsigned int)cfg.tokens_embed_num, (unsigned int)cfg.vlm_hidden_size, cfg.use_mmap_embed)) {
             err = "token embedding init failed: " + cfg.tokens_embed;
             return false;
         }
+        trace("embed init ok");
         if (!init_one(image_encoder, cfg.image_encoder_axmodel, "image_encoder")) return false;
         if (!init_one(state_proj, cfg.state_proj_axmodel, "state_proj")) return false;
         if (!init_one(action_embed, cfg.action_embed_axmodel, "action_embed")) return false;
@@ -274,10 +349,12 @@ struct Runner::Impl {
             char path[2048];
             std::snprintf(path, sizeof(path), cfg.llm_template_axmodel.c_str(), i);
             layers[(size_t)i].reset(new ax_runner_t());
-            if (!init_one(*layers[(size_t)i], path, "llm_layer")) return false;
+            const std::string layer_name = "llm_layer_" + std::to_string(i);
+            if (!init_one(*layers[(size_t)i], path, layer_name.c_str())) return false;
         }
         prefix_gid = layers.empty() ? 0 : (layers[0]->get_num_input_groups() > 1 ? 1 : 0);
         decode_gid = 0;
+        trace("init_models ok prefix_gid=" + std::to_string(prefix_gid) + " decode_gid=" + std::to_string(decode_gid));
         return true;
     }
 
@@ -321,12 +398,32 @@ void Runner::Deinit()
 
 bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
 {
+    trace("Predict enter input images=" + std::to_string(input.images.size()) +
+          " state=" + std::to_string(input.state.size()) +
+          " lang=" + std::to_string(input.language_tokens.size()) +
+          " noise=" + std::to_string(input.noise.size()));
     if (!impl_) {
         last_error_ = "runner is not initialized";
         return false;
     }
     auto& I = *impl_;
     const Config& cfg = I.cfg;
+    auto run_inference = [&](ax_runner_t& runner, const std::string& name) -> bool {
+        const int rc = runner.inference();
+        if (rc != 0) {
+            last_error_ = name + " inference failed: " + std::to_string(rc);
+            return false;
+        }
+        return true;
+    };
+    auto run_group_inference = [&](ax_runner_t& runner, int gid, const std::string& name) -> bool {
+        const int rc = runner.inference(gid);
+        if (rc != 0) {
+            last_error_ = name + " group " + std::to_string(gid) + " inference failed: " + std::to_string(rc);
+            return false;
+        }
+        return true;
+    };
 
     const size_t image_elems = (size_t)cfg.num_images * 3u * (size_t)cfg.image_height * (size_t)cfg.image_width;
     std::vector<float> images = input.images;
@@ -354,15 +451,23 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
 
     const size_t one_image_elems = (size_t)3 * (size_t)cfg.image_height * (size_t)cfg.image_width;
     for (int img_i = 0; img_i < cfg.num_images; ++img_i) {
+        trace("image_encoder begin image=" + std::to_string(img_i));
         std::vector<float> image(images.begin() + (size_t)img_i * one_image_elems,
                                  images.begin() + (size_t)(img_i + 1) * one_image_elems);
         const auto& t_in = input_by_name_or_index(I.image_encoder, "image", 0);
         if (!copy_float_input(I.image_encoder, t_in, image, last_error_)) return false;
-        I.image_encoder.inference();
+        if (!run_inference(I.image_encoder, "image_encoder")) return false;
+        trace("image_encoder inference done image=" + std::to_string(img_i));
         const size_t out_elems = (size_t)cfg.image_tokens * (size_t)cfg.vlm_hidden_size;
         const auto& t_out = output_by_name_or_index(I.image_encoder, "image_embeds", 0);
         auto image_embeds = read_tensor_bf16(I.image_encoder, t_out, out_elems, last_error_);
         if (image_embeds.empty()) return false;
+        {
+            char dump_name[128];
+            std::snprintf(dump_name, sizeof(dump_name), "image_%02d_embeds.fp32.bin", img_i);
+            dump_bf16_as_f32(dump_name, image_embeds);
+        }
+        trace("image_encoder read done image=" + std::to_string(img_i));
         prefix_embed.insert(prefix_embed.end(), image_embeds.begin(), image_embeds.end());
         prefix_pad.insert(prefix_pad.end(), (size_t)cfg.image_tokens, 1);
         prefix_att_ar.insert(prefix_att_ar.end(), (size_t)cfg.image_tokens, 0);
@@ -381,11 +486,15 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
     }
 
     const auto& state_in = input_by_name_or_index(I.state_proj, "state", 0);
+    trace("state_proj begin");
     if (!copy_float_input(I.state_proj, state_in, state, last_error_)) return false;
-    I.state_proj.inference();
+    if (!run_inference(I.state_proj, "state_proj")) return false;
+    trace("state_proj inference done");
     const auto& state_out = output_by_name_or_index(I.state_proj, "state_embeds", 0);
     auto state_embed = read_tensor_bf16(I.state_proj, state_out, (size_t)cfg.vlm_hidden_size, last_error_);
     if (state_embed.empty()) return false;
+    dump_bf16_as_f32("state_embeds.fp32.bin", state_embed);
+    trace("state_proj read done");
     prefix_embed.insert(prefix_embed.end(), state_embed.begin(), state_embed.end());
     prefix_pad.push_back(1);
     prefix_att_ar.push_back(1);
@@ -409,6 +518,7 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
     std::vector<std::vector<uint16_t>> v_cache((size_t)cfg.num_layers);
     std::vector<uint16_t> layer_in = prefix_embed;
     for (int layer_i = 0; layer_i < cfg.num_layers; ++layer_i) {
+        trace("prefix layer begin layer=" + std::to_string(layer_i));
         auto& lyr = *I.layers[(size_t)layer_i];
         const int gid = I.prefix_gid;
         const auto& t_input = group_input(lyr, gid, "input");
@@ -417,7 +527,8 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
         v_h2d(V_WADDR(t_input), layer_in.data(), std::min((size_t)t_input.nSize, layer_in.size() * sizeof(uint16_t)), lyr.get_devid());
         v_h2d(V_WADDR(t_mask), p_mask.data(), std::min((size_t)t_mask.nSize, p_mask.size() * sizeof(uint16_t)), lyr.get_devid());
         if (!copy_u32_input(lyr, t_indices, p_indices, last_error_)) return false;
-        lyr.inference(gid);
+        if (!run_group_inference(lyr, gid, "prefix layer " + std::to_string(layer_i))) return false;
+        trace("prefix layer inference done layer=" + std::to_string(layer_i));
 
         const auto& out_k = group_output(lyr, gid, "K_cache_out");
         const auto& out_v = group_output(lyr, gid, "V_cache_out");
@@ -428,6 +539,7 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
         const auto& out = group_output(lyr, gid, "output");
         layer_in = read_tensor_bf16(lyr, out, (size_t)cfg.prefix_len * (size_t)cfg.vlm_hidden_size, last_error_);
         if (layer_in.empty()) return false;
+        trace("prefix layer read done layer=" + std::to_string(layer_i));
     }
 
     std::vector<float> x_t = input.noise;
@@ -437,18 +549,24 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
         std::normal_distribution<float> dist(0.0f, 1.0f);
         for (float& v : x_t) v = dist(gen);
     }
+    dump_f32("input_noise.fp32.bin", x_t);
 
     const float dt = -1.0f / (float)std::max(1, cfg.num_steps);
     const auto s_indices = suffix_indices(prefix_valid, cfg.chunk_size);
 
     for (int step = 0; step < cfg.num_steps; ++step) {
+        trace("denoise step begin step=" + std::to_string(step));
+        char dump_name[128];
+        std::snprintf(dump_name, sizeof(dump_name), "step_%02d_x_before.fp32.bin", step);
+        dump_f32(dump_name, x_t);
         const float t = 1.0f + (float)step * dt;
         const auto& a_in = input_by_name_or_index(I.action_embed, "noisy_actions", 0);
         if (!copy_float_input(I.action_embed, a_in, x_t, last_error_)) return false;
         const auto& t_in = input_by_name_or_index(I.action_embed, "timestep", 1);
         std::vector<float> timestep{t};
         if (!copy_float_input(I.action_embed, t_in, timestep, last_error_)) return false;
-        I.action_embed.inference();
+        if (!run_inference(I.action_embed, "action_embed")) return false;
+        trace("action_embed inference done step=" + std::to_string(step));
         const auto& a_out = output_by_name_or_index(I.action_embed, "suffix_embeds", 0);
         std::vector<uint16_t> suffix_hidden = read_tensor_bf16(
             I.action_embed,
@@ -456,8 +574,11 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
             (size_t)cfg.chunk_size * (size_t)cfg.expert_hidden_size,
             last_error_);
         if (suffix_hidden.empty()) return false;
+        std::snprintf(dump_name, sizeof(dump_name), "step_%02d_suffix_embeds.fp32.bin", step);
+        dump_bf16_as_f32(dump_name, suffix_hidden);
 
         for (int layer_i = 0; layer_i < cfg.num_layers; ++layer_i) {
+            trace("decode layer begin step=" + std::to_string(step) + " layer=" + std::to_string(layer_i));
             auto& lyr = *I.layers[(size_t)layer_i];
             const int gid = I.decode_gid;
             const auto& t_layer_input = group_input(lyr, gid, "input");
@@ -500,7 +621,8 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
             v_h2d(V_WADDR(t_layer_k), k_in.data(), std::min((size_t)t_layer_k.nSize, k_in.size() * sizeof(uint16_t)), lyr.get_devid());
             v_h2d(V_WADDR(t_layer_v), v_in.data(), std::min((size_t)t_layer_v.nSize, v_in.size() * sizeof(uint16_t)), lyr.get_devid());
             if (!copy_u32_input(lyr, t_layer_indices, s_indices, last_error_)) return false;
-            lyr.inference(gid);
+            if (!run_group_inference(lyr, gid, "decode layer step=" + std::to_string(step) + " layer=" + std::to_string(layer_i))) return false;
+            trace("decode layer inference done step=" + std::to_string(step) + " layer=" + std::to_string(layer_i));
             const auto& t_layer_out = group_output(lyr, gid, "output");
             suffix_hidden = read_tensor_bf16(
                 lyr,
@@ -508,28 +630,41 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
                 (size_t)cfg.chunk_size * (size_t)cfg.expert_hidden_size,
                 last_error_);
             if (suffix_hidden.empty()) return false;
+            trace("decode layer read done step=" + std::to_string(step) + " layer=" + std::to_string(layer_i));
         }
 
         const auto& post_in = input_by_name_or_index(I.post, "input", 0);
+        trace("llm_post begin step=" + std::to_string(step));
         v_h2d(V_WADDR(post_in), suffix_hidden.data(), std::min((size_t)post_in.nSize, suffix_hidden.size() * sizeof(uint16_t)), I.post.get_devid());
-        I.post.inference();
+        if (!run_inference(I.post, "llm_post")) return false;
+        trace("llm_post inference done step=" + std::to_string(step));
         const auto& post_out = output_by_name_or_index(I.post, "output", 0);
         suffix_hidden = read_tensor_bf16(I.post, post_out, (size_t)cfg.chunk_size * (size_t)cfg.expert_hidden_size, last_error_);
         if (suffix_hidden.empty()) return false;
+        std::snprintf(dump_name, sizeof(dump_name), "step_%02d_suffix_hidden.fp32.bin", step);
+        dump_bf16_as_f32(dump_name, suffix_hidden);
 
         std::vector<float> suffix_hidden_fp32((size_t)cfg.chunk_size * (size_t)cfg.expert_hidden_size);
         for (size_t i = 0; i < suffix_hidden.size(); ++i) suffix_hidden_fp32[i] = bfloat16(suffix_hidden[i]).fp32();
 
         const auto& out_in = input_by_name_or_index(I.action_out, "suffix_hidden", 0);
+        trace("action_out begin step=" + std::to_string(step));
         if (!copy_float_input(I.action_out, out_in, suffix_hidden_fp32, last_error_)) return false;
-        I.action_out.inference();
+        if (!run_inference(I.action_out, "action_out")) return false;
+        trace("action_out inference done step=" + std::to_string(step));
         const auto& out_v = output_by_name_or_index(I.action_out, "velocity", 0);
         auto v_t = read_tensor_fp32(I.action_out, out_v, x_t.size(), last_error_);
         if (v_t.empty()) return false;
+        std::snprintf(dump_name, sizeof(dump_name), "step_%02d_velocity.fp32.bin", step);
+        dump_f32(dump_name, v_t);
         for (size_t i = 0; i < x_t.size(); ++i) x_t[i] += dt * v_t[i];
+        std::snprintf(dump_name, sizeof(dump_name), "step_%02d_x_after.fp32.bin", step);
+        dump_f32(dump_name, x_t);
+        trace("denoise step done step=" + std::to_string(step));
     }
 
     out_actions = std::move(x_t);
+    dump_f32("final_action_norm_32.fp32.bin", out_actions);
     const int norm_dim = std::min<int>(
         cfg.action_dim,
         std::min(cfg.action_mean.size(), cfg.action_std.size()));
@@ -541,6 +676,7 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
             }
         }
     }
+    dump_f32("final_action_denorm_32.fp32.bin", out_actions);
     if (cfg.output_action_dim > 0 && cfg.output_action_dim < cfg.action_dim) {
         std::vector<float> truncated((size_t)cfg.chunk_size * (size_t)cfg.output_action_dim);
         for (int t = 0; t < cfg.chunk_size; ++t) {
@@ -550,6 +686,8 @@ bool Runner::Predict(const Input& input, std::vector<float>& out_actions)
         }
         out_actions = std::move(truncated);
     }
+    dump_f32("final_action.fp32.bin", out_actions);
+    trace("Predict done actions=" + std::to_string(out_actions.size()));
     return true;
 }
 
