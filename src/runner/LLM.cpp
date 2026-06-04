@@ -252,6 +252,12 @@ struct LLM::Impl {
     std::vector<int> last_run_generated_token_ids;
     bool b_os_kvcache = false;
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
+    struct LinearStateSnapshot {
+        int token_len = 0;
+        std::vector<std::vector<unsigned short>> k;
+        std::vector<std::vector<unsigned short>> v;
+    };
+    std::vector<LinearStateSnapshot> linear_state_snapshots_;
     int precompute_len = 0;
     std::vector<int> prefill_history_kv_cache_num_grp;
     std::vector<int> prefill_symbolic_kv_cache_num_grp;
@@ -681,6 +687,86 @@ struct LLM::Impl {
                 }
             }
         }
+    }
+
+    void drop_linear_state_snapshots_after(int token_len)
+    {
+        linear_state_snapshots_.erase(
+            std::remove_if(linear_state_snapshots_.begin(),
+                           linear_state_snapshots_.end(),
+                           [token_len](const LinearStateSnapshot &snapshot) {
+                               return snapshot.token_len > token_len;
+                           }),
+            linear_state_snapshots_.end());
+    }
+
+    int best_linear_state_snapshot_len(int token_len) const
+    {
+        int best = -1;
+        for (const auto &snapshot : linear_state_snapshots_)
+        {
+            if (snapshot.token_len <= token_len && snapshot.token_len > best)
+                best = snapshot.token_len;
+        }
+        return best;
+    }
+
+    void capture_linear_state_snapshot(int token_len)
+    {
+        if (token_len <= 0 || !has_linear_attention_layers()) return;
+
+        LinearStateSnapshot snapshot;
+        snapshot.token_len = token_len;
+        snapshot.k.resize((size_t)_attr.axmodel_num);
+        snapshot.v.resize((size_t)_attr.axmodel_num);
+
+        for (int i = 0; i < _attr.axmodel_num; ++i)
+        {
+            if (!is_linear_layer(i)) continue;
+
+            auto &lyr = llama_layers[(size_t)i];
+            const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
+            auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
+            auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
+            snapshot.k[(size_t)i].resize((size_t)t_k.nSize / sizeof(unsigned short));
+            snapshot.v[(size_t)i].resize((size_t)t_v.nSize / sizeof(unsigned short));
+            llm_d2h(snapshot.k[(size_t)i].data(), LLM_RADDR(t_k), t_k.nSize, LLM_DEVID(lyr));
+            llm_d2h(snapshot.v[(size_t)i].data(), LLM_RADDR(t_v), t_v.nSize, LLM_DEVID(lyr));
+        }
+
+        auto it = std::find_if(linear_state_snapshots_.begin(),
+                               linear_state_snapshots_.end(),
+                               [token_len](const LinearStateSnapshot &existing) {
+                                   return existing.token_len == token_len;
+                               });
+        if (it != linear_state_snapshots_.end())
+            *it = std::move(snapshot);
+        else
+            linear_state_snapshots_.push_back(std::move(snapshot));
+    }
+
+    bool restore_linear_state_snapshot_to_host_cache(int token_len)
+    {
+        if (!has_linear_attention_layers() || token_len <= 0) return true;
+
+        auto it = std::find_if(linear_state_snapshots_.begin(),
+                               linear_state_snapshots_.end(),
+                               [token_len](const LinearStateSnapshot &snapshot) {
+                                   return snapshot.token_len == token_len;
+                               });
+        if (it == linear_state_snapshots_.end())
+            return false;
+
+        if ((int)k_caches.size() != _attr.axmodel_num) k_caches.resize((size_t)_attr.axmodel_num);
+        if ((int)v_caches.size() != _attr.axmodel_num) v_caches.resize((size_t)_attr.axmodel_num);
+
+        for (int i = 0; i < _attr.axmodel_num; ++i)
+        {
+            if (!is_linear_layer(i)) continue;
+            k_caches[(size_t)i] = it->k[(size_t)i];
+            v_caches[(size_t)i] = it->v[(size_t)i];
+        }
+        return true;
     }
 
     static inline std::vector<float> l2norm(std::vector<float> embedding)
@@ -1579,6 +1665,15 @@ struct LLM::Impl {
         return layer_idx >= 0 &&
                layer_idx < (int)layer_is_linear_attn.size() &&
                layer_is_linear_attn[(size_t)layer_idx];
+    }
+
+    bool has_linear_attention_layers() const
+    {
+        for (bool is_linear : layer_is_linear_attn)
+        {
+            if (is_linear) return true;
+        }
+        return false;
     }
 
     bool is_sliding_attention_layer(int layer_idx) const
@@ -2860,7 +2955,7 @@ struct LLM::Impl {
 
     void ResetKVCache()
     {
-        last_tokens_ids.clear(); last_history_snapshot.clear(); run_input_token_ids.clear(); last_run_generated_token_ids.clear(); k_caches.clear(); v_caches.clear(); precompute_len = 0; cached_mrope_next_pos = -1; active_prefill_pos_start = -1; active_token_pos_start = -1; reset_full_cache_slot_state();
+        last_tokens_ids.clear(); last_history_snapshot.clear(); run_input_token_ids.clear(); last_run_generated_token_ids.clear(); k_caches.clear(); v_caches.clear(); linear_state_snapshots_.clear(); precompute_len = 0; cached_mrope_next_pos = -1; active_prefill_pos_start = -1; active_token_pos_start = -1; reset_full_cache_slot_state();
         decode_grpid = decode_grpids_.empty() ? 0 : decode_grpids_.back();
         _attr.prefill_grpid = prefill_grpids_.empty() ? 1 : prefill_grpids_.back();
         if (!_attr.prefill_max_kv_cache_num_grp.empty())
@@ -3225,6 +3320,7 @@ struct LLM::Impl {
             }
 
             mark_full_cache_slots(history_len, input_num_token);
+            capture_linear_state_snapshot(history_len + input_num_token);
             if (p == prefill_split_num - 1)
                 memcpy(embed.data(), embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
         }
@@ -3829,49 +3925,129 @@ struct LLM::Impl {
             const int new_len = (int)new_tokens.size();
             const int prev_tokens = (int)last_tokens_ids.size();
             const int prev_kv = precompute_len;
+            int keep = new_len;
 
-            if (prev_tokens != new_len)
+            if (has_linear_attention_layers())
             {
-                last_tokens_ids.resize((size_t)new_len);
+                const int target = tokens_diff.empty() ? std::max(0, new_len - 1) : new_len;
+                keep = best_linear_state_snapshot_len(target);
+                if (target > 0 && keep < 0)
+                {
+                    ALOGW("token rollback has no linear state snapshot <= %d. force ResetKVCache and recompute.", target);
+                    ResetKVCache();
+                    tokens_diff = new_tokens;
+                    offset = 0;
+                    not_append = false;
+                }
+                else
+                {
+                    keep = std::max(0, keep);
+                    if (!restore_linear_state_snapshot_to_host_cache(keep))
+                    {
+                        ALOGW("failed to restore linear state snapshot at %d. force ResetKVCache and recompute.", keep);
+                        ResetKVCache();
+                        tokens_diff = new_tokens;
+                        offset = 0;
+                        not_append = false;
+                    }
+                    else
+                    {
+                        drop_linear_state_snapshots_after(keep);
+                        if (prev_tokens != keep) last_tokens_ids.resize((size_t)keep);
+                        if (precompute_len > keep) precompute_len = keep;
+                        if (cached_mrope_next_pos >= keep) cached_mrope_next_pos = -1;
+                        offset = keep;
+                        tokens_diff.assign(new_tokens.begin() + keep, new_tokens.end());
+                        ALOGI("token rollback: reuse KV prefix tokens=%d via linear snapshot (prev_tokens=%d prev_kv=%d) recompute_suffix=%zu",
+                              keep,
+                              prev_tokens,
+                              prev_kv,
+                              tokens_diff.size());
+                    }
+                }
             }
-            if (precompute_len > new_len)
+            else
             {
-                precompute_len = new_len;
-            }
-            if (cached_mrope_next_pos >= new_len)
-            {
-                cached_mrope_next_pos = -1;
-            }
+                if (prev_tokens != keep)
+                {
+                    last_tokens_ids.resize((size_t)keep);
+                }
+                if (precompute_len > keep)
+                {
+                    precompute_len = keep;
+                }
+                if (cached_mrope_next_pos >= keep)
+                {
+                    cached_mrope_next_pos = -1;
+                }
 
-            ALOGI("token rollback: reuse KV prefix tokens=%d (prev_tokens=%d prev_kv=%d)",
-                  new_len,
-                  prev_tokens,
-                  prev_kv);
+                ALOGI("token rollback: reuse KV prefix tokens=%d (prev_tokens=%d prev_kv=%d)",
+                      keep,
+                      prev_tokens,
+                      prev_kv);
+            }
         }
         else if (token_prefix_reuse)
         {
-            const int keep = offset;
+            int keep = offset;
             const int prev_tokens = (int)last_tokens_ids.size();
             const int prev_kv = precompute_len;
 
-            if (prev_tokens != keep)
+            if (has_linear_attention_layers())
             {
-                last_tokens_ids.resize((size_t)keep);
+                keep = best_linear_state_snapshot_len(offset);
+                if (keep < 0)
+                {
+                    ALOGW("token prefix reuse has no linear state snapshot <= %d. force ResetKVCache and recompute.", offset);
+                    ResetKVCache();
+                    tokens_diff = new_tokens;
+                    offset = 0;
+                    not_append = false;
+                }
+                else if (!restore_linear_state_snapshot_to_host_cache(keep))
+                {
+                    ALOGW("failed to restore linear state snapshot at %d. force ResetKVCache and recompute.", keep);
+                    ResetKVCache();
+                    tokens_diff = new_tokens;
+                    offset = 0;
+                    not_append = false;
+                }
+                else
+                {
+                    drop_linear_state_snapshots_after(keep);
+                    if (prev_tokens != keep) last_tokens_ids.resize((size_t)keep);
+                    if (precompute_len > keep) precompute_len = keep;
+                    if (cached_mrope_next_pos >= keep) cached_mrope_next_pos = -1;
+                    offset = keep;
+                    tokens_diff.assign(new_tokens.begin() + keep, new_tokens.end());
+                    ALOGI("token prefix reuse: reuse KV prefix tokens=%d via linear snapshot (prev_tokens=%d prev_kv=%d) recompute_suffix=%zu",
+                          keep,
+                          prev_tokens,
+                          prev_kv,
+                          tokens_diff.size());
+                }
             }
-            if (precompute_len > keep)
+            else
             {
-                precompute_len = keep;
-            }
-            if (cached_mrope_next_pos >= keep)
-            {
-                cached_mrope_next_pos = -1;
-            }
+                if (prev_tokens != keep)
+                {
+                    last_tokens_ids.resize((size_t)keep);
+                }
+                if (precompute_len > keep)
+                {
+                    precompute_len = keep;
+                }
+                if (cached_mrope_next_pos >= keep)
+                {
+                    cached_mrope_next_pos = -1;
+                }
 
-            ALOGI("token prefix reuse: reuse KV prefix tokens=%d (prev_tokens=%d prev_kv=%d) recompute_suffix=%zu",
-                  keep,
-                  prev_tokens,
-                  prev_kv,
-                  tokens_diff.size());
+                ALOGI("token prefix reuse: reuse KV prefix tokens=%d (prev_tokens=%d prev_kv=%d) recompute_suffix=%zu",
+                      keep,
+                      prev_tokens,
+                      prev_kv,
+                      tokens_diff.size());
+            }
         }
         if (tokens_diff.empty())
         {
