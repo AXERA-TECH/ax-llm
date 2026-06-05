@@ -2428,6 +2428,7 @@ struct LLM::Impl {
         if (!tokenizer) { ALOGE("create_tokenizer(%s) failed", this->_attr.tokenizer_type.c_str()); return false; }
         if (!tokenizer->load(attr.url_tokenizer_model)) { ALOGE("tokenizer.init(%s) failed", attr.url_tokenizer_model.c_str()); return false; }
         tokenizer->set_think_in_prompt(!tokenizer_uses_hidden_channel_markup(this->_attr.tokenizer_type));
+        tokenizer->set_generation_thinking_mode(this->_attr.generation_thinking_mode);
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
 
 #ifdef USE_AXCL
@@ -4905,6 +4906,8 @@ LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
 void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p); }
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
+void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
+void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
