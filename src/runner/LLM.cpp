@@ -498,6 +498,61 @@ struct LLM::Impl {
         return "提示：为保证视频解析质量，本次视频请求已按新会话处理，未使用此前对话上下文。\n\n";
     }
 
+    static bool request_has_video_media(const std::vector<Content> &history,
+                                        const std::vector<::MediaInputs> &media_inputs)
+    {
+        for (const auto &media : media_inputs)
+        {
+            if (media.content_index < history.size() && history[media.content_index].type == VIDEO)
+                return true;
+        }
+        return false;
+    }
+
+    static bool normalize_away_video_history(std::vector<Content> &history,
+                                             std::vector<::MediaInputs> &media_inputs)
+    {
+        if (history.empty()) return false;
+
+        size_t current_user_index = history.size();
+        for (size_t i = history.size(); i > 0; --i)
+        {
+            if (history[i - 1].role == USER)
+            {
+                current_user_index = i - 1;
+                break;
+            }
+        }
+        if (current_user_index >= history.size()) return false;
+
+        std::vector<Content> normalized;
+        normalized.reserve(history.size());
+        for (size_t i = 0; i < current_user_index; ++i)
+        {
+            if (history[i].role == SYSTEM)
+                normalized.push_back(history[i]);
+        }
+
+        const size_t new_user_index = normalized.size();
+        normalized.push_back(history[current_user_index]);
+
+        std::vector<::MediaInputs> normalized_media;
+        if (history[current_user_index].type == VIDEO)
+        {
+            for (auto it = media_inputs.rbegin(); it != media_inputs.rend(); ++it)
+            {
+                if (it->content_index == current_user_index && !it->uris.empty())
+                {
+                    normalized_media.push_back({new_user_index, it->uris});
+                    break;
+                }
+            }
+        }
+        media_inputs = std::move(normalized_media);
+        history = std::move(normalized);
+        return true;
+    }
+
     void clear_last_error()
     {
         last_error_message.clear();
@@ -940,6 +995,12 @@ struct LLM::Impl {
 
         append_eos = false;
         eos_token_id = -1;
+    }
+
+    bool is_minicpmv46_tokenizer() const
+    {
+        const std::string key = key_of(_attr.tokenizer_type);
+        return key == "minicpmv46" || key == "minicpmv46vl";
     }
 
     int group_index_by_gid(const std::vector<int> &grpids, int gid) const
@@ -2320,15 +2381,30 @@ struct LLM::Impl {
         vmins.reserve(tail_media_inputs.size());
         for (const auto &m : tail_media_inputs) vmins.push_back({m.content_index, m.uris});
 
+        std::vector<int> close_tokens = encode_text_without_tokenizer_prefix("<|im_end|>\n");
+        if (close_tokens.empty()) return false;
+
+        vision::PromptBudget budget;
+        const int max_cap = !_attr.prefill_max_kv_cache_num_grp.empty()
+                                ? _attr.prefill_max_kv_cache_num_grp.back()
+                                : _attr.prefill_max_token_num;
+        int remaining = std::max(0, max_cap - precompute_len - (int)close_tokens.size());
+        if (_attr.prefill_token_num > 0)
+        {
+            remaining = ALIGN_DOWN(remaining, _attr.prefill_token_num);
+        }
+        budget.prefill_token_num = _attr.prefill_token_num;
+        budget.max_total_tokens = remaining;
+        budget.max_tail_tokens = remaining;
+
         std::vector<Content> prepared_tail;
         std::vector<int> tail_ids;
         vision::RunState tail_state;
-        if (!vision->Prepare(tail_history, vmins, nullptr, prepared_tail, tail_ids, tail_state, err))
+        if (!vision->Prepare(tail_history, vmins, &budget, prepared_tail, tail_ids, tail_state, err))
             return false;
         strip_empty_prompt_prefix(tail_ids);
 
-        std::vector<int> close_tokens = encode_text_without_tokenizer_prefix("<|im_end|>\n");
-        if (close_tokens.empty() || tail_ids.empty())
+        if (tail_ids.empty())
             return false;
 
         new_tokens = last_tokens_ids;
@@ -3505,11 +3581,10 @@ struct LLM::Impl {
         ChannelSectionFilter channel_filter;
         channel_filter.reset();
         const bool hide_channel_markup = tokenizer_uses_hidden_channel_markup(_attr.tokenizer_type);
-        const std::string tokenizer_key = key_of(_attr.tokenizer_type);
         const bool force_linear_prefill_decode_replay =
-            std::getenv("AXLLM_FORCE_LINEAR_PREFILL_DECODE_REPLAY") ||
-            tokenizer_key == "minicpmv46" ||
-            tokenizer_key == "minicpmv46vl";
+            std::getenv("AXLLM_FORCE_LINEAR_PREFILL_DECODE_REPLAY") != nullptr;
+        const bool disable_minicpm_linear_prefill_decode_replay =
+            std::getenv("AXLLM_DISABLE_MINICPM_LINEAR_PREFILL_DECODE_REPLAY") != nullptr;
         const bool debug_prefill =
             std::getenv("AXLLM_DEBUG_PREFILL") ||
             std::getenv("AXLLM_DEBUG_LAYER0_IO") ||
@@ -3590,6 +3665,21 @@ struct LLM::Impl {
         int input_embed_num  = (int)(test_embed.size() / _attr.tokens_embed_size);
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
         ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
+        const bool auto_minicpm_linear_prefill_decode_replay =
+            !disable_minicpm_linear_prefill_decode_replay &&
+            is_minicpmv46_tokenizer() &&
+            !has_vision_state &&
+            input_embed_num > 0 &&
+            input_embed_num <= _attr.prefill_token_num;
+        const bool use_linear_prefill_decode_replay =
+            force_linear_prefill_decode_replay || auto_minicpm_linear_prefill_decode_replay;
+        if (auto_minicpm_linear_prefill_decode_replay)
+        {
+            ALOGI("MiniCPM-V-4.6 short text prefill uses decode replay: input_tokens=%d prefill_tokens=%d precompute_len=%d",
+                  input_embed_num,
+                  _attr.prefill_token_num,
+                  precompute_len);
+        }
         timer t_cost, ttft_timer, decode_timer; ttft_timer.start();
         bool decode_timer_started = false;
 
@@ -3838,7 +3928,7 @@ struct LLM::Impl {
                     prefill_input_snapshot = embed_tmp;
                 bool used_decode_replay = false;
                 int infer_ret = 0;
-                if (linear_prefill && force_linear_prefill_decode_replay)
+                if (linear_prefill && use_linear_prefill_decode_replay)
                 {
                     used_decode_replay = replay_linear_prefill_via_decode(m,
                                                                           lyr.layer,
@@ -4523,15 +4613,48 @@ struct LLM::Impl {
     {
         clear_last_error();
         has_vision_state = false;
+        std::vector<::MediaInputs> effective_media_inputs = media_inputs;
+        bool video_history_isolated = false;
+
+        if (request_has_video_media(history, effective_media_inputs))
+        {
+            const size_t old_history_size = history.size();
+            const size_t old_media_size = effective_media_inputs.size();
+            if (normalize_away_video_history(history, effective_media_inputs))
+            {
+                ALOGW("video history is isolated to current user turn: old_history=%zu new_history=%zu old_media_inputs=%zu new_media_inputs=%zu",
+                      old_history_size,
+                      history.size(),
+                      old_media_size,
+                      effective_media_inputs.size());
+                ResetKVCache();
+                video_history_isolated = true;
+            }
+        }
 
         std::vector<int> new_tokens;
         std::string response_prefix;
         bool used_cached_text_turn = false;
         bool used_cached_media_turn = false;
-        const size_t append_start = last_history_snapshot.size();
-        const bool no_new_media_input = !has_new_media_input(media_inputs, append_start);
+        size_t append_start = last_history_snapshot.size();
+        if (!last_history_snapshot.empty() && !is_history_prefix(last_history_snapshot, history))
+        {
+            ALOGW("raw history not append. force ResetKVCache before request processing.");
+            ResetKVCache();
+            append_start = 0;
+        }
+
+        const std::string tokenizer_key_for_cache = key_of(_attr.tokenizer_type);
+        const bool is_minicpm_v46_cache =
+            tokenizer_key_for_cache == "minicpmv46" ||
+            tokenizer_key_for_cache == "minicpmv46vl";
+        const bool allow_cached_text_turn =
+            supports_cached_im_chat_turn_tokens() &&
+            (!is_minicpm_v46_cache ||
+             std::getenv("AXLLM_ENABLE_MINICPMV46_TEXT_KV_CACHE") != nullptr);
+        const bool no_new_media_input = !has_new_media_input(effective_media_inputs, append_start);
         const bool cached_text_turn_requested = vision && vision->enabled() &&
-                                                supports_cached_im_chat_turn_tokens() &&
+                                                allow_cached_text_turn &&
                                                 !last_history_snapshot.empty() &&
                                                 precompute_len > 0 &&
                                                 no_new_media_input &&
@@ -4585,7 +4708,7 @@ struct LLM::Impl {
         else if (cached_media_turn_requested)
         {
             std::string verr;
-            if (!history_appended || !build_cached_im_chat_media_turn_tokens(history, media_inputs, append_start, new_tokens, vision_state, verr))
+            if (!history_appended || !build_cached_im_chat_media_turn_tokens(history, effective_media_inputs, append_start, new_tokens, vision_state, verr))
             {
                 set_last_error("无法增量处理新增多模态输入，请 /reset 后重新开始。");
                 ALOGE("failed to build cached media turn tokens: %s", verr.c_str());
@@ -4602,11 +4725,11 @@ struct LLM::Impl {
         if (!used_cached_text_turn && !used_cached_media_turn && vision && vision->enabled())
         {
             // If caller provides media, we will fill num_media/num_media_tokens and build injection state.
-            if (!media_inputs.empty())
+            if (!effective_media_inputs.empty())
             {
                 std::vector<vision::MediaInputs> vmins;
-                vmins.reserve(media_inputs.size());
-                for (const auto &m : media_inputs) vmins.push_back({m.content_index, m.uris});
+                vmins.reserve(effective_media_inputs.size());
+                for (const auto &m : effective_media_inputs) vmins.push_back({m.content_index, m.uris});
 
                 vision::PromptBudget budget;
                 budget.last_tokens = last_tokens_ids;
@@ -4952,14 +5075,22 @@ struct LLM::Impl {
         last_tokens_ids = std::move(cached_prefix_tokens);
         last_tokens_ids.insert(last_tokens_ids.end(), tokens_diff.begin(), tokens_diff.end());
         last_tokens_ids.insert(last_tokens_ids.end(), last_run_generated_token_ids.begin(), last_run_generated_token_ids.end());
-        GetKVCache(k_caches, v_caches, precompute_len);
-        if ((int)last_tokens_ids.size() != precompute_len)
+        if (video_history_isolated)
         {
-            ALOGW("exact cached token prefix length differs from KV: tokens=%zu precompute_len=%d generated=%zu input=%zu",
-                  last_tokens_ids.size(),
-                  precompute_len,
-                  last_run_generated_token_ids.size(),
-                  tokens_diff.size());
+            ALOGW("drop KV cache after isolated video-history request");
+            ResetKVCache();
+        }
+        else
+        {
+            GetKVCache(k_caches, v_caches, precompute_len);
+            if ((int)last_tokens_ids.size() != precompute_len)
+            {
+                ALOGW("exact cached token prefix length differs from KV: tokens=%zu precompute_len=%d generated=%zu input=%zu",
+                      last_tokens_ids.size(),
+                      precompute_len,
+                      last_run_generated_token_ids.size(),
+                      tokens_diff.size());
+            }
         }
 
         has_vision_state = false;

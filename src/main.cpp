@@ -1636,6 +1636,26 @@ static std::string extract_media_url(const nlohmann::json &item, const char *pri
     return extract_from_key(fallback_key);
 }
 
+static void infer_media_type_from_uri_prefix(std::string &raw_url, ContentType &part_type)
+{
+    const std::string lowered = lower_copy(raw_url);
+    if (lowered.rfind("video:", 0) == 0)
+    {
+        part_type = VIDEO;
+        raw_url = trim_copy(raw_url.substr(6));
+    }
+    else if (lowered.rfind("audio:", 0) == 0)
+    {
+        part_type = AUDIO;
+        raw_url = trim_copy(raw_url.substr(6));
+    }
+    else if (lowered.rfind("image:", 0) == 0)
+    {
+        part_type = IMAGE;
+        raw_url = trim_copy(raw_url.substr(6));
+    }
+}
+
 // Handle HTTP API messages
 bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history,
                          std::vector<MediaInputs> *media_inputs = nullptr,
@@ -1703,6 +1723,7 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                     }
                     if (!raw_url.empty())
                     {
+                        infer_media_type_from_uri_prefix(raw_url, part_type);
                         if (media_type != TEXT && media_type != part_type)
                         {
                             ALOGE("mixed media types in a single message are not supported yet");
@@ -1753,6 +1774,21 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     }
 
     return true;
+}
+
+static void prepend_config_system_prompt_if_missing(const LLMAttrType &attr,
+                                                    std::vector<Content> &history,
+                                                    std::vector<MediaInputs> &media_inputs)
+{
+    const std::string system_prompt = get_effective_system_prompt(attr);
+    if (system_prompt.empty()) return;
+    if (!history.empty() && history.front().role == SYSTEM) return;
+
+    history.insert(history.begin(), {SYSTEM, TEXT, system_prompt});
+    for (auto &media : media_inputs)
+    {
+        media.content_index += 1;
+    }
 }
 
 static bool normalize_single_image_ocr_request(const ModelConfig &config,
@@ -2149,6 +2185,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
                 }
+                prepend_config_system_prompt_if_missing(config.attr, history, media_inputs);
                 int output_max_tokens = resolve_chat_output_max_tokens(config, req, llm.getAttr()->max_token_len);
                 if (hymt_translation_mode) {
                     std::string hymt_err;
