@@ -1537,81 +1537,6 @@ struct LLM::Impl {
         for (int i = 0; i < n; ++i) linear_mask_tmp[(size_t)i] = one;
     }
 
-    bool replay_linear_prefill_via_decode(int layer_idx,
-                                          ax_runner_t &layer,
-                                          int prefill_gid,
-                                          int decode_grpid,
-                                          const std::vector<unsigned short> &prefill_input,
-                                          int input_num_token,
-                                          int seq_start_pos,
-                                          int devid,
-                                          std::vector<unsigned short> &prefill_output)
-    {
-        if (input_num_token <= 0) return true;
-        const size_t hidden_words = (size_t)_attr.tokens_embed_size;
-        const size_t need_words = (size_t)input_num_token * hidden_words;
-        if (prefill_input.size() < need_words)
-        {
-            ALOGE("linear prefill decode replay input too small: layer=%d input_words=%zu need_words=%zu",
-                  layer_idx,
-                  prefill_input.size(),
-                  need_words);
-            return false;
-        }
-
-        auto &t_idx = layer.get_input(decode_grpid, "indices");
-        auto &t_mask = layer.get_input(decode_grpid, "mask");
-        auto &t_in = layer.get_input(decode_grpid, "input");
-        auto &t_out = layer.get_output(decode_grpid, "output");
-
-        const size_t mask_elems = std::max((size_t)1, (size_t)t_mask.nSize / sizeof(unsigned short));
-        const unsigned short one = bfloat16(1.0f).data;
-        std::vector<unsigned short> linear_decode_mask(mask_elems, one);
-
-        prefill_output.assign(prefill_input.size(), 0);
-        for (int j = 0; j < input_num_token; ++j)
-        {
-            const unsigned int decode_pos = (unsigned int)(seq_start_pos + j);
-            std::memcpy(t_idx.pVirAddr, &decode_pos, std::min((size_t)t_idx.nSize, sizeof(decode_pos)));
-            std::memcpy(t_mask.pVirAddr,
-                        linear_decode_mask.data(),
-                        std::min((size_t)t_mask.nSize, linear_decode_mask.size() * sizeof(unsigned short)));
-
-            const unsigned short *src_embed = prefill_input.data() + (size_t)j * hidden_words;
-            std::memcpy(t_in.pVirAddr, src_embed, std::min((size_t)t_in.nSize, hidden_words * sizeof(unsigned short)));
-
-            const int ret = layer.inference(decode_grpid);
-            if (ret != 0)
-            {
-                ALOGE("linear prefill decode replay failed: layer=%d prefill_gid=%d decode_gid=%d token_idx=%d pos=%u ret=0x%x",
-                      layer_idx,
-                      prefill_gid,
-                      decode_grpid,
-                      j,
-                      decode_pos,
-                      ret);
-                return false;
-            }
-
-            sync_linear_input_state_from_group(layer_idx, layer, decode_grpid, devid, false);
-
-            unsigned short *dst_hidden = prefill_output.data() + (size_t)j * hidden_words;
-            std::memcpy(dst_hidden, t_out.pVirAddr, std::min((size_t)t_out.nSize, hidden_words * sizeof(unsigned short)));
-        }
-
-        sync_linear_input_state_from_group(layer_idx, layer, decode_grpid, devid, true);
-        if (std::getenv("AXLLM_DEBUG_PREFILL") || std::getenv("AXLLM_DEBUG_LINEAR_STATE"))
-        {
-            ALOGI("linear prefill decode replay applied: layer=%d prefill_gid=%d decode_gid=%d tokens=%d seq_start_pos=%d",
-                  layer_idx,
-                  prefill_gid,
-                  decode_grpid,
-                  input_num_token,
-                  seq_start_pos);
-        }
-        return true;
-    }
-
     void copy_full_cache_prefix_to_group(ax_runner_t &layer,
                                          int dst_gid,
                                          int src_gid,
@@ -3581,10 +3506,6 @@ struct LLM::Impl {
         ChannelSectionFilter channel_filter;
         channel_filter.reset();
         const bool hide_channel_markup = tokenizer_uses_hidden_channel_markup(_attr.tokenizer_type);
-        const bool force_linear_prefill_decode_replay =
-            std::getenv("AXLLM_FORCE_LINEAR_PREFILL_DECODE_REPLAY") != nullptr;
-        const bool disable_minicpm_linear_prefill_decode_replay =
-            std::getenv("AXLLM_DISABLE_MINICPM_LINEAR_PREFILL_DECODE_REPLAY") != nullptr;
         const bool debug_prefill =
             std::getenv("AXLLM_DEBUG_PREFILL") ||
             std::getenv("AXLLM_DEBUG_LAYER0_IO") ||
@@ -3665,21 +3586,6 @@ struct LLM::Impl {
         int input_embed_num  = (int)(test_embed.size() / _attr.tokens_embed_size);
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
         ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
-        const bool auto_minicpm_linear_prefill_decode_replay =
-            !disable_minicpm_linear_prefill_decode_replay &&
-            is_minicpmv46_tokenizer() &&
-            !has_vision_state &&
-            input_embed_num > 0 &&
-            input_embed_num <= _attr.prefill_token_num;
-        const bool use_linear_prefill_decode_replay =
-            force_linear_prefill_decode_replay || auto_minicpm_linear_prefill_decode_replay;
-        if (auto_minicpm_linear_prefill_decode_replay)
-        {
-            ALOGI("MiniCPM-V-4.6 short text prefill uses decode replay: input_tokens=%d prefill_tokens=%d precompute_len=%d",
-                  input_embed_num,
-                  _attr.prefill_token_num,
-                  precompute_len);
-        }
         timer t_cost, ttft_timer, decode_timer; ttft_timer.start();
         bool decode_timer_started = false;
 
@@ -3923,58 +3829,14 @@ struct LLM::Impl {
                     dump_selected_prefill_tensors(lyr.layer, layer_prefill_grpid, -1);
                 const bool linear_prefill = is_linear_layer(m);
                 const int layer_decode_grpid = decode_gid_for_layer(m, decode_grpid);
-                std::vector<unsigned short> prefill_input_snapshot;
-                if (linear_prefill)
-                    prefill_input_snapshot = embed_tmp;
-                bool used_decode_replay = false;
-                int infer_ret = 0;
-                if (linear_prefill && use_linear_prefill_decode_replay)
+                const int infer_ret = lyr.layer.inference(layer_prefill_grpid);
+                if (infer_ret != 0)
                 {
-                    used_decode_replay = replay_linear_prefill_via_decode(m,
-                                                                          lyr.layer,
-                                                                          layer_prefill_grpid,
-                                                                          layer_decode_grpid,
-                                                                          prefill_input_snapshot,
-                                                                          input_num_token,
-                                                                          rope_start_pos,
-                                                                          devid,
-                                                                          embed_tmp);
-                    if (!used_decode_replay)
-                    {
-                        ALOGE("prefill layer %d forced decode replay failed", m);
-                        return final_out;
-                    }
+                    ALOGW("prefill layer %d gid=%d inference failed: 0x%x", m, layer_prefill_grpid, infer_ret);
+                    return final_out;
                 }
-                else
-                {
-                    infer_ret = lyr.layer.inference(layer_prefill_grpid);
-                    if (infer_ret != 0)
-                    {
-                        ALOGW("prefill layer %d gid=%d inference failed: 0x%x", m, layer_prefill_grpid, infer_ret);
-                        if (linear_prefill)
-                        {
-                            used_decode_replay = replay_linear_prefill_via_decode(m,
-                                                                                  lyr.layer,
-                                                                                  layer_prefill_grpid,
-                                                                                  layer_decode_grpid,
-                                                                                  prefill_input_snapshot,
-                                                                                  input_num_token,
-                                                                                  rope_start_pos,
-                                                                                  devid,
-                                                                                  embed_tmp);
-                            if (!used_decode_replay)
-                            {
-                                ALOGE("prefill layer %d decode replay fallback failed", m);
-                                return final_out;
-                            }
-                        }
-                        else
-                        {
-                            return final_out;
-                        }
-                    }
-                }
-                if (infer_ret == 0 && linear_prefill && !used_decode_replay)
+                if (debug_prefill) ALOGI("prefill layer %d inference done", m);
+                if (std::getenv("AXLLM_DEBUG_LAYER0_IO") && m == 0 && p == 0)
                 {
                     try
                     {
@@ -3984,79 +3846,16 @@ struct LLM::Impl {
                         {
                             float min_v = 0.0f, max_v = 0.0f, mean_abs = 0.0f;
                             summarize_bf16_buffer((const unsigned short *)t_out0.pVirAddr, n, min_v, max_v, mean_abs);
-                            const bool bad_output = !std::isfinite(min_v) ||
-                                                    !std::isfinite(max_v) ||
-                                                    !std::isfinite(mean_abs) ||
-                                                    mean_abs == 0.0f;
-                            if (bad_output)
-                            {
-                                ALOGW("prefill layer %d gid=%d output unhealthy: min=%.6f max=%.6f mean_abs=%.6f, fallback to decode replay",
-                                      m,
-                                      layer_prefill_grpid,
-                                      min_v,
-                                      max_v,
-                                      mean_abs);
-                                used_decode_replay = replay_linear_prefill_via_decode(m,
-                                                                                      lyr.layer,
-                                                                                      layer_prefill_grpid,
-                                                                                      layer_decode_grpid,
-                                                                                      prefill_input_snapshot,
-                                                                                      input_num_token,
-                                                                                      rope_start_pos,
-                                                                                      devid,
-                                                                                      embed_tmp);
-                                if (!used_decode_replay)
-                                {
-                                    ALOGE("prefill layer %d decode replay fallback failed after unhealthy output", m);
-                                    return final_out;
-                                }
-                            }
+                            ALOGI("DBGIO step=0 gid=%d output hash=0x%llx min=%.6f max=%.6f mean_abs=%.6f",
+                                  layer_prefill_grpid,
+                                  (unsigned long long)hash_u16_buffer((const unsigned short *)t_out0.pVirAddr, n),
+                                  min_v,
+                                  max_v,
+                                  mean_abs);
                         }
                     }
-                    catch (const std::exception &e)
+                    catch (const std::exception &)
                     {
-                        ALOGW("prefill layer %d unhealthy-output check skipped: %s", m, e.what());
-                    }
-                }
-                if (debug_prefill) ALOGI("prefill layer %d inference done", m);
-                if (std::getenv("AXLLM_DEBUG_LAYER0_IO") && m == 0 && p == 0)
-                {
-                    if (!used_decode_replay)
-                    {
-                        try
-                        {
-                            const auto &t_out0 = lyr.layer.get_output(layer_prefill_grpid, "output");
-                            const int n = (int)(t_out0.nSize / sizeof(unsigned short));
-                            if (n > 0 && t_out0.pVirAddr)
-                            {
-                                float min_v = 0.0f, max_v = 0.0f, mean_abs = 0.0f;
-                                summarize_bf16_buffer((const unsigned short *)t_out0.pVirAddr, n, min_v, max_v, mean_abs);
-                                ALOGI("DBGIO step=0 gid=%d output hash=0x%llx min=%.6f max=%.6f mean_abs=%.6f",
-                                      layer_prefill_grpid,
-                                      (unsigned long long)hash_u16_buffer((const unsigned short *)t_out0.pVirAddr, n),
-                                      min_v,
-                                      max_v,
-                                      mean_abs);
-                            }
-                        }
-                        catch (const std::exception &)
-                        {
-                        }
-                    }
-                    else
-                    {
-                        float min_v = 0.0f, max_v = 0.0f, mean_abs = 0.0f;
-                        summarize_bf16_buffer(embed_tmp.data(),
-                                              (int)(embed_tmp.size()),
-                                              min_v,
-                                              max_v,
-                                              mean_abs);
-                        ALOGI("DBGIO step=0 gid=%d decode_replay_output hash=0x%llx min=%.6f max=%.6f mean_abs=%.6f",
-                              layer_prefill_grpid,
-                              (unsigned long long)hash_u16_buffer(embed_tmp.data(), (int)embed_tmp.size()),
-                              min_v,
-                              max_v,
-                              mean_abs);
                     }
                 }
                 auto &dec_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
@@ -4065,8 +3864,7 @@ struct LLM::Impl {
                 {
                     (void)dec_k;
                     (void)dec_v;
-                    if (!used_decode_replay)
-                        sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true);
+                    sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true);
                 }
                 else
                 {
@@ -4099,16 +3897,9 @@ struct LLM::Impl {
                     }
                 }
 
-                if (!used_decode_replay)
-                {
-                    auto &t_out = lyr.layer.get_output(layer_prefill_grpid, "output");
-                    llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
-                    if (debug_prefill) ALOGI("prefill layer %d output d2h done", m);
-                }
-                else
-                {
-                    if (debug_prefill) ALOGI("prefill layer %d output decode replay done", m);
-                }
+                auto &t_out = lyr.layer.get_output(layer_prefill_grpid, "output");
+                llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
+                if (debug_prefill) ALOGI("prefill layer %d output d2h done", m);
                 if (std::getenv("AXLLM_DEBUG_DECODE_TRACE") &&
                     p == prefill_split_num - 1 &&
                     input_num_token > 0 &&
