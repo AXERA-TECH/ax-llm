@@ -147,6 +147,8 @@ int main(int argc, char** argv) {
     if (j.contains("vision_patch_size")) attr.vision_patch_size = j["vision_patch_size"].get<int>();
     if (j.contains("vision_fps")) attr.vision_fps = j["vision_fps"].get<int>();
     if (j.contains("vision_tokens_per_second")) attr.vision_tokens_per_second = j["vision_tokens_per_second"].get<int>();
+    if (j.contains("vision_num_frames")) attr.vision_num_frames = j["vision_num_frames"].get<int>();
+    if (j.contains("vision_do_sample_frames")) attr.vision_do_sample_frames = j["vision_do_sample_frames"].get<bool>();
 
     // Auto-pick a smoke image if this is a VLM model and caller didn't specify one.
     if (attr.vlm_type != VLMType::None && image_path.empty() && video_dir.empty() && audio_path.empty())

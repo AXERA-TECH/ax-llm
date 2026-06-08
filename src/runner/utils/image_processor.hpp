@@ -33,6 +33,15 @@ int Gemma4ImageProcessor(axcv::Mat& src,
                          int tgt_h, int tgt_w,
                          int patch_size = 16);
 
+// MiniCPM-V 4.6 image processor:
+// Pillow-bicubic resize -> RGB -> HF reshape_by_patch layout [C, patch_size, -1].
+// Values remain uint8 here; callers convert to float32 with mean/std 0.5.
+int MiniCPMV46ImageProcessor(axcv::Mat& src,
+                             std::vector<unsigned char>& output,
+                             int tgt_h,
+                             int tgt_w,
+                             int patch_size = 14);
+
 // SmolVLM2 image processor:
 // For each input image, outputs 5 blocks: 2x2 tiles (4) + global resized image (1).
 int Smolvlm2ImageProcessor(std::vector<axcv::Mat>& src,

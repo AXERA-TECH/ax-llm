@@ -37,6 +37,8 @@ static std::vector<std::string> required_tokenizers()
         "PaddleOCRVL",
         "Gemma4",
         "Gemma4VL",
+        "MiniCPMV46",
+        "MiniCPMV46VL",
     };
 }
 
@@ -67,4 +69,3 @@ int main(int argc, char **argv)
     std::cout << "[OK] Tokenizer create smoke passed (" << names.size() << " types)\n";
     return 0;
 }
-

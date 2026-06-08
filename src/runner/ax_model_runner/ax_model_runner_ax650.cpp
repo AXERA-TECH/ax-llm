@@ -54,6 +54,12 @@ static int prepare_io_struct_only(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_
 static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data,
                                  std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRATEGY_T> strategy, std::vector<std::string> skip_alloc_names = {})
 {
+    const bool force_uncached = std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr;
+    if (force_uncached)
+    {
+        strategy.first = AX_ENGINE_ABST_DEFAULT;
+        strategy.second = AX_ENGINE_ABST_DEFAULT;
+    }
     int ret = prepare_io_struct_only(info, io_data);
     if (ret != 0)
         return ret;
@@ -220,6 +226,7 @@ int ax_runner_ax650::sub_init()
             auto *first_info = m_handle->io_info[0];
             auto &first_data = m_handle->io_data[0];
             if (!first_info || !first_data.pInputs) return 0;
+            const bool force_uncached = std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr;
 
             for (size_t i = 0; i < first_info->nInputSize && i < first_data.nInputSize; ++i)
             {
@@ -231,14 +238,24 @@ int ax_runner_ax650::sub_init()
 
                 if (buf.phyAddr != 0) AX_SYS_MemFree(buf.phyAddr, buf.pVirAddr);
 
-                int ret = AX_SYS_MemAllocCached((AX_U64 *)(&buf.phyAddr),
-                                               &buf.pVirAddr,
-                                               want_bytes,
-                                               AX_CMM_ALIGN_SIZE,
-                                               (const AX_S8 *)(AX_CMM_SESSION_NAME));
+                int ret = force_uncached
+                              ? AX_SYS_MemAlloc((AX_U64 *)(&buf.phyAddr),
+                                                &buf.pVirAddr,
+                                                want_bytes,
+                                                AX_CMM_ALIGN_SIZE,
+                                                (const AX_S8 *)(AX_CMM_SESSION_NAME))
+                              : AX_SYS_MemAllocCached((AX_U64 *)(&buf.phyAddr),
+                                                      &buf.pVirAddr,
+                                                      want_bytes,
+                                                      AX_CMM_ALIGN_SIZE,
+                                                      (const AX_S8 *)(AX_CMM_SESSION_NAME));
                 if (ret != 0)
                 {
-                    ALOGE("AX_SYS_MemAllocCached(%s, %zu) failed, ret=0x%x", name, want_bytes, ret);
+                    ALOGE("AX_SYS_MemAlloc%s(%s, %zu) failed, ret=0x%x",
+                          force_uncached ? "" : "Cached",
+                          name,
+                          want_bytes,
+                          ret);
                     buf.phyAddr = 0;
                     buf.pVirAddr = nullptr;
                     return ret;
@@ -259,8 +276,11 @@ int ax_runner_ax650::sub_init()
         if (ret != 0) return ret;
     }
 
-    // 2. 处理中间 Group 的内存共享逻辑 (原有逻辑的 Hack)
-    if (io_count > 2)
+    // 2. Share skipped KV inputs across groups.
+    // Two-group models (decode + one prefill group) still need the last
+    // group's skipped K/V inputs to alias group0; otherwise the prefill
+    // group's fake K/V tensors can keep null buffers and poison layer0.
+    if (io_count > 1)
     {
         auto &first_io_data = m_handle->io_data[0];
         auto &first_io_info = m_handle->io_info[0];
@@ -298,7 +318,13 @@ int ax_runner_ax650::sub_init()
                 last_io_data.pInputs[i].nSize = first_buf->nSize;
             }
         }
+    }
 
+    // 3. 处理中间 Group 的内存共享逻辑 (原有逻辑的 Hack)
+    if (io_count > 2)
+    {
+        auto &last_io_data = m_handle->io_data[io_count - 1];
+        auto &last_io_info = m_handle->io_info[io_count - 1];
         for (size_t grpid = 1; grpid < io_count - 1; grpid++)
         {
             auto &io_info = m_handle->io_info[grpid];
@@ -362,7 +388,7 @@ int ax_runner_ax650::sub_init()
         }
     }
 
-    // 3. 构建 Tensor 对象
+    // 4. 构建 Tensor 对象
     for (size_t grpid = 0; grpid < io_count; grpid++)
     {
         auto &io_info = m_handle->io_info[grpid];
@@ -633,6 +659,7 @@ int ax_runner_ax650::inference()
     if (!has_handle_loaded())
         return -1;
 
+    const bool force_runsync = std::getenv("AXLLM_AX650_FORCE_RUNSYNC") != nullptr;
     if (_auto_sync_before_inference)
     {
         for (size_t i = 0; i < get_num_inputs(); i++)
@@ -658,9 +685,14 @@ int ax_runner_ax650::inference()
     }
     else
     {
-        if (m_handle->context != 0)
+        if (!force_runsync && m_handle->context != 0)
         {
             ret = AX_ENGINE_RunGroupIOSync(m_handle->handle, m_handle->context, 0, &m_handle->io_data[0]);
+            if (ret != 0)
+            {
+                ALOGW("AX_ENGINE_RunGroupIOSync(grpid=0) failed: 0x%x, fallback to AX_ENGINE_RunSync", ret);
+                ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[0]);
+            }
         }
         else
         {
@@ -695,6 +727,39 @@ int ax_runner_ax650::inference(int grpid)
         return -1;
     if (grpid < 0 || grpid >= (int)m_handle->io_data.size())
         return -1;
+    const bool force_runsync = std::getenv("AXLLM_AX650_FORCE_RUNSYNC") != nullptr;
+
+    if (std::getenv("AXLLM_DEBUG_LAYER0_IO"))
+    {
+        auto *info = m_handle->io_info[(size_t)grpid];
+        auto &io = m_handle->io_data[(size_t)grpid];
+        ALOGI("AX650 inference grpid=%d io_inputs=%u io_outputs=%u", grpid, io.nInputSize, io.nOutputSize);
+        if (info)
+        {
+            for (size_t i = 0; i < io.nInputSize && i < info->nInputSize; ++i)
+            {
+                const char *name = info->pInputs[i].pName ? info->pInputs[i].pName : "(null)";
+                ALOGI("AX650 io_in[%zu] name=%s phy=%p vir=%p data_bytes=%u info_bytes=%u",
+                      i,
+                      name,
+                      (void *)io.pInputs[i].phyAddr,
+                      io.pInputs[i].pVirAddr,
+                      io.pInputs[i].nSize,
+                      info->pInputs[i].nSize);
+            }
+            for (size_t i = 0; i < io.nOutputSize && i < info->nOutputSize; ++i)
+            {
+                const char *name = info->pOutputs[i].pName ? info->pOutputs[i].pName : "(null)";
+                ALOGI("AX650 io_out[%zu] name=%s phy=%p vir=%p data_bytes=%u info_bytes=%u",
+                      i,
+                      name,
+                      (void *)io.pOutputs[i].phyAddr,
+                      io.pOutputs[i].pVirAddr,
+                      io.pOutputs[i].nSize,
+                      info->pOutputs[i].nSize);
+            }
+        }
+    }
 
     if (_auto_sync_before_inference)
     {
@@ -717,9 +782,14 @@ int ax_runner_ax650::inference(int grpid)
     }
     else
     {
-        if (m_handle->context != 0)
+        if (!force_runsync && m_handle->context != 0)
         {
             ret = AX_ENGINE_RunGroupIOSync(m_handle->handle, m_handle->context, grpid, &m_handle->io_data[grpid]);
+            if (ret != 0)
+            {
+                ALOGW("AX_ENGINE_RunGroupIOSync(grpid=%d) failed: 0x%x, fallback to AX_ENGINE_RunSync", grpid, ret);
+                ret = AX_ENGINE_RunSync(m_handle->handle, &m_handle->io_data[grpid]);
+            }
         }
         else
         {
@@ -730,6 +800,12 @@ int ax_runner_ax650::inference(int grpid)
     {
         ALOGE("AX_ENGINE_Run%s failed: 0x%x", m_handle->io_data.size() == 1 ? "Sync" : "GroupIOSync", ret);
         return ret;
+    }
+    else if (std::getenv("AXLLM_DEBUG_LAYER0_IO"))
+    {
+        ALOGI("AX_ENGINE_Run%s(grpid=%d) ok",
+              m_handle->io_data.size() == 1 ? "Sync" : "GroupIOSync",
+              grpid);
     }
 
     if (_auto_sync_after_inference)

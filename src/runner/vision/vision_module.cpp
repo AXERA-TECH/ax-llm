@@ -528,13 +528,13 @@ static int count_appended_tokens(const std::vector<int>& prev_tokens,
     return (int)next_tokens.size();
 }
 
-static VideoFrameFitResult fit_gemma4_video_frame_count(const std::shared_ptr<BaseTokenizer>& tokenizer,
-                                                        std::vector<Content> probe_history,
-                                                        size_t content_index,
-                                                        int frame_cap,
-                                                        int tokens_per_block,
-                                                        const std::vector<int>& prev_tokens,
-                                                        int max_tail_tokens)
+static VideoFrameFitResult fit_video_frame_count(const std::shared_ptr<BaseTokenizer>& tokenizer,
+                                                 std::vector<Content> probe_history,
+                                                 size_t content_index,
+                                                 int frame_cap,
+                                                 int tokens_per_block,
+                                                 const std::vector<int>& prev_tokens,
+                                                 int max_tail_tokens)
 {
     VideoFrameFitResult result;
     if (!tokenizer || content_index >= probe_history.size() || frame_cap <= 0 || max_tail_tokens <= 0)
@@ -1364,6 +1364,17 @@ bool VisionModule::Init(VLMType type,
                 tokens_per_block_ = tpb;
                 picked = true;
             }
+        } else if (type_ == VLMType::MiniCPMV46VL) {
+            int out_is_bf16 = -1, tpb = 0;
+            if (try_pick_by_bytes(4, out_is_bf16, tpb)) {
+                impl_->encoder_output_is_bf16 = out_is_bf16;
+                tokens_per_block_ = tpb;
+                picked = true;
+            } else if (try_pick_by_bytes(2, out_is_bf16, tpb)) {
+                impl_->encoder_output_is_bf16 = out_is_bf16;
+                tokens_per_block_ = tpb;
+                picked = true;
+            }
         }
 
         if (!picked) {
@@ -1486,6 +1497,14 @@ bool VisionModule::Init(VLMType type,
         if (!get_single_token_id(tokenizer_, "<|audio|>", audio_pad_id_, err)) return false;
         vision_start_id_ = -1;
         ALOGI("Gemma4-VL token ids: image_pad=%d video_pad=%d audio_pad=%d", image_pad_id_, video_pad_id_, audio_pad_id_);
+        break;
+    case VLMType::MiniCPMV46VL:
+        if (!get_single_token_id(tokenizer_, "<|image_pad|>", image_pad_id_, err)) return false;
+        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) {
+            video_pad_id_ = image_pad_id_;
+        }
+        vision_start_id_ = -1;
+        ALOGI("MiniCPM-V-4.6 token ids: image_pad=%d video_pad=%d", image_pad_id_, video_pad_id_);
         break;
     default:
         break;
@@ -2049,6 +2068,26 @@ bool VisionModule::EncodeForContent(const Content& content,
                     return false;
                 blocks_for_one.push_back(std::move(emb));
             }
+            else if (type_ == VLMType::MiniCPMV46VL) {
+                std::vector<unsigned char> pv;
+                if (MiniCPMV46ImageProcessor(img, pv, vision_height_, vision_width_, patch_size_) != 0) {
+                    err = "MiniCPM-V-4.6 image preprocessing failed";
+                    return false;
+                }
+                {
+                    unsigned char mn = 255, mx = 0;
+                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
+                    ALOGI("MiniCPM-V-4.6 pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
+                          pv.size(), (unsigned)mn, (unsigned)mx,
+                          vision_width_, vision_height_, patch_size_);
+                }
+                std::vector<unsigned short> emb;
+                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                                  pv, emb, 0.5f, 0.5f,
+                                                  0, nullptr, err))
+                    return false;
+                blocks_for_one.push_back(std::move(emb));
+            }
             else if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
                 std::vector<axcv::Mat> one{img};
                 std::vector<std::vector<unsigned char>> pixel_values;
@@ -2182,6 +2221,34 @@ bool VisionModule::EncodeForContent(const Content& content,
             if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
                                                pv, emb, 0.5f, 0.5f, 0, nullptr, err))
                 return false;
+            out_blocks.push_back(std::move(emb));
+        }
+        return true;
+    }
+
+    if (type_ == VLMType::MiniCPMV46VL) {
+        out_num_media_for_tokenizer = (int)frames.size();
+        out_num_media_tokens = tokens_per_block_;
+        out_blocks.reserve(frames.size());
+        for (auto& frame : frames) {
+            std::vector<unsigned char> pv;
+            if (MiniCPMV46ImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_) != 0) {
+                err = "MiniCPM-V-4.6 video frame preprocessing failed";
+                return false;
+            }
+            std::vector<unsigned short> emb;
+            if (!encode_block_normalized_float(impl_->encoder,
+                                               devid,
+                                               impl_->encoder_output_is_bf16,
+                                               pv,
+                                               emb,
+                                               0.5f,
+                                               0.5f,
+                                               0,
+                                               nullptr,
+                                               err)) {
+                return false;
+            }
             out_blocks.push_back(std::move(emb));
         }
         return true;
@@ -2330,13 +2397,13 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                     current_fit.frame_count = 0;
                     current_fit.tail_tokens = budget->max_tail_tokens + 1;
                 } else {
-                    current_fit = fit_gemma4_video_frame_count(tokenizer_,
-                                                               history_in,
-                                                               video_index,
-                                                               frame_cap,
-                                                               tokens_per_block_,
-                                                               budget->last_tokens,
-                                                               budget->max_tail_tokens);
+                    current_fit = fit_video_frame_count(tokenizer_,
+                                                        history_in,
+                                                        video_index,
+                                                        frame_cap,
+                                                        tokens_per_block_,
+                                                        budget->last_tokens,
+                                                        budget->max_tail_tokens);
                 }
 
                 VideoFrameFitResult fresh_fit;
@@ -2344,13 +2411,13 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                 size_t fresh_video_index = (size_t)-1;
                 if (can_compare_fresh) {
                     build_video_fresh_history(history_in, video_index, fresh_history, fresh_video_index);
-                    fresh_fit = fit_gemma4_video_frame_count(tokenizer_,
-                                                             fresh_history,
-                                                             fresh_video_index,
-                                                             frame_cap,
-                                                             tokens_per_block_,
-                                                             {},
-                                                             budget->max_total_tokens);
+                    fresh_fit = fit_video_frame_count(tokenizer_,
+                                                      fresh_history,
+                                                      fresh_video_index,
+                                                      frame_cap,
+                                                      tokens_per_block_,
+                                                      {},
+                                                      budget->max_total_tokens);
                 }
 
                 const bool auto_reset_for_video = can_compare_fresh && fresh_fit.frame_count > current_fit.frame_count;
@@ -2450,13 +2517,13 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                         return false;
                     }
 
-                    const auto fit = fit_gemma4_video_frame_count(tokenizer_,
-                                                                  history_out,
-                                                                  i,
-                                                                  frame_cap,
-                                                                  tokens_per_block_,
-                                                                  budget->last_tokens,
-                                                                  budget->max_tail_tokens);
+                    const auto fit = fit_video_frame_count(tokenizer_,
+                                                           history_out,
+                                                           i,
+                                                           frame_cap,
+                                                           tokens_per_block_,
+                                                           budget->last_tokens,
+                                                           budget->max_tail_tokens);
                     if (fit.frame_count <= 0) {
                         err = "Gemma4 video prompt exceeds current prefill budget: 1 frame requires " +
                               std::to_string(fit.tail_tokens) + " tail tokens, budget allows " +
@@ -2481,6 +2548,56 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                       budget ? budget->max_tail_tokens : -1,
                       budget ? budget->precompute_len : 0);
             }
+        }
+        else if (type_ == VLMType::MiniCPMV46VL && c.type == VIDEO) {
+            std::vector<std::string> all_frame_files;
+            if (!collect_video_frame_paths(it->second.uris, all_frame_files, &temp_dirs, err)) return false;
+
+            int frame_cap = (video_num_frames_ > 0)
+                                ? std::min((int)all_frame_files.size(), video_num_frames_)
+                                : (int)all_frame_files.size();
+            if (frame_cap <= 0) {
+                err = "MiniCPM-V-4.6 video has no usable frames";
+                return false;
+            }
+
+            int fitted_tail_tokens = -1;
+            if (budget) {
+                if (budget->max_history_tokens > 0 && budget->precompute_len > budget->max_history_tokens) {
+                    err = "MiniCPM-V-4.6 video prompt exceeds current history budget before frame injection";
+                    return false;
+                }
+
+                const auto fit = fit_video_frame_count(tokenizer_,
+                                                       history_out,
+                                                       i,
+                                                       frame_cap,
+                                                       tokens_per_block_,
+                                                       budget->last_tokens,
+                                                       budget->max_tail_tokens);
+                if (fit.frame_count <= 0) {
+                    err = "MiniCPM-V-4.6 video prompt exceeds current prefill budget: 1 frame requires " +
+                          std::to_string(fit.tail_tokens) + " tail tokens, budget allows " +
+                          std::to_string(budget->max_tail_tokens);
+                    return false;
+                }
+                frame_cap = fit.frame_count;
+                fitted_tail_tokens = fit.tail_tokens;
+            }
+
+            effective_media.uris = sample_frame_paths(all_frame_files, frame_cap, video_do_sample_frames_);
+            if ((int)effective_media.uris.size() != frame_cap) {
+                err = "MiniCPM-V-4.6 video frame sampler produced an unexpected frame count";
+                return false;
+            }
+
+            ALOGI("MiniCPM-V-4.6 video frames selected: %d/%zu (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
+                  frame_cap,
+                  all_frame_files.size(),
+                  video_num_frames_,
+                  fitted_tail_tokens,
+                  budget ? budget->max_tail_tokens : -1,
+                  budget ? budget->precompute_len : 0);
         }
 
         int num_media_for_tokenizer = 0;
