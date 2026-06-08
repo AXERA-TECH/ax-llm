@@ -27,6 +27,43 @@
 #include "runner/utils/net_utils.hpp"
 #include "runner/utils/sample_log.h"
 
+#ifndef AXLLM_GIT_COMMIT
+#define AXLLM_GIT_COMMIT "unknown"
+#endif
+#ifndef AXLLM_GIT_BRANCH
+#define AXLLM_GIT_BRANCH "unknown"
+#endif
+#ifndef AXLLM_GIT_DIRTY
+#define AXLLM_GIT_DIRTY "unknown"
+#endif
+#ifndef AXLLM_TOKENIZER_GIT_COMMIT
+#define AXLLM_TOKENIZER_GIT_COMMIT "unknown"
+#endif
+#ifndef AXLLM_TOKENIZER_GIT_DIRTY
+#define AXLLM_TOKENIZER_GIT_DIRTY "unknown"
+#endif
+#ifndef AXLLM_BUILD_TYPE
+#define AXLLM_BUILD_TYPE "unknown"
+#endif
+#ifndef AXLLM_BUILD_BACKEND
+#define AXLLM_BUILD_BACKEND "unknown"
+#endif
+#ifndef AXLLM_SYSTEM_NAME
+#define AXLLM_SYSTEM_NAME "unknown"
+#endif
+#ifndef AXLLM_SYSTEM_PROCESSOR
+#define AXLLM_SYSTEM_PROCESSOR "unknown"
+#endif
+#ifndef AXLLM_COMPILER_ID
+#define AXLLM_COMPILER_ID "unknown"
+#endif
+#ifndef AXLLM_COMPILER_VERSION
+#define AXLLM_COMPILER_VERSION "unknown"
+#endif
+#ifndef AXLLM_OPENMP
+#define AXLLM_OPENMP "unknown"
+#endif
+
 #ifdef USE_AXCL
 #include <axcl.h>
 #else
@@ -2366,9 +2403,27 @@ int run_server_mode(const ModelConfig &config, int port)
 }
 
 // Print usage
+void print_version()
+{
+    printf("axllm version\n");
+    printf("  git commit       : %s\n", AXLLM_GIT_COMMIT);
+    printf("  git branch       : %s\n", AXLLM_GIT_BRANCH);
+    printf("  git dirty        : %s\n", AXLLM_GIT_DIRTY);
+    printf("  tokenizer commit : %s\n", AXLLM_TOKENIZER_GIT_COMMIT);
+    printf("  tokenizer dirty  : %s\n", AXLLM_TOKENIZER_GIT_DIRTY);
+    printf("  build time       : %s %s\n", __DATE__, __TIME__);
+    printf("  build type       : %s\n", AXLLM_BUILD_TYPE);
+    printf("  backend          : %s\n", AXLLM_BUILD_BACKEND);
+    printf("  platform         : %s %s\n", AXLLM_SYSTEM_NAME, AXLLM_SYSTEM_PROCESSOR);
+    printf("  compiler         : %s %s\n", AXLLM_COMPILER_ID, AXLLM_COMPILER_VERSION);
+    printf("  c++ standard     : %ld\n", (long)__cplusplus);
+    printf("  openmp           : %s\n", AXLLM_OPENMP);
+}
+
 void print_usage(const char *program_name)
 {
     printf("Usage:\n");
+    printf("  %s version                     Print build and git version information\n", program_name);
     printf("  %s run <model_path> [options]    Run interactive chat mode\n", program_name);
     printf("  %s serve <model_path> [options]  Run HTTP API server mode\n", program_name);
     printf("\n");
@@ -2400,6 +2455,21 @@ int main(int argc, char *argv[])
     // Initialize logger early so Windows console uses UTF-8 (prevents Chinese/box-drawing garbling).
     (void)axllm::Logger::level();
 #endif
+
+    if (argc >= 2)
+    {
+        std::string first_arg = argv[1];
+        if (first_arg == "version" || first_arg == "--version" || first_arg == "-v")
+        {
+            print_version();
+            return 0;
+        }
+        if (first_arg == "--help" || first_arg == "-h")
+        {
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
 
     if (argc < 3)
     {

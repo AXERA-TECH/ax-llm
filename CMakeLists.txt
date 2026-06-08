@@ -47,6 +47,88 @@ if(NOT BUILD_AX650 AND NOT BUILD_AXCL)
 endif()
 
 # ---------------------------------------------------------------------------
+# Build/version metadata
+# ---------------------------------------------------------------------------
+set(AXLLM_GIT_COMMIT "unknown")
+set(AXLLM_GIT_BRANCH "unknown")
+set(AXLLM_GIT_DIRTY "unknown")
+set(AXLLM_TOKENIZER_GIT_COMMIT "unknown")
+set(AXLLM_TOKENIZER_GIT_DIRTY "unknown")
+
+find_package(Git QUIET)
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE AXLLM_GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE AXLLM_GIT_BRANCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} diff --quiet --ignore-submodules HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        RESULT_VARIABLE AXLLM_GIT_DIRTY_RESULT
+        ERROR_QUIET
+    )
+    if(AXLLM_GIT_DIRTY_RESULT EQUAL 0)
+        set(AXLLM_GIT_DIRTY "no")
+    else()
+        set(AXLLM_GIT_DIRTY "yes")
+    endif()
+
+    if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/tokenizer.axera/.git)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/tokenizer.axera
+            OUTPUT_VARIABLE AXLLM_TOKENIZER_GIT_COMMIT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} diff --quiet HEAD
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/tokenizer.axera
+            RESULT_VARIABLE AXLLM_TOKENIZER_GIT_DIRTY_RESULT
+            ERROR_QUIET
+        )
+        if(AXLLM_TOKENIZER_GIT_DIRTY_RESULT EQUAL 0)
+            set(AXLLM_TOKENIZER_GIT_DIRTY "no")
+        else()
+            set(AXLLM_TOKENIZER_GIT_DIRTY "yes")
+        endif()
+    endif()
+endif()
+
+function(axllm_apply_build_info target backend)
+    if(OpenMP_CXX_FOUND)
+        set(AXLLM_OPENMP_STATUS "ON")
+    else()
+        set(AXLLM_OPENMP_STATUS "OFF")
+    endif()
+
+    target_compile_definitions(${target} PRIVATE
+        AXLLM_GIT_COMMIT="${AXLLM_GIT_COMMIT}"
+        AXLLM_GIT_BRANCH="${AXLLM_GIT_BRANCH}"
+        AXLLM_GIT_DIRTY="${AXLLM_GIT_DIRTY}"
+        AXLLM_TOKENIZER_GIT_COMMIT="${AXLLM_TOKENIZER_GIT_COMMIT}"
+        AXLLM_TOKENIZER_GIT_DIRTY="${AXLLM_TOKENIZER_GIT_DIRTY}"
+        AXLLM_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+        AXLLM_BUILD_BACKEND="${backend}"
+        AXLLM_SYSTEM_NAME="${CMAKE_SYSTEM_NAME}"
+        AXLLM_SYSTEM_PROCESSOR="${CMAKE_SYSTEM_PROCESSOR}"
+        AXLLM_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+        AXLLM_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+        AXLLM_OPENMP="${AXLLM_OPENMP_STATUS}"
+    )
+endfunction()
+
+# ---------------------------------------------------------------------------
 # SDK 路径
 # ---------------------------------------------------------------------------
 
@@ -168,6 +250,7 @@ if(BUILD_AX650)
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_ax650.cpp
     )
+    axllm_apply_build_info(axllm "AX650")
     add_executable(llm_smoke tools/llm_smoke.cpp
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_ax650.cpp
@@ -235,6 +318,7 @@ if(BUILD_AXCL)
         src/runner/ax_model_runner/ax_model_runner_axcl.cpp
         src/runner/utils/axcl_manager.cpp
     )
+    axllm_apply_build_info(axllm "AXCL")
     target_include_directories(axllm PRIVATE ${AXCL_INCLUDE_DIRS})
     target_compile_definitions(axllm PRIVATE USE_AXCL)
     target_link_libraries(axllm
