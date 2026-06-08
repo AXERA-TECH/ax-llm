@@ -19,6 +19,7 @@ artifacts/
 install/
 tmp/
 scripts/__pycache__/
+scripts/tmp/
 scripts/cert.pem
 scripts/key.pem
 scripts/output.wav
