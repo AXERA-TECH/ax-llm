@@ -2283,6 +2283,14 @@ int run_server_mode(const ModelConfig &config, int port)
                       thinking_mode_name(request_thinking_mode),
                       req.parsed_messages.size(),
                       req.stop.size());
+                llm.MarkRequestStart();
+                struct RequestTimingGuard {
+                    LLM &llm;
+                    ~RequestTimingGuard()
+                    {
+                        llm.ClearRequestStart();
+                    }
+                } request_timing_guard{llm};
 
                 struct SamplingOverrideGuard {
                     LLM &llm;

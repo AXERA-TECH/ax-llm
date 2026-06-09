@@ -120,6 +120,8 @@ public:
     void ClearRequestSamplingOverride();
     void SetRequestThinkingMode(ThinkingMode mode);
     void ClearRequestThinkingMode();
+    void MarkRequestStart();
+    void ClearRequestStart();
     std::string GetLastError() const;
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
