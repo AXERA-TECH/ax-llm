@@ -60,6 +60,15 @@ struct LLMAttrType {
     int kv_cache_num = 1024; // auto calc
     int kv_cache_size = 256; // auto calc
 
+    // ---- Multi-slot prefix KV cache (serve: many users / many system prompts) ----
+    // Number of KV cache slots. 1 = disabled (single context, current behavior).
+    // Each request matches the slot with the longest common token prefix; misses
+    // evict the least-recently-used slot. Only one request runs at a time.
+    int kv_cache_slots = 1;
+    // Where slot KV lives: "device" (zero-copy pointer switch, implemented) or
+    // "host" (DDR copy on switch, reserved for a follow-up).
+    std::string kv_cache_slot_location = "device";
+
     std::vector<int> prefill_max_kv_cache_num_grp;
     int prefill_grpid = -1;
     std::string post_config_path = "post_config.json";

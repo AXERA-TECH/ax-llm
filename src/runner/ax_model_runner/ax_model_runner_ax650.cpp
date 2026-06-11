@@ -584,6 +584,11 @@ void ax_runner_ax650::deinit()
     if (!m_handle)
         return;
 
+    // Restore slot-0 binding and free extra slot buffers before the engine
+    // buffers are freed below, so the dedup-free loop sees the genuine engine
+    // K/V buffers (slot 0) rather than a leftover extra slot.
+    kv_cache_slots_release();
+
     // 使用 Set 防止物理内存被重复释放 (Double Free)
     std::unordered_set<unsigned long long> freed_phy_addrs;
 
@@ -822,4 +827,154 @@ int ax_runner_ax650::inference(int grpid)
         }
     }
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-slot KV cache (device-resident prefix cache)
+// ---------------------------------------------------------------------------
+int ax_runner_ax650::kv_cache_slots_init(int num_slots)
+{
+    if (num_slots <= 1)
+    {
+        kv_num_slots_ = 1;
+        kv_active_slot_ = 0;
+        return 1;
+    }
+    if (!m_handle || m_handle->io_data.empty() || m_handle->io_info.empty())
+        return -1;
+
+    const int ngrp = (int)m_handle->io_data.size();
+    const bool force_uncached = std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr;
+    const std::vector<std::string> kv_names = {"K_cache", "V_cache"};
+
+    kv_slot_tensors_.clear();
+    for (const auto &name : kv_names)
+    {
+        KvSlotTensor st;
+        st.name = name;
+        st.idx_in_group.assign(ngrp, -1);
+        // Locate the tensor index in each group and the engine (slot-0) buffer.
+        unsigned long long slot0_phy = 0;
+        void *slot0_vir = nullptr;
+        size_t max_bytes = 0;
+        for (int g = 0; g < ngrp; ++g)
+        {
+            auto *info = m_handle->io_info[g];
+            auto &io = m_handle->io_data[g];
+            if (!info || !io.pInputs) continue;
+            for (uint i = 0; i < info->nInputSize; ++i)
+            {
+                const char *pn = info->pInputs[i].pName;
+                if (!pn || name != pn) continue;
+                st.idx_in_group[g] = (int)i;
+                max_bytes = std::max(max_bytes, (size_t)io.pInputs[i].nSize);
+                if (io.pInputs[i].phyAddr != 0 && slot0_phy == 0)
+                {
+                    slot0_phy = io.pInputs[i].phyAddr;
+                    slot0_vir = io.pInputs[i].pVirAddr;
+                }
+                break;
+            }
+        }
+        if (max_bytes == 0 || slot0_phy == 0)
+        {
+            ALOGW("kv slot: tensor %s not found / unallocated, skip", name.c_str());
+            continue;
+        }
+        st.bytes = max_bytes;
+        st.slot_phy.assign(num_slots, 0);
+        st.slot_vir.assign(num_slots, nullptr);
+        st.slot_phy[0] = slot0_phy; // borrowed engine buffer
+        st.slot_vir[0] = slot0_vir;
+        for (int s = 1; s < num_slots; ++s)
+        {
+            AX_U64 phy = 0;
+            void *vir = nullptr;
+            int ret = force_uncached
+                          ? AX_SYS_MemAlloc(&phy, &vir, max_bytes, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME))
+                          : AX_SYS_MemAllocCached(&phy, &vir, max_bytes, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
+            if (ret != 0)
+            {
+                ALOGE("kv slot: alloc %s slot %d (%zu bytes) failed: 0x%x", name.c_str(), s, max_bytes, ret);
+                // Free what we already allocated for this tensor, then bail.
+                for (int k = 1; k < s; ++k)
+                    if (st.slot_phy[k]) AX_SYS_MemFree(st.slot_phy[k], st.slot_vir[k]);
+                return -1;
+            }
+            memset(vir, 0, max_bytes);
+            st.slot_phy[s] = phy;
+            st.slot_vir[s] = vir;
+        }
+        kv_slot_tensors_.push_back(std::move(st));
+    }
+
+    if (kv_slot_tensors_.empty())
+        return -1;
+
+    kv_num_slots_ = num_slots;
+    kv_active_slot_ = 0;
+    ALOGI("kv cache slots ready: num_slots=%d tensors=%zu", num_slots, kv_slot_tensors_.size());
+    return num_slots;
+}
+
+int ax_runner_ax650::kv_cache_slots_activate(int slot)
+{
+    if (kv_num_slots_ <= 1) return slot == 0 ? 0 : -1;
+    if (slot < 0 || slot >= kv_num_slots_) return -1;
+    if (slot == kv_active_slot_) return 0;
+
+    const int ngrp = (int)m_handle->io_data.size();
+    for (auto &st : kv_slot_tensors_)
+    {
+        const unsigned long long phy = st.slot_phy[slot];
+        void *vir = st.slot_vir[slot];
+        for (int g = 0; g < ngrp; ++g)
+        {
+            const int idx = st.idx_in_group[g];
+            if (idx < 0) continue;
+            auto &io = m_handle->io_data[g];
+            if (io.pInputs && idx < (int)io.nInputSize)
+            {
+                io.pInputs[idx].phyAddr = phy;
+                io.pInputs[idx].pVirAddr = vir;
+            }
+            if (g < (int)mgroup_input_tensors.size() && idx < (int)mgroup_input_tensors[g].size())
+            {
+                mgroup_input_tensors[g][idx].phyAddr = phy;
+                mgroup_input_tensors[g][idx].pVirAddr = vir;
+            }
+        }
+    }
+    if (!mgroup_input_tensors.empty())
+        minput_tensors = mgroup_input_tensors[0];
+    build_tensor_maps();
+    kv_active_slot_ = slot;
+    return 0;
+}
+
+void ax_runner_ax650::kv_cache_slots_release()
+{
+    if (kv_slot_tensors_.empty())
+    {
+        kv_num_slots_ = 1;
+        kv_active_slot_ = 0;
+        return;
+    }
+    // Rebind descriptors/io_data back to slot 0 (the engine's own buffers).
+    if (kv_active_slot_ != 0)
+        kv_cache_slots_activate(0);
+    // Free owned (slot >= 1) buffers.
+    for (auto &st : kv_slot_tensors_)
+    {
+        for (int s = 1; s < (int)st.slot_phy.size(); ++s)
+        {
+            if (st.slot_phy[s])
+                AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]);
+            st.slot_phy[s] = 0;
+            st.slot_vir[s] = nullptr;
+        }
+    }
+    kv_slot_tensors_.clear();
+    kv_num_slots_ = 1;
+    kv_active_slot_ = 0;
 }

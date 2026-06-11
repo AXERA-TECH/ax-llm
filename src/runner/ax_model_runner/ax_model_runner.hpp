@@ -48,6 +48,24 @@ protected:
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_output_tensors;
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_input_tensors;
 
+    // ---- Multi-slot KV cache (device-resident prefix cache) ----
+    // One entry per slottable input tensor (e.g. "K_cache" / "V_cache"). Each
+    // holds, per slot, the device buffer backing that tensor. Slot 0 is the
+    // engine's own buffer (borrowed, not owned by the slot pool); slots 1.. are
+    // extra buffers allocated by the backend. Activating a slot rebinds every
+    // group's tensor to that slot's buffer with zero data copy.
+    struct KvSlotTensor
+    {
+        std::string name;
+        size_t bytes = 0;                          // buffer size (max over groups)
+        std::vector<int> idx_in_group;             // tensor index per group, -1 if absent
+        std::vector<unsigned long long> slot_phy;  // [num_slots] device/phys addr
+        std::vector<void *> slot_vir;              // [num_slots] cpu-mapped/scratch addr (may be null)
+    };
+    std::vector<KvSlotTensor> kv_slot_tensors_;
+    int kv_num_slots_ = 1;
+    int kv_active_slot_ = 0;
+
     void build_tensor_maps()
     {
         map_input_tensors.clear();
@@ -160,4 +178,24 @@ public:
 
     virtual int inference() = 0;
     virtual int inference(int grpid) = 0;
+
+    // ---- Multi-slot KV cache API ----
+    // Allocate num_slots-1 extra device buffers for each slottable KV tensor
+    // (slot 0 reuses the engine's own buffer). Returns the number of slots
+    // actually available (>=1), or <0 on error. Default: unsupported (returns -1).
+    virtual int kv_cache_slots_init(int num_slots)
+    {
+        (void)num_slots;
+        return -1;
+    }
+
+    // Rebind every group's KV tensors to the given slot's buffers (zero copy).
+    // Returns 0 on success, <0 on error. Default: only slot 0 is valid.
+    virtual int kv_cache_slots_activate(int slot)
+    {
+        return slot == 0 ? 0 : -1;
+    }
+
+    int kv_cache_slots_count() const { return kv_num_slots_; }
+    int kv_cache_active_slot() const { return kv_active_slot_; }
 };
