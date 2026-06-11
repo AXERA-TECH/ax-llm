@@ -347,6 +347,7 @@ struct LLM::Impl {
     // a per-slot device buffer managed by the backend (zero-copy activate). The
     // working fields above (last_*, precompute_len, linear snapshots, full-cache
     // slot bookkeeping) always reflect the currently active slot.
+    enum class KvSlotLocation { Device, Host };
     struct KvCacheSlot {
         bool used = false;
         std::vector<Content> last_history_snapshot;
@@ -357,11 +358,15 @@ struct LLM::Impl {
         std::vector<unsigned char> full_cache_valid_slots;
         bool full_cache_has_sparse_slots = false;
         uint64_t lru = 0;
+        // Host-mode only: per-layer host copy of this slot's device K/V. Swapped
+        // in/out of the single engine KV buffer on activation.
+        std::vector<std::vector<unsigned short>> host_k, host_v;
     };
     std::vector<KvCacheSlot> kv_slots_;
     int kv_active_slot_idx_ = 0;
     bool multi_slot_enabled_ = false;
     bool multi_slot_active_request_ = false; // this request is served from a slot
+    KvSlotLocation kv_slot_location_ = KvSlotLocation::Device;
     uint64_t kv_slot_lru_counter_ = 0;
     // A used slot is reused when it shares at least this many leading tokens with
     // the request (covers same-system-prompt requests; avoids clobbering a slot
@@ -1042,6 +1047,19 @@ struct LLM::Impl {
         const int idx = group_index_by_gid(prefill_grpids_, gid);
         if (idx < 0 || idx >= (int)_attr.prefill_max_kv_cache_num_grp.size()) return -1;
         return _attr.prefill_max_kv_cache_num_grp[(size_t)idx];
+    }
+
+    // Largest single-chunk prefill that needs no cached history (history_cap == 0).
+    // A request within this size is cheaper to prefill fresh than to reuse via the
+    // model's wider history-bearing prefill group, so multi-slot skips reuse below it.
+    int cheap_prefill_capacity() const
+    {
+        int cap = 0;
+        const size_t n = std::min(prefill_history_kv_cache_num_grp.size(), _attr.prefill_max_kv_cache_num_grp.size());
+        for (size_t i = 0; i < n; ++i)
+            if (prefill_history_kv_cache_num_grp[i] == 0)
+                cap = std::max(cap, _attr.prefill_max_kv_cache_num_grp[i]);
+        return cap;
     }
 
     int decode_capacity_by_gid(int gid) const
@@ -3428,6 +3446,7 @@ struct LLM::Impl {
     void init_kv_slots()
     {
         multi_slot_enabled_ = false;
+        multi_slot_active_request_ = false;
         kv_slots_.clear();
         kv_active_slot_idx_ = 0;
         kv_slot_lru_counter_ = 0;
@@ -3440,35 +3459,87 @@ struct LLM::Impl {
             ALOGW("kv_cache_slots=%d ignored: not supported together with dynamic_load_enable yet", want);
             return;
         }
-        if (_attr.vlm_type != VLMType::None)
-        {
-            ALOGW("kv_cache_slots=%d ignored for VLM (vlm_type=%s); using single context",
-                  want, std::string(VLMTypeName(_attr.vlm_type)).c_str());
-            return;
-        }
+
         std::string loc = _attr.kv_cache_slot_location;
         std::transform(loc.begin(), loc.end(), loc.begin(), ::tolower);
-        if (loc != "device")
-        {
-            ALOGW("kv_cache_slot_location='%s' not implemented yet; only 'device' is supported",
-                  _attr.kv_cache_slot_location.c_str());
-        }
+        kv_slot_location_ = (loc == "host" || loc == "ddr") ? KvSlotLocation::Host : KvSlotLocation::Device;
+        if (loc != "host" && loc != "ddr" && loc != "device")
+            ALOGW("kv_cache_slot_location='%s' unknown; defaulting to 'device'", _attr.kv_cache_slot_location.c_str());
 
-        for (int i = 0; i < _attr.axmodel_num; ++i)
+        // Device mode keeps N device-resident KV buffer sets per layer (zero-copy
+        // activate). Host mode keeps one engine buffer + N host copies (saves CMM,
+        // copies KV on switch) and needs no backend allocation.
+        if (kv_slot_location_ == KvSlotLocation::Device)
         {
-            const int r = llama_layers[i].layer.kv_cache_slots_init(want);
-            if (r < want)
+            for (int i = 0; i < _attr.axmodel_num; ++i)
             {
-                ALOGE("layer %d kv_cache_slots_init(%d) failed (ret=%d); disabling multi-slot", i, want, r);
-                for (int j = 0; j <= i; ++j) llama_layers[j].layer.kv_cache_slots_activate(0);
-                return;
+                const int r = llama_layers[i].layer.kv_cache_slots_init(want);
+                if (r < want)
+                {
+                    ALOGE("layer %d kv_cache_slots_init(%d) failed (ret=%d); disabling multi-slot", i, want, r);
+                    for (int j = 0; j <= i; ++j) llama_layers[j].layer.kv_cache_slots_activate(0);
+                    return;
+                }
             }
         }
 
         kv_slots_.resize(want);
         kv_active_slot_idx_ = 0;
         multi_slot_enabled_ = true;
-        ALOGI("multi-slot prefix KV cache enabled: slots=%d location=device", want);
+        ALOGI("multi-slot prefix KV cache enabled: slots=%d location=%s vlm=%s", want,
+              kv_slot_location_ == KvSlotLocation::Host ? "host" : "device",
+              _attr.vlm_type == VLMType::None ? "no" : std::string(VLMTypeName(_attr.vlm_type)).c_str());
+    }
+
+    // Host mode: copy the active slot's device KV into its host store.
+    void host_dump_active_kv()
+    {
+        if (kv_active_slot_idx_ < 0 || kv_active_slot_idx_ >= (int)kv_slots_.size()) return;
+        auto &s = kv_slots_[(size_t)kv_active_slot_idx_];
+        s.host_k.assign(_attr.axmodel_num, {});
+        s.host_v.assign(_attr.axmodel_num, {});
+        for (int m = 0; m < _attr.axmodel_num; ++m)
+        {
+            auto &lyr = llama_layers[(size_t)m];
+            const int devid = LLM_DEVID(lyr);
+            const int gid = decode_gid_for_layer(m, decode_grpid);
+            auto &t_k = lyr.layer.get_input(gid, "K_cache");
+            auto &t_v = lyr.layer.get_input(gid, "V_cache");
+            size_t k_elems, v_elems;
+            if (is_linear_layer(m))
+            {
+                k_elems = (size_t)t_k.nSize / sizeof(unsigned short);
+                v_elems = (size_t)t_v.nSize / sizeof(unsigned short);
+            }
+            else
+            {
+                const size_t layer_kv = (size_t)kv_cache_size_for_layer(m);
+                k_elems = v_elems = (size_t)std::max(0, precompute_len) * layer_kv;
+            }
+            s.host_k[(size_t)m].resize(k_elems);
+            s.host_v[(size_t)m].resize(v_elems);
+            if (k_elems) llm_d2h(s.host_k[(size_t)m].data(), LLM_RADDR(t_k), std::min(k_elems * sizeof(unsigned short), (size_t)t_k.nSize), devid);
+            if (v_elems) llm_d2h(s.host_v[(size_t)m].data(), LLM_RADDR(t_v), std::min(v_elems * sizeof(unsigned short), (size_t)t_v.nSize), devid);
+        }
+    }
+
+    // Host mode: load a slot's host KV into the (shared) device decode-group buffer.
+    void host_load_kv(int idx)
+    {
+        auto &s = kv_slots_[(size_t)idx];
+        if ((int)s.host_k.size() != _attr.axmodel_num) return; // fresh slot, nothing to load
+        for (int m = 0; m < _attr.axmodel_num; ++m)
+        {
+            auto &lyr = llama_layers[(size_t)m];
+            const int devid = LLM_DEVID(lyr);
+            const int gid = decode_gid_for_layer(m, decode_grpid);
+            auto &t_k = lyr.layer.get_input(gid, "K_cache");
+            auto &t_v = lyr.layer.get_input(gid, "V_cache");
+            if (!s.host_k[(size_t)m].empty())
+                llm_h2d(LLM_WADDR(t_k), s.host_k[(size_t)m].data(), std::min(s.host_k[(size_t)m].size() * sizeof(unsigned short), (size_t)t_k.nSize), devid);
+            if (!s.host_v[(size_t)m].empty())
+                llm_h2d(LLM_WADDR(t_v), s.host_v[(size_t)m].data(), std::min(s.host_v[(size_t)m].size() * sizeof(unsigned short), (size_t)t_v.nSize), devid);
+        }
     }
 
     void save_active_kv_slot()
@@ -3484,19 +3555,28 @@ struct LLM::Impl {
         s.full_cache_valid_slots = full_cache_valid_slots_;
         s.full_cache_has_sparse_slots = full_cache_has_sparse_slots_;
         s.used = (precompute_len > 0) || !last_tokens_ids.empty();
+        if (kv_slot_location_ == KvSlotLocation::Host && s.used)
+            host_dump_active_kv();
     }
 
     bool activate_kv_slot(int idx)
     {
         if (!multi_slot_enabled_) return false;
         if (idx < 0 || idx >= (int)kv_slots_.size()) return false;
-        for (int i = 0; i < _attr.axmodel_num; ++i)
+        if (kv_slot_location_ == KvSlotLocation::Device)
         {
-            if (llama_layers[i].layer.kv_cache_slots_activate(idx) != 0)
+            for (int i = 0; i < _attr.axmodel_num; ++i)
             {
-                ALOGE("kv_cache_slots_activate(layer=%d slot=%d) failed", i, idx);
-                return false;
+                if (llama_layers[i].layer.kv_cache_slots_activate(idx) != 0)
+                {
+                    ALOGE("kv_cache_slots_activate(layer=%d slot=%d) failed", i, idx);
+                    return false;
+                }
             }
+        }
+        else
+        {
+            host_load_kv(idx); // copy this slot's host KV onto the single device buffer
         }
         auto &s = kv_slots_[(size_t)idx];
         last_history_snapshot = s.last_history_snapshot;
@@ -3570,6 +3650,81 @@ struct LLM::Impl {
             fresh = true;
         }
 
+        // Perf: if the whole request fits the cheap (history-less) prefill group, a
+        // fresh prefill is faster than reuse via the model's wider history group
+        // (which attends over its full compiled width regardless of real history).
+        // Keep slot affinity (`chosen`) but re-prefill instead of reusing.
+        if (!fresh && best >= 0)
+        {
+            const int cheap_cap = cheap_prefill_capacity();
+            if (cheap_cap > 0 && (int)sel_tokens.size() <= cheap_cap)
+                fresh = true;
+        }
+        commit_kv_slot_choice(chosen, fresh, best_off, (int)sel_tokens.size());
+    }
+
+    // VLM slot selection: tokenizing VLM history needs the (expensive) vision
+    // Prepare, so match on the chat history (Content) prefix instead. The chosen
+    // slot's token-level reuse logic still refines actual KV reuse afterwards.
+    void select_kv_slot_by_history(const std::vector<Content> &history)
+    {
+        multi_slot_active_request_ = false;
+        if (!multi_slot_enabled_) return;
+        multi_slot_active_request_ = true;
+
+        int best = -1, best_common = 0;
+        uint64_t best_lru = 0;
+        int free_slot = -1, lru_victim = 0;
+        uint64_t lru_min = 0;
+        bool lru_init = false;
+        for (int i = 0; i < (int)kv_slots_.size(); ++i)
+        {
+            const auto &s = kv_slots_[(size_t)i];
+            if (!s.used)
+            {
+                if (free_slot < 0) free_slot = i;
+                continue;
+            }
+            if (!lru_init || s.lru < lru_min) { lru_min = s.lru; lru_victim = i; lru_init = true; }
+            const auto &h = s.last_history_snapshot;
+            const int n = (int)std::min(h.size(), history.size());
+            int common = 0;
+            while (common < n && same_history_content(h[(size_t)common], history[(size_t)common])) ++common;
+            if (common > best_common || (common == best_common && s.lru > best_lru))
+            {
+                best_common = common;
+                best = i;
+                best_lru = s.lru;
+            }
+        }
+
+        int chosen;
+        bool fresh;
+        if (best >= 0 && best_common >= 1)   // share at least the system turn
+        {
+            chosen = best;
+            fresh = false;
+        }
+        else if (free_slot >= 0)
+        {
+            chosen = free_slot;
+            fresh = true;
+        }
+        else if (best >= 0 && best_common > 0)
+        {
+            chosen = best;
+            fresh = false;
+        }
+        else
+        {
+            chosen = lru_victim;
+            fresh = true;
+        }
+        commit_kv_slot_choice(chosen, fresh, best_common, (int)history.size());
+    }
+
+    void commit_kv_slot_choice(int chosen, bool fresh, int shared, int req_size)
+    {
         if (chosen != kv_active_slot_idx_)
         {
             save_active_kv_slot();
@@ -3579,10 +3734,12 @@ struct LLM::Impl {
         {
             ResetKVCache();
             kv_slots_[(size_t)chosen].used = false;
+            kv_slots_[(size_t)chosen].host_k.clear();
+            kv_slots_[(size_t)chosen].host_v.clear();
         }
         kv_slots_[(size_t)chosen].lru = ++kv_slot_lru_counter_;
-        ALOGI("kv slot select: chosen=%d reuse=%d shared_prefix=%d req_tokens=%zu (slots=%zu)",
-              chosen, fresh ? 0 : 1, fresh ? 0 : best_off, sel_tokens.size(), kv_slots_.size());
+        ALOGI("kv slot select: chosen=%d reuse=%d shared=%d req=%d (slots=%zu)",
+              chosen, fresh ? 0 : 1, fresh ? 0 : shared, req_size, kv_slots_.size());
     }
 
     std::string Run(std::vector<unsigned short> &test_embed, int output_max_token = -1)
@@ -4504,13 +4661,17 @@ struct LLM::Impl {
         std::vector<::MediaInputs> effective_media_inputs = media_inputs;
         bool video_history_isolated = false;
 
-        // Multi-slot prefix KV cache (text LLM): pick the slot whose cached tokens
-        // are the longest prefix of this request; misses evict the LRU slot. This
-        // must run before the single-context history-prefix reset below, so the
-        // chosen slot's snapshot is in place when the existing reuse logic runs.
-        if (multi_slot_enabled_ && _attr.vlm_type == VLMType::None)
+        // Multi-slot prefix KV cache: pick the slot sharing the longest prefix with
+        // this request; misses evict the LRU slot. Must run before the single-context
+        // history-prefix reset below so the chosen slot's snapshot is in place when
+        // the existing reuse logic runs. Text LLM matches on tokens; VLM matches on
+        // chat history (tokenizing VLM history needs the expensive vision Prepare).
+        if (multi_slot_enabled_)
         {
-            select_kv_slot(tokenizer->encode(history));
+            if (_attr.vlm_type == VLMType::None)
+                select_kv_slot(tokenizer->encode(history));
+            else
+                select_kv_slot_by_history(history);
         }
 
         if (request_has_video_media(history, effective_media_inputs))
