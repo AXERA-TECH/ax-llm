@@ -228,6 +228,32 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 - `vision_height`
 - `full_attention_interval`（Qwen3.5 等混合 linear/full attention 模型需要，用于标记每 N 层为 full-attention）
 
+### 多槽前缀 KV 缓存（serve 多用户 / 多套提示词加速）
+
+`serve` 为单实例串行处理，但常会有**多个用户**或**多套系统提示词**轮流请求。默认只有一份上下文，一旦请求前缀和上一次不同就会重新跑整段 prefill，非常慢。开启多槽前缀 KV 缓存后，可缓存**多份**前缀 token 及其 KV：每个请求按**最长公共前缀**匹配到对应的槽并复用其 KV（只对新增 token 做 prefill），未命中则覆盖**最久未使用（LRU）**的槽。一次仍只处理一个请求。
+
+在模型目录 `config.json` 中配置：
+
+```json
+{
+  "kv_cache_slots": 4,
+  "kv_cache_slot_location": "device"
+}
+```
+
+- `kv_cache_slots`：缓存槽数量（默认 `1`，即关闭多槽、与原行为完全一致）。
+- `kv_cache_slot_location`：KV 存放位置（默认 `device`）。
+  - `device`：每槽一份设备 KV buffer，激活时**零拷贝重绑定**，切换最快；代价是 N× 设备 CMM。
+  - `host`（或 `ddr`）：单份设备 KV + 每槽一份主机内存副本，激活时 D2H/H2D 拷贝；**省 CMM**（无论多少槽只占一份设备 buffer），切换有拷贝开销。
+
+说明：
+
+- 文本 LLM 与 **VLM 均支持**；VLM 命中复用时会**跳过 vision encoder 重跑**。
+- **自动预算**：开启时会先评估一份槽的占用，并按剩余 CMM / 主机内存（保留安全余量）决定实际能开几份。若实际能开的份数 **< 配置值**，会告警并按能开的份数启用（而非 OOM 崩溃）。例如配置 4 份但显存只够 3 份，就用 3 份并打印 `⚠` 告警。
+- 与 `dynamic_load_enable` 暂不可同时开启（同时配置会告警并退回单槽）。
+
+更多细节见 `docs/multi_slot_kv_cache.md`。
+
 ### Embedding（/v1/embeddings）使用说明
 
 `axllm` 支持在 `serve` 模式下加载 Embedding 模型，并提供 OpenAI 兼容的 `/v1/embeddings` 接口（Embedding 模型 **不支持** `run` 交互模式）。
