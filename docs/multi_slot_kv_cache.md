@@ -14,7 +14,7 @@ OpenAI chat 协议是无状态的(每次发全量 history),因此**不需要 ses
 
 - 缓存**多份** prefix token 及其 KV(槽 slot)。
 - 份数由 config 配置;一次仍只处理一个请求。
-- 每个请求按 token **最长公共前缀**匹配槽;命中则复用其 KV,只对增量做 prefill;不命中则覆盖**最久未使用(LRU)**的槽,整段 prefill。
+- 每个请求按 token **最长公共前缀**匹配槽;命中则复用其 KV,只对增量做 prefill;不命中则覆盖**最久未使用**(LRU)的槽,整段 prefill。
 - KV 内存位置可配:
   - `device`:每槽一份设备 K/V buffer,激活时**零拷贝重绑定**引擎输入张量,切换最快;代价是 N× 设备 CMM。
   - `host`(DDR):单份设备 K/V + 每槽一份 host K/V,激活时把旧槽 D2H、新槽 H2D;**省 CMM**(无论多少槽只占 1 份设备 buffer),切换有拷贝开销。
