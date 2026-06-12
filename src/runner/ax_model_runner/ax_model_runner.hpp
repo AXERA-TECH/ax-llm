@@ -48,6 +48,24 @@ protected:
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_output_tensors;
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_input_tensors;
 
+    // ---- Multi-slot KV cache (device-resident prefix cache) ----
+    // One entry per slottable input tensor (e.g. "K_cache" / "V_cache"). Each
+    // holds, per slot, the device buffer backing that tensor. Slot 0 is the
+    // engine's own buffer (borrowed, not owned by the slot pool); slots 1.. are
+    // extra buffers allocated by the backend. Activating a slot rebinds every
+    // group's tensor to that slot's buffer with zero data copy.
+    struct KvSlotTensor
+    {
+        std::string name;
+        size_t bytes = 0;                          // buffer size (max over groups)
+        std::vector<int> idx_in_group;             // tensor index per group, -1 if absent
+        std::vector<unsigned long long> slot_phy;  // [num_slots] device/phys addr
+        std::vector<void *> slot_vir;              // [num_slots] cpu-mapped/scratch addr (may be null)
+    };
+    std::vector<KvSlotTensor> kv_slot_tensors_;
+    int kv_num_slots_ = 1;
+    int kv_active_slot_ = 0;
+
     void build_tensor_maps()
     {
         map_input_tensors.clear();
@@ -160,4 +178,31 @@ public:
 
     virtual int inference() = 0;
     virtual int inference(int grpid) = 0;
+
+    // ---- Multi-slot KV cache API (device mode) ----
+    // Phase 1: locate the slottable KV tensors (K_cache/V_cache), record slot 0
+    // (the engine's own buffer), and return the per-slot device bytes that ONE
+    // extra slot would consume (sum of K+V buffer sizes). 0 = unsupported / no KV.
+    // Allocates nothing beyond bookkeeping, so the engine can budget first.
+    virtual size_t kv_cache_slots_prepare() { return 0; }
+
+    // Phase 2: allocate extra device buffers up to `num_slots` total (slot 0 is
+    // the engine buffer). Allocates incrementally and stops at the first failure
+    // instead of erroring out. Returns the number of slots actually available
+    // (>=1). Default: only slot 0.
+    virtual int kv_cache_slots_alloc(int num_slots) { return num_slots <= 1 ? 1 : 1; }
+
+    // Free extra slot buffers so exactly `n` slots remain (>=1). Used to trim all
+    // layers down to a common count. Returns the resulting count.
+    virtual int kv_cache_slots_set_count(int n) { return n < 1 ? 1 : n; }
+
+    // Rebind every group's KV tensors to the given slot's buffers (zero copy).
+    // Returns 0 on success, <0 on error. Default: only slot 0 is valid.
+    virtual int kv_cache_slots_activate(int slot)
+    {
+        return slot == 0 ? 0 : -1;
+    }
+
+    int kv_cache_slots_count() const { return kv_num_slots_; }
+    int kv_cache_active_slot() const { return kv_active_slot_; }
 };

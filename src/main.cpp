@@ -382,6 +382,19 @@ struct ModelConfig
                 attr.dynamic_load_pool_size = 2;
             }
 
+            // Optional: multi-slot prefix KV cache (serve: many users / system prompts).
+            // kv_cache_slots=1 (default) keeps the current single-context behavior.
+            attr.kv_cache_slots = 1;
+            if (auto v = json_int_value(j, "kv_cache_slots"); v.has_value())
+            {
+                attr.kv_cache_slots = *v;
+            }
+            if (attr.kv_cache_slots < 1) attr.kv_cache_slots = 1;
+            if (j.contains("kv_cache_slot_location") && j["kv_cache_slot_location"].is_string())
+            {
+                attr.kv_cache_slot_location = j["kv_cache_slot_location"].get<std::string>();
+            }
+
             // Optional: models with mixed linear/full attention layers (e.g., Qwen3.5).
             // Keep config minimal: only an interval is needed (layer count comes from `axmodel_num`).
             attr.full_attention_interval = 0;

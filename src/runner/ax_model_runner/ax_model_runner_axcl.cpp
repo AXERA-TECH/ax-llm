@@ -592,6 +592,11 @@ void ax_runner_axcl::deinit()
 {
     if (m_handle)
     {
+        // Restore slot-0 binding and free extra slot buffers before the engine
+        // buffers are freed, so the dedup-free loop sees the genuine engine K/V
+        // device buffers (slot 0) rather than a leftover extra slot.
+        kv_cache_slots_release();
+
         std::vector<unsigned long long> free_phy_addr;
         std::vector<void *> free_vir_addr;
 
@@ -760,4 +765,159 @@ int ax_runner_axcl::inference(int grpid)
             axcl_Memcpy(mgroup_output_tensors[grpid][i].pVirAddr, (void *)mgroup_output_tensors[grpid][i].phyAddr, mgroup_output_tensors[grpid][i].nSize, AXCL_MEMCPY_DEVICE_TO_HOST, dev_id);
 
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-slot KV cache (device-resident prefix cache)
+// ---------------------------------------------------------------------------
+size_t ax_runner_axcl::kv_cache_slots_prepare()
+{
+    kv_slot_tensors_.clear();
+    kv_num_slots_ = 1;
+    kv_active_slot_ = 0;
+    if (!m_handle || mgroup_input_tensors.empty())
+        return 0;
+
+    const int ngrp = (int)mgroup_input_tensors.size();
+    const std::vector<std::string> kv_names = {"K_cache", "V_cache"};
+    size_t per_slot_bytes = 0;
+    for (const auto &name : kv_names)
+    {
+        KvSlotTensor st;
+        st.name = name;
+        st.idx_in_group.assign(ngrp, -1);
+        unsigned long long slot0_phy = 0;
+        size_t max_bytes = 0;
+        for (int g = 0; g < ngrp; ++g)
+        {
+            for (size_t i = 0; i < mgroup_input_tensors[g].size(); ++i)
+            {
+                if (mgroup_input_tensors[g][i].sName != name) continue;
+                st.idx_in_group[g] = (int)i;
+                max_bytes = std::max(max_bytes, (size_t)mgroup_input_tensors[g][i].nSize);
+                if (mgroup_input_tensors[g][i].phyAddr != 0 && slot0_phy == 0)
+                    slot0_phy = mgroup_input_tensors[g][i].phyAddr;
+                break;
+            }
+        }
+        if (max_bytes == 0 || slot0_phy == 0)
+        {
+            ALOGW("kv slot: tensor %s not found / unallocated, skip", name.c_str());
+            continue;
+        }
+        st.bytes = max_bytes;
+        st.slot_phy.assign(1, slot0_phy); // slot 0 = borrowed engine device buffer
+        st.slot_vir.assign(1, nullptr);
+        per_slot_bytes += max_bytes;
+        kv_slot_tensors_.push_back(std::move(st));
+    }
+    return kv_slot_tensors_.empty() ? 0 : per_slot_bytes;
+}
+
+int ax_runner_axcl::kv_cache_slots_alloc(int num_slots)
+{
+    if (num_slots <= 1 || kv_slot_tensors_.empty())
+    {
+        kv_num_slots_ = 1;
+        return 1;
+    }
+    for (auto &st : kv_slot_tensors_) { st.slot_phy.resize(num_slots, 0); st.slot_vir.resize(num_slots, nullptr); }
+
+    int achieved = 1;
+    for (int s = 1; s < num_slots; ++s)
+    {
+        bool ok = true;
+        for (auto &st : kv_slot_tensors_)
+        {
+            void *devPtr = nullptr;
+            int ret = axcl_Malloc(&devPtr, st.bytes, axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST, dev_id);
+            if (ret != 0 || !devPtr)
+            {
+                ALOGW("kv slot: axcl_Malloc %s slot %d (%zu bytes) failed: %d", st.name.c_str(), s, st.bytes, ret);
+                ok = false;
+                break;
+            }
+            axcl_Memset(devPtr, 0, st.bytes, dev_id);
+            st.slot_phy[s] = (unsigned long long)devPtr;
+        }
+        if (!ok)
+        {
+            for (auto &st : kv_slot_tensors_)
+                if (st.slot_phy[s]) { axcl_Free((void *)st.slot_phy[s], dev_id); st.slot_phy[s] = 0; }
+            break;
+        }
+        achieved = s + 1;
+    }
+    for (auto &st : kv_slot_tensors_) { st.slot_phy.resize(achieved); st.slot_vir.resize(achieved); }
+    kv_num_slots_ = achieved;
+    kv_active_slot_ = 0;
+    return achieved;
+}
+
+int ax_runner_axcl::kv_cache_slots_set_count(int n)
+{
+    if (n < 1) n = 1;
+    if (kv_slot_tensors_.empty()) { kv_num_slots_ = 1; return 1; }
+    if (kv_active_slot_ >= n) kv_cache_slots_activate(0);
+    for (auto &st : kv_slot_tensors_)
+    {
+        for (int s = n; s < (int)st.slot_phy.size(); ++s)
+            if (st.slot_phy[s]) { axcl_Free((void *)st.slot_phy[s], dev_id); st.slot_phy[s] = 0; }
+        if ((int)st.slot_phy.size() > n) { st.slot_phy.resize(n); st.slot_vir.resize(n); }
+    }
+    kv_num_slots_ = n;
+    return n;
+}
+
+int ax_runner_axcl::kv_cache_slots_activate(int slot)
+{
+    if (kv_num_slots_ <= 1) return slot == 0 ? 0 : -1;
+    if (slot < 0 || slot >= kv_num_slots_) return -1;
+    if (slot == kv_active_slot_) return 0;
+
+    const int ngrp = (int)mgroup_input_tensors.size();
+    for (auto &st : kv_slot_tensors_)
+    {
+        const unsigned long long phy = st.slot_phy[slot];
+        for (int g = 0; g < ngrp; ++g)
+        {
+            const int idx = st.idx_in_group[g];
+            if (idx < 0) continue;
+            int ret = set_input(g, idx, phy, st.bytes);
+            if (ret != 0)
+            {
+                ALOGE("kv slot: set_input(grp=%d %s) slot %d failed: %d", g, st.name.c_str(), slot, ret);
+                return ret;
+            }
+        }
+    }
+    if (!mgroup_input_tensors.empty())
+        minput_tensors = mgroup_input_tensors[0];
+    build_tensor_maps();
+    kv_active_slot_ = slot;
+    return 0;
+}
+
+void ax_runner_axcl::kv_cache_slots_release()
+{
+    if (kv_slot_tensors_.empty())
+    {
+        kv_num_slots_ = 1;
+        kv_active_slot_ = 0;
+        return;
+    }
+    if (kv_active_slot_ != 0)
+        kv_cache_slots_activate(0);
+    for (auto &st : kv_slot_tensors_)
+    {
+        for (int s = 1; s < (int)st.slot_phy.size(); ++s)
+        {
+            if (st.slot_phy[s])
+                axcl_Free((void *)st.slot_phy[s], dev_id);
+            st.slot_phy[s] = 0;
+        }
+    }
+    kv_slot_tensors_.clear();
+    kv_num_slots_ = 1;
+    kv_active_slot_ = 0;
 }

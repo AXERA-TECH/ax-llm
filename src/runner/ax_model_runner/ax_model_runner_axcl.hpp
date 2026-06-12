@@ -34,4 +34,13 @@ public:
     // int inference(ax_image_t *pstFrame) override;
     int inference() override;
     int inference(int grpid) override;
+
+    size_t kv_cache_slots_prepare() override;
+    int kv_cache_slots_alloc(int num_slots) override;
+    int kv_cache_slots_set_count(int n) override;
+    int kv_cache_slots_activate(int slot) override;
+
+protected:
+    // Restore slot 0 binding and free slots 1.. (owned) device buffers.
+    void kv_cache_slots_release();
 };
