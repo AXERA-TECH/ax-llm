@@ -832,28 +832,22 @@ int ax_runner_ax650::inference(int grpid)
 // ---------------------------------------------------------------------------
 // Multi-slot KV cache (device-resident prefix cache)
 // ---------------------------------------------------------------------------
-int ax_runner_ax650::kv_cache_slots_init(int num_slots)
+size_t ax_runner_ax650::kv_cache_slots_prepare()
 {
-    if (num_slots <= 1)
-    {
-        kv_num_slots_ = 1;
-        kv_active_slot_ = 0;
-        return 1;
-    }
+    kv_slot_tensors_.clear();
+    kv_num_slots_ = 1;
+    kv_active_slot_ = 0;
     if (!m_handle || m_handle->io_data.empty() || m_handle->io_info.empty())
-        return -1;
+        return 0;
 
     const int ngrp = (int)m_handle->io_data.size();
-    const bool force_uncached = std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr;
     const std::vector<std::string> kv_names = {"K_cache", "V_cache"};
-
-    kv_slot_tensors_.clear();
+    size_t per_slot_bytes = 0;
     for (const auto &name : kv_names)
     {
         KvSlotTensor st;
         st.name = name;
         st.idx_in_group.assign(ngrp, -1);
-        // Locate the tensor index in each group and the engine (slot-0) buffer.
         unsigned long long slot0_phy = 0;
         void *slot0_vir = nullptr;
         size_t max_bytes = 0;
@@ -882,39 +876,72 @@ int ax_runner_ax650::kv_cache_slots_init(int num_slots)
             continue;
         }
         st.bytes = max_bytes;
-        st.slot_phy.assign(num_slots, 0);
-        st.slot_vir.assign(num_slots, nullptr);
-        st.slot_phy[0] = slot0_phy; // borrowed engine buffer
-        st.slot_vir[0] = slot0_vir;
-        for (int s = 1; s < num_slots; ++s)
+        st.slot_phy.assign(1, slot0_phy); // slot 0 = borrowed engine buffer
+        st.slot_vir.assign(1, slot0_vir);
+        per_slot_bytes += max_bytes;
+        kv_slot_tensors_.push_back(std::move(st));
+    }
+    return kv_slot_tensors_.empty() ? 0 : per_slot_bytes;
+}
+
+int ax_runner_ax650::kv_cache_slots_alloc(int num_slots)
+{
+    if (num_slots <= 1 || kv_slot_tensors_.empty())
+    {
+        kv_num_slots_ = 1;
+        return 1;
+    }
+    const bool force_uncached = std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr;
+    for (auto &st : kv_slot_tensors_) { st.slot_phy.resize(num_slots, 0); st.slot_vir.resize(num_slots, nullptr); }
+
+    int achieved = 1;
+    for (int s = 1; s < num_slots; ++s)
+    {
+        bool ok = true;
+        for (auto &st : kv_slot_tensors_)
         {
             AX_U64 phy = 0;
             void *vir = nullptr;
             int ret = force_uncached
-                          ? AX_SYS_MemAlloc(&phy, &vir, max_bytes, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME))
-                          : AX_SYS_MemAllocCached(&phy, &vir, max_bytes, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
+                          ? AX_SYS_MemAlloc(&phy, &vir, st.bytes, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME))
+                          : AX_SYS_MemAllocCached(&phy, &vir, st.bytes, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
             if (ret != 0)
             {
-                ALOGE("kv slot: alloc %s slot %d (%zu bytes) failed: 0x%x", name.c_str(), s, max_bytes, ret);
-                // Free what we already allocated for this tensor, then bail.
-                for (int k = 1; k < s; ++k)
-                    if (st.slot_phy[k]) AX_SYS_MemFree(st.slot_phy[k], st.slot_vir[k]);
-                return -1;
+                ALOGW("kv slot: alloc %s slot %d (%zu bytes) failed: 0x%x", st.name.c_str(), s, st.bytes, ret);
+                ok = false;
+                break;
             }
-            memset(vir, 0, max_bytes);
+            memset(vir, 0, st.bytes);
             st.slot_phy[s] = phy;
             st.slot_vir[s] = vir;
         }
-        kv_slot_tensors_.push_back(std::move(st));
+        if (!ok)
+        {
+            for (auto &st : kv_slot_tensors_)
+                if (st.slot_phy[s]) { AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]); st.slot_phy[s] = 0; st.slot_vir[s] = nullptr; }
+            break;
+        }
+        achieved = s + 1;
     }
-
-    if (kv_slot_tensors_.empty())
-        return -1;
-
-    kv_num_slots_ = num_slots;
+    for (auto &st : kv_slot_tensors_) { st.slot_phy.resize(achieved); st.slot_vir.resize(achieved); }
+    kv_num_slots_ = achieved;
     kv_active_slot_ = 0;
-    ALOGI("kv cache slots ready: num_slots=%d tensors=%zu", num_slots, kv_slot_tensors_.size());
-    return num_slots;
+    return achieved;
+}
+
+int ax_runner_ax650::kv_cache_slots_set_count(int n)
+{
+    if (n < 1) n = 1;
+    if (kv_slot_tensors_.empty()) { kv_num_slots_ = 1; return 1; }
+    if (kv_active_slot_ >= n) kv_cache_slots_activate(0);
+    for (auto &st : kv_slot_tensors_)
+    {
+        for (int s = n; s < (int)st.slot_phy.size(); ++s)
+            if (st.slot_phy[s]) { AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]); st.slot_phy[s] = 0; st.slot_vir[s] = nullptr; }
+        if ((int)st.slot_phy.size() > n) { st.slot_phy.resize(n); st.slot_vir.resize(n); }
+    }
+    kv_num_slots_ = n;
+    return n;
 }
 
 int ax_runner_ax650::kv_cache_slots_activate(int slot)

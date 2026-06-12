@@ -179,15 +179,22 @@ public:
     virtual int inference() = 0;
     virtual int inference(int grpid) = 0;
 
-    // ---- Multi-slot KV cache API ----
-    // Allocate num_slots-1 extra device buffers for each slottable KV tensor
-    // (slot 0 reuses the engine's own buffer). Returns the number of slots
-    // actually available (>=1), or <0 on error. Default: unsupported (returns -1).
-    virtual int kv_cache_slots_init(int num_slots)
-    {
-        (void)num_slots;
-        return -1;
-    }
+    // ---- Multi-slot KV cache API (device mode) ----
+    // Phase 1: locate the slottable KV tensors (K_cache/V_cache), record slot 0
+    // (the engine's own buffer), and return the per-slot device bytes that ONE
+    // extra slot would consume (sum of K+V buffer sizes). 0 = unsupported / no KV.
+    // Allocates nothing beyond bookkeeping, so the engine can budget first.
+    virtual size_t kv_cache_slots_prepare() { return 0; }
+
+    // Phase 2: allocate extra device buffers up to `num_slots` total (slot 0 is
+    // the engine buffer). Allocates incrementally and stops at the first failure
+    // instead of erroring out. Returns the number of slots actually available
+    // (>=1). Default: only slot 0.
+    virtual int kv_cache_slots_alloc(int num_slots) { return num_slots <= 1 ? 1 : 1; }
+
+    // Free extra slot buffers so exactly `n` slots remain (>=1). Used to trim all
+    // layers down to a common count. Returns the resulting count.
+    virtual int kv_cache_slots_set_count(int n) { return n < 1 ? 1 : n; }
 
     // Rebind every group's KV tensors to the given slot's buffers (zero copy).
     // Returns 0 on success, <0 on error. Default: only slot 0 is valid.

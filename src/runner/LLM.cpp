@@ -9,10 +9,14 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <queue>
 #include <thread>
+#ifndef _WIN32
+#include <sys/sysinfo.h>
+#endif
 
 #include "bfloat16.hpp"
 #include "Gemma4PerLayerHelper.hpp"
@@ -3440,9 +3444,21 @@ struct LLM::Impl {
         }
     }
 
+    // Remaining device CMM in MB for a layer's device (AX650: single chip).
+    int remaining_cmm_mb(int devid) const
+    {
+#ifdef USE_AXCL
+        return axcl_GetCMMRemain(devid);
+#else
+        (void)devid;
+        return get_remaining_cmm_size();
+#endif
+    }
+
     // ---- Multi-slot prefix KV cache management ----
-    // Allocate per-layer device slot buffers and enable the feature. Called from
-    // Init() after layers/groups are ready. Safe no-op when slots<=1.
+    // Called from Init() after layers/groups are ready. Estimates how many slots
+    // actually fit before allocating, reduces to what fits, and warns when the
+    // configured count cannot be satisfied. Safe no-op when slots<=1.
     void init_kv_slots()
     {
         multi_slot_enabled_ = false;
@@ -3466,29 +3482,110 @@ struct LLM::Impl {
         if (loc != "host" && loc != "ddr" && loc != "device")
             ALOGW("kv_cache_slot_location='%s' unknown; defaulting to 'device'", _attr.kv_cache_slot_location.c_str());
 
-        // Device mode keeps N device-resident KV buffer sets per layer (zero-copy
-        // activate). Host mode keeps one engine buffer + N host copies (saves CMM,
-        // copies KV on switch) and needs no backend allocation.
+        const std::string vlm_tag = _attr.vlm_type == VLMType::None ? std::string("no") : std::string(VLMTypeName(_attr.vlm_type));
+        int granted = want;
+
         if (kv_slot_location_ == KvSlotLocation::Device)
         {
+            // 1) Build per-layer slot metadata and sum per-slot device bytes by device.
+            std::map<int, size_t> per_dev_bytes;
             for (int i = 0; i < _attr.axmodel_num; ++i)
             {
-                const int r = llama_layers[i].layer.kv_cache_slots_init(want);
-                if (r < want)
+                const size_t b = llama_layers[i].layer.kv_cache_slots_prepare();
+                if (b == 0)
                 {
-                    ALOGE("layer %d kv_cache_slots_init(%d) failed (ret=%d); disabling multi-slot", i, want, r);
-                    for (int j = 0; j <= i; ++j) llama_layers[j].layer.kv_cache_slots_activate(0);
+                    ALOGE("layer %d has no slottable KV tensors; disabling multi-slot", i);
+                    for (int j = 0; j <= i; ++j) llama_layers[j].layer.kv_cache_slots_set_count(1);
                     return;
                 }
+                per_dev_bytes[layer_devid_for(i)] += b;
+            }
+
+            // 2) Budget: keep a safety margin of free CMM for runtime allocations.
+            const long long margin = 256LL * 1024 * 1024;
+            for (const auto &kv : per_dev_bytes)
+            {
+                const int dev = kv.first;
+                const long long per_slot = (long long)kv.second;
+                const long long free_b = (long long)remaining_cmm_mb(dev) * 1024LL * 1024LL;
+                const long long usable = free_b - margin;
+                int fit = 1;
+                if (per_slot > 0 && usable > 0) fit = 1 + (int)(usable / per_slot);
+                ALOGI("kv slot budget: dev=%d per_slot=%lldMB free=%lldMB margin=256MB -> max_slots=%d",
+                      dev, per_slot >> 20, free_b >> 20, fit);
+                granted = std::min(granted, fit);
+            }
+            if (granted < 1) granted = 1;
+            if (granted < want)
+                ALOGW("⚠ kv_cache_slots=%d requested but device CMM only fits %d; reducing to %d", want, granted, granted);
+            if (granted <= 1)
+            {
+                ALOGW("⚠ kv_cache_slots disabled: device CMM cannot fit even one extra slot");
+                for (int i = 0; i < _attr.axmodel_num; ++i) llama_layers[i].layer.kv_cache_slots_set_count(1);
+                return;
+            }
+
+            // 3) Allocate the budgeted count; take the min actually achieved
+            //    (fragmentation may yield less than the estimate), then trim all
+            //    layers to that common count.
+            int achieved = granted;
+            for (int i = 0; i < _attr.axmodel_num; ++i)
+                achieved = std::min(achieved, llama_layers[i].layer.kv_cache_slots_alloc(granted));
+            if (achieved < granted)
+                ALOGW("⚠ kv_cache_slots: allocated %d of estimated %d (CMM fragmentation); using %d", achieved, granted, achieved);
+            for (int i = 0; i < _attr.axmodel_num; ++i) llama_layers[i].layer.kv_cache_slots_set_count(achieved);
+            granted = achieved;
+            if (granted <= 1)
+            {
+                ALOGW("⚠ kv_cache_slots disabled after allocation (only 1 slot available)");
+                return;
+            }
+        }
+        else // Host mode: one device buffer + N host copies; bound by host RAM.
+        {
+            size_t per_slot = 0;
+            const int gid0 = decode_grpids_.empty() ? 0 : decode_grpids_.back();
+            for (int i = 0; i < _attr.axmodel_num; ++i)
+            {
+                const int gid = decode_gid_for_layer(i, gid0);
+                per_slot += (size_t)llama_layers[i].layer.get_input(gid, "K_cache").nSize;
+                per_slot += (size_t)llama_layers[i].layer.get_input(gid, "V_cache").nSize;
+            }
+            long long free_ram = 0;
+#ifndef _WIN32
+            struct sysinfo si;
+            if (sysinfo(&si) == 0) free_ram = (long long)si.freeram * (long long)si.mem_unit;
+#endif
+            const long long margin = 512LL * 1024 * 1024;
+            int fit = want;
+            if (free_ram > 0 && per_slot > 0)
+            {
+                const long long usable = free_ram - margin;
+                fit = 1;
+                if (usable > 0) fit = 1 + (int)(usable / (long long)per_slot);
+            }
+            ALOGI("kv slot budget (host): per_slot<=%zuMB free_ram=%lldMB -> max_slots=%d",
+                  per_slot >> 20, free_ram >> 20, fit);
+            granted = std::min(want, fit);
+            if (granted < 1) granted = 1;
+            if (granted < want)
+                ALOGW("⚠ kv_cache_slots=%d requested but host RAM only fits ~%d; reducing to %d", want, granted, granted);
+            if (granted <= 1)
+            {
+                ALOGW("⚠ kv_cache_slots disabled: host RAM cannot fit even one extra slot");
+                return;
             }
         }
 
-        kv_slots_.resize(want);
+        kv_slots_.resize(granted);
         kv_active_slot_idx_ = 0;
         multi_slot_enabled_ = true;
-        ALOGI("multi-slot prefix KV cache enabled: slots=%d location=%s vlm=%s", want,
-              kv_slot_location_ == KvSlotLocation::Host ? "host" : "device",
-              _attr.vlm_type == VLMType::None ? "no" : std::string(VLMTypeName(_attr.vlm_type)).c_str());
+        if (granted < want)
+            ALOGW("multi-slot prefix KV cache: %d/%d slots enabled (location=%s vlm=%s)", granted, want,
+                  kv_slot_location_ == KvSlotLocation::Host ? "host" : "device", vlm_tag.c_str());
+        else
+            ALOGI("multi-slot prefix KV cache enabled: slots=%d location=%s vlm=%s", granted,
+                  kv_slot_location_ == KvSlotLocation::Host ? "host" : "device", vlm_tag.c_str());
     }
 
     // Host mode: copy the active slot's device KV into its host store.

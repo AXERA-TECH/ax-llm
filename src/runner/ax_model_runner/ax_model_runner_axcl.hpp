@@ -35,7 +35,9 @@ public:
     int inference() override;
     int inference(int grpid) override;
 
-    int kv_cache_slots_init(int num_slots) override;
+    size_t kv_cache_slots_prepare() override;
+    int kv_cache_slots_alloc(int num_slots) override;
+    int kv_cache_slots_set_count(int n) override;
     int kv_cache_slots_activate(int slot) override;
 
 protected:

@@ -770,21 +770,17 @@ int ax_runner_axcl::inference(int grpid)
 // ---------------------------------------------------------------------------
 // Multi-slot KV cache (device-resident prefix cache)
 // ---------------------------------------------------------------------------
-int ax_runner_axcl::kv_cache_slots_init(int num_slots)
+size_t ax_runner_axcl::kv_cache_slots_prepare()
 {
-    if (num_slots <= 1)
-    {
-        kv_num_slots_ = 1;
-        kv_active_slot_ = 0;
-        return 1;
-    }
+    kv_slot_tensors_.clear();
+    kv_num_slots_ = 1;
+    kv_active_slot_ = 0;
     if (!m_handle || mgroup_input_tensors.empty())
-        return -1;
+        return 0;
 
     const int ngrp = (int)mgroup_input_tensors.size();
     const std::vector<std::string> kv_names = {"K_cache", "V_cache"};
-
-    kv_slot_tensors_.clear();
+    size_t per_slot_bytes = 0;
     for (const auto &name : kv_names)
     {
         KvSlotTensor st;
@@ -810,33 +806,67 @@ int ax_runner_axcl::kv_cache_slots_init(int num_slots)
             continue;
         }
         st.bytes = max_bytes;
-        st.slot_phy.assign(num_slots, 0);
-        st.slot_vir.assign(num_slots, nullptr);
-        st.slot_phy[0] = slot0_phy; // borrowed engine device buffer
-        for (int s = 1; s < num_slots; ++s)
-        {
-            void *devPtr = nullptr;
-            int ret = axcl_Malloc(&devPtr, max_bytes, axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST, dev_id);
-            if (ret != 0 || !devPtr)
-            {
-                ALOGE("kv slot: axcl_Malloc %s slot %d (%zu bytes) failed: %d", name.c_str(), s, max_bytes, ret);
-                for (int k = 1; k < s; ++k)
-                    if (st.slot_phy[k]) axcl_Free((void *)st.slot_phy[k], dev_id);
-                return -1;
-            }
-            axcl_Memset(devPtr, 0, max_bytes, dev_id);
-            st.slot_phy[s] = (unsigned long long)devPtr;
-        }
+        st.slot_phy.assign(1, slot0_phy); // slot 0 = borrowed engine device buffer
+        st.slot_vir.assign(1, nullptr);
+        per_slot_bytes += max_bytes;
         kv_slot_tensors_.push_back(std::move(st));
     }
+    return kv_slot_tensors_.empty() ? 0 : per_slot_bytes;
+}
 
-    if (kv_slot_tensors_.empty())
-        return -1;
+int ax_runner_axcl::kv_cache_slots_alloc(int num_slots)
+{
+    if (num_slots <= 1 || kv_slot_tensors_.empty())
+    {
+        kv_num_slots_ = 1;
+        return 1;
+    }
+    for (auto &st : kv_slot_tensors_) { st.slot_phy.resize(num_slots, 0); st.slot_vir.resize(num_slots, nullptr); }
 
-    kv_num_slots_ = num_slots;
+    int achieved = 1;
+    for (int s = 1; s < num_slots; ++s)
+    {
+        bool ok = true;
+        for (auto &st : kv_slot_tensors_)
+        {
+            void *devPtr = nullptr;
+            int ret = axcl_Malloc(&devPtr, st.bytes, axclrtMemMallocPolicy::AXCL_MEM_MALLOC_HUGE_FIRST, dev_id);
+            if (ret != 0 || !devPtr)
+            {
+                ALOGW("kv slot: axcl_Malloc %s slot %d (%zu bytes) failed: %d", st.name.c_str(), s, st.bytes, ret);
+                ok = false;
+                break;
+            }
+            axcl_Memset(devPtr, 0, st.bytes, dev_id);
+            st.slot_phy[s] = (unsigned long long)devPtr;
+        }
+        if (!ok)
+        {
+            for (auto &st : kv_slot_tensors_)
+                if (st.slot_phy[s]) { axcl_Free((void *)st.slot_phy[s], dev_id); st.slot_phy[s] = 0; }
+            break;
+        }
+        achieved = s + 1;
+    }
+    for (auto &st : kv_slot_tensors_) { st.slot_phy.resize(achieved); st.slot_vir.resize(achieved); }
+    kv_num_slots_ = achieved;
     kv_active_slot_ = 0;
-    ALOGI("kv cache slots ready (axcl dev %d): num_slots=%d tensors=%zu", dev_id, num_slots, kv_slot_tensors_.size());
-    return num_slots;
+    return achieved;
+}
+
+int ax_runner_axcl::kv_cache_slots_set_count(int n)
+{
+    if (n < 1) n = 1;
+    if (kv_slot_tensors_.empty()) { kv_num_slots_ = 1; return 1; }
+    if (kv_active_slot_ >= n) kv_cache_slots_activate(0);
+    for (auto &st : kv_slot_tensors_)
+    {
+        for (int s = n; s < (int)st.slot_phy.size(); ++s)
+            if (st.slot_phy[s]) { axcl_Free((void *)st.slot_phy[s], dev_id); st.slot_phy[s] = 0; }
+        if ((int)st.slot_phy.size() > n) { st.slot_phy.resize(n); st.slot_vir.resize(n); }
+    }
+    kv_num_slots_ = n;
+    return n;
 }
 
 int ax_runner_axcl::kv_cache_slots_activate(int slot)
