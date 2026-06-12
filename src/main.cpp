@@ -2051,6 +2051,7 @@ int run_server_mode(const ModelConfig &config, int port)
             timeout_ms = 300000;
         }
         g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
         g_server.run(port);
     }
     else
@@ -2387,6 +2388,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+            g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
             g_server.run(port);
         }
         llm.Deinit();
