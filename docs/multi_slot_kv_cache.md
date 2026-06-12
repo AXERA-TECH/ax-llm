@@ -29,6 +29,20 @@ OpenAI chat 协议是无状态的(每次发全量 history),因此**不需要 ses
 
 默认 `kv_cache_slots=1`,对既有模型零影响。仅当显式设 `>1` 才启用。
 
+### 显存/内存自适应(放不下就降级 + 报警)
+
+开启多槽时**先评估再分配**,避免配置过大导致 OOM:
+
+- device 模式:先为每层建立槽元数据并算出**一份槽的设备 CMM 占用**(各层 K+V,按设备汇总),查询每张卡的剩余 CMM(`get_remaining_cmm_size` / `axcl_GetCMMRemain`),保留 256MB 余量后算出最多能开几份;按各设备取最小值并以 config 为上限。实际分配若因碎片不足,会把所有层裁剪到真正分配成功的份数。
+- host 模式:按空闲主机内存(`sysinfo`,保留 512MB 余量)估算。
+- 若实际能开的份数 **< config 请求**,会 `⚠` 告警并按能开的份数启用;一份都开不下则关闭多槽。例如配置 4 份但卡上只够 3 份,就用 3 份并告警。
+
+示例日志:
+```
+kv slot budget: dev=0 per_slot=139MB free=6474MB margin=256MB -> max_slots=44
+⚠ kv_cache_slots=9999 requested but device CMM only fits 44; reducing to 44
+```
+
 ## 设计
 
 ### 一个"槽"包含什么
