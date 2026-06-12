@@ -45,6 +45,7 @@ struct LLMAttrType {
 
     std::string tokenizer_type;
     std::string url_tokenizer_model = "http://127.0.0.1:12345";
+    ThinkingMode generation_thinking_mode = ThinkingMode::Unspecified;
     bool b_bos = true, b_eos = false;
     std::string filename_tokens_embed = "tinyllama.model.embed_tokens.weight.bfloat16.bin";
     int tokens_embed_num = 32000;
@@ -126,6 +127,10 @@ public:
     LLaMaEmbedSelector *getEmbedSelector();
     void SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p);
     void ClearRequestSamplingOverride();
+    void SetRequestThinkingMode(ThinkingMode mode);
+    void ClearRequestThinkingMode();
+    void MarkRequestStart();
+    void ClearRequestStart();
     std::string GetLastError() const;
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);

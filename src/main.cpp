@@ -1,4 +1,5 @@
 #include <iostream>
+#include <algorithm>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -167,6 +168,49 @@ static inline std::vector<Content> make_initial_history(const LLMAttrType &attr)
         history.push_back({SYSTEM, TEXT, system_prompt});
     }
     return history;
+}
+
+static const char *thinking_mode_name(ThinkingMode mode)
+{
+    switch (mode)
+    {
+    case ThinkingMode::Think:
+        return "think";
+    case ThinkingMode::NoThink:
+        return "no_think";
+    case ThinkingMode::Unspecified:
+    default:
+        return "default";
+    }
+}
+
+static std::string ascii_lower_copy(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+static std::optional<ThinkingMode> json_thinking_mode_value(const nlohmann::json &j)
+{
+    if (j.contains("enable_thinking") && j["enable_thinking"].is_boolean())
+    {
+        return j["enable_thinking"].get<bool>() ? ThinkingMode::Think : ThinkingMode::NoThink;
+    }
+
+    if (j.contains("thinking_mode") && j["thinking_mode"].is_string())
+    {
+        const std::string mode = ascii_lower_copy(j["thinking_mode"].get<std::string>());
+        if (mode == "default" || mode == "unspecified" || mode == "auto")
+            return ThinkingMode::Unspecified;
+        if (mode == "think" || mode == "thinking" || mode == "enable_thinking")
+            return ThinkingMode::Think;
+        if (mode == "no_think" || mode == "nothink" || mode == "non_thinking" || mode == "disable_thinking")
+            return ThinkingMode::NoThink;
+    }
+
+    return std::nullopt;
 }
 
 // Config structure for JSON configuration
@@ -352,6 +396,10 @@ struct ModelConfig
 
             check_key("tokenizer_type");
             attr.tokenizer_type = j["tokenizer_type"].get<std::string>();
+            if (auto mode = json_thinking_mode_value(j); mode.has_value())
+            {
+                attr.generation_thinking_mode = *mode;
+            }
 
             check_key("filename_tokens_embed");
             attr.filename_tokens_embed = j["filename_tokens_embed"].get<std::string>();
@@ -1428,6 +1476,44 @@ static int resolve_chat_output_max_tokens(const ModelConfig &config,
     return output_max_tokens;
 }
 
+static ThinkingMode resolve_chat_thinking_mode(const ModelConfig &config,
+                                               const openai_api::ChatRequest &req)
+{
+    if (req.has_enable_thinking)
+    {
+        return req.enable_thinking ? ThinkingMode::Think : ThinkingMode::NoThink;
+    }
+    return config.attr.generation_thinking_mode;
+}
+
+static bool should_emit_thinking_markup(ThinkingMode mode)
+{
+    return mode == ThinkingMode::Think;
+}
+
+static bool has_thinking_open_tag(const std::string &text)
+{
+    return text.find("<think>") != std::string::npos;
+}
+
+static bool has_thinking_close_tag(const std::string &text)
+{
+    return text.find("</think>") != std::string::npos;
+}
+
+static std::string wrap_thinking_text_for_client(std::string text)
+{
+    if (!has_thinking_open_tag(text))
+    {
+        text.insert(0, "<think>\n");
+    }
+    if (!has_thinking_close_tag(text))
+    {
+        text.append("\n</think>");
+    }
+    return text;
+}
+
 static std::string build_hymt_translation_prompt(const std::string &source_text,
                                                  const std::string &target_language,
                                                  bool use_zh_template)
@@ -2184,6 +2270,7 @@ int run_server_mode(const ModelConfig &config, int port)
             options.supports_vision = config.attr.vlm_type != VLMType::None;
             options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+            options.extra_fields["thinking_mode"] = thinking_mode_name(llm.getAttr()->generation_thinking_mode);
             if (config.server_max_output_tokens > 0) options.extra_fields["server_max_output_tokens"] = config.server_max_output_tokens;
 
             const bool single_image_ocr_mode = config.attr.vlm_type == VLMType::PaddleOCRVL;
@@ -2196,7 +2283,9 @@ int run_server_mode(const ModelConfig &config, int port)
                     return;
                 }
 
-                ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f messages=%zu stop=%zu",
+                const ThinkingMode request_thinking_mode = resolve_chat_thinking_mode(config, req);
+
+                ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f has_enable_thinking=%d thinking_mode=%s messages=%zu stop=%zu",
                       req.model.c_str(),
                       req.stream ? 1 : 0,
                       req.max_tokens,
@@ -2204,8 +2293,18 @@ int run_server_mode(const ModelConfig &config, int port)
                       req.temperature,
                       req.has_top_p ? 1 : 0,
                       req.top_p,
+                      req.has_enable_thinking ? 1 : 0,
+                      thinking_mode_name(request_thinking_mode),
                       req.parsed_messages.size(),
                       req.stop.size());
+                llm.MarkRequestStart();
+                struct RequestTimingGuard {
+                    LLM &llm;
+                    ~RequestTimingGuard()
+                    {
+                        llm.ClearRequestStart();
+                    }
+                } request_timing_guard{llm};
 
                 struct SamplingOverrideGuard {
                     LLM &llm;
@@ -2221,6 +2320,18 @@ int run_server_mode(const ModelConfig &config, int port)
                         llm.ClearRequestSamplingOverride();
                     }
                 } sampling_guard(llm, req, !single_image_ocr_mode);
+
+                struct ThinkingModeGuard {
+                    LLM &llm;
+                    explicit ThinkingModeGuard(LLM &llm, ThinkingMode mode) : llm(llm)
+                    {
+                        llm.SetRequestThinkingMode(mode);
+                    }
+                    ~ThinkingModeGuard()
+                    {
+                        llm.ClearRequestThinkingMode();
+                    }
+                } thinking_guard(llm, request_thinking_mode);
 
                 auto push_chat_error = [&](const std::string &code, const std::string &message) {
                     provider->push(openai_api::OutputChunk::Error(code, message));
@@ -2273,15 +2384,36 @@ int run_server_mode(const ModelConfig &config, int port)
 
                 if (req.stream) {
                     bool streamed_any = false;
-                    auto callback = [provider, model_id = req.model, &streamed_any](std::string str, float token_per_sec, void *reserve) {
+                    const bool emit_thinking_markup = should_emit_thinking_markup(request_thinking_mode);
+                    bool thinking_open_emitted = false;
+                    std::string streamed_text;
+                    auto callback = [provider,
+                                     model_id = req.model,
+                                     emit_thinking_markup,
+                                     &streamed_any,
+                                     &thinking_open_emitted,
+                                     &streamed_text](std::string str, float token_per_sec, void *reserve) {
                         if (!provider->is_writable()) {
                             ALOGE("provider not writable");
                             return;
                         }
-                        if (!str.empty()) streamed_any = true;
-                        auto chunk = openai_api::OutputChunk::TextDelta(str, model_id);
+                        std::string out = str;
+                        if (emit_thinking_markup)
+                        {
+                            streamed_text += str;
+                            if (!thinking_open_emitted && !out.empty())
+                            {
+                                if (!has_thinking_open_tag(out))
+                                {
+                                    out.insert(0, "<think>\n");
+                                }
+                                thinking_open_emitted = true;
+                            }
+                        }
+                        if (!out.empty()) streamed_any = true;
+                        auto chunk = openai_api::OutputChunk::TextDelta(out, model_id);
                         provider->push(chunk);
-                        fprintf(stdout, "%s", str.c_str());
+                        fprintf(stdout, "%s", out.c_str());
                         fflush(stdout);
                     };
 
@@ -2297,6 +2429,12 @@ int run_server_mode(const ModelConfig &config, int port)
                         }
                     }
                     if (streamed_any) {
+                        if (emit_thinking_markup && thinking_open_emitted && !has_thinking_close_tag(streamed_text))
+                        {
+                            provider->push(openai_api::OutputChunk::TextDelta("\n</think>", req.model));
+                            fprintf(stdout, "%s", "\n</think>");
+                            fflush(stdout);
+                        }
                         provider->push(openai_api::OutputChunk::FinalText("", req.model));
                     }
                 } else {
@@ -2320,6 +2458,10 @@ int run_server_mode(const ModelConfig &config, int port)
                         cleanup_temp_files(temp_files);
                         push_chat_error("model_error", "模型运行失败，请重新尝试。");
                         return;
+                    }
+                    if (should_emit_thinking_markup(request_thinking_mode))
+                    {
+                        final_text = wrap_thinking_text_for_client(final_text);
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
                     fprintf(stdout, "%s", final_text.c_str());

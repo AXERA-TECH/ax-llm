@@ -39,6 +39,7 @@ static std::vector<std::string> required_tokenizers()
         "Gemma4VL",
         "MiniCPMV46",
         "MiniCPMV46VL",
+        "MiniCPM5",
     };
 }
 

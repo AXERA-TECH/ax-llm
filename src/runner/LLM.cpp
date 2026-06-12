@@ -422,6 +422,8 @@ struct LLM::Impl {
     std::atomic<bool> b_stop{false};
     LLMPostprocess postprocess;
     std::string last_error_message;
+    std::chrono::steady_clock::time_point request_start_time_;
+    bool request_start_active_ = false;
 
     bool dynamic_layer_load_enabled() const
     {
@@ -530,6 +532,26 @@ struct LLM::Impl {
     static std::string video_quality_reset_notice()
     {
         return "提示：为保证视频解析质量，本次视频请求已按新会话处理，未使用此前对话上下文。\n\n";
+    }
+
+    void MarkRequestStart()
+    {
+        request_start_time_ = std::chrono::steady_clock::now();
+        request_start_active_ = true;
+    }
+
+    void ClearRequestStart()
+    {
+        request_start_active_ = false;
+    }
+
+    float CurrentRequestElapsedMs() const
+    {
+        if (!request_start_active_)
+            return -1.0f;
+        const auto now = std::chrono::steady_clock::now();
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - request_start_time_).count();
+        return static_cast<float>(us) / 1000.0f;
     }
 
     static bool request_has_video_media(const std::vector<Content> &history,
@@ -2475,6 +2497,7 @@ struct LLM::Impl {
         if (!tokenizer) { ALOGE("create_tokenizer(%s) failed", this->_attr.tokenizer_type.c_str()); return false; }
         if (!tokenizer->load(attr.url_tokenizer_model)) { ALOGE("tokenizer.init(%s) failed", attr.url_tokenizer_model.c_str()); return false; }
         tokenizer->set_think_in_prompt(!tokenizer_uses_hidden_channel_markup(this->_attr.tokenizer_type));
+        tokenizer->set_generation_thinking_mode(this->_attr.generation_thinking_mode);
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
 
 #ifdef USE_AXCL
@@ -4318,7 +4341,19 @@ struct LLM::Impl {
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr;
             next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
             dump_decode_trace(0, post_out, _attr.tokens_embed_num, next_token);
-            ALOGI("ttft: %.2f ms", ttft_timer.cost());
+            const float ttft_text_ms = ttft_timer.cost();
+            const float ttft_e2e_ms = CurrentRequestElapsedMs();
+            if (ttft_e2e_ms >= 0.0f)
+            {
+                const float ttft_prepare_ms = std::max(0.0f, ttft_e2e_ms - ttft_text_ms);
+                ALOGI("ttft: %.2f ms (prepare=%.2f ms, text=%.2f ms)", ttft_e2e_ms, ttft_prepare_ms, ttft_text_ms);
+                ALOGI("ttft_prepare: %.2f ms", ttft_prepare_ms);
+                ALOGI("ttft_text: %.2f ms", ttft_text_ms);
+            }
+            else
+            {
+                ALOGI("ttft: %.2f ms", ttft_text_ms);
+            }
             if (debug_prefill) ALOGI("first decode token: id=%d", next_token);
             if (next_token < 0 || next_token >= _attr.tokens_embed_num)
             {
@@ -5281,6 +5316,10 @@ LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
 void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p); }
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
+void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
+void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }
+void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
+void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
