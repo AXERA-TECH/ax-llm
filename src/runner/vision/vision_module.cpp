@@ -2491,10 +2491,13 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
             auto plan_it = gemma4_video_plans.find(i);
             if (plan_it != gemma4_video_plans.end()) {
                 effective_media.uris = plan_it->second.sampled_uris;
-                ALOGI("Gemma4 video frames selected: %d/%d (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
+                const int requested_cap = (video_num_frames_ > 0)
+                                              ? std::min(plan_it->second.total_frame_count, video_num_frames_)
+                                              : plan_it->second.total_frame_count;
+                ALOGI("Gemma4 video frame plan: selected_frames=%d source_frames=%d requested_cap=%d tail_tokens=%d max_tail=%d precompute_len=%d",
                       plan_it->second.frame_count,
                       plan_it->second.total_frame_count,
-                      video_num_frames_,
+                      requested_cap,
                       plan_it->second.fitted_tail_tokens,
                       plan_it->second.max_tail_tokens,
                       plan_it->second.precompute_len);
@@ -2505,6 +2508,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                 int frame_cap = (video_num_frames_ > 0)
                                     ? std::min((int)all_frame_files.size(), video_num_frames_)
                                     : (int)all_frame_files.size();
+                const int requested_cap = frame_cap;
                 if (frame_cap <= 0) {
                     err = "Gemma4 video has no usable frames";
                     return false;
@@ -2540,10 +2544,10 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                     return false;
                 }
 
-                ALOGI("Gemma4 video frames selected: %d/%zu (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
+                ALOGI("Gemma4 video frame plan: selected_frames=%d source_frames=%zu requested_cap=%d tail_tokens=%d max_tail=%d precompute_len=%d",
                       frame_cap,
                       all_frame_files.size(),
-                      video_num_frames_,
+                      requested_cap,
                       fitted_tail_tokens,
                       budget ? budget->max_tail_tokens : -1,
                       budget ? budget->precompute_len : 0);
@@ -2556,6 +2560,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
             int frame_cap = (video_num_frames_ > 0)
                                 ? std::min((int)all_frame_files.size(), video_num_frames_)
                                 : (int)all_frame_files.size();
+            const int requested_cap = frame_cap;
             if (frame_cap <= 0) {
                 err = "MiniCPM-V-4.6 video has no usable frames";
                 return false;
@@ -2591,10 +2596,10 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                 return false;
             }
 
-            ALOGI("MiniCPM-V-4.6 video frames selected: %d/%zu (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
+            ALOGI("MiniCPM-V-4.6 video frame plan: selected_frames=%d source_frames=%zu requested_cap=%d tail_tokens=%d max_tail=%d precompute_len=%d",
                   frame_cap,
                   all_frame_files.size(),
-                  video_num_frames_,
+                  requested_cap,
                   fitted_tail_tokens,
                   budget ? budget->max_tail_tokens : -1,
                   budget ? budget->precompute_len : 0);
