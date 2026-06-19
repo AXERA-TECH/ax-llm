@@ -78,6 +78,46 @@ static openai_api::Server g_server;
 static std::atomic<bool> g_running{true};
 // In interactive mode: SIGINT/Ctrl+C stops current generation and returns to prompt.
 // In server mode: SIGINT/Ctrl+C exits the process (by stopping server loop).
+
+class ProviderKeepAlive {
+public:
+    explicit ProviderKeepAlive(const std::shared_ptr<openai_api::BaseDataProvider> &provider,
+                               std::chrono::milliseconds interval = std::chrono::milliseconds(1000))
+        : provider_(provider), interval_(interval), running_(provider != nullptr)
+    {
+        if (!running_) return;
+        worker_ = std::thread([this]() {
+            while (running_.load())
+            {
+                std::this_thread::sleep_for(interval_);
+                if (!running_.load()) break;
+                provider_->reset_timeout();
+            }
+        });
+    }
+
+    ~ProviderKeepAlive()
+    {
+        stop();
+    }
+
+    void stop()
+    {
+        bool expected = true;
+        if (running_.compare_exchange_strong(expected, false))
+        {
+            if (worker_.joinable()) worker_.join();
+            return;
+        }
+        if (worker_.joinable()) worker_.join();
+    }
+
+private:
+    std::shared_ptr<openai_api::BaseDataProvider> provider_;
+    std::chrono::milliseconds interval_;
+    std::atomic<bool> running_{false};
+    std::thread worker_;
+};
 static std::atomic<bool> g_exit_on_sigint{true};
 
 // Terminal settings for handling UTF-8 backspace
@@ -773,6 +813,67 @@ static std::string trim_copy(const std::string &s)
     size_t end = s.size();
     while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) end--;
     return s.substr(start, end - start);
+}
+
+static std::string normalized_key(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc)) out.push_back((char)std::tolower(uc));
+    }
+    return out;
+}
+
+static std::string embedding_prompt_name_from_request(const nlohmann::json &raw)
+{
+    auto pick = [&](const char *key) -> std::string {
+        if (!raw.contains(key) || !raw[key].is_string()) return {};
+        return normalized_key(trim_copy(raw[key].get<std::string>()));
+    };
+
+    std::string name = pick("prompt_name");
+    if (name.empty()) name = pick("input_type");
+    if (name == "document" || name == "doc") return "document";
+    return "query";
+}
+
+static std::string embedding_prefix_for_prompt_name(const std::string &prompt_name)
+{
+    return prompt_name == "document" ? "Document: " : "Query: ";
+}
+
+static bool starts_with_embedding_prefix(const std::string &text)
+{
+    return text.rfind("Query: ", 0) == 0 || text.rfind("Document: ", 0) == 0;
+}
+
+static void apply_jina_embedding_prompt_prefix(std::vector<std::string> &inputs, const std::string &prompt_name)
+{
+    const std::string prefix = embedding_prefix_for_prompt_name(prompt_name);
+    for (auto &input : inputs)
+    {
+        if (!starts_with_embedding_prefix(input))
+        {
+            input = prefix + input;
+        }
+    }
+}
+
+static void apply_jina_embedding_prompt_prefix(std::vector<Content> &history, const std::string &prompt_name)
+{
+    const std::string prefix = embedding_prefix_for_prompt_name(prompt_name);
+    for (auto &content : history)
+    {
+        if (content.role != USER) continue;
+        if (content.type != TEXT && content.type != IMAGE && content.type != VIDEO && content.type != AUDIO) continue;
+        if (!starts_with_embedding_prefix(content.data))
+        {
+            content.data = prefix + content.data;
+        }
+    }
 }
 
 // Read UTF-8 character length
@@ -2150,7 +2251,6 @@ int run_server_mode(const ModelConfig &config, int port)
             timeout_ms = 300000;
         }
         g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
-        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
         g_server.run(port);
     }
     else
@@ -2169,13 +2269,15 @@ int run_server_mode(const ModelConfig &config, int port)
 
         if (config.is_embedding_model())
         {
-            g_server.registerEmbedding(model_name, [&llm](const openai_api::EmbeddingRequest &req,
+            const bool use_jina_prompt_prefix = normalized_key(config.attr.tokenizer_type) == "qwen3omni";
+            g_server.registerEmbedding(model_name, [&llm, use_jina_prompt_prefix](const openai_api::EmbeddingRequest &req,
                                                                std::shared_ptr<openai_api::BaseDataProvider> provider)
                                        {
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
                 }
+                ProviderKeepAlive keepalive(provider);
 
                 if (!req.encoding_format.empty() && req.encoding_format != "float") {
                     ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
@@ -2193,6 +2295,9 @@ int run_server_mode(const ModelConfig &config, int port)
                         provider->end();
                         return;
                     }
+                    if (use_jina_prompt_prefix) {
+                        apply_jina_embedding_prompt_prefix(history, embedding_prompt_name_from_request(req.raw));
+                    }
 
                     std::vector<float> embedding;
                     if (!llm.Embed(history, media_inputs, embedding))
@@ -2206,19 +2311,26 @@ int run_server_mode(const ModelConfig &config, int port)
 
                     std::vector<std::vector<float>> embeds;
                     embeds.push_back(std::move(embedding));
+                    keepalive.stop();
                     auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
                     provider->push(chunk);
                     provider->end();
                     return;
                 }
 
+                std::vector<std::string> inputs = req.inputs;
+                if (use_jina_prompt_prefix) {
+                    apply_jina_embedding_prompt_prefix(inputs, embedding_prompt_name_from_request(req.raw));
+                }
+
                 std::vector<std::vector<float>> embeds;
-                if (!llm.EmbedBatch(req.inputs, embeds)) {
+                if (!llm.EmbedBatch(inputs, embeds)) {
                     ALOGE("EmbedBatch failed");
                     provider->end();
                     return;
                 }
 
+                keepalive.stop();
                 auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
                 provider->push(chunk);
                 provider->end(); });
@@ -2257,6 +2369,13 @@ int run_server_mode(const ModelConfig &config, int port)
                     printf("  GET  %s/models\n", base.c_str());
                 }
             }
+            int timeout_ms = config.server_timeout_ms;
+            if (timeout_ms <= 0)
+            {
+                ALOGW("invalid server_timeout_ms=%d, fallback to default 300000ms", timeout_ms);
+                timeout_ms = 300000;
+            }
+            g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
             g_server.run(port);
         }
         else
@@ -2543,7 +2662,6 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
-            g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
             g_server.run(port);
         }
         llm.Deinit();

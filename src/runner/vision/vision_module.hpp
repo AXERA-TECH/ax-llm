@@ -92,7 +92,7 @@ public:
     void Deinit();
 
     // Prepare `history_out` by filling `num_media/num_media_tokens`, then:
-    // - `input_ids_out = tokenizer->encode(history_out)`
+    // - `input_ids_out = tokenizer->encode(history_out, add_generation_prompt)`
     // - build `state_out` for multimodal injection and (optional) mRoPE position ids.
     bool Prepare(const std::vector<Content>& history_in,
                  const std::vector<MediaInputs>& media_inputs,
@@ -101,6 +101,7 @@ public:
                  std::vector<int>& input_ids_out,
                  RunState& state_out,
                  std::string& err,
+                 bool add_generation_prompt = true,
                  PrepareMetadata* meta = nullptr);
 
 private:

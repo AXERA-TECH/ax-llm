@@ -263,13 +263,13 @@ if(BUILD_AX650)
     target_link_libraries(axllm
         -L${BSP_MSP_DIR}/lib
         ax_engine ax_interpreter ax_sys
-        pthread tokenizer openai_api::server
+        pthread dl tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
     target_link_libraries(llm_smoke
         -L${BSP_MSP_DIR}/lib
         ax_engine ax_interpreter ax_sys
-        pthread tokenizer openai_api::server
+        pthread dl tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
     if(OpenMP_CXX_FOUND)
@@ -284,7 +284,7 @@ endif()
 # AXCL PCIe 后端  →  axllm
 # ---------------------------------------------------------------------------
 if(BUILD_AXCL)
-    set(AXCL_LINK_LIBS tokenizer openai_api::server Threads::Threads)
+    set(AXCL_LINK_LIBS tokenizer openai_api::server Threads::Threads dl)
 
     if(WIN32)
         find_library(AXCL_RT_LIBRARY
