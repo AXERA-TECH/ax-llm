@@ -10,7 +10,7 @@
 |---|---|---|
 | `model_name` | string | 模型名(显示在 `/v1/models`、日志) |
 | `tokenizer_type` | string | 分词器类型(如 `Qwen3` / `Qwen3VL` / `Gemma4VL` / `SmolLM2` …) |
-| `url_tokenizer_model` | string | 分词器文件路径或 HTTP 地址 |
+| `url_tokenizer_model` | string | **本地**分词器文件路径(如 `qwen3_tokenizer.txt`)。⚠ 字段名带 `url`、默认值带 `http` 都是历史遗留;**当前只读本地文件,不支持 HTTP** |
 | `template_filename_axmodel` | string | 每层 axmodel 文件名模板,含 `%d`(如 `qwen3_p128_l%d_together.axmodel`) |
 | `axmodel_num` | int | transformer 层数 |
 | `filename_post_axmodel` | string | 输出 logits 的 post axmodel |
@@ -26,7 +26,7 @@
 | `post_config_path` | `post_config.json` | 采样配置文件 |
 | `bos` / `eos` | `true` / `false` | 是否加 BOS/EOS |
 | `pad_token_id` | 0 | pad token id |
-| `thinking_mode` / `enable_thinking` | 模型默认 | 推理(思考)模式开关,用于 Qwen3 / MiniCPM5 等带思考链的模型;也可在 `/v1/chat/completions` 请求里按次覆盖 |
+| `enable_thinking`(bool) 或 `thinking_mode`(string) | 模型默认 | 思考链开关(Qwen3 / MiniCPM5 等)。`enable_thinking`: `true`/`false`;`thinking_mode`: `think`/`no_think`/`default`(`default`/`auto`=按模型默认)。也可在 `/v1/chat/completions` 请求里按次覆盖 |
 
 ## 加载与内存
 
@@ -59,6 +59,8 @@
 | `sliding_window` | 0 | 滑动窗口大小 |
 | `num_kv_shared_layers` | 0 | 末尾共享 KV 的层数 |
 
+> 这几项也可不在 `config.json` 顶层写:`full_attention_interval` / `num_kv_shared_layers` 会回退读 `text_config.*`;`sliding_window` / `layer_types` 未配置时会自动从模型目录下分词器的 sidecar config 读取。
+
 ## 多槽前缀 KV 缓存（serve 多用户/多提示词加速）
 
 | 字段 | 默认 | 说明 |
@@ -80,13 +82,12 @@
 | `vision_patch_size` / `vision_temporal_patch_size` / `vision_spatial_merge_size` | 14 / 2 / 2 | patchify 参数 |
 | `vision_fps` / `vision_tokens_per_second` | 1 / 1 | 视频时间缩放(Qwen2.5-VL mRoPE) |
 | `vision_num_frames` / `vision_do_sample_frames` | 0 / true | 视频抽帧上限 / 是否均匀抽帧 |
-| `video_processor` | — | 视频处理器选择(部分模型) |
 
 ## Embedding
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `is_embedding`(别名 `embedding`/`embedding_type`) | `false` | 以 Embedding 模式启动,提供 `/v1/embeddings`(不支持 `run`) |
+| `is_embedding`(别名 `embedding`;旧 `embedding_type`/`EMBEDDING_TYPE` 已废弃) | `false` | 以 Embedding 模式启动,提供 `/v1/embeddings`(不支持 `run`) |
 
 ## Gemma4 per-layer 投影
 
@@ -102,8 +103,8 @@
 |---|---|---|
 | `port` | 8000 | 监听端口 |
 | `server_timeout_ms` | 300000 | 请求超时(并发排队也复用该值) |
-| `server_default_max_tokens` | — | 请求默认 max_tokens |
-| `server_max_output_tokens` | — | 输出 token 硬上限 |
+| `server_default_max_tokens` | 0 | 请求未带 max_tokens 时的默认值(0=用内置默认) |
+| `server_max_output_tokens` | 0 | 输出 token 硬上限(0=不额外限制) |
 | `server_forced_prompt_text` | — | 强制提示词(如 OCR 规整) |
 
 ## AXCL（PCIe 多卡）
