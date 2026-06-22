@@ -133,6 +133,12 @@ axllm
 
 如需 API/Gradio 示例，可继续使用 `scripts/` 下的脚本（与分支功能一致）。
 
+## 配置文件
+
+模型目录 `config.json` 的**全部字段说明**见 **[docs/configuration.md](docs/configuration.md)**（必填项、动态加载、多槽 KV 缓存、内存安全预检、VLM/视觉、Embedding、服务、AXCL 多卡等）。
+
+> 默认开启**内存安全预检**(`mem_guard_enable`)：加载模型前按文件大小估算占用并对照剩余 CMM/DDR，放不下会告警/中止（可弹 Y/N 确认），避免强行加载超额模型导致驱动崩溃。详见配置文档。
+
 ### Docker（CI 导出镜像）
 
 本仓库提供 GitHub Actions 工作流 `Docker Images` 用于构建并导出 Docker 镜像（按后端/架构拆分），产物同时提供：
@@ -201,58 +207,11 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 
 ### 动态加载（降低 CMM 占用）
 
-在 **CMM 较小** 的设备上，可开启“动态加载”以降低模型常驻 CMM 的占用：运行时仅保持少量 layer 的句柄/权重常驻，其他 layer 按需加载并在池满时释放。
-
-在模型目录 `config.json` 中配置：
-
-```json
-{
-  "dynamic_load_enable": true,
-  "dynamic_load_pool_size": 2
-}
-```
-
-- `dynamic_load_enable`：是否开启动态加载（默认 `false`）。
-- `dynamic_load_pool_size`：动态加载池大小（默认 `2`，仅在 enable 时生效）。
-
-注意：
-
-- 动态加载的目标是 **省 CMM**，通常会显著降低 token/s（尤其在 `pool_size` 远小于 layer 数量时）。
-- 当 `pool_size` 接近模型 layer 数量时，可恢复接近常规模式的性能，但此时 CMM 节省效果会变弱。
-- 当前 AXCL 后端开启动态加载时仅支持 **单卡**（多卡场景会拒绝开启）。
-- `vision_patch_size`
-
-可选字段（建议保留，未配置时会自动从视觉编码模型输入形状推断）：
-
-- `vision_width`
-- `vision_height`
-- `full_attention_interval`（Qwen3.5 等混合 linear/full attention 模型需要，用于标记每 N 层为 full-attention）
+CMM 较小的设备上可开启动态加载：运行时仅常驻少量 layer 的权重，其他按需加载、池满释放，显著省 CMM（但会降速）。配置 `dynamic_load_enable` / `dynamic_load_pool_size`，详见 [配置文档](docs/configuration.md)。
 
 ### 多槽前缀 KV 缓存（serve 多用户 / 多套提示词加速）
 
-`serve` 为单实例串行处理，但常会有**多个用户**或**多套系统提示词**轮流请求。默认只有一份上下文，一旦请求前缀和上一次不同就会重新跑整段 prefill，非常慢。开启多槽前缀 KV 缓存后，可缓存**多份**前缀 token 及其 KV：每个请求按**最长公共前缀**匹配到对应的槽并复用其 KV（只对新增 token 做 prefill），未命中则覆盖**最久未使用**（LRU）的槽。一次仍只处理一个请求。
-
-在模型目录 `config.json` 中配置：
-
-```json
-{
-  "kv_cache_slots": 4,
-  "kv_cache_slot_location": "device"
-}
-```
-
-- `kv_cache_slots`：缓存槽数量（默认 `1`，即关闭多槽、与原行为完全一致）。
-- `kv_cache_slot_location`：KV 存放位置（默认 `device`）。
-  - `device`：每槽一份设备 KV buffer，激活时**零拷贝重绑定**，切换最快；代价是 N× 设备 CMM。
-  - `host`（或 `ddr`）：单份设备 KV + 每槽一份主机内存副本，激活时 D2H/H2D 拷贝；**省 CMM**（无论多少槽只占一份设备 buffer），切换有拷贝开销。
-
-说明：
-
-- 文本 LLM 与 **VLM 均支持**；VLM 命中复用时会**跳过 vision encoder 重跑**。
-- **自动预算**：开启时会先评估一份槽的占用，并按剩余 CMM / 主机内存（保留安全余量）决定实际能开几份。若实际能开的份数 **< 配置值**，会告警并按能开的份数启用（而非 OOM 崩溃）。例如配置 4 份但显存只够 3 份，就用 3 份并打印 `⚠` 告警。
-- 与 `dynamic_load_enable` 暂不可同时开启（同时配置会告警并退回单槽）。
-
-更多细节见 [docs/multi_slot_kv_cache.md](docs/multi_slot_kv_cache.md)。
+`serve` 单实例串行处理，多个用户 / 多套系统提示词轮流请求时，默认只有一份上下文会反复重跑 prefill。开启多槽后可缓存多份前缀 KV，按最长公共前缀命中复用、未命中覆盖 LRU（文本与 VLM 均支持，VLM 复用时跳过 vision encoder）。配置 `kv_cache_slots` / `kv_cache_slot_location`，详见 [配置文档](docs/configuration.md) 与 [设计文档](docs/multi_slot_kv_cache.md)。
 
 ### Embedding（/v1/embeddings）使用说明
 

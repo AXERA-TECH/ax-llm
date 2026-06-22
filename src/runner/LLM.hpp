@@ -70,6 +70,19 @@ struct LLMAttrType {
     // "host" (DDR copy on switch, reserved for a follow-up).
     std::string kv_cache_slot_location = "device";
 
+    // ---- Pre-load memory guard (avoid loading models that overflow CMM/DDR
+    //      and crash the NPU driver) ----
+    // Before loading each piece (layer / post / vision & audio encoders / token
+    // embedding / per-layer projections) the estimated footprint (~file size) is
+    // checked against the remaining CMM (device pieces) or host DDR (host pieces).
+    bool mem_guard_enable = true;     // master switch
+    int mem_guard_floor_mb = 128;     // keep at least this much free after a load
+    // What to do when a load would breach the floor:
+    //   "prompt" : ask [y/N] on a TTY, otherwise abort (serve / headless)
+    //   "abort"  : refuse the load with a clear error
+    //   "warn"   : log a warning and load anyway
+    std::string mem_guard_on_unsafe = "prompt";
+
     std::vector<int> prefill_max_kv_cache_num_grp;
     int prefill_grpid = -1;
     std::string post_config_path = "post_config.json";
