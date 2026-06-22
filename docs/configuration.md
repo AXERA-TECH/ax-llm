@@ -42,13 +42,20 @@
 
 ### 内存安全预检（防止超 CMM/DDR 加载导致驱动崩溃）
 
-开启后,加载模型前会按**文件大小**估算各部分占用,并对照剩余内存判断是否安全:
+开启后分**两道**核对剩余内存,任一不安全都按 `mem_guard_on_unsafe` 处理。
 
-- **CMM**(设备显存,各层 / post / 视觉&音频编码器):用现有 `remain` 查询(AX650 读 `/proc/ax_proc/mem_cmm_info`,AXCL 经 axcl-smi),多卡按各卡分别核算。
+**① 加载前（按文件大小估算）** —— 拦住"明显放不下"的模型:
+
+- **CMM**(设备显存,各层 / post / 视觉&音频编码器):AX650 读 `/proc/ax_proc/mem_cmm_info`,AXCL 用 `axcl_GetCMMRemain`,多卡按各卡分别核算。
 - **DDR**(主机内存,token embedding 非 mmap 时 / Gemma per-layer 权重):读 `/proc/meminfo` 的 **MemAvailable**(已扣可回收 buffer/cache,是"真正可用",避免误报)。
-- 若 `剩余 - 估算 < mem_guard_floor_mb` → 按 `mem_guard_on_unsafe` 处理:`abort` 直接中止并报错;`warn` 仅告警继续;`prompt` 在交互式终端弹 `[y/N]`(默认 N=不加载),无终端(serve/docker)时退化为 `abort`。
+
+**② 加载中（实测外推）** —— 文件大小估不到引擎加载每层时额外分配的 KV/IO 缓冲(约比纯权重多 ~30%,且随 context 长度增长)。故加载层时按**实测的每层 CMM 增量**外推"剩余层 + post 尾部",一旦预计突破 floor 就**在分配前中止**(此时只加载了头几层,可干净回收,驱动不崩)。多卡并行加载时任一卡触发会停下其它卡。注:此阶段不再交互弹窗(①已问过),`prompt` 在此等同 `abort`。
+
+判定:若 `剩余 - 估算 < mem_guard_floor_mb` → `abort` 直接中止并报错;`warn` 仅告警继续;`prompt` 在交互式终端弹 `[y/N]`(默认 N=不加载),无终端(serve/docker)时退化为 `abort`。
+
 - 关闭:`mem_guard_enable=false`。
-- 说明:`dynamic_load_enable=true` 时层权重会在加载后释放,故预检不计层权重(只算 post/编码器/主机部分)。
+- `dynamic_load_enable=true`:层权重加载后即释放,①不计层权重,②仍按实测拦截层 IO。
+- 多槽(`kv_cache_slots>1`)的 N×KV 申请本就按已知真实尺寸精确预算,并把 `mem_guard_floor_mb` 作为保留余量(取与内置 256MB/512MB 的较大者)。
 
 ## 注意力(混合注意力 / 长上下文模型)
 
