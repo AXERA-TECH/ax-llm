@@ -16,6 +16,16 @@
 #include <numeric>
 #include <sstream>
 
+// popen/pclose are POSIX; with -std=c++17 (__STRICT_ANSI__) mingw hides them.
+// Use the MS-prefixed names on Windows (always available in <stdio.h>).
+#ifdef _WIN32
+#define AXLLM_POPEN _popen
+#define AXLLM_PCLOSE _pclose
+#else
+#define AXLLM_POPEN popen
+#define AXLLM_PCLOSE pclose
+#endif
+
 #include "bfloat16.hpp"
 #include "sample_log.h"
 #include "utils/files.hpp"
@@ -296,7 +306,7 @@ static bool read_video_duration_ffprobe(const std::string& video_path,
         "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 " +
         shell_quote(video_path) + " 2>/dev/null";
 
-    FILE* pipe = popen(cmd.c_str(), "r");
+    FILE* pipe = AXLLM_POPEN(cmd.c_str(), "r");
     if (!pipe) {
         err = "failed to run ffprobe for video duration: " + video_path;
         return false;
@@ -305,7 +315,7 @@ static bool read_video_duration_ffprobe(const std::string& video_path,
     std::string output;
     char buf[256];
     while (fgets(buf, sizeof(buf), pipe)) output += buf;
-    const int status = pclose(pipe);
+    const int status = AXLLM_PCLOSE(pipe);
     if (status != 0) {
         err = "ffprobe failed to read video duration: " + video_path;
         return false;
