@@ -30,6 +30,8 @@
 
 #include "vision/vision_module.hpp"
 
+#include "ax_cmm_utils.hpp"  // memory queries + pre-load mem guard (both backends)
+
 #ifdef USE_AXCL
 #include "ax_model_runner/ax_model_runner_axcl.hpp"
 #include "utils/axcl_manager.h"
@@ -2429,6 +2431,103 @@ struct LLM::Impl {
         return true;
     }
 
+    // ---- Pre-load memory guard helpers ----
+    int device_remaining_cmm_mb(int devid) const
+    {
+#ifdef USE_AXCL
+        return axcl_GetCMMRemain(devid);
+#else
+        (void)devid;
+        return get_remaining_cmm_size();
+#endif
+    }
+
+    // Guard a device (CMM) load. `est_mb` defaults to the model file size.
+    bool guard_device_load(const std::string &file, int devid, int est_mb = -1)
+    {
+        if (!_attr.mem_guard_enable) return true;
+        if (est_mb < 0) est_mb = estimate_model_mb(file);
+        const int remain = device_remaining_cmm_mb(devid);
+        if (mem_guard_allow_load(_attr.mem_guard_enable, _attr.mem_guard_floor_mb,
+                                 _attr.mem_guard_on_unsafe, file, est_mb, remain))
+            return true;
+        set_last_error("CMM 不足，已中止加载: " + file + "（可调小模型/释放显存，或在 config.json 设 mem_guard_enable=false）");
+        ALOGE("mem-guard aborted device load: %s (est %d MB, remain %d MB)", file.c_str(), est_mb, remain);
+        return false;
+    }
+
+    // Guard a host (DDR) load.
+    bool guard_host_load(const std::string &file, int est_mb = -1)
+    {
+        if (!_attr.mem_guard_enable) return true;
+        if (est_mb < 0) est_mb = estimate_model_mb(file);
+        const int remain = get_remaining_ddr_size();
+        if (mem_guard_allow_load(_attr.mem_guard_enable, _attr.mem_guard_floor_mb,
+                                 _attr.mem_guard_on_unsafe, file, est_mb, remain))
+            return true;
+        set_last_error("主机内存(DDR)不足，已中止加载: " + file + "（或在 config.json 设 mem_guard_enable=false）");
+        ALOGE("mem-guard aborted host load: %s (est %d MB, remain %d MB)", file.c_str(), est_mb, remain);
+        return false;
+    }
+
+    // Pre-flight memory budget check before loading any model piece. Sums the
+    // estimated footprint (~file sizes) and checks it against remaining CMM (per
+    // device) and host DDR. `dev_of_layer` gives each layer's device id for
+    // multi-device (AXCL); empty => single on-chip device (AX650, devid -1).
+    bool mem_preflight(const std::vector<int> &dev_of_layer)
+    {
+        if (!_attr.mem_guard_enable) return true;
+
+        // Host DDR: token embedding (only when read fully into RAM, not mmap) +
+        // optional Gemma per-layer projection weights.
+        int host_mb = 0;
+        if (!_attr.b_use_mmap_load_embed)
+            host_mb += estimate_model_mb(_attr.filename_tokens_embed);
+        if (_attr.hidden_size_per_layer_input > 0)
+        {
+            host_mb += estimate_model_mb(_attr.filename_tokens_embed_per_layer);
+            host_mb += estimate_model_mb(_attr.filename_per_layer_model_projection);
+            host_mb += estimate_model_mb(_attr.filename_per_layer_projection_norm);
+        }
+        if (host_mb > 0 && !guard_host_load("host: token-embedding / per-layer weights", host_mb))
+            return false;
+
+        // CMM: vision/audio encoders (always fully resident) + post + layers.
+        int enc_mb = 0;
+        if (_attr.vlm_type != VLMType::None)
+        {
+            enc_mb += estimate_model_mb(_attr.filename_image_encoder_axmodel);
+            enc_mb += estimate_model_mb(_attr.filename_audio_encoder_axmodel_5s);
+            enc_mb += estimate_model_mb(_attr.filename_audio_encoder_axmodel_30s);
+        }
+        // Dynamic load frees layer weights after init, so don't count them; their
+        // residency is bounded by the pool, and dynamic load is the save-CMM mode.
+        const bool count_layers = !dynamic_layer_load_enabled();
+
+        if (dev_of_layer.empty())
+        {
+            int cmm_mb = enc_mb + estimate_model_mb(_attr.filename_post_axmodel);
+            if (count_layers)
+                for (auto &l : llama_layers) cmm_mb += estimate_model_mb(l.filename);
+            if (!guard_device_load("device CMM (encoders + post" + std::string(count_layers ? " + all layers)" : ")"), -1, cmm_mb))
+                return false;
+        }
+        else
+        {
+            std::map<int, int> need;
+            if (count_layers)
+                for (size_t i = 0; i < llama_layers.size() && i < dev_of_layer.size(); ++i)
+                    need[dev_of_layer[i]] += estimate_model_mb(llama_layers[i].filename);
+            const int post_dev = dev_of_layer.back();
+            need[post_dev] += estimate_model_mb(_attr.filename_post_axmodel);
+            need[dev_of_layer.front()] += enc_mb;
+            for (const auto &kv : need)
+                if (!guard_device_load("device " + std::to_string(kv.first) + " CMM", kv.first, kv.second))
+                    return false;
+        }
+        return true;
+    }
+
     bool Init(LLMAttrType attr)
     {
         ALOGI("LLM init start");
@@ -2516,6 +2615,8 @@ struct LLM::Impl {
             if (dev_idx >= 0 && (size_t)dev_idx < _attr.dev_ids.size())
                 dynamic_layer_devids_[(size_t)i] = _attr.dev_ids[(size_t)dev_idx];
         }
+
+        if (!mem_preflight(dynamic_layer_devids_)) return false;
 
         if (dynamic_layer_load_enabled())
         {
@@ -2648,6 +2749,7 @@ struct LLM::Impl {
             sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
             llama_layers[i].filename = axmodel_path;
         }
+        if (!mem_preflight({})) return false;
         if (dynamic_layer_load_enabled())
         {
             for (int i = 0; i < attr.axmodel_num; i++)

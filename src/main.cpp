@@ -443,6 +443,18 @@ struct ModelConfig
                 attr.kv_cache_slot_location = j["kv_cache_slot_location"].get<std::string>();
             }
 
+            // Pre-load memory guard.
+            json_bool_value(j, "mem_guard_enable", attr.mem_guard_enable);
+            if (auto v = json_int_value(j, "mem_guard_floor_mb"); v.has_value())
+            {
+                attr.mem_guard_floor_mb = *v;
+            }
+            if (attr.mem_guard_floor_mb < 0) attr.mem_guard_floor_mb = 0;
+            if (j.contains("mem_guard_on_unsafe") && j["mem_guard_on_unsafe"].is_string())
+            {
+                attr.mem_guard_on_unsafe = j["mem_guard_on_unsafe"].get<std::string>();
+            }
+
             // Optional: models with mixed linear/full attention layers (e.g., Qwen3.5).
             // Keep config minimal: only an interval is needed (layer count comes from `axmodel_num`).
             attr.full_attention_interval = 0;
