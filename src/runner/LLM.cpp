@@ -2528,6 +2528,86 @@ struct LLM::Impl {
         return true;
     }
 
+    // ---- Running (measurement-based) load guard ----
+    // The file-size pre-flight under-counts CMM because the engine also allocates
+    // each layer's KV/IO buffers at load time (~30% above raw weights, growing with
+    // context length). During the layer load we measure ACTUAL per-device CMM
+    // consumption and extrapolate to the not-yet-loaded layers + post/encoder tail,
+    // aborting *before* an allocation that would breach the floor (and crash the
+    // driver). Mid-load never prompts (stage-1 pre-flight already did); under
+    // on_unsafe=prompt this checkpoint degrades to abort.
+    std::map<int, int> rl_baseline_mb_; // per-device remaining CMM before the loop
+    std::map<int, int> rl_total_;       // per-device layer count
+    std::map<int, int> rl_tail_mb_;     // per-device post/encoder file MB (loaded after layers)
+
+    struct GuardVerdict { bool ok = true; bool warned = false; std::string what; int projected = 0; int remain = -1; };
+
+    void running_guard_init()
+    {
+        rl_baseline_mb_.clear();
+        rl_total_.clear();
+        rl_tail_mb_.clear();
+        if (!_attr.mem_guard_enable || _attr.axmodel_num <= 0) return;
+        for (int i = 0; i < _attr.axmodel_num; ++i)
+            rl_total_[layer_devid_for(i)] += 1;
+        for (const auto &kv : rl_total_)
+            rl_baseline_mb_[kv.first] = device_remaining_cmm_mb(kv.first);
+        // tail: post head loads on the last layer's device; vision/audio encoders on the first.
+        rl_tail_mb_[layer_devid_for(_attr.axmodel_num - 1)] += estimate_model_mb(_attr.filename_post_axmodel);
+        if (_attr.vlm_type != VLMType::None)
+        {
+            const int front_dev = layer_devid_for(0);
+            rl_tail_mb_[front_dev] += estimate_model_mb(_attr.filename_image_encoder_axmodel);
+            rl_tail_mb_[front_dev] += estimate_model_mb(_attr.filename_audio_encoder_axmodel_5s);
+            rl_tail_mb_[front_dev] += estimate_model_mb(_attr.filename_audio_encoder_axmodel_30s);
+        }
+    }
+
+    // Pure (no logging / no shared-state writes -> safe to call from loader threads).
+    // Call BEFORE initializing a layer on `devid`; `loaded_on_dev` = layers already
+    // loaded on this device. verdict.ok=false means abort.
+    GuardVerdict running_guard_eval(int devid, int loaded_on_dev) const
+    {
+        GuardVerdict v;
+        auto get = [](const std::map<int, int> &m, int k) { auto it = m.find(k); return it == m.end() ? 0 : it->second; };
+        if (!_attr.mem_guard_enable || loaded_on_dev <= 0) return v;
+        auto bit = rl_baseline_mb_.find(devid);
+        if (bit == rl_baseline_mb_.end()) return v;
+        const int baseline = bit->second;
+        const int cur = device_remaining_cmm_mb(devid);
+        v.remain = cur;
+        if (cur < 0 || baseline < 0) return v;
+        const int used = baseline - cur;
+        if (used <= 0) return v; // no measurable consumption yet -> can't project
+        const double per_layer = (double)used / loaded_on_dev;
+        const int left = std::max(0, get(rl_total_, devid) - loaded_on_dev);
+        const int tail = (int)(get(rl_tail_mb_, devid) * 1.15 + 0.5);
+        v.projected = (int)(per_layer * left + 0.5) + tail;
+        if (cur - v.projected >= _attr.mem_guard_floor_mb) return v; // safe
+        char what[192];
+        std::snprintf(what, sizeof(what), "device %d CMM (%d more layers @~%.0f MB + tail %d MB, measured)",
+                      devid, left, per_layer, tail);
+        v.what = what;
+        if (_attr.mem_guard_on_unsafe == "warn") { v.warned = true; return v; } // warn -> proceed
+        v.ok = false; // abort / prompt -> abort mid-load
+        return v;
+    }
+
+    // Sequential-path wrapper: evaluate, log, and on abort set last_error. Returns
+    // false to abort. Safe only on the main thread (logs / writes last_error).
+    bool running_guard_check(int devid, int loaded_on_dev)
+    {
+        const GuardVerdict v = running_guard_eval(devid, loaded_on_dev);
+        if (v.warned)
+            ALOGW("[mem-guard] WARN(measured): %s (projected +%d MB, remain %d MB) -> continuing",
+                  v.what.c_str(), v.projected, v.remain);
+        if (v.ok) return true;
+        ALOGE("mem-guard aborted mid-load: %s (projected +%d MB, remain %d MB)", v.what.c_str(), v.projected, v.remain);
+        set_last_error("CMM 不足，已中止加载(实测外推): " + v.what +
+                       "（可调小模型/释放显存，或在 config.json 设 mem_guard_enable=false）");
+        return false;
+    }
+
     bool Init(LLMAttrType attr)
     {
         ALOGI("LLM init start");
@@ -2617,6 +2697,7 @@ struct LLM::Impl {
         }
 
         if (!mem_preflight(dynamic_layer_devids_)) return false;
+        running_guard_init();
 
         if (dynamic_layer_load_enabled())
         {
@@ -2634,6 +2715,7 @@ struct LLM::Impl {
             const int devid = _attr.dev_ids.front();
             for (int i = 0; i < attr.axmodel_num; i++)
             {
+                if (!running_guard_check(devid, i)) return false;
                 const int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
                 if (ret != 0)
                 {
@@ -2666,6 +2748,9 @@ struct LLM::Impl {
             int ret = -1;
             int devid = -1;
             int remain_mb = -1;
+            bool skipped = false;   // not loaded (a prior guard abort stopped the run)
+            int guard = 0;          // 0=ok, 1=warn(loaded anyway), 2=mem-guard abort(not loaded)
+            std::string guard_what;
             std::string msg;
         };
 
@@ -2679,6 +2764,7 @@ struct LLM::Impl {
         std::mutex q_mu;
         std::condition_variable q_cv;
         std::queue<LoadResult> q;
+        std::atomic<bool> load_abort{false};  // measured guard refused -> stop all device threads
         std::vector<std::thread> loaders;
         loaders.reserve(_attr.dev_ids.size());
 
@@ -2686,20 +2772,42 @@ struct LLM::Impl {
         {
             const int devid = _attr.dev_ids[dev_idx];
             loaders.emplace_back([&, dev_idx, devid]() {
+                int loaded_on_dev = 0;
                 for (const int i : models_per_dev[dev_idx])
                 {
-                    const int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
-                    const int remain = axcl_GetCMMRemain(devid);
-
-                    char buf[256];
-                    std::snprintf(buf, sizeof(buf), "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, devid, remain);
-
                     LoadResult r;
                     r.idx = i;
-                    r.ret = ret;
                     r.devid = devid;
-                    r.remain_mb = remain;
-                    r.msg = buf;
+                    if (load_abort.load(std::memory_order_relaxed))
+                    {
+                        r.skipped = true; // another layer/device already breached the budget
+                    }
+                    else
+                    {
+                        // Measured-extrapolation guard (pure -> thread-safe). On abort,
+                        // stop this and the other device threads before over-allocating.
+                        const GuardVerdict v = running_guard_eval(devid, loaded_on_dev);
+                        if (!v.ok)
+                        {
+                            load_abort.store(true, std::memory_order_relaxed);
+                            r.guard = 2;
+                            r.guard_what = v.what;
+                            r.remain_mb = v.remain;
+                            r.skipped = true;
+                        }
+                        else
+                        {
+                            const int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
+                            const int remain = axcl_GetCMMRemain(devid);
+                            ++loaded_on_dev;
+                            char buf[256];
+                            std::snprintf(buf, sizeof(buf), "init %d axmodel ok,devid(%d) remain_cmm(%d MB)", i, devid, remain);
+                            r.ret = ret;
+                            r.remain_mb = remain;
+                            r.msg = buf;
+                            if (v.warned) { r.guard = 1; r.guard_what = v.what; }
+                        }
+                    }
 
                     {
                         std::lock_guard<std::mutex> lk(q_mu);
@@ -2712,6 +2820,7 @@ struct LLM::Impl {
 
         int progress_step = 1;
         int finished = 0;
+        bool guard_aborted = false;
         while (finished < attr.axmodel_num)
         {
             LoadResult r;
@@ -2721,15 +2830,28 @@ struct LLM::Impl {
                 r = std::move(q.front());
                 q.pop();
             }
+            finished++;
+            if (r.guard == 2)
+            {
+                guard_aborted = true;
+                ALOGE("mem-guard aborted mid-load: %s (remain %d MB)", r.guard_what.c_str(), r.remain_mb);
+                set_last_error("CMM 不足，已中止加载(实测外推): " + r.guard_what +
+                               "（可调小模型/释放显存，或在 config.json 设 mem_guard_enable=false）");
+                continue;
+            }
+            if (r.skipped) continue; // a prior abort stopped this layer
+            if (r.guard == 1)
+                ALOGW("[mem-guard] WARN(measured): %s (remain %d MB) -> continuing", r.guard_what.c_str(), r.remain_mb);
             if (r.idx >= 0 && r.idx < attr.axmodel_num) rets[r.idx] = r.ret;
             update_cqdm(&cqdm, progress_step++, "count", r.msg.c_str());
-            finished++;
         }
 
         for (auto &t : loaders)
         {
             if (t.joinable()) t.join();
         }
+
+        if (guard_aborted) return false;
 
         for (int i = 0; i < attr.axmodel_num; i++) { if (rets[i] != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; } }
         {
@@ -2750,10 +2872,12 @@ struct LLM::Impl {
             llama_layers[i].filename = axmodel_path;
         }
         if (!mem_preflight({})) return false;
+        running_guard_init();
         if (dynamic_layer_load_enabled())
         {
             for (int i = 0; i < attr.axmodel_num; i++)
             {
+                if (!running_guard_check(-1, i)) return false;
                 int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), -1);
                 if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
                 llama_layers[i].layer.set_auto_sync_before_inference(true);
@@ -2780,6 +2904,7 @@ struct LLM::Impl {
         {
             for (int i = 0; i < attr.axmodel_num; i++)
             {
+                if (!running_guard_check(-1, i)) return false;
                 int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), -1);
                 if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
                 llama_layers[i].layer.set_auto_sync_before_inference(true);
@@ -3627,7 +3752,9 @@ struct LLM::Impl {
             }
 
             // 2) Budget: keep a safety margin of free CMM for runtime allocations.
-            const long long margin = 256LL * 1024 * 1024;
+            //    Honor mem_guard_floor_mb when it asks for a larger reserve (never smaller).
+            const long long floor_b = _attr.mem_guard_enable ? (long long)_attr.mem_guard_floor_mb * 1024 * 1024 : 0;
+            const long long margin = std::max(256LL * 1024 * 1024, floor_b);
             for (const auto &kv : per_dev_bytes)
             {
                 const int dev = kv.first;
@@ -3681,7 +3808,8 @@ struct LLM::Impl {
             struct sysinfo si;
             if (sysinfo(&si) == 0) free_ram = (long long)si.freeram * (long long)si.mem_unit;
 #endif
-            const long long margin = 512LL * 1024 * 1024;
+            const long long host_floor_b = _attr.mem_guard_enable ? (long long)_attr.mem_guard_floor_mb * 1024 * 1024 : 0;
+            const long long margin = std::max(512LL * 1024 * 1024, host_floor_b);
             int fit = want;
             if (free_ram > 0 && per_slot > 0)
             {
