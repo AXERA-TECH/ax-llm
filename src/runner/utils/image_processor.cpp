@@ -406,10 +406,10 @@ int Qwen2VideoProcessor(std::vector<axcv::Mat>& src,
             for (int d5 = 0; d5 < grid_w / merge_size; d5++) {
                 for (int d3 = 0; d3 < merge_size; d3++) {
                     for (int d6 = 0; d6 < merge_size; d6++) {
-                        for (int d1 = 0; d1 < temporal_patch_size; d1++) {
-                            for (int d4 = 0; d4 < patch_size; d4++) {
-                                for (int d7 = 0; d7 < patch_size; d7++) {
-                                    for (int d8 = 0; d8 < channel; d8++) {
+                        for (int d8 = 0; d8 < channel; d8++) {
+                            for (int d1 = 0; d1 < temporal_patch_size; d1++) {
+                                for (int d4 = 0; d4 < patch_size; d4++) {
+                                    for (int d7 = 0; d7 < patch_size; d7++) {
                                         size_t idx = (size_t)d0 * temporal_patch_size * grid_h * patch_size * grid_w * patch_size * channel;
                                         idx += (size_t)d1 * grid_h * patch_size * grid_w * patch_size * channel;
                                         idx += (size_t)d2 * merge_size * patch_size * grid_w * patch_size * channel;

@@ -2396,7 +2396,7 @@ struct LLM::Impl {
         std::vector<Content> prepared_tail;
         std::vector<int> tail_ids;
         vision::RunState tail_state;
-        if (!vision->Prepare(tail_history, vmins, &budget, prepared_tail, tail_ids, tail_state, err))
+        if (!vision->Prepare(tail_history, vmins, &budget, prepared_tail, tail_ids, tail_state, err, true))
             return false;
         strip_empty_prompt_prefix(tail_ids);
 
@@ -3368,7 +3368,7 @@ struct LLM::Impl {
                 std::vector<Content> prepared_history;
                 vision::RunState st;
                 std::string verr;
-                if (!vision->Prepare(history_in, vmins, nullptr, prepared_history, token_ids, st, verr))
+                if (!vision->Prepare(history_in, vmins, nullptr, prepared_history, token_ids, st, verr, false))
                 {
                     ALOGE("vision.Prepare failed: %s", verr.c_str());
                     return false;
@@ -5181,7 +5181,7 @@ struct LLM::Impl {
                 vision::RunState st;
                 vision::PrepareMetadata prepare_meta;
                 std::string verr;
-                if (!vision->Prepare(history, vmins, &budget, prepared_history, input_ids, st, verr, &prepare_meta))
+                if (!vision->Prepare(history, vmins, &budget, prepared_history, input_ids, st, verr, true, &prepare_meta))
                 {
                     if (verr.find("exceeds current prefill budget") != std::string::npos ||
                         verr.find("exceeds current history budget") != std::string::npos ||

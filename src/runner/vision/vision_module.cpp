@@ -48,10 +48,18 @@ namespace {
 constexpr double kDefaultRawVideoSampleFps = 2.0;
 
 struct AudioEncoderRuntime {
+    enum class ProfileKind {
+        None = 0,
+        Gemma4,
+        Whisper,
+    };
+
     ax_runner_t encoder;
     bool encoder_inited = false;
     int encoder_output_is_bf16 = -1;
+    ProfileKind profile_kind = ProfileKind::None;
     audio::Gemma4AudioProfile profile;
+    audio::WhisperAudioProfile whisper_profile;
     std::string axmodel_path;
 };
 
@@ -763,6 +771,7 @@ static bool init_audio_profile(AudioEncoderRuntime& runtime,
         return false;
     }
     runtime.encoder_inited = true;
+    runtime.profile_kind = AudioEncoderRuntime::ProfileKind::Gemma4;
     runtime.profile = profile;
     runtime.axmodel_path = axmodel_path;
 
@@ -801,6 +810,63 @@ static bool init_audio_profile(AudioEncoderRuntime& runtime,
           runtime.profile.duration_sec,
           runtime.profile.num_mel_frames,
           runtime.profile.num_audio_tokens,
+          (runtime.encoder_output_is_bf16 ? "bf16" : "fp32"));
+    return true;
+}
+
+static bool init_whisper_audio_profile(AudioEncoderRuntime& runtime,
+                                       const std::string& axmodel_path,
+                                       int devid,
+                                       int tokens_embed_size,
+                                       std::string& err)
+{
+    if (runtime.encoder.init(axmodel_path.c_str(), devid) != 0) {
+        err = "init whisper audio encoder axmodel failed: " + axmodel_path;
+        return false;
+    }
+    runtime.encoder_inited = true;
+    runtime.profile_kind = AudioEncoderRuntime::ProfileKind::Whisper;
+    runtime.axmodel_path = axmodel_path;
+
+#ifdef USE_AXCL
+    runtime.encoder.set_auto_sync_before_inference(true);
+    runtime.encoder.set_auto_sync_after_inference(true);
+#endif
+
+    const auto& in0 = runtime.encoder.get_input(0);
+    if (in0.vShape.size() >= 3) {
+        runtime.whisper_profile.feature_size = (int)in0.vShape[in0.vShape.size() - 2];
+        runtime.whisper_profile.num_mel_frames = (int)in0.vShape[in0.vShape.size() - 1];
+    } else {
+        const size_t elem = ((size_t)in0.nSize % sizeof(float) == 0) ? ((size_t)in0.nSize / sizeof(float)) : 0;
+        runtime.whisper_profile.feature_size = 128;
+        runtime.whisper_profile.num_mel_frames =
+            (runtime.whisper_profile.feature_size > 0) ? (int)(elem / (size_t)runtime.whisper_profile.feature_size) : 0;
+    }
+
+    if (runtime.whisper_profile.feature_size <= 0 || runtime.whisper_profile.num_mel_frames <= 0) {
+        err = "failed to infer whisper audio input layout: " + axmodel_path;
+        return false;
+    }
+    runtime.whisper_profile.duration_sec =
+        (float)runtime.whisper_profile.num_mel_frames * (float)runtime.whisper_profile.hop_length /
+        (float)runtime.whisper_profile.sampling_rate;
+
+    const auto& out0 = runtime.encoder.get_output(0);
+    int out_is_bf16 = -1;
+    int tokens_per_block = 0;
+    if (!try_pick_tokens_by_output_bytes(out0, tokens_embed_size, out_is_bf16, tokens_per_block)) {
+        err = "failed to infer whisper audio output layout: " + axmodel_path;
+        return false;
+    }
+
+    runtime.encoder_output_is_bf16 = out_is_bf16;
+    runtime.whisper_profile.num_audio_tokens = tokens_per_block;
+    ALOGI("Whisper audio profile init ok: path=%s duration=%.1fs mel_frames=%d tokens=%d out_dtype=%s",
+          axmodel_path.c_str(),
+          runtime.whisper_profile.duration_sec,
+          runtime.whisper_profile.num_mel_frames,
+          runtime.whisper_profile.num_audio_tokens,
           (runtime.encoder_output_is_bf16 ? "bf16" : "fp32"));
     return true;
 }
@@ -1170,7 +1236,7 @@ bool VisionModule::Init(VLMType type,
     const auto& in0 = impl_->encoder.get_input(0);
 
     // Auto-resolve vision width/height from encoder input shape/size, so users don't need to manually set them.
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) {
+    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) {
         const int old_w = vision_width_;
         const int old_h = vision_height_;
 
@@ -1180,6 +1246,11 @@ bool VisionModule::Init(VLMType type,
         if (type_ == VLMType::PaddleOCRVL && (eff_nSize % sizeof(float)) == 0) {
             eff_nSize /= sizeof(float);
             ALOGI("PaddleOCRVL: encoder input nSize=%zu -> eff_nSize=%zu (float32 input)",
+                  (size_t)in0.nSize, eff_nSize);
+        } else if (type_ == VLMType::Qwen3Omni && (eff_nSize % sizeof(float)) == 0) {
+            // Jina omni vision export consumes float32 patchified pixels, not raw uint8 NHWC bytes.
+            eff_nSize /= sizeof(float);
+            ALOGI("Qwen3Omni: encoder input nSize=%zu -> eff_nSize=%zu (float32 patch input)",
                   (size_t)in0.nSize, eff_nSize);
         }
 
@@ -1320,7 +1391,7 @@ bool VisionModule::Init(VLMType type,
 
         bool picked = false;
 
-        if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) {
+        if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) {
             const int grid_h = vision_height_ / std::max(1, patch_size_);
             const int grid_w = vision_width_ / std::max(1, patch_size_);
             const int llm_grid_h = grid_h / std::max(1, spatial_merge_size_);
@@ -1422,6 +1493,19 @@ bool VisionModule::Init(VLMType type,
         ALOGI("Gemma4 video config: num_frames=%d do_sample_frames=%d",
               video_num_frames_,
               video_do_sample_frames_ ? 1 : 0);
+    } else if (type_ == VLMType::Qwen3Omni) {
+        if (video_num_frames_ <= 0) video_num_frames_ = 8;
+        if (!audio_encoder_axmodel_30s.empty() && is_file(audio_encoder_axmodel_30s)) {
+            if (!init_whisper_audio_profile(impl_->audio_30s, audio_encoder_axmodel_30s, devid, tokens_embed_size_, err)) {
+                return false;
+            }
+        }
+        if (!impl_->audio_30s.encoder_inited) {
+            ALOGW("Qwen3Omni audio encoder is not configured or missing; AUDIO inputs will be rejected.");
+        }
+        ALOGI("Qwen3Omni video config: num_frames=%d do_sample_frames=%d",
+              video_num_frames_,
+              video_do_sample_frames_ ? 1 : 0);
     }
 
     cache_key_prefix_ = "vlm=" + std::string(VLMTypeName(type_)) + "|enc=" + normalize_path_for_key(encoder_axmodel) +
@@ -1435,7 +1519,7 @@ bool VisionModule::Init(VLMType type,
                         "|ps=" + std::to_string(patch_size_) +
                         "|fps=" + std::to_string(fps_) +
                         "|tps=" + std::to_string(tokens_per_second_);
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
+    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni) {
         cache_key_prefix_ += "|resize=pillow_bicubic";
     } else if (type_ == VLMType::PaddleOCRVL) {
         cache_key_prefix_ += "|resize=pillow_bicubic|patch=nchw_v2";
@@ -1458,10 +1542,15 @@ bool VisionModule::Init(VLMType type,
     switch (type_) {
     case VLMType::Qwen2_5VL:
     case VLMType::Qwen3VL:
+    case VLMType::Qwen3Omni:
         if (!get_single_token_id(tokenizer_, "<|image_pad|>", image_pad_id_, err)) return false;
         if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) return false;
+        if (type_ == VLMType::Qwen3Omni) {
+            if (!get_single_token_id(tokenizer_, "<|audio_pad|>", audio_pad_id_, err)) return false;
+        }
         if (!get_single_token_id(tokenizer_, "<|vision_start|>", vision_start_id_, err)) return false;
-        ALOGI("Qwen-VL token ids: vision_start=%d image_pad=%d video_pad=%d", vision_start_id_, image_pad_id_, video_pad_id_);
+        ALOGI("Qwen token ids: vision_start=%d image_pad=%d video_pad=%d audio_pad=%d",
+              vision_start_id_, image_pad_id_, video_pad_id_, audio_pad_id_);
         break;
     case VLMType::PaddleOCRVL:
         if (!get_single_token_id(tokenizer_, "<|IMAGE_PLACEHOLDER|>", image_pad_id_, err)) return false;
@@ -1549,6 +1638,17 @@ static bool encode_block_normalized_float(ax_runner_t& enc, int devid, int out_i
     std::vector<float> fp32(expected_float_elems);
     for (size_t i = 0; i < expected_float_elems; ++i) {
         fp32[i] = (float)bytes[i] * scale + shift;
+    }
+    if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_PATCH_HEAD")) {
+        std::string preview;
+        const size_t limit = std::min<size_t>(16, fp32.size());
+        for (size_t i = 0; i < limit; ++i) {
+            if (i) preview += ",";
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.6f", fp32[i]);
+            preview += buf;
+        }
+        ALOGI("normalized patch head[%zu]: %s", limit, preview.c_str());
     }
 
     // Copy float32 data to encoder input; zero-pad tail if needed.
@@ -1912,6 +2012,48 @@ bool VisionModule::EncodeForContent(const Content& content,
             }
             return true;
         }
+        if (type_ == VLMType::Qwen3Omni) {
+            if (media.uris.size() != 1) {
+                err = "Qwen3Omni audio expects exactly 1 audio file per message";
+                return false;
+            }
+            if (!impl_->audio_30s.encoder_inited) {
+                err = "Qwen3Omni audio encoder is not initialized";
+                return false;
+            }
+            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
+                ALOGI("Qwen3Omni audio begin: uri=%s", media.uris[0].c_str());
+            }
+
+            std::vector<float> input_features;
+            if (!audio::LoadWhisperAudioInputFeatures(media.uris[0], impl_->audio_30s.whisper_profile, input_features, nullptr, err)) {
+                return false;
+            }
+            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
+                ALOGI("Qwen3Omni audio features ready: elems=%zu", input_features.size());
+            }
+
+            std::vector<unsigned short> emb;
+            if (!encode_block_fp32(impl_->audio_30s.encoder,
+                                   impl_->audio_30s.encoder.get_devid(),
+                                   impl_->audio_30s.encoder_output_is_bf16,
+                                   input_features,
+                                   emb,
+                                   err)) {
+                return false;
+            }
+            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
+                ALOGI("Qwen3Omni audio encoder ready: bf16_elems=%zu", emb.size());
+            }
+
+            out_num_media_for_tokenizer = 1;
+            out_num_media_tokens = impl_->audio_30s.whisper_profile.num_audio_tokens;
+            out_blocks.push_back(std::move(emb));
+            ALOGI("Qwen3Omni audio profile selected: %.1fs -> %d tokens",
+                  impl_->audio_30s.whisper_profile.duration_sec,
+                  impl_->audio_30s.whisper_profile.num_audio_tokens);
+            return true;
+        }
         err = "AUDIO not supported for this vlm_type";
         return false;
     }
@@ -1991,7 +2133,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                                     (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                                 }
                             }
-                            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+                            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
                             continue;
                         }
                     }
@@ -2011,7 +2153,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                             (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                         }
                     }
-                    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+                    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
                     continue;
                 }
             }
@@ -2088,7 +2230,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                     return false;
                 blocks_for_one.push_back(std::move(emb));
             }
-            else if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
+            else if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni) {
                 std::vector<axcv::Mat> one{img};
                 std::vector<std::vector<unsigned char>> pixel_values;
                 Qwen2VideoProcessor(one, pixel_values, vision_height_, vision_width_, temporal_patch_size_, spatial_merge_size_, patch_size_);
@@ -2103,9 +2245,31 @@ bool VisionModule::EncodeForContent(const Content& content,
                           vision_width_, vision_height_, temporal_patch_size_, patch_size_, spatial_merge_size_);
                 }
                 std::vector<unsigned short> emb;
-                if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pixel_values[0], emb,
-                                     deepstack_layers_, (out_deepstack_append ? &deepstack_for_one : nullptr), err))
-                    return false;
+                if (type_ == VLMType::Qwen3Omni) {
+                    if (!encode_block_normalized_float(impl_->encoder,
+                                                       devid,
+                                                       impl_->encoder_output_is_bf16,
+                                                       pixel_values[0],
+                                                       emb,
+                                                       0.5f,
+                                                       0.5f,
+                                                       0,
+                                                       nullptr,
+                                                       err)) {
+                        return false;
+                    }
+                } else {
+                    if (!encode_block_u8(impl_->encoder,
+                                         devid,
+                                         impl_->encoder_output_is_bf16,
+                                         pixel_values[0],
+                                         emb,
+                                         deepstack_layers_,
+                                         (out_deepstack_append ? &deepstack_for_one : nullptr),
+                                         err)) {
+                        return false;
+                    }
+                }
                 blocks_for_one.push_back(std::move(emb));
             }
             else if (type_ == VLMType::InternVL3 || type_ == VLMType::FastVLM) {
@@ -2144,7 +2308,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                     (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                 }
             }
-            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
         }
 
         return true;
@@ -2186,6 +2350,36 @@ bool VisionModule::EncodeForContent(const Content& content,
             if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
                                                pv, emb, 0.0f, 1.0f, 0, nullptr, err))
                 return false;
+            out_blocks.push_back(std::move(emb));
+        }
+        return true;
+    }
+
+    if (type_ == VLMType::Qwen3Omni) {
+        out_num_media_for_tokenizer = (int)frames.size();
+        out_num_media_tokens = tokens_per_block_;
+        out_blocks.reserve(frames.size());
+        for (auto& frame : frames) {
+            std::vector<axcv::Mat> one{frame};
+            std::vector<std::vector<unsigned char>> pixel_values;
+            Qwen2VideoProcessor(one, pixel_values, vision_height_, vision_width_, temporal_patch_size_, spatial_merge_size_, patch_size_);
+            if (pixel_values.size() != 1) {
+                err = "Qwen2VideoProcessor(video frame) returned != 1 block";
+                return false;
+            }
+            std::vector<unsigned short> emb;
+            if (!encode_block_normalized_float(impl_->encoder,
+                                               devid,
+                                               impl_->encoder_output_is_bf16,
+                                               pixel_values[0],
+                                               emb,
+                                               0.5f,
+                                               0.5f,
+                                               0,
+                                               nullptr,
+                                               err)) {
+                return false;
+            }
             out_blocks.push_back(std::move(emb));
         }
         return true;
@@ -2351,6 +2545,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                            std::vector<int>& input_ids_out,
                            RunState& state_out,
                            std::string& err,
+                           bool add_generation_prompt,
                            PrepareMetadata* meta)
 {
     if (!enabled_) { err = "vision module disabled"; return false; }
@@ -2553,7 +2748,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                       budget ? budget->precompute_len : 0);
             }
         }
-        else if (type_ == VLMType::MiniCPMV46VL && c.type == VIDEO) {
+        else if ((type_ == VLMType::MiniCPMV46VL || type_ == VLMType::Qwen3Omni) && c.type == VIDEO) {
             std::vector<std::string> all_frame_files;
             if (!collect_video_frame_paths(it->second.uris, all_frame_files, &temp_dirs, err)) return false;
 
@@ -2562,14 +2757,15 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                                 : (int)all_frame_files.size();
             const int requested_cap = frame_cap;
             if (frame_cap <= 0) {
-                err = "MiniCPM-V-4.6 video has no usable frames";
+                err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") + " video has no usable frames";
                 return false;
             }
 
             int fitted_tail_tokens = -1;
             if (budget) {
                 if (budget->max_history_tokens > 0 && budget->precompute_len > budget->max_history_tokens) {
-                    err = "MiniCPM-V-4.6 video prompt exceeds current history budget before frame injection";
+                    err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                          " video prompt exceeds current history budget before frame injection";
                     return false;
                 }
 
@@ -2581,7 +2777,8 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                                                        budget->last_tokens,
                                                        budget->max_tail_tokens);
                 if (fit.frame_count <= 0) {
-                    err = "MiniCPM-V-4.6 video prompt exceeds current prefill budget: 1 frame requires " +
+                    err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                          " video prompt exceeds current prefill budget: 1 frame requires " +
                           std::to_string(fit.tail_tokens) + " tail tokens, budget allows " +
                           std::to_string(budget->max_tail_tokens);
                     return false;
@@ -2592,11 +2789,13 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
 
             effective_media.uris = sample_frame_paths(all_frame_files, frame_cap, video_do_sample_frames_);
             if ((int)effective_media.uris.size() != frame_cap) {
-                err = "MiniCPM-V-4.6 video frame sampler produced an unexpected frame count";
+                err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                      " video frame sampler produced an unexpected frame count";
                 return false;
             }
 
-            ALOGI("MiniCPM-V-4.6 video frame plan: selected_frames=%d source_frames=%zu requested_cap=%d tail_tokens=%d max_tail=%d precompute_len=%d",
+            ALOGI("%s video frames selected: %d/%zu (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
+                  (type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6"),
                   frame_cap,
                   all_frame_files.size(),
                   requested_cap,
@@ -2622,7 +2821,18 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
         video_grid_thw.insert(video_grid_thw.end(), vid_grid.begin(), vid_grid.end());
     }
 
-    input_ids_out = tokenizer_->encode(history_out);
+    if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
+        for (size_t i = 0; i < history_out.size(); ++i) {
+            const auto& c = history_out[i];
+            ALOGI("Prepare history[%zu]: role=%d type=%d num_media=%d num_media_tokens=%d text_len=%zu",
+                  i, (int)c.role, (int)c.type, c.num_media, c.num_media_tokens, c.data.size());
+        }
+        ALOGI("Prepare tokenizer encode start: add_generation_prompt=%d", add_generation_prompt ? 1 : 0);
+    }
+    input_ids_out = tokenizer_->encode(history_out, add_generation_prompt);
+    if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
+        ALOGI("Prepare tokenizer encode done: tokens=%zu", input_ids_out.size());
+    }
     if (!BuildInjectionState(input_ids_out, all_blocks, all_deepstack, state_out, err)) return false;
 
     // Optional: mRoPE (Qwen-VL). PaddleOCR-VL axmodels are exported with
