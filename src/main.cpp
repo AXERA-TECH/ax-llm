@@ -527,6 +527,10 @@ struct ModelConfig
 
             check_key("tokens_embed_size");
             attr.tokens_embed_size = j["tokens_embed_size"].get<int>();
+            if (j.contains("prefill_mask_mode") && j["prefill_mask_mode"].is_string())
+            {
+                attr.prefill_mask_mode = j["prefill_mask_mode"].get<std::string>();
+            }
             if (j.contains("pad_token_id")) attr.pad_token_id = j["pad_token_id"].get<int>();
             if (j.contains("hidden_size_per_layer_input")) attr.hidden_size_per_layer_input = j["hidden_size_per_layer_input"].get<int>();
             if (j.contains("rms_norm_eps")) attr.rms_norm_eps = j["rms_norm_eps"].get<float>();
@@ -551,6 +555,10 @@ struct ModelConfig
             else if (j.contains("use_mmap_load_embed"))
             {
                 attr.b_use_mmap_load_embed = j["use_mmap_load_embed"].get<bool>();
+            }
+            if (j.contains("release_axmodel_buffer_after_init"))
+            {
+                attr.b_release_axmodel_buffer_after_init = j["release_axmodel_buffer_after_init"].get<bool>();
             }
             json_bool_value(j, "bos", attr.b_bos);
             json_bool_value(j, "eos", attr.b_eos);
@@ -625,13 +633,37 @@ struct ModelConfig
                 // Backward compatible with older branches.
                 attr.filename_image_encoder_axmodel = j["filename_image_encoder_axmodedl"].get<std::string>();
             }
-            if (j.contains("filename_audio_encoder_axmodel_5s"))
+            const bool has_audio_encoder_5s_key = j.contains("filename_audio_encoder_axmodel_5s");
+            const bool has_audio_encoder_30s_key = j.contains("filename_audio_encoder_axmodel_30s");
+            const bool has_audio_encoder_short_key = j.contains("filename_audio_encoder_axmodel_short");
+            const bool has_audio_encoder_long_key = j.contains("filename_audio_encoder_axmodel_long");
+            if (has_audio_encoder_5s_key)
             {
                 attr.filename_audio_encoder_axmodel_5s = j["filename_audio_encoder_axmodel_5s"].get<std::string>();
             }
-            if (j.contains("filename_audio_encoder_axmodel_30s"))
+            if (has_audio_encoder_short_key)
+            {
+                attr.filename_audio_encoder_axmodel_5s = j["filename_audio_encoder_axmodel_short"].get<std::string>();
+            }
+            if (has_audio_encoder_30s_key)
             {
                 attr.filename_audio_encoder_axmodel_30s = j["filename_audio_encoder_axmodel_30s"].get<std::string>();
+            }
+            if (has_audio_encoder_long_key)
+            {
+                attr.filename_audio_encoder_axmodel_30s = j["filename_audio_encoder_axmodel_long"].get<std::string>();
+            }
+            if (attr.vlm_type == VLMType::Gemma4VL &&
+                !has_audio_encoder_5s_key &&
+                !has_audio_encoder_30s_key &&
+                !has_audio_encoder_short_key &&
+                !has_audio_encoder_long_key)
+            {
+                attr.filename_audio_encoder_axmodel_5s = "gemma4_audio_5s.axmodel";
+                attr.filename_audio_encoder_axmodel_30s = "gemma4_audio_30s.axmodel";
+                ALOGW("Gemma4VL config does not set filename_audio_encoder_axmodel_5s/30s; "
+                      "falling back to legacy defaults gemma4_audio_5s.axmodel and gemma4_audio_30s.axmodel. "
+                      "Please add these keys to config.json explicitly in newly published packages.");
             }
 
             if (j.contains("vision_cache_dir"))
@@ -2381,9 +2413,11 @@ int run_server_mode(const ModelConfig &config, int port)
         else
         {
             const bool has_audio_encoder =
-                config.attr.vlm_type == VLMType::Gemma4VL &&
-                (file_exist(config.attr.filename_audio_encoder_axmodel_5s) ||
-                 file_exist(config.attr.filename_audio_encoder_axmodel_30s));
+                (config.attr.vlm_type == VLMType::Gemma4VL || config.attr.vlm_type == VLMType::Qwen3Omni) &&
+                ((!config.attr.filename_audio_encoder_axmodel_5s.empty() &&
+                  file_exist(config.attr.filename_audio_encoder_axmodel_5s)) ||
+                 (!config.attr.filename_audio_encoder_axmodel_30s.empty() &&
+                  file_exist(config.attr.filename_audio_encoder_axmodel_30s)));
 
             openai_api::ChatModelOptions options;
             options.supports_vision = config.attr.vlm_type != VLMType::None;

@@ -13,6 +13,7 @@
 
 #define AX_CMM_ALIGN_SIZE 128
 const char *AX_CMM_SESSION_NAME = "npu";
+static const char *AXLLM_RELEASE_AXMODEL_BUFFER_AFTER_INIT = "AXLLM_RELEASE_AXMODEL_BUFFER_AFTER_INIT";
 
 typedef enum
 {
@@ -142,6 +143,18 @@ static AX_ENGINE_IO_BUFFER_T *find_output_buffer_by_name(AX_ENGINE_IO_INFO_T *in
     }
 
     return nullptr;
+}
+
+static void release_model_buffer_after_init_if_enabled(std::vector<char> &buffer)
+{
+    if (!std::getenv(AXLLM_RELEASE_AXMODEL_BUFFER_AFTER_INIT) || buffer.empty())
+    {
+        return;
+    }
+
+    const size_t bytes = buffer.size();
+    std::vector<char>().swap(buffer);
+    ALOGI("released host-side axmodel buffer after init: %.2f MB", bytes / 1024.0 / 1024.0);
 }
 
 int ax_runner_ax650::sub_init()
@@ -493,7 +506,12 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
         }
         m_handle->context = 0;
     }
-    return sub_init();
+    ret = sub_init();
+    if (ret == 0)
+    {
+        release_model_buffer_after_init_if_enabled(m_model_buffer);
+    }
+    return ret;
 }
 
 bool ax_runner_ax650::has_handle_loaded() const
@@ -564,6 +582,8 @@ int ax_runner_ax650::load_handle_reuse_io(const char *model_file, int /*devid*/)
     // Keep existing io_data + buffers. Clear io_info pointers to avoid dangling refs
     // from the previous handle instance (they are owned by the engine).
     for (auto &p : m_handle->io_info) p = nullptr;
+
+    release_model_buffer_after_init_if_enabled(m_model_buffer);
 
     return 0;
 }

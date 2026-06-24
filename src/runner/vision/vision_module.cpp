@@ -728,6 +728,25 @@ static bool get_single_token_id(const std::shared_ptr<BaseTokenizer>& tok, const
     return true;
 }
 
+static bool get_single_token_id_with_fallbacks(const std::shared_ptr<BaseTokenizer>& tok,
+                                               std::initializer_list<const char*> candidates,
+                                               int& out_id,
+                                               std::string& err,
+                                               std::string* out_token = nullptr)
+{
+    std::string last_err;
+    for (const char* candidate : candidates) {
+        std::string candidate_err;
+        if (get_single_token_id(tok, candidate, out_id, candidate_err)) {
+            if (out_token) *out_token = candidate;
+            return true;
+        }
+        last_err = std::move(candidate_err);
+    }
+    err = std::move(last_err);
+    return false;
+}
+
 static bool parse_gemma4_profile_from_path(const std::string& path, int& out_h, int& out_w, int& out_tokens)
 {
     std::smatch m;
@@ -878,7 +897,15 @@ static AudioEncoderRuntime* select_audio_profile(AudioEncoderRuntime* p5,
     if (p5 && !p5->encoder_inited) p5 = nullptr;
     if (p30 && !p30->encoder_inited) p30 = nullptr;
 
-    if (p5 && duration_sec <= p5->profile.duration_sec + 0.25f) return p5;
+    const auto profile_duration = [](const AudioEncoderRuntime* runtime) -> float {
+        if (!runtime) return 0.0f;
+        if (runtime->profile_kind == AudioEncoderRuntime::ProfileKind::Whisper) {
+            return runtime->whisper_profile.duration_sec;
+        }
+        return runtime->profile.duration_sec;
+    };
+
+    if (p5 && duration_sec <= profile_duration(p5) + 0.25f) return p5;
     if (p30) return p30;
     if (p5) return p5;
     return nullptr;
@@ -1495,12 +1522,17 @@ bool VisionModule::Init(VLMType type,
               video_do_sample_frames_ ? 1 : 0);
     } else if (type_ == VLMType::Qwen3Omni) {
         if (video_num_frames_ <= 0) video_num_frames_ = 8;
+        if (!audio_encoder_axmodel_5s.empty() && is_file(audio_encoder_axmodel_5s)) {
+            if (!init_whisper_audio_profile(impl_->audio_5s, audio_encoder_axmodel_5s, devid, tokens_embed_size_, err)) {
+                return false;
+            }
+        }
         if (!audio_encoder_axmodel_30s.empty() && is_file(audio_encoder_axmodel_30s)) {
             if (!init_whisper_audio_profile(impl_->audio_30s, audio_encoder_axmodel_30s, devid, tokens_embed_size_, err)) {
                 return false;
             }
         }
-        if (!impl_->audio_30s.encoder_inited) {
+        if (!impl_->audio_5s.encoder_inited && !impl_->audio_30s.encoder_inited) {
             ALOGW("Qwen3Omni audio encoder is not configured or missing; AUDIO inputs will be rejected.");
         }
         ALOGI("Qwen3Omni video config: num_frames=%d do_sample_frames=%d",
@@ -1543,12 +1575,19 @@ bool VisionModule::Init(VLMType type,
     case VLMType::Qwen2_5VL:
     case VLMType::Qwen3VL:
     case VLMType::Qwen3Omni:
-        if (!get_single_token_id(tokenizer_, "<|image_pad|>", image_pad_id_, err)) return false;
-        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) return false;
+        if (!get_single_token_id_with_fallbacks(tokenizer_, {"<|image_pad|>", "<image>"}, image_pad_id_, err)) return false;
+        if (!get_single_token_id_with_fallbacks(tokenizer_, {"<|video_pad|>", "<video>", "<image>"}, video_pad_id_, err)) return false;
         if (type_ == VLMType::Qwen3Omni) {
             if (!get_single_token_id(tokenizer_, "<|audio_pad|>", audio_pad_id_, err)) return false;
         }
-        if (!get_single_token_id(tokenizer_, "<|vision_start|>", vision_start_id_, err)) return false;
+        if (!get_single_token_id(tokenizer_, "<|vision_start|>", vision_start_id_, err)) {
+            if (type_ == VLMType::Qwen3Omni) {
+                // Jina omni variants collapse vision sentinels away before tokenization.
+                vision_start_id_ = -1;
+            } else {
+                return false;
+            }
+        }
         ALOGI("Qwen token ids: vision_start=%d image_pad=%d video_pad=%d audio_pad=%d",
               vision_start_id_, image_pad_id_, video_pad_id_, audio_pad_id_);
         break;
@@ -2017,7 +2056,12 @@ bool VisionModule::EncodeForContent(const Content& content,
                 err = "Qwen3Omni audio expects exactly 1 audio file per message";
                 return false;
             }
-            if (!impl_->audio_30s.encoder_inited) {
+            float duration_sec = 0.0f;
+            if (!audio::ReadAudioDurationSeconds(media.uris[0], duration_sec, err)) {
+                return false;
+            }
+            auto* runtime = select_audio_profile(&impl_->audio_5s, &impl_->audio_30s, duration_sec);
+            if (!runtime) {
                 err = "Qwen3Omni audio encoder is not initialized";
                 return false;
             }
@@ -2026,7 +2070,7 @@ bool VisionModule::EncodeForContent(const Content& content,
             }
 
             std::vector<float> input_features;
-            if (!audio::LoadWhisperAudioInputFeatures(media.uris[0], impl_->audio_30s.whisper_profile, input_features, nullptr, err)) {
+            if (!audio::LoadWhisperAudioInputFeatures(media.uris[0], runtime->whisper_profile, input_features, nullptr, err)) {
                 return false;
             }
             if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
@@ -2034,9 +2078,9 @@ bool VisionModule::EncodeForContent(const Content& content,
             }
 
             std::vector<unsigned short> emb;
-            if (!encode_block_fp32(impl_->audio_30s.encoder,
-                                   impl_->audio_30s.encoder.get_devid(),
-                                   impl_->audio_30s.encoder_output_is_bf16,
+            if (!encode_block_fp32(runtime->encoder,
+                                   runtime->encoder.get_devid(),
+                                   runtime->encoder_output_is_bf16,
                                    input_features,
                                    emb,
                                    err)) {
@@ -2047,11 +2091,18 @@ bool VisionModule::EncodeForContent(const Content& content,
             }
 
             out_num_media_for_tokenizer = 1;
-            out_num_media_tokens = impl_->audio_30s.whisper_profile.num_audio_tokens;
+            out_num_media_tokens = runtime->whisper_profile.num_audio_tokens;
             out_blocks.push_back(std::move(emb));
-            ALOGI("Qwen3Omni audio profile selected: %.1fs -> %d tokens",
-                  impl_->audio_30s.whisper_profile.duration_sec,
-                  impl_->audio_30s.whisper_profile.num_audio_tokens);
+            if (duration_sec > runtime->whisper_profile.duration_sec) {
+                ALOGW("Qwen3Omni audio input %.3fs exceeds selected %.1fs profile; trailing audio will be truncated",
+                      duration_sec,
+                      runtime->whisper_profile.duration_sec);
+            } else {
+                ALOGI("Qwen3Omni audio profile selected: %.1fs -> %d tokens (input=%.3fs)",
+                      runtime->whisper_profile.duration_sec,
+                      runtime->whisper_profile.num_audio_tokens,
+                      duration_sec);
+            }
             return true;
         }
         err = "AUDIO not supported for this vlm_type";

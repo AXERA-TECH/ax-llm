@@ -209,6 +209,23 @@ static inline std::string getenv_string(const char *name)
     return v ? std::string(v) : std::string();
 }
 
+static inline void set_ax650_model_buffer_release_env(bool enabled)
+{
+#ifndef USE_AXCL
+#ifndef _WIN32
+    if (enabled)
+    {
+        ::setenv("AXLLM_RELEASE_AXMODEL_BUFFER_AFTER_INIT", "1", 1);
+        ALOGI("AX650 host-side axmodel buffer release is enabled after engine init");
+    }
+#else
+    (void)enabled;
+#endif
+#else
+    (void)enabled;
+#endif
+}
+
 static inline bool same_history_content(const Content &lhs, const Content &rhs)
 {
     return lhs.role == rhs.role &&
@@ -644,6 +661,7 @@ struct LLM::Impl {
                                           int token_rows,
                                           int history_len,
                                           int valid_rows,
+                                          bool bidirectional = false,
                                           bool sliding_attention = false,
                                           int sliding_window = 0)
     {
@@ -652,6 +670,13 @@ struct LLM::Impl {
         const int rows = std::max(0, std::min(token_rows, valid_rows));
         for (int r = 0; r < rows; ++r) {
             auto row = mask_tmp.data() + r * (kv_cache_num + token_rows);
+            if (bidirectional)
+            {
+                for (int j = 0; j < history_len; ++j) row[j] = 0;
+                const int cur = kv_cache_num;
+                for (int j = cur; j < cur + rows; ++j) row[j] = 0;
+                continue;
+            }
             int history_start = 0;
             int current_start = 0;
             if (sliding_attention && sliding_window > 0)
@@ -677,6 +702,7 @@ struct LLM::Impl {
                            token_rows,
                            history_len,
                            valid_rows,
+                           _attr.prefill_mask_mode == "bidirectional",
                            is_sliding_attention_layer(layer_idx),
                            _attr.sliding_window);
     }
@@ -1041,16 +1067,36 @@ struct LLM::Impl {
     static inline void embedding_profile_for_tokenizer(const std::string &tokenizer_type, bool &append_eos, int &eos_token_id)
     {
         const std::string key = key_of(tokenizer_type);
-        if (key == "qwen3" || key == "qwen3vl")
+        if (key == "qwen3" || key == "qwen3vl" || key == "qwen3omni")
         {
-            // Align with /home/axera/libembeding.axera (Qwen3-Embedding-0.6B)
+            // Align with Python-side embedding references for the Qwen3 family.
+            // Resolve the actual special-token id from the loaded tokenizer later instead of
+            // hard-coding a single family-wide id, because Jina omni variants use 128001.
             append_eos = true;
-            eos_token_id = 151643;
+            eos_token_id = -1;
             return;
         }
 
         append_eos = false;
         eos_token_id = -1;
+    }
+
+    static inline bool resolve_single_special_token_id(const std::shared_ptr<BaseTokenizer> &tok,
+                                                       std::initializer_list<const char *> candidates,
+                                                       int &out_id)
+    {
+        if (!tok) return false;
+        for (const char *candidate : candidates)
+        {
+            if (!candidate || !candidate[0]) continue;
+            const std::vector<int> ids = tok->encode(std::string(candidate));
+            if (ids.size() == 1)
+            {
+                out_id = ids[0];
+                return true;
+            }
+        }
+        return false;
     }
 
     bool is_minicpmv46_tokenizer() const
@@ -2433,6 +2479,7 @@ struct LLM::Impl {
     {
         ALOGI("LLM init start");
         this->_attr = attr;
+        set_ax650_model_buffer_release_env(_attr.b_release_axmodel_buffer_after_init);
         dynamic_layer_load_enabled_ = _attr.dynamic_load_enable;
         dynamic_layer_pool_size_ = _attr.dynamic_load_pool_size;
         if (dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ <= 0)
@@ -2496,6 +2543,20 @@ struct LLM::Impl {
         tokenizer = create_tokenizer(this->_attr.tokenizer_type);
         if (!tokenizer) { ALOGE("create_tokenizer(%s) failed", this->_attr.tokenizer_type.c_str()); return false; }
         if (!tokenizer->load(attr.url_tokenizer_model)) { ALOGE("tokenizer.init(%s) failed", attr.url_tokenizer_model.c_str()); return false; }
+        if (embedding_append_eos && embedding_eos_token_id < 0)
+        {
+            int resolved_eos_id = -1;
+            if (resolve_single_special_token_id(tokenizer, {"<|end_of_text|>", "<|endoftext|>"}, resolved_eos_id))
+            {
+                embedding_eos_token_id = resolved_eos_id;
+                ALOGI("embedding eos token resolved from tokenizer: %d", embedding_eos_token_id);
+            }
+            else
+            {
+                ALOGW("embedding eos token could not be resolved from tokenizer; keep append_eos disabled for safety");
+                embedding_append_eos = false;
+            }
+        }
         tokenizer->set_think_in_prompt(!tokenizer_uses_hidden_channel_markup(this->_attr.tokenizer_type));
         tokenizer->set_generation_thinking_mode(this->_attr.generation_thinking_mode);
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
@@ -2931,7 +2992,12 @@ struct LLM::Impl {
             }
 
             mask_tmp.assign((size_t)_attr.prefill_token_num * (size_t)(kv_cache_num + _attr.prefill_token_num), bfloat16(-65536.f).data);
-            build_prefill_mask(mask_tmp, kv_cache_num, _attr.prefill_token_num, history_len, input_num_token);
+            build_prefill_mask(mask_tmp,
+                               kv_cache_num,
+                               _attr.prefill_token_num,
+                               history_len,
+                               input_num_token,
+                               _attr.prefill_mask_mode == "bidirectional");
 
             std::fill(embed_tmp.begin(), embed_tmp.end(), 0);
             const size_t copy_tokens = (size_t)input_num_token;

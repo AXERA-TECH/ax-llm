@@ -40,6 +40,7 @@ struct LLMAttrType {
 
     int prefill_token_num = 96; // auto calc
     int prefill_max_token_num = 512;
+    std::string prefill_mask_mode = "causal";
 
     std::string filename_post_axmodel = "tinyllama-int8/tinyllama_post.axmodel";
 
@@ -74,6 +75,7 @@ struct LLMAttrType {
     int prefill_grpid = -1;
     std::string post_config_path = "post_config.json";
     bool b_use_mmap_load_embed = false;
+    bool b_release_axmodel_buffer_after_init = false;
 
     // ---- vision / VLM (optional, runtime switch by `vlm_type`) ----
     // If `vlm_type != VLMType::None`, vision encoder will be initialized and used.
@@ -83,8 +85,8 @@ struct LLMAttrType {
 
     // Vision encoder axmodel (image/video encoder). Required if `vlm_type != VLMType::None`.
     std::string filename_image_encoder_axmodel = "image_encoder.axmodel";
-    std::string filename_audio_encoder_axmodel_5s = "gemma4_audio_5s.axmodel";
-    std::string filename_audio_encoder_axmodel_30s = "gemma4_audio_30s.axmodel";
+    std::string filename_audio_encoder_axmodel_5s;
+    std::string filename_audio_encoder_axmodel_30s;
 
     // Optional: vision embedding cache directory. If empty: memory-only cache for the process lifetime.
     // If set: read/write encoded embeddings for repeated images across runs.
