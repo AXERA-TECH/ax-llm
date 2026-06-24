@@ -8,10 +8,8 @@
 #include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
-#include <filesystem>
 #include <fstream>
 #include <limits>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -22,6 +20,17 @@ constexpr float kMelFloor = 1e-3f;
 constexpr float kMinFrequency = 0.0f;
 constexpr float kMaxFrequency = 8000.0f;
 constexpr float kWhisperMelFloor = 1e-10f;
+
+static bool audio_profile_enabled()
+{
+    return std::getenv("AXLLM_PROFILE_EMBEDDING") || std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO");
+}
+
+static double elapsed_ms(std::chrono::steady_clock::time_point start,
+                         std::chrono::steady_clock::time_point end)
+{
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 static inline uint16_t read_u16_le(const unsigned char* p)
 {
@@ -34,61 +43,6 @@ static inline uint32_t read_u32_le(const unsigned char* p)
            ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) |
            ((uint32_t)p[3] << 24);
-}
-
-static bool command_exists(const char* name)
-{
-    if (!name || !*name) return false;
-    const char* path_env = std::getenv("PATH");
-    if (!path_env || !*path_env) return false;
-
-    std::stringstream ss(path_env);
-    std::string dir;
-    while (std::getline(ss, dir, ':')) {
-        if (dir.empty()) dir = ".";
-        std::error_code ec;
-        const auto candidate = std::filesystem::path(dir) / name;
-        const auto st = std::filesystem::status(candidate, ec);
-        if (!ec && std::filesystem::exists(st) && !std::filesystem::is_directory(st)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static std::string shell_quote(const std::string& value)
-{
-    std::string quoted;
-    quoted.reserve(value.size() + 2);
-    quoted.push_back('\'');
-    for (char c : value) {
-        if (c == '\'') quoted += "'\\''";
-        else quoted.push_back(c);
-    }
-    quoted.push_back('\'');
-    return quoted;
-}
-
-static bool maybe_decode_audio_via_ffmpeg(const std::string& input_path,
-                                          int sampling_rate,
-                                          std::string& decoded_path,
-                                          std::string& err)
-{
-    if (!command_exists("ffmpeg")) return false;
-    std::error_code ec;
-    std::filesystem::path temp_dir = std::filesystem::temp_directory_path(ec);
-    if (ec || temp_dir.empty()) temp_dir = "/tmp";
-    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-    decoded_path = (temp_dir / ("axllm_audio_" + std::to_string(nonce) + ".wav")).string();
-    const std::string cmd = "ffmpeg -nostdin -hide_banner -loglevel error -y -i " +
-                            shell_quote(input_path) + " -ac 1 -ar " + std::to_string(sampling_rate) +
-                            " -f wav " + shell_quote(decoded_path);
-    const int ret = std::system(cmd.c_str());
-    if (ret == 0) return true;
-    std::filesystem::remove(decoded_path, ec);
-    decoded_path.clear();
-    err = "ffmpeg audio decode failed";
-    return false;
 }
 
 struct WavFormat {
@@ -422,6 +376,7 @@ static void apply_whisper_resample_compat_correction(std::vector<float>& feature
 static bool read_wav_mono_f32(const std::string& path,
                               std::vector<float>& waveform,
                               int& sample_rate,
+                              int* channels_out,
                               std::string& err)
 {
     std::ifstream ifs(path, std::ios::binary);
@@ -484,6 +439,9 @@ static bool read_wav_mono_f32(const std::string& path,
     if (fmt.audio_format != 1 && fmt.audio_format != 3) {
         err = "unsupported wav format code: " + std::to_string(fmt.audio_format);
         return false;
+    }
+    if (channels_out) {
+        *channels_out = (int)fmt.num_channels;
     }
 
     const int bytes_per_sample = std::max<int>(1, (int)fmt.bits_per_sample / 8);
@@ -709,7 +667,7 @@ bool ReadAudioDurationSeconds(const std::string& audio_path,
 {
     std::vector<float> waveform;
     int source_sample_rate = 0;
-    if (!read_wav_mono_f32(audio_path, waveform, source_sample_rate, err)) {
+    if (!read_wav_mono_f32(audio_path, waveform, source_sample_rate, nullptr, err)) {
         return false;
     }
     out_duration_sec = source_sample_rate > 0 ? (float)waveform.size() / (float)source_sample_rate : 0.0f;
@@ -724,7 +682,7 @@ bool LoadGemma4AudioInputFeatures(const std::string& audio_path,
 {
     std::vector<float> waveform;
     int source_sample_rate = 0;
-    if (!read_wav_mono_f32(audio_path, waveform, source_sample_rate, err)) {
+    if (!read_wav_mono_f32(audio_path, waveform, source_sample_rate, nullptr, err)) {
         return false;
     }
 
@@ -761,35 +719,34 @@ bool LoadWhisperAudioInputFeatures(const std::string& audio_path,
                                    float* out_duration_sec,
                                    std::string& err)
 {
-    std::string working_audio_path = audio_path;
-    std::string decoded_audio_path;
-    std::string ffmpeg_err;
-    const bool decoded_with_ffmpeg =
-        maybe_decode_audio_via_ffmpeg(audio_path, profile.sampling_rate, decoded_audio_path, ffmpeg_err);
-    if (decoded_with_ffmpeg) {
-        working_audio_path = decoded_audio_path;
-    }
+    const auto total_start = std::chrono::steady_clock::now();
+    const auto decode_start = std::chrono::steady_clock::now();
+    const bool decoded_with_ffmpeg = false;
+    const auto decode_end = std::chrono::steady_clock::now();
 
     std::vector<float> waveform;
     int source_sample_rate = 0;
-    if (!read_wav_mono_f32(working_audio_path, waveform, source_sample_rate, err)) {
-        if (decoded_with_ffmpeg) {
-            std::error_code ec;
-            std::filesystem::remove(decoded_audio_path, ec);
-        }
+    int source_channels = 0;
+    const auto read_start = std::chrono::steady_clock::now();
+    if (!read_wav_mono_f32(audio_path, waveform, source_sample_rate, &source_channels, err)) {
         return false;
     }
-    if (decoded_with_ffmpeg) {
-        std::error_code ec;
-        std::filesystem::remove(decoded_audio_path, ec);
-    }
+    const auto read_end = std::chrono::steady_clock::now();
 
     if (out_duration_sec) {
         *out_duration_sec = source_sample_rate > 0 ? (float)waveform.size() / (float)source_sample_rate : 0.0f;
     }
 
-    std::vector<float> mono = resample_via_libsamplerate(waveform, source_sample_rate, profile.sampling_rate);
-    if (mono.empty()) mono = resample_bandlimited(waveform, source_sample_rate, profile.sampling_rate);
+    const auto resample_start = std::chrono::steady_clock::now();
+    if (source_sample_rate != profile.sampling_rate || source_channels != 1) {
+        err = "audio input must be " + std::to_string(profile.sampling_rate) +
+              " Hz mono WAV for this AX650 package; got sample_rate=" +
+              std::to_string(source_sample_rate) + ", channels=" + std::to_string(source_channels) +
+              ". Please convert offline to 16 kHz mono PCM WAV.";
+        return false;
+    }
+    std::vector<float> mono = std::move(waveform);
+    const auto resample_end = std::chrono::steady_clock::now();
     const size_t target_samples = (size_t)profile.num_mel_frames * (size_t)profile.hop_length;
     if (mono.size() < target_samples) {
         mono.resize(target_samples, 0.0f);
@@ -806,11 +763,33 @@ bool LoadWhisperAudioInputFeatures(const std::string& audio_path,
         fixed_profile.num_audio_tokens = fixed_profile.num_mel_frames / 4;
     }
 
+    const auto mel_start = std::chrono::steady_clock::now();
     if (!compute_whisper_log_mel_features(mono, fixed_profile, input_features, err)) {
         return false;
     }
+    const auto mel_end = std::chrono::steady_clock::now();
+    const auto correction_start = std::chrono::steady_clock::now();
     if (source_sample_rate != profile.sampling_rate) {
         apply_whisper_resample_compat_correction(input_features, fixed_profile);
+    }
+    const auto correction_end = std::chrono::steady_clock::now();
+    if (audio_profile_enabled()) {
+        std::fprintf(stderr,
+                     "AXLLM_AUDIO_PROFILE type=whisper path=%s decoded=%d src_rate=%d dst_rate=%d "
+                     "input_samples=%zu output_samples=%zu decode_ms=%.3f read_ms=%.3f resample_ms=%.3f "
+                     "log_mel_ms=%.3f correction_ms=%.3f total_ms=%.3f\n",
+                     audio_path.c_str(),
+                     decoded_with_ffmpeg ? 1 : 0,
+                     source_sample_rate,
+                     profile.sampling_rate,
+                     waveform.size(),
+                     mono.size(),
+                     elapsed_ms(decode_start, decode_end),
+                     elapsed_ms(read_start, read_end),
+                     elapsed_ms(resample_start, resample_end),
+                     elapsed_ms(mel_start, mel_end),
+                     elapsed_ms(correction_start, correction_end),
+                     elapsed_ms(total_start, correction_end));
     }
     return true;
 }
