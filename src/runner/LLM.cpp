@@ -63,6 +63,17 @@ static inline void llm_d2d(void *vir_dst, const void *vir_src, size_t n, int /*d
 
 namespace {
 
+static inline double elapsed_ms(std::chrono::steady_clock::time_point start,
+                                std::chrono::steady_clock::time_point end)
+{
+    return (double)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+}
+
+static inline bool profile_embedding_enabled()
+{
+    return std::getenv("AXLLM_PROFILE_EMBEDDING") != nullptr;
+}
+
 template <typename RunnerT>
 const ax_runner_tensor_t *try_get_group_input_tensor(RunnerT &runner, int grpid, const std::string &name)
 {
@@ -2490,6 +2501,11 @@ struct LLM::Impl {
         dynamic_layer_lru_.clear();
         dynamic_layer_devids_.clear();
         embedding_profile_for_tokenizer(_attr.tokenizer_type, embedding_append_eos, embedding_eos_token_id);
+        if (_attr.embedding_append_eos_configured)
+        {
+            embedding_append_eos = _attr.embedding_append_eos;
+            embedding_eos_token_id = -1;
+        }
         init_layer_types();
         init_shared_kv_source_layers();
         cache_ref_full_layer_idx = first_full_layer_idx();
@@ -2897,6 +2913,7 @@ struct LLM::Impl {
 
     bool EmbedTokens(const std::vector<int> &token_ids, std::vector<float> &out_embedding)
     {
+        const auto profile_start = std::chrono::steady_clock::now();
         b_stop.store(false, std::memory_order_relaxed);
 
         if (token_ids.empty())
@@ -3179,6 +3196,15 @@ struct LLM::Impl {
             out_embedding[(size_t)i] = bfloat16(embed_bf16[(size_t)i]).fp32();
         }
         out_embedding = l2norm(std::move(out_embedding));
+        if (profile_embedding_enabled())
+        {
+            const auto profile_end = std::chrono::steady_clock::now();
+            ALOGI("AXLLM_EMBED_PROFILE stage=llm_prefill tokens=%d chunks=%d prefill_len=%d elapsed_ms=%.3f",
+                  input_embed_num,
+                  prefill_split_num,
+                  _attr.prefill_token_num,
+                  elapsed_ms(profile_start, profile_end));
+        }
         return true;
     }
 
@@ -3186,6 +3212,7 @@ struct LLM::Impl {
                       const std::vector<::MediaInputs> &media_inputs,
                       std::vector<float> &out_embedding)
     {
+        const auto total_start = std::chrono::steady_clock::now();
         if (!tokenizer)
         {
             ALOGE("LLM not initialized");
@@ -3196,10 +3223,13 @@ struct LLM::Impl {
         vision_state = {};
 
         std::vector<int> token_ids;
+        double prepare_ms = 0.0;
+        size_t soft_token_count = 0;
         if (vision && vision->enabled())
         {
             if (!media_inputs.empty())
             {
+                const auto prepare_start = std::chrono::steady_clock::now();
                 std::vector<vision::MediaInputs> vmins;
                 vmins.reserve(media_inputs.size());
                 for (const auto &m : media_inputs) vmins.push_back({m.content_index, m.uris});
@@ -3213,6 +3243,9 @@ struct LLM::Impl {
                     return false;
                 }
                 (void)prepared_history;
+                const auto prepare_end = std::chrono::steady_clock::now();
+                prepare_ms = elapsed_ms(prepare_start, prepare_end);
+                soft_token_count = st.vision_embed.size() / (size_t)_attr.tokens_embed_size;
                 vision_state = std::move(st);
                 has_vision_state = true;
             }
@@ -3233,21 +3266,37 @@ struct LLM::Impl {
             token_ids.push_back(embedding_eos_token_id);
         }
 
+        const auto prefill_start = std::chrono::steady_clock::now();
         const bool ok = EmbedTokens(token_ids, out_embedding);
+        const auto prefill_end = std::chrono::steady_clock::now();
 
         has_vision_state = false;
         vision_state = {};
+
+        if (profile_embedding_enabled())
+        {
+            const auto total_end = std::chrono::steady_clock::now();
+            ALOGI("AXLLM_EMBED_PROFILE request=multimodal tokens=%zu soft_tokens=%zu prepare_ms=%.3f llm_prefill_ms=%.3f total_ms=%.3f ok=%d",
+                  token_ids.size(),
+                  soft_token_count,
+                  prepare_ms,
+                  elapsed_ms(prefill_start, prefill_end),
+                  elapsed_ms(total_start, total_end),
+                  ok ? 1 : 0);
+        }
 
         return ok;
     }
 
     bool EmbedText(const std::string &text, std::vector<float> &out_embedding)
     {
+        const auto total_start = std::chrono::steady_clock::now();
         if (!tokenizer)
         {
             ALOGE("LLM not initialized");
             return false;
         }
+        const auto tokenize_start = std::chrono::steady_clock::now();
         std::vector<int> token_ids = tokenizer->encode(text);
         if (embedding_append_eos && embedding_eos_token_id >= 0) token_ids.push_back(embedding_eos_token_id);
 
@@ -3257,7 +3306,19 @@ struct LLM::Impl {
             if (embedding_append_eos && !token_ids.empty()) token_ids.back() = embedding_eos_token_id;
         }
 
-        return EmbedTokens(token_ids, out_embedding);
+        const auto prefill_start = std::chrono::steady_clock::now();
+        const bool ok = EmbedTokens(token_ids, out_embedding);
+        const auto prefill_end = std::chrono::steady_clock::now();
+        if (profile_embedding_enabled())
+        {
+            ALOGI("AXLLM_EMBED_PROFILE request=text tokens=%zu tokenize_ms=%.3f llm_prefill_ms=%.3f total_ms=%.3f ok=%d",
+                  token_ids.size(),
+                  elapsed_ms(tokenize_start, prefill_start),
+                  elapsed_ms(prefill_start, prefill_end),
+                  elapsed_ms(total_start, prefill_end),
+                  ok ? 1 : 0);
+        }
+        return ok;
     }
 
     bool EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings)

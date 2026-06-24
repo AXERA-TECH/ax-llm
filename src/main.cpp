@@ -265,6 +265,7 @@ struct ModelConfig
     int server_max_output_tokens = 0;
     std::string server_forced_prompt_text;
     bool is_embedding = false;
+    bool jina_embedding_prompt_prefix = false;
     bool is_image_generation = false;
     std::string image_model_dir = ".";
 
@@ -595,6 +596,15 @@ struct ModelConfig
             {
                 // Embedding models don't require postprocess config; keep logs clean by skipping load.
                 attr.post_config_path.clear();
+            }
+            if (j.contains("jina_embedding_prompt_prefix"))
+            {
+                jina_embedding_prompt_prefix = j["jina_embedding_prompt_prefix"].get<bool>();
+            }
+            if (j.contains("embedding_append_eos"))
+            {
+                attr.embedding_append_eos_configured = true;
+                attr.embedding_append_eos = j["embedding_append_eos"].get<bool>();
             }
 
             // Optional VLM switch
@@ -2301,7 +2311,7 @@ int run_server_mode(const ModelConfig &config, int port)
 
         if (config.is_embedding_model())
         {
-            const bool use_jina_prompt_prefix = normalized_key(config.attr.tokenizer_type) == "qwen3omni";
+            const bool use_jina_prompt_prefix = config.jina_embedding_prompt_prefix;
             g_server.registerEmbedding(model_name, [&llm, use_jina_prompt_prefix](const openai_api::EmbeddingRequest &req,
                                                                std::shared_ptr<openai_api::BaseDataProvider> provider)
                                        {

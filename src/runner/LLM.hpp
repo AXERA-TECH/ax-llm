@@ -76,6 +76,8 @@ struct LLMAttrType {
     std::string post_config_path = "post_config.json";
     bool b_use_mmap_load_embed = false;
     bool b_release_axmodel_buffer_after_init = false;
+    bool embedding_append_eos_configured = false;
+    bool embedding_append_eos = false;
 
     // ---- vision / VLM (optional, runtime switch by `vlm_type`) ----
     // If `vlm_type != VLMType::None`, vision encoder will be initialized and used.
