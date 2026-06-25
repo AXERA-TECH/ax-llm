@@ -1596,6 +1596,13 @@ static ThinkingMode resolve_chat_thinking_mode(const ModelConfig &config,
     {
         return req.enable_thinking ? ThinkingMode::Think : ThinkingMode::NoThink;
     }
+    if (req.has_thinking_mode)
+    {
+        nlohmann::json tmp;
+        tmp["thinking_mode"] = req.thinking_mode;
+        if (auto mode = json_thinking_mode_value(tmp); mode.has_value())
+            return *mode;
+    }
     return config.attr.generation_thinking_mode;
 }
 
@@ -2415,6 +2422,13 @@ int run_server_mode(const ModelConfig &config, int port)
                 }
 
                 const ThinkingMode request_thinking_mode = resolve_chat_thinking_mode(config, req);
+                if (request_thinking_mode != ThinkingMode::Unspecified && !llm.TokenizerSupportsThinkingToggle())
+                {
+                    static std::atomic<bool> warned_unsupported_thinking{false};
+                    if (!warned_unsupported_thinking.exchange(true))
+                        ALOGW("[thinking] this model's tokenizer does not honor thinking_mode/enable_thinking; request setting ignored "
+                              "(currently supported: Qwen3 family, MiniCPM5)");
+                }
 
                 ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f has_enable_thinking=%d thinking_mode=%s messages=%zu stop=%zu",
                       req.model.c_str(),

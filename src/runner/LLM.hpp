@@ -142,6 +142,9 @@ public:
     void ClearRequestSamplingOverride();
     void SetRequestThinkingMode(ThinkingMode mode);
     void ClearRequestThinkingMode();
+    // True if the active tokenizer actually honors think/no_think in its prompt
+    // (so callers can warn when a mode is requested but would be ignored).
+    bool TokenizerSupportsThinkingToggle() const;
     void MarkRequestStart();
     void ClearRequestStart();
     std::string GetLastError() const;

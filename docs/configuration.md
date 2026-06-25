@@ -26,7 +26,20 @@
 | `post_config_path` | `post_config.json` | 采样配置文件 |
 | `bos` / `eos` | `true` / `false` | 是否加 BOS/EOS |
 | `pad_token_id` | 0 | pad token id |
-| `enable_thinking`(bool) 或 `thinking_mode`(string) | 模型默认 | 思考链开关(Qwen3 / MiniCPM5 等)。`enable_thinking`: `true`/`false`;`thinking_mode`: `think`/`no_think`/`default`(`default`/`auto`=按模型默认)。也可在 `/v1/chat/completions` 请求里按次覆盖 |
+| `enable_thinking`(bool) 或 `thinking_mode`(string) | 模型默认 | 思考开关,见下「思考模式」 |
+
+### 思考模式
+
+控制**本轮生成模型要不要思考**(thinking / reasoning)。一个开关,两种等价写法:
+
+- `enable_thinking`(bool):`true`=思考,`false`=不思考;
+- `thinking_mode`(string):`think`=思考,`no_think`=不思考,`default`/`auto`=按模型默认。
+
+两者都给时 `enable_thinking` 优先;都不给则用模型默认。也可在 `/v1/chat/completions` 请求体里**按次覆盖**(同样支持这两个键,可放在顶层或 `chat_template_kwargs` 下),请求结束后回落到 config 默认。
+
+⚠ **当前真正生效的 tokenizer:Qwen3 全家(Qwen3 / Qwen3VL / Qwen3Omni / Qwen2.5 / Qwen3.5)、MiniCPM5。** 其它 tokenizer 暂不支持该开关——设置会被**忽略并在日志告警一次**(不会再静默无效)。`no_think` 的实现方式是对齐各自官方模板(如 Qwen3 在生成提示后注入空 `<think>\n\n</think>` 块)。
+
+> 注意:这与 `think_in_prompt` 是**两回事**。`think_in_prompt` 指"多轮历史里 assistant 旧的思考内容是否保留",由 tokenizer 类型自动决定(仅 Gemma4/Gemma4VL 为 false,其余保留),**不可配置**,与本开关无关。
 
 ## 加载与内存
 

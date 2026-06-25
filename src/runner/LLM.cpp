@@ -2677,6 +2677,9 @@ struct LLM::Impl {
         if (!tokenizer->load(attr.url_tokenizer_model)) { ALOGE("tokenizer.init(%s) failed", attr.url_tokenizer_model.c_str()); return false; }
         tokenizer->set_think_in_prompt(!tokenizer_uses_hidden_channel_markup(this->_attr.tokenizer_type));
         tokenizer->set_generation_thinking_mode(this->_attr.generation_thinking_mode);
+        if (this->_attr.generation_thinking_mode != ThinkingMode::Unspecified && !tokenizer->supports_thinking_toggle())
+            ALOGW("[thinking] tokenizer_type='%s' does not honor thinking_mode/enable_thinking; the setting is ignored "
+                  "(currently supported: Qwen3 family, MiniCPM5)", this->_attr.tokenizer_type.c_str());
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
 
 #ifdef USE_AXCL
@@ -5548,6 +5551,7 @@ void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bo
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
 void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
 void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }
+bool LLM::TokenizerSupportsThinkingToggle() const { return impl_->tokenizer ? impl_->tokenizer->supports_thinking_toggle() : false; }
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
 void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
