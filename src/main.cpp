@@ -671,6 +671,37 @@ struct ModelConfig
                 attr.dev_ids = {0};
             }
 
+            // Env override: AXLLM_DEVICES=0,1 takes precedence over config "devices".
+            // Handy for running several model instances on different cards without
+            // editing each config.json (e.g. `AXLLM_DEVICES=2,3 axllm serve <dir>`).
+            if (const char *dev_env = std::getenv("AXLLM_DEVICES"); dev_env && *dev_env)
+            {
+                std::vector<int> override_ids;
+                std::stringstream dss(dev_env);
+                std::string tok;
+                while (std::getline(dss, tok, ','))
+                {
+                    const size_t a = tok.find_first_not_of(" \t");
+                    const size_t b = tok.find_last_not_of(" \t");
+                    if (a == std::string::npos) continue;
+                    tok = tok.substr(a, b - a + 1);
+                    try { override_ids.push_back(std::stoi(tok)); }
+                    catch (...) { ALOGW("AXLLM_DEVICES: ignoring invalid token '%s'", tok.c_str()); }
+                }
+                if (!override_ids.empty())
+                {
+                    attr.dev_ids = override_ids;
+                    std::string joined;
+                    for (size_t i = 0; i < override_ids.size(); ++i)
+                        joined += (i ? "," : "") + std::to_string(override_ids[i]);
+                    ALOGI("AXLLM_DEVICES override: using devices [%s] (config \"devices\" ignored)", joined.c_str());
+                }
+                else
+                {
+                    ALOGW("AXLLM_DEVICES is set but no valid device ids parsed; keeping config devices");
+                }
+            }
+
 #endif
             // Load prompt
             if (j.contains("system_prompt"))

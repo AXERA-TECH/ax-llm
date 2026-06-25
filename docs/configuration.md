@@ -133,6 +133,13 @@
 |---|---|---|
 | `devices` | `[0]` | 使用的设备 id 列表(多卡张量并行) |
 
+> **环境变量覆盖**:`AXLLM_DEVICES=0,1 axllm run/serve <model_dir>` 会覆盖 config 里的 `devices`(逗号分隔的设备 id),无需改 config.json。常用于多卡上各起一个模型实例跑测试,例如:
+> ```sh
+> AXLLM_DEVICES=0,1 axllm serve <dirA> &
+> AXLLM_DEVICES=2,3 axllm serve <dirB> &
+> ```
+> 仅 AXCL 构建有效;设了但解析不出有效 id 时回退到 config。
+
 ## 图像生成（SD1.5）
 
 | 字段 | 说明 |
