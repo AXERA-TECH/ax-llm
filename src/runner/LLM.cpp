@@ -451,8 +451,11 @@ struct LLM::Impl {
     std::deque<int> dynamic_layer_lru_;
     std::string active_shared_weight_task_;
     std::string active_image_encoder_axmodel_;
+    std::string active_image_mapper_axmodel_;
     std::string active_audio_encoder_axmodel_5s_;
+    std::string active_audio_projector_axmodel_5s_;
     std::string active_audio_encoder_axmodel_30s_;
+    std::string active_audio_projector_axmodel_30s_;
     int active_vision_num_frames_ = -1;
 
     int decode_grpid = 0;
@@ -496,16 +499,25 @@ struct LLM::Impl {
 
         const std::string image_encoder =
             adapter.image_encoder_axmodel.empty() ? _attr.filename_image_encoder_axmodel : adapter.image_encoder_axmodel;
+        const std::string image_mapper =
+            adapter.image_mapper_axmodel.empty() ? _attr.filename_image_mapper_axmodel : adapter.image_mapper_axmodel;
         const std::string audio_5s =
             adapter.audio_encoder_axmodel_5s.empty() ? _attr.filename_audio_encoder_axmodel_5s : adapter.audio_encoder_axmodel_5s;
+        const std::string audio_projector_5s =
+            adapter.audio_projector_axmodel_5s.empty() ? _attr.filename_audio_projector_axmodel_5s : adapter.audio_projector_axmodel_5s;
         const std::string audio_30s =
             adapter.audio_encoder_axmodel_30s.empty() ? _attr.filename_audio_encoder_axmodel_30s : adapter.audio_encoder_axmodel_30s;
+        const std::string audio_projector_30s =
+            adapter.audio_projector_axmodel_30s.empty() ? _attr.filename_audio_projector_axmodel_30s : adapter.audio_projector_axmodel_30s;
         const int video_num_frames =
             adapter.vision_num_frames > 0 ? adapter.vision_num_frames : _attr.vision_num_frames;
 
         if (image_encoder == active_image_encoder_axmodel_ &&
+            image_mapper == active_image_mapper_axmodel_ &&
             audio_5s == active_audio_encoder_axmodel_5s_ &&
+            audio_projector_5s == active_audio_projector_axmodel_5s_ &&
             audio_30s == active_audio_encoder_axmodel_30s_ &&
+            audio_projector_30s == active_audio_projector_axmodel_30s_ &&
             video_num_frames == active_vision_num_frames_)
         {
             return true;
@@ -535,6 +547,9 @@ struct LLM::Impl {
                           _attr.vision_do_sample_frames,
                           audio_5s,
                           audio_30s,
+                          image_mapper,
+                          audio_projector_5s,
+                          audio_projector_30s,
                           err))
         {
             set_last_error("failed to switch media encoders for adapter task " + adapter.task_id + ": " + err);
@@ -543,21 +558,27 @@ struct LLM::Impl {
         }
 
         active_image_encoder_axmodel_ = image_encoder;
+        active_image_mapper_axmodel_ = image_mapper;
         active_audio_encoder_axmodel_5s_ = audio_5s;
+        active_audio_projector_axmodel_5s_ = audio_projector_5s;
         active_audio_encoder_axmodel_30s_ = audio_30s;
+        active_audio_projector_axmodel_30s_ = audio_projector_30s;
         active_vision_num_frames_ = video_num_frames;
-        ALOGI("active media encoders switched for task=%s image=%s audio_5s=%s audio_30s=%s video_num_frames=%d",
+        ALOGI("active media encoders switched for task=%s image=%s image_mapper=%s audio_5s=%s audio_projector_5s=%s audio_30s=%s audio_projector_30s=%s video_num_frames=%d",
               adapter.task_id.c_str(),
               active_image_encoder_axmodel_.c_str(),
+              active_image_mapper_axmodel_.c_str(),
               active_audio_encoder_axmodel_5s_.c_str(),
+              active_audio_projector_axmodel_5s_.c_str(),
               active_audio_encoder_axmodel_30s_.c_str(),
+              active_audio_projector_axmodel_30s_.c_str(),
               active_vision_num_frames_);
         return true;
     }
 
-    bool SetSharedWeightTask(const std::string &task_id)
+    bool SetSharedWeightTask(const std::string &task_id, bool switch_media_encoders)
     {
-        if (task_id.empty() || task_id == active_shared_weight_task_)
+        if (task_id.empty())
         {
             return true;
         }
@@ -568,6 +589,15 @@ struct LLM::Impl {
             set_last_error("unknown shared weight adapter task: " + task_id);
             ALOGE("unknown shared weight adapter task: %s", task_id.c_str());
             return false;
+        }
+
+        if (task_id == active_shared_weight_task_)
+        {
+            if (switch_media_encoders && !ReinitVisionForAdapter(*adapter))
+            {
+                return false;
+            }
+            return true;
         }
         if (adapter->adapter_weight_template_filename.empty() ||
             adapter->adapter_patch_manifest_template_filename.empty())
@@ -617,7 +647,7 @@ struct LLM::Impl {
         }
 
         active_shared_weight_task_ = task_id;
-        if (!ReinitVisionForAdapter(*adapter))
+        if (switch_media_encoders && !ReinitVisionForAdapter(*adapter))
         {
             return false;
         }
@@ -3092,6 +3122,9 @@ struct LLM::Impl {
                               _attr.vision_do_sample_frames,
                               _attr.filename_audio_encoder_axmodel_5s,
                               _attr.filename_audio_encoder_axmodel_30s,
+                              _attr.filename_image_mapper_axmodel,
+                              _attr.filename_audio_projector_axmodel_5s,
+                              _attr.filename_audio_projector_axmodel_30s,
                               verr))
             {
                 ALOGE("vision.Init(vlm_type=%s/%d) failed: %s",
@@ -3101,8 +3134,11 @@ struct LLM::Impl {
                 return false;
             }
             active_image_encoder_axmodel_ = _attr.filename_image_encoder_axmodel;
+            active_image_mapper_axmodel_ = _attr.filename_image_mapper_axmodel;
             active_audio_encoder_axmodel_5s_ = _attr.filename_audio_encoder_axmodel_5s;
+            active_audio_projector_axmodel_5s_ = _attr.filename_audio_projector_axmodel_5s;
             active_audio_encoder_axmodel_30s_ = _attr.filename_audio_encoder_axmodel_30s;
+            active_audio_projector_axmodel_30s_ = _attr.filename_audio_projector_axmodel_30s;
             active_vision_num_frames_ = _attr.vision_num_frames;
         }
 
@@ -5672,7 +5708,7 @@ void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->s
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
 void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
-bool LLM::SetSharedWeightTask(const std::string &task_id) { return impl_->SetSharedWeightTask(task_id); }
+bool LLM::SetSharedWeightTask(const std::string &task_id, bool switch_media_encoders) { return impl_->SetSharedWeightTask(task_id, switch_media_encoders); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
 bool LLM::Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding) { return impl_->EmbedHistory(history, media_inputs, out_embedding); }

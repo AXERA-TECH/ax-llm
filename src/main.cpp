@@ -515,13 +515,25 @@ struct ModelConfig
                     {
                         adapter.image_encoder_axmodel = item["image_encoder_axmodel"].get<std::string>();
                     }
+                    if (item.contains("image_mapper_axmodel"))
+                    {
+                        adapter.image_mapper_axmodel = item["image_mapper_axmodel"].get<std::string>();
+                    }
                     if (item.contains("audio_encoder_axmodel_5s"))
                     {
                         adapter.audio_encoder_axmodel_5s = item["audio_encoder_axmodel_5s"].get<std::string>();
                     }
+                    if (item.contains("audio_projector_axmodel_5s"))
+                    {
+                        adapter.audio_projector_axmodel_5s = item["audio_projector_axmodel_5s"].get<std::string>();
+                    }
                     if (item.contains("audio_encoder_axmodel_30s"))
                     {
                         adapter.audio_encoder_axmodel_30s = item["audio_encoder_axmodel_30s"].get<std::string>();
+                    }
+                    if (item.contains("audio_projector_axmodel_30s"))
+                    {
+                        adapter.audio_projector_axmodel_30s = item["audio_projector_axmodel_30s"].get<std::string>();
                     }
                     if (item.contains("vision_num_frames"))
                     {
@@ -745,6 +757,10 @@ struct ModelConfig
                 // Backward compatible with older branches.
                 attr.filename_image_encoder_axmodel = j["filename_image_encoder_axmodedl"].get<std::string>();
             }
+            if (j.contains("filename_image_mapper_axmodel"))
+            {
+                attr.filename_image_mapper_axmodel = j["filename_image_mapper_axmodel"].get<std::string>();
+            }
             const bool has_audio_encoder_5s_key = j.contains("filename_audio_encoder_axmodel_5s");
             const bool has_audio_encoder_30s_key = j.contains("filename_audio_encoder_axmodel_30s");
             const bool has_audio_encoder_short_key = j.contains("filename_audio_encoder_axmodel_short");
@@ -764,6 +780,14 @@ struct ModelConfig
             if (has_audio_encoder_long_key)
             {
                 attr.filename_audio_encoder_axmodel_30s = j["filename_audio_encoder_axmodel_long"].get<std::string>();
+            }
+            if (j.contains("filename_audio_projector_axmodel_5s"))
+            {
+                attr.filename_audio_projector_axmodel_5s = j["filename_audio_projector_axmodel_5s"].get<std::string>();
+            }
+            if (j.contains("filename_audio_projector_axmodel_30s"))
+            {
+                attr.filename_audio_projector_axmodel_30s = j["filename_audio_projector_axmodel_30s"].get<std::string>();
             }
             if (attr.vlm_type == VLMType::Gemma4VL &&
                 !has_audio_encoder_5s_key &&
@@ -903,10 +927,16 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
             resolve_path(model_path, adapter.adapter_patch_manifest_filename_post);
         adapter.image_encoder_axmodel =
             resolve_path(model_path, adapter.image_encoder_axmodel);
+        adapter.image_mapper_axmodel =
+            resolve_path(model_path, adapter.image_mapper_axmodel);
         adapter.audio_encoder_axmodel_5s =
             resolve_path(model_path, adapter.audio_encoder_axmodel_5s);
+        adapter.audio_projector_axmodel_5s =
+            resolve_path(model_path, adapter.audio_projector_axmodel_5s);
         adapter.audio_encoder_axmodel_30s =
             resolve_path(model_path, adapter.audio_encoder_axmodel_30s);
+        adapter.audio_projector_axmodel_30s =
+            resolve_path(model_path, adapter.audio_projector_axmodel_30s);
     }
     if (!is_url(config.attr.url_tokenizer_model))
         config.attr.url_tokenizer_model = resolve_path(model_path, config.attr.url_tokenizer_model);
@@ -916,8 +946,13 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
     config.attr.filename_per_layer_projection_norm = resolve_path(model_path, config.attr.filename_per_layer_projection_norm);
     config.attr.post_config_path = resolve_path(model_path, config.attr.post_config_path);
     config.attr.filename_image_encoder_axmodel = resolve_path(model_path, config.attr.filename_image_encoder_axmodel);
+    config.attr.filename_image_mapper_axmodel = resolve_path(model_path, config.attr.filename_image_mapper_axmodel);
     config.attr.filename_audio_encoder_axmodel_5s = resolve_path(model_path, config.attr.filename_audio_encoder_axmodel_5s);
+    config.attr.filename_audio_projector_axmodel_5s =
+        resolve_path(model_path, config.attr.filename_audio_projector_axmodel_5s);
     config.attr.filename_audio_encoder_axmodel_30s = resolve_path(model_path, config.attr.filename_audio_encoder_axmodel_30s);
+    config.attr.filename_audio_projector_axmodel_30s =
+        resolve_path(model_path, config.attr.filename_audio_projector_axmodel_30s);
     config.attr.vision_cache_dir = resolve_path(model_path, config.attr.vision_cache_dir);
     if (!config.attr.shared_base_template_filename_axmodel.empty() ||
         (!config.attr.shared_base_weight_template_filename.empty() &&
@@ -942,8 +977,11 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
             adapter.adapter_patch_manifest_filename_post =
                 config.attr.shared_adapter_patch_manifest_filename_post;
             adapter.image_encoder_axmodel = config.attr.filename_image_encoder_axmodel;
+            adapter.image_mapper_axmodel = config.attr.filename_image_mapper_axmodel;
             adapter.audio_encoder_axmodel_5s = config.attr.filename_audio_encoder_axmodel_5s;
+            adapter.audio_projector_axmodel_5s = config.attr.filename_audio_projector_axmodel_5s;
             adapter.audio_encoder_axmodel_30s = config.attr.filename_audio_encoder_axmodel_30s;
+            adapter.audio_projector_axmodel_30s = config.attr.filename_audio_projector_axmodel_30s;
             adapter.vision_num_frames = config.attr.vision_num_frames;
             config.attr.shared_weight_adapters.push_back(std::move(adapter));
         }
@@ -2498,13 +2536,6 @@ int run_server_mode(const ModelConfig &config, int port)
                     ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
                 }
 
-                const std::string adapter_task = embedding_adapter_task_from_request(req.raw);
-                if (!adapter_task.empty() && !llm.SetSharedWeightTask(adapter_task)) {
-                    ALOGE("failed to switch embedding adapter task to '%s'", adapter_task.c_str());
-                    provider->end();
-                    return;
-                }
-
                 if (req.raw.contains("messages") && req.raw["messages"].is_array())
                 {
                     std::vector<Content> history;
@@ -2513,6 +2544,13 @@ int run_server_mode(const ModelConfig &config, int port)
                     if (!handle_api_messages(req.raw["messages"], history, &media_inputs, &temp_files))
                     {
                         ALOGE("handle_api_messages failed for embeddings messages");
+                        cleanup_temp_files(temp_files);
+                        provider->end();
+                        return;
+                    }
+                    const std::string adapter_task = embedding_adapter_task_from_request(req.raw);
+                    if (!adapter_task.empty() && !llm.SetSharedWeightTask(adapter_task, !media_inputs.empty())) {
+                        ALOGE("failed to switch embedding adapter task to '%s'", adapter_task.c_str());
                         cleanup_temp_files(temp_files);
                         provider->end();
                         return;
@@ -2536,6 +2574,13 @@ int run_server_mode(const ModelConfig &config, int port)
                     keepalive.stop();
                     auto chunk = openai_api::OutputChunk::BatchEmbeddings(embeds, req.model);
                     provider->push(chunk);
+                    provider->end();
+                    return;
+                }
+
+                const std::string adapter_task = embedding_adapter_task_from_request(req.raw);
+                if (!adapter_task.empty() && !llm.SetSharedWeightTask(adapter_task, false)) {
+                    ALOGE("failed to switch embedding adapter task to '%s'", adapter_task.c_str());
                     provider->end();
                     return;
                 }

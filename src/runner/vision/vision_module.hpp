@@ -87,6 +87,9 @@ public:
               bool video_do_sample_frames,
               const std::string& audio_encoder_axmodel_5s,
               const std::string& audio_encoder_axmodel_30s,
+              const std::string& image_mapper_axmodel,
+              const std::string& audio_projector_axmodel_5s,
+              const std::string& audio_projector_axmodel_30s,
               std::string& err);
 
     void Deinit();

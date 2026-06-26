@@ -29,8 +29,11 @@ struct LLMSharedWeightAdapter {
     std::string adapter_weight_filename_post;
     std::string adapter_patch_manifest_filename_post;
     std::string image_encoder_axmodel;
+    std::string image_mapper_axmodel;
     std::string audio_encoder_axmodel_5s;
+    std::string audio_projector_axmodel_5s;
     std::string audio_encoder_axmodel_30s;
+    std::string audio_projector_axmodel_30s;
     int vision_num_frames = -1;
 };
 
@@ -111,8 +114,11 @@ struct LLMAttrType {
 
     // Vision encoder axmodel (image/video encoder). Required if `vlm_type != VLMType::None`.
     std::string filename_image_encoder_axmodel = "image_encoder.axmodel";
+    std::string filename_image_mapper_axmodel;
     std::string filename_audio_encoder_axmodel_5s;
+    std::string filename_audio_projector_axmodel_5s;
     std::string filename_audio_encoder_axmodel_30s;
+    std::string filename_audio_projector_axmodel_30s;
 
     // Optional: vision embedding cache directory. If empty: memory-only cache for the process lifetime.
     // If set: read/write encoded embeddings for repeated images across runs.
@@ -160,7 +166,7 @@ public:
     void MarkRequestStart();
     void ClearRequestStart();
     std::string GetLastError() const;
-    bool SetSharedWeightTask(const std::string &task_id);
+    bool SetSharedWeightTask(const std::string &task_id, bool switch_media_encoders = true);
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
     bool Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding);

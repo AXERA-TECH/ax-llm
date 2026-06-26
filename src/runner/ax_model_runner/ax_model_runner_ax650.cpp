@@ -305,34 +305,116 @@ static std::vector<AX_ENGINE_BLOB_PATCH_T> make_engine_patch_list(const std::vec
     return engine_patches;
 }
 
-static bool build_restore_patch_from_base(const std::vector<char> &base_weight,
-                                          const std::vector<ax_runner_shared_patch_t> &patches,
-                                          std::vector<char> &restore_buffer,
-                                          std::vector<ax_runner_shared_patch_t> &restore_patches)
+static bool build_transition_patch_from_base_and_target(const std::vector<char> &base_weight,
+                                                        const std::vector<ax_runner_shared_patch_t> &current_patches,
+                                                        const std::vector<char> &target_adapter_weight,
+                                                        const std::vector<ax_runner_shared_patch_t> &target_patches,
+                                                        std::vector<char> &transition_buffer,
+                                                        std::vector<ax_runner_shared_patch_t> &transition_patches)
 {
-    restore_buffer.clear();
-    restore_patches.clear();
-    restore_patches.reserve(patches.size());
-
-    for (const auto &patch : patches)
+    struct Interval
     {
-        const size_t offset = patch.offset;
-        const size_t size = patch.size;
-        if (size == 0 || offset > base_weight.size() || size > base_weight.size() - offset)
+        unsigned int start;
+        unsigned int end;
+    };
+
+    std::vector<Interval> intervals;
+    intervals.reserve(current_patches.size() + target_patches.size());
+    auto append_interval = [&](const ax_runner_shared_patch_t &patch) -> bool {
+        if (patch.size == 0 ||
+            patch.offset > std::numeric_limits<unsigned int>::max() - patch.size ||
+            (size_t)patch.offset > base_weight.size() ||
+            (size_t)patch.size > base_weight.size() - (size_t)patch.offset)
         {
-            ALOGE("base restore segment out of range: offset=%u size=%u base_size=%zu",
+            ALOGE("shared transition segment out of range: offset=%u size=%u base_size=%zu",
                   patch.offset,
                   patch.size,
                   base_weight.size());
             return false;
         }
+        intervals.push_back({patch.offset, patch.offset + patch.size});
+        return true;
+    };
 
-        ax_runner_shared_patch_t restore = patch;
-        restore.patch_offset = (unsigned int)restore_buffer.size();
-        restore_buffer.insert(restore_buffer.end(),
-                              base_weight.begin() + (ptrdiff_t)offset,
-                              base_weight.begin() + (ptrdiff_t)(offset + size));
-        restore_patches.push_back(restore);
+    for (const auto &patch : current_patches)
+    {
+        if (!append_interval(patch)) return false;
+    }
+    for (const auto &patch : target_patches)
+    {
+        if ((size_t)patch.patch_offset > target_adapter_weight.size() ||
+            (size_t)patch.size > target_adapter_weight.size() - (size_t)patch.patch_offset)
+        {
+            ALOGE("target adapter segment out of range: offset=%u size=%u patch_offset=%u target_size=%zu",
+                  patch.offset,
+                  patch.size,
+                  patch.patch_offset,
+                  target_adapter_weight.size());
+            return false;
+        }
+        if (!append_interval(patch)) return false;
+    }
+
+    transition_buffer.clear();
+    transition_patches.clear();
+    if (intervals.empty())
+    {
+        return true;
+    }
+
+    std::sort(intervals.begin(), intervals.end(), [](const Interval &lhs, const Interval &rhs) {
+        if (lhs.start != rhs.start) return lhs.start < rhs.start;
+        return lhs.end < rhs.end;
+    });
+
+    std::vector<Interval> merged;
+    merged.reserve(intervals.size());
+    for (const auto &interval : intervals)
+    {
+        if (merged.empty() || interval.start > merged.back().end)
+        {
+            merged.push_back(interval);
+        }
+        else if (interval.end > merged.back().end)
+        {
+            merged.back().end = interval.end;
+        }
+    }
+
+    for (const auto &interval : merged)
+    {
+        const size_t interval_start = interval.start;
+        const size_t interval_end = interval.end;
+        const size_t interval_size = interval_end - interval_start;
+        ax_runner_shared_patch_t transition{};
+        transition.offset = interval.start;
+        transition.size = (unsigned int)interval_size;
+        transition.patch_offset = (unsigned int)transition_buffer.size();
+
+        transition_buffer.insert(transition_buffer.end(),
+                                 base_weight.begin() + (ptrdiff_t)interval_start,
+                                 base_weight.begin() + (ptrdiff_t)interval_end);
+
+        char *dst = transition_buffer.data() + transition.patch_offset;
+        for (const auto &target : target_patches)
+        {
+            const size_t target_start = target.offset;
+            const size_t target_end = target_start + target.size;
+            const size_t overlap_start = std::max(interval_start, target_start);
+            const size_t overlap_end = std::min(interval_end, target_end);
+            if (overlap_start >= overlap_end)
+            {
+                continue;
+            }
+
+            const size_t target_src_offset = (size_t)target.patch_offset + (overlap_start - target_start);
+            const size_t dst_offset = overlap_start - interval_start;
+            std::copy(target_adapter_weight.begin() + (ptrdiff_t)target_src_offset,
+                      target_adapter_weight.begin() + (ptrdiff_t)(target_src_offset + overlap_end - overlap_start),
+                      dst + (ptrdiff_t)dst_offset);
+        }
+
+        transition_patches.push_back(transition);
     }
 
     return true;
@@ -919,39 +1001,46 @@ int ax_runner_ax650::switch_shared_weight_task(const char *shared_adapter_weight
 
     if (has_handle_loaded())
     {
-        if (!m_shared_adapter_patches.empty())
+        if (m_shared_adapter_patches.empty())
+        {
+            const int patch_ret = apply_wbt_patch(m_handle->handle,
+                                                  next_patch_buffer,
+                                                  next_patches,
+                                                  next_task_id.c_str());
+            if (patch_ret != 0)
+            {
+                return patch_ret;
+            }
+        }
+        else
         {
             std::vector<char> base_weight;
             if (load_file_to_buffer(m_shared_base_weight_file.c_str(), base_weight) != 0)
             {
-                ALOGE("load shared base weight failed for restore: %s", m_shared_base_weight_file.c_str());
+                ALOGE("load shared base weight failed for transition: %s", m_shared_base_weight_file.c_str());
                 return -1;
             }
 
-            std::vector<char> restore_buffer;
-            std::vector<ax_runner_shared_patch_t> restore_patches;
-            if (!build_restore_patch_from_base(base_weight, m_shared_adapter_patches, restore_buffer, restore_patches))
+            std::vector<char> transition_buffer;
+            std::vector<ax_runner_shared_patch_t> transition_patches;
+            if (!build_transition_patch_from_base_and_target(base_weight,
+                                                             m_shared_adapter_patches,
+                                                             next_patch_buffer,
+                                                             next_patches,
+                                                             transition_buffer,
+                                                             transition_patches))
             {
                 return -1;
             }
 
-            const int restore_ret = apply_wbt_patch(m_handle->handle,
-                                                    restore_buffer,
-                                                    restore_patches,
-                                                    "base_restore");
-            if (restore_ret != 0)
+            const int patch_ret = apply_wbt_patch(m_handle->handle,
+                                                  transition_buffer,
+                                                  transition_patches,
+                                                  next_task_id.c_str());
+            if (patch_ret != 0)
             {
-                return restore_ret;
+                return patch_ret;
             }
-        }
-
-        const int patch_ret = apply_wbt_patch(m_handle->handle,
-                                              next_patch_buffer,
-                                              next_patches,
-                                              next_task_id.c_str());
-        if (patch_ret != 0)
-        {
-            return patch_ret;
         }
     }
 

@@ -57,11 +57,22 @@ struct AudioEncoderRuntime {
     ax_runner_t encoder;
     bool encoder_inited = false;
     int encoder_output_is_bf16 = -1;
+    ax_runner_t projector;
+    bool projector_inited = false;
+    int projector_output_is_bf16 = -1;
     ProfileKind profile_kind = ProfileKind::None;
     audio::Gemma4AudioProfile profile;
     audio::WhisperAudioProfile whisper_profile;
     std::string axmodel_path;
+    std::string projector_axmodel_path;
 };
+
+static void reset_audio_runtime(AudioEncoderRuntime& runtime)
+{
+    if (runtime.projector_inited) runtime.projector.deinit();
+    if (runtime.encoder_inited) runtime.encoder.deinit();
+    runtime = AudioEncoderRuntime();
+}
 
 struct ScopedTempDirs {
     std::vector<std::string> dirs;
@@ -606,9 +617,18 @@ struct VisionModule::Impl {
     ax_runner_t encoder;
     bool encoder_inited = false;
     int encoder_output_is_bf16 = -1;
+    std::string encoder_axmodel_path;
+    ax_runner_t image_mapper;
+    bool image_mapper_inited = false;
+    int image_mapper_output_is_bf16 = -1;
+    std::string image_mapper_axmodel_path;
 
     AudioEncoderRuntime audio_5s;
     AudioEncoderRuntime audio_30s;
+    std::string pending_audio_encoder_axmodel_5s;
+    std::string pending_audio_projector_axmodel_5s;
+    std::string pending_audio_encoder_axmodel_30s;
+    std::string pending_audio_projector_axmodel_30s;
 
     // For "classic image encoder" layout detection.
     int input_is_nchw = -1; // 1=NCHW float32, 0=NHWC u8, -1=unknown
@@ -875,8 +895,30 @@ static bool init_whisper_audio_profile(AudioEncoderRuntime& runtime,
     int out_is_bf16 = -1;
     int tokens_per_block = 0;
     if (!try_pick_tokens_by_output_bytes(out0, tokens_embed_size, out_is_bf16, tokens_per_block)) {
-        err = "failed to infer whisper audio output layout: " + axmodel_path;
-        return false;
+        int elem_count = 1;
+        for (auto d : out0.vShape) elem_count *= (int)d;
+        if (elem_count <= 0) {
+            err = "failed to infer whisper audio output layout: " + axmodel_path;
+            return false;
+        }
+        if ((size_t)elem_count * sizeof(float) == (size_t)out0.nSize) {
+            out_is_bf16 = 0;
+        } else if ((size_t)elem_count * sizeof(unsigned short) == (size_t)out0.nSize) {
+            out_is_bf16 = 1;
+        } else {
+            err = "failed to infer whisper audio output dtype: " + axmodel_path;
+            return false;
+        }
+        const int hidden = out0.vShape.empty() ? 0 : (int)out0.vShape.back();
+        if (hidden <= 0 || elem_count % hidden != 0) {
+            err = "failed to infer whisper audio token count from output shape: " + axmodel_path;
+            return false;
+        }
+        tokens_per_block = elem_count / hidden;
+        ALOGW("Whisper audio output dim differs from LLM embed dim; inferred tokens=%d hidden=%d from output shape for %s",
+              tokens_per_block,
+              hidden,
+              axmodel_path.c_str());
     }
 
     runtime.encoder_output_is_bf16 = out_is_bf16;
@@ -887,6 +929,73 @@ static bool init_whisper_audio_profile(AudioEncoderRuntime& runtime,
           runtime.whisper_profile.num_mel_frames,
           runtime.whisper_profile.num_audio_tokens,
           (runtime.encoder_output_is_bf16 ? "bf16" : "fp32"));
+    return true;
+}
+
+static bool init_projection_model(ax_runner_t& runner,
+                                  bool& inited,
+                                  int& output_is_bf16,
+                                  std::string& current_path,
+                                  const std::string& axmodel_path,
+                                  int devid,
+                                  int tokens_embed_size,
+                                  int& tokens_per_block,
+                                  const char* label,
+                                  std::string& err)
+{
+    if (axmodel_path.empty()) {
+        if (inited) {
+            runner.deinit();
+            inited = false;
+        }
+        output_is_bf16 = -1;
+        current_path.clear();
+        return true;
+    }
+    if (!is_file(axmodel_path)) {
+        err = std::string(label) + " axmodel does not exist: " + axmodel_path;
+        return false;
+    }
+    if (inited && current_path == axmodel_path) {
+        int out_is_bf16 = -1;
+        int tpb = 0;
+        if (!try_pick_tokens_by_output_bytes(runner.get_output(0), tokens_embed_size, out_is_bf16, tpb)) {
+            err = std::string("failed to infer existing ") + label + " output layout: " + axmodel_path;
+            return false;
+        }
+        output_is_bf16 = out_is_bf16;
+        tokens_per_block = tpb;
+        return true;
+    }
+    if (inited) {
+        runner.deinit();
+        inited = false;
+    }
+    if (runner.init(axmodel_path.c_str(), devid) != 0) {
+        err = std::string("init ") + label + " axmodel failed: " + axmodel_path;
+        return false;
+    }
+    inited = true;
+    current_path = axmodel_path;
+
+#ifdef USE_AXCL
+    runner.set_auto_sync_before_inference(true);
+    runner.set_auto_sync_after_inference(true);
+#endif
+
+    int out_is_bf16 = -1;
+    int tpb = 0;
+    if (!try_pick_tokens_by_output_bytes(runner.get_output(0), tokens_embed_size, out_is_bf16, tpb)) {
+        err = std::string("failed to infer ") + label + " output layout: " + axmodel_path;
+        return false;
+    }
+    output_is_bf16 = out_is_bf16;
+    tokens_per_block = tpb;
+    ALOGI("%s init ok: path=%s tokens=%d out_dtype=%s",
+          label,
+          axmodel_path.c_str(),
+          tokens_per_block,
+          output_is_bf16 ? "bf16" : "fp32");
     return true;
 }
 
@@ -908,6 +1017,72 @@ static AudioEncoderRuntime* select_audio_profile(AudioEncoderRuntime* p5,
     if (p5 && duration_sec <= profile_duration(p5) + 0.25f) return p5;
     if (p30) return p30;
     if (p5) return p5;
+    return nullptr;
+}
+
+static bool ensure_qwen3omni_audio_runtime(AudioEncoderRuntime& runtime,
+                                           const std::string& encoder_axmodel,
+                                           const std::string& projector_axmodel,
+                                           int devid,
+                                           int tokens_embed_size,
+                                           std::string& err)
+{
+    if (encoder_axmodel.empty()) return false;
+    if (!runtime.encoder_inited) {
+        if (!is_file(encoder_axmodel)) {
+            err = "Qwen3Omni audio encoder axmodel does not exist: " + encoder_axmodel;
+            return false;
+        }
+        if (!init_whisper_audio_profile(runtime, encoder_axmodel, devid, tokens_embed_size, err)) {
+            return false;
+        }
+    }
+    if (!projector_axmodel.empty()) {
+        int projector_tokens = 0;
+        if (!init_projection_model(runtime.projector,
+                                   runtime.projector_inited,
+                                   runtime.projector_output_is_bf16,
+                                   runtime.projector_axmodel_path,
+                                   projector_axmodel,
+                                   devid,
+                                   tokens_embed_size,
+                                   projector_tokens,
+                                   "Qwen3Omni audio projector",
+                                   err)) {
+            return false;
+        }
+        runtime.whisper_profile.num_audio_tokens = projector_tokens;
+    }
+    return true;
+}
+
+static AudioEncoderRuntime* ensure_select_qwen3omni_audio_profile(AudioEncoderRuntime& p5,
+                                                                  AudioEncoderRuntime& p30,
+                                                                  const std::string& p5_encoder,
+                                                                  const std::string& p5_projector,
+                                                                  const std::string& p30_encoder,
+                                                                  const std::string& p30_projector,
+                                                                  float duration_sec,
+                                                                  int devid,
+                                                                  int tokens_embed_size,
+                                                                  std::string& err)
+{
+    if (!p5_encoder.empty()) {
+        if (!ensure_qwen3omni_audio_runtime(p5, p5_encoder, p5_projector, devid, tokens_embed_size, err)) {
+            return nullptr;
+        }
+        if (duration_sec <= p5.whisper_profile.duration_sec + 0.25f || p30_encoder.empty()) {
+            return &p5;
+        }
+    }
+    if (!p30_encoder.empty()) {
+        if (!ensure_qwen3omni_audio_runtime(p30, p30_encoder, p30_projector, devid, tokens_embed_size, err)) {
+            return nullptr;
+        }
+        return &p30;
+    }
+    if (p5.encoder_inited) return &p5;
+    err = "Qwen3Omni audio encoder is not configured";
     return nullptr;
 }
 
@@ -1171,6 +1346,9 @@ VisionModule& VisionModule::operator=(VisionModule&&) noexcept = default;
 void VisionModule::Deinit()
 {
     if (impl_) {
+        if (impl_->image_mapper_inited) impl_->image_mapper.deinit();
+        if (impl_->audio_5s.projector_inited) impl_->audio_5s.projector.deinit();
+        if (impl_->audio_30s.projector_inited) impl_->audio_30s.projector.deinit();
         if (impl_->encoder_inited) impl_->encoder.deinit();
         if (impl_->audio_5s.encoder_inited) impl_->audio_5s.encoder.deinit();
         if (impl_->audio_30s.encoder_inited) impl_->audio_30s.encoder.deinit();
@@ -1208,9 +1386,28 @@ bool VisionModule::Init(VLMType type,
                         bool video_do_sample_frames,
                         const std::string& audio_encoder_axmodel_5s,
                         const std::string& audio_encoder_axmodel_30s,
+                        const std::string& image_mapper_axmodel,
+                        const std::string& audio_projector_axmodel_5s,
+                        const std::string& audio_projector_axmodel_30s,
                         std::string& err)
 {
-    Deinit();
+    const bool can_reuse_encoder =
+        enabled_ && impl_ && impl_->encoder_inited &&
+        type_ == type &&
+        tokens_embed_size_ == tokens_embed_size &&
+        impl_->encoder_axmodel_path == encoder_axmodel &&
+        impl_->encoder.get_devid() == devid &&
+        vision_width_ == vision_width &&
+        vision_height_ == vision_height &&
+        temporal_patch_size_ == temporal_patch_size &&
+        spatial_merge_size_ == spatial_merge_size &&
+        patch_size_ == patch_size;
+
+    if (!can_reuse_encoder) {
+        Deinit();
+    } else {
+        ALOGI("VisionModule reusing image encoder: %s", encoder_axmodel.c_str());
+    }
 
     tokens_embed_size_ = tokens_embed_size;
     tokenizer_ = tokenizer;
@@ -1232,7 +1429,7 @@ bool VisionModule::Init(VLMType type,
         return true;
     }
 
-    impl_.reset(new Impl());
+    if (!impl_) impl_.reset(new Impl());
 
     vision_width_ = vision_width;
     vision_height_ = vision_height;
@@ -1244,21 +1441,24 @@ bool VisionModule::Init(VLMType type,
     video_num_frames_ = video_num_frames;
     video_do_sample_frames_ = video_do_sample_frames;
 
-    // Load encoder axmodel (all supported VLM types in this repo need it).
-    if (encoder_axmodel.empty()) {
-        err = "filename_image_encoder_axmodel is empty";
-        return false;
-    }
-    if (impl_->encoder.init(encoder_axmodel.c_str(), devid) != 0) {
-        err = "init vision encoder axmodel failed: " + encoder_axmodel;
-        return false;
-    }
-    impl_->encoder_inited = true;
+    if (!can_reuse_encoder) {
+        // Load encoder axmodel (all supported VLM types in this repo need it).
+        if (encoder_axmodel.empty()) {
+            err = "filename_image_encoder_axmodel is empty";
+            return false;
+        }
+        if (impl_->encoder.init(encoder_axmodel.c_str(), devid) != 0) {
+            err = "init vision encoder axmodel failed: " + encoder_axmodel;
+            return false;
+        }
+        impl_->encoder_inited = true;
+        impl_->encoder_axmodel_path = encoder_axmodel;
 
 #ifdef USE_AXCL
-    impl_->encoder.set_auto_sync_before_inference(true);
-    impl_->encoder.set_auto_sync_after_inference(true);
+        impl_->encoder.set_auto_sync_before_inference(true);
+        impl_->encoder.set_auto_sync_after_inference(true);
 #endif
+    }
 
     const auto& in0 = impl_->encoder.get_input(0);
 
@@ -1502,6 +1702,28 @@ bool VisionModule::Init(VLMType type,
         }
     }
 
+    if (type_ == VLMType::Qwen3Omni && !image_mapper_axmodel.empty()) {
+        int mapper_tokens = 0;
+        if (!init_projection_model(impl_->image_mapper,
+                                   impl_->image_mapper_inited,
+                                   impl_->image_mapper_output_is_bf16,
+                                   impl_->image_mapper_axmodel_path,
+                                   image_mapper_axmodel,
+                                   devid,
+                                   tokens_embed_size_,
+                                   mapper_tokens,
+                                   "Qwen3Omni vision mapper",
+                                   err)) {
+            return false;
+        }
+        tokens_per_block_ = mapper_tokens;
+    } else if (impl_->image_mapper_inited) {
+        impl_->image_mapper.deinit();
+        impl_->image_mapper_inited = false;
+        impl_->image_mapper_output_is_bf16 = -1;
+        impl_->image_mapper_axmodel_path.clear();
+    }
+
     if (type_ == VLMType::Gemma4VL) {
         if (video_num_frames_ <= 0) video_num_frames_ = 32;
         if (!audio_encoder_axmodel_5s.empty() && is_file(audio_encoder_axmodel_5s)) {
@@ -1522,18 +1744,24 @@ bool VisionModule::Init(VLMType type,
               video_do_sample_frames_ ? 1 : 0);
     } else if (type_ == VLMType::Qwen3Omni) {
         if (video_num_frames_ <= 0) video_num_frames_ = 8;
-        if (!audio_encoder_axmodel_5s.empty() && is_file(audio_encoder_axmodel_5s)) {
-            if (!init_whisper_audio_profile(impl_->audio_5s, audio_encoder_axmodel_5s, devid, tokens_embed_size_, err)) {
-                return false;
-            }
+        if (impl_->pending_audio_encoder_axmodel_5s != audio_encoder_axmodel_5s ||
+            impl_->pending_audio_projector_axmodel_5s != audio_projector_axmodel_5s) {
+            reset_audio_runtime(impl_->audio_5s);
         }
-        if (!audio_encoder_axmodel_30s.empty() && is_file(audio_encoder_axmodel_30s)) {
-            if (!init_whisper_audio_profile(impl_->audio_30s, audio_encoder_axmodel_30s, devid, tokens_embed_size_, err)) {
-                return false;
-            }
+        if (impl_->pending_audio_encoder_axmodel_30s != audio_encoder_axmodel_30s ||
+            impl_->pending_audio_projector_axmodel_30s != audio_projector_axmodel_30s) {
+            reset_audio_runtime(impl_->audio_30s);
         }
-        if (!impl_->audio_5s.encoder_inited && !impl_->audio_30s.encoder_inited) {
-            ALOGW("Qwen3Omni audio encoder is not configured or missing; AUDIO inputs will be rejected.");
+        impl_->pending_audio_encoder_axmodel_5s = audio_encoder_axmodel_5s;
+        impl_->pending_audio_projector_axmodel_5s = audio_projector_axmodel_5s;
+        impl_->pending_audio_encoder_axmodel_30s = audio_encoder_axmodel_30s;
+        impl_->pending_audio_projector_axmodel_30s = audio_projector_axmodel_30s;
+        if (audio_encoder_axmodel_5s.empty() && audio_encoder_axmodel_30s.empty()) {
+            ALOGW("Qwen3Omni audio encoder is not configured; AUDIO inputs will be rejected.");
+        } else {
+            ALOGI("Qwen3Omni audio encoders configured for lazy init: short=%s long=%s",
+                  audio_encoder_axmodel_5s.c_str(),
+                  audio_encoder_axmodel_30s.c_str());
         }
         ALOGI("Qwen3Omni video config: num_frames=%d do_sample_frames=%d",
               video_num_frames_,
@@ -1541,6 +1769,7 @@ bool VisionModule::Init(VLMType type,
     }
 
     cache_key_prefix_ = "vlm=" + std::string(VLMTypeName(type_)) + "|enc=" + normalize_path_for_key(encoder_axmodel) +
+                        "|mapper=" + normalize_path_for_key(image_mapper_axmodel) +
                         "|e=" + std::to_string(tokens_embed_size_) +
                         "|t=" + std::to_string(tokens_per_block_) +
                         "|ds=" + std::to_string(deepstack_layers_) +
@@ -1793,6 +2022,138 @@ static bool encode_block_fp32(ax_runner_t& enc, int devid, int out_is_bf16,
     }
     for (int i = 0; i < elem_count; ++i) out_bf16[i] = bfloat16(tmp[i]).data;
     return true;
+}
+
+static bool write_fp32_input(ax_runner_t& enc, int devid, const std::vector<float>& values, std::string& err)
+{
+    const auto& in0 = enc.get_input(0);
+    const size_t input_fp32_bytes = values.size() * sizeof(float);
+    const size_t input_bf16_bytes = values.size() * sizeof(unsigned short);
+
+    if ((size_t)in0.nSize == input_fp32_bytes || (size_t)in0.nSize > input_fp32_bytes) {
+        if ((size_t)in0.nSize == input_fp32_bytes) {
+            if (in0.pVirAddr) std::memcpy(in0.pVirAddr, values.data(), input_fp32_bytes);
+            else v_h2d(V_WADDR(in0), values.data(), input_fp32_bytes, devid);
+        } else {
+            std::vector<unsigned char> tmp((size_t)in0.nSize, 0);
+            std::memcpy(tmp.data(), values.data(), input_fp32_bytes);
+            if (in0.pVirAddr) std::memcpy(in0.pVirAddr, tmp.data(), tmp.size());
+            else v_h2d(V_WADDR(in0), tmp.data(), tmp.size(), devid);
+        }
+        return true;
+    }
+
+    if ((size_t)in0.nSize == input_bf16_bytes || (size_t)in0.nSize > input_bf16_bytes) {
+        std::vector<unsigned short> bf16(values.size());
+        for (size_t i = 0; i < values.size(); ++i) bf16[i] = fp32_to_bfloat16_rne(values[i]);
+        if ((size_t)in0.nSize == input_bf16_bytes) {
+            if (in0.pVirAddr) std::memcpy(in0.pVirAddr, bf16.data(), input_bf16_bytes);
+            else v_h2d(V_WADDR(in0), bf16.data(), input_bf16_bytes, devid);
+        } else {
+            std::vector<unsigned char> tmp((size_t)in0.nSize, 0);
+            std::memcpy(tmp.data(), bf16.data(), input_bf16_bytes);
+            if (in0.pVirAddr) std::memcpy(in0.pVirAddr, tmp.data(), tmp.size());
+            else v_h2d(V_WADDR(in0), tmp.data(), tmp.size(), devid);
+        }
+        return true;
+    }
+
+    err = "model input tensor too small for fp32/bf16 input";
+    return false;
+}
+
+static bool read_output_fp32(ax_runner_t& enc, int devid, int out_is_bf16, std::vector<float>& out_fp32, std::string& err)
+{
+    const auto& out0 = enc.get_output(0);
+    int elem_count = 0;
+    if (out_is_bf16) {
+        elem_count = (int)((size_t)out0.nSize / sizeof(unsigned short));
+    } else {
+        elem_count = (int)((size_t)out0.nSize / sizeof(float));
+    }
+    if (elem_count <= 0) {
+        err = "model output elem_count invalid";
+        return false;
+    }
+
+    out_fp32.resize(elem_count);
+    if (out_is_bf16) {
+        std::vector<unsigned short> tmp(elem_count);
+        if (out0.pVirAddr) std::memcpy(tmp.data(), out0.pVirAddr, (size_t)elem_count * sizeof(unsigned short));
+        else v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(unsigned short), devid);
+        for (int i = 0; i < elem_count; ++i) out_fp32[i] = bfloat16(tmp[i]).fp32();
+    } else {
+        if (out0.pVirAddr) std::memcpy(out_fp32.data(), out0.pVirAddr, (size_t)elem_count * sizeof(float));
+        else v_d2h(out_fp32.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
+    }
+    return true;
+}
+
+static bool read_output_bf16(ax_runner_t& enc, int devid, int out_is_bf16, std::vector<unsigned short>& out_bf16, std::string& err)
+{
+    const auto& out0 = enc.get_output(0);
+    int elem_count = 0;
+    if (out_is_bf16) {
+        elem_count = (int)((size_t)out0.nSize / sizeof(unsigned short));
+    } else {
+        elem_count = (int)((size_t)out0.nSize / sizeof(float));
+    }
+    if (elem_count <= 0) {
+        err = "model output elem_count invalid";
+        return false;
+    }
+
+    out_bf16.resize(elem_count);
+    if (out_is_bf16) {
+        if (out0.pVirAddr) std::memcpy(out_bf16.data(), out0.pVirAddr, (size_t)elem_count * sizeof(unsigned short));
+        else v_d2h(out_bf16.data(), V_RADDR(out0), (size_t)elem_count * sizeof(unsigned short), devid);
+    } else {
+        std::vector<float> tmp(elem_count);
+        if (out0.pVirAddr) std::memcpy(tmp.data(), out0.pVirAddr, (size_t)elem_count * sizeof(float));
+        else v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
+        for (int i = 0; i < elem_count; ++i) out_bf16[i] = fp32_to_bfloat16_rne(tmp[i]);
+    }
+    return true;
+}
+
+static bool run_fp32_model_to_fp32(ax_runner_t& enc,
+                                   int devid,
+                                   int out_is_bf16,
+                                   const std::vector<float>& values,
+                                   std::vector<float>& out_fp32,
+                                   std::string& err)
+{
+    if (!write_fp32_input(enc, devid, values, err)) return false;
+    enc.inference();
+    return read_output_fp32(enc, devid, out_is_bf16, out_fp32, err);
+}
+
+static bool run_fp32_model_to_bf16(ax_runner_t& enc,
+                                   int devid,
+                                   int out_is_bf16,
+                                   const std::vector<float>& values,
+                                   std::vector<unsigned short>& out_bf16,
+                                   std::string& err)
+{
+    if (!write_fp32_input(enc, devid, values, err)) return false;
+    enc.inference();
+    return read_output_bf16(enc, devid, out_is_bf16, out_bf16, err);
+}
+
+static bool encode_normalized_float_to_fp32(ax_runner_t& enc,
+                                            int devid,
+                                            int out_is_bf16,
+                                            const std::vector<unsigned char>& bytes,
+                                            std::vector<float>& out_fp32,
+                                            float img_mean,
+                                            float img_std,
+                                            std::string& err)
+{
+    const float scale = 1.0f / (255.0f * img_std);
+    const float shift = -img_mean / img_std;
+    std::vector<float> fp32(bytes.size());
+    for (size_t i = 0; i < bytes.size(); ++i) fp32[i] = (float)bytes[i] * scale + shift;
+    return run_fp32_model_to_fp32(enc, devid, out_is_bf16, fp32, out_fp32, err);
 }
 
 static bool encode_block_u8(ax_runner_t& enc, int devid, int out_is_bf16,
@@ -2060,9 +2421,18 @@ bool VisionModule::EncodeForContent(const Content& content,
             if (!audio::ReadAudioDurationSeconds(media.uris[0], duration_sec, err)) {
                 return false;
             }
-            auto* runtime = select_audio_profile(&impl_->audio_5s, &impl_->audio_30s, duration_sec);
+            auto* runtime = ensure_select_qwen3omni_audio_profile(impl_->audio_5s,
+                                                                  impl_->audio_30s,
+                                                                  impl_->pending_audio_encoder_axmodel_5s,
+                                                                  impl_->pending_audio_projector_axmodel_5s,
+                                                                  impl_->pending_audio_encoder_axmodel_30s,
+                                                                  impl_->pending_audio_projector_axmodel_30s,
+                                                                  duration_sec,
+                                                                  devid,
+                                                                  tokens_embed_size_,
+                                                                  err);
             if (!runtime) {
-                err = "Qwen3Omni audio encoder is not initialized";
+                if (err.empty()) err = "Qwen3Omni audio encoder is not initialized";
                 return false;
             }
             if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
@@ -2078,13 +2448,33 @@ bool VisionModule::EncodeForContent(const Content& content,
             }
 
             std::vector<unsigned short> emb;
-            if (!encode_block_fp32(runtime->encoder,
-                                   runtime->encoder.get_devid(),
-                                   runtime->encoder_output_is_bf16,
-                                   input_features,
-                                   emb,
-                                   err)) {
-                return false;
+            if (runtime->projector_inited) {
+                std::vector<float> tower_out;
+                if (!run_fp32_model_to_fp32(runtime->encoder,
+                                            runtime->encoder.get_devid(),
+                                            runtime->encoder_output_is_bf16,
+                                            input_features,
+                                            tower_out,
+                                            err)) {
+                    return false;
+                }
+                if (!run_fp32_model_to_bf16(runtime->projector,
+                                            runtime->projector.get_devid(),
+                                            runtime->projector_output_is_bf16,
+                                            tower_out,
+                                            emb,
+                                            err)) {
+                    return false;
+                }
+            } else {
+                if (!encode_block_fp32(runtime->encoder,
+                                       runtime->encoder.get_devid(),
+                                       runtime->encoder_output_is_bf16,
+                                       input_features,
+                                       emb,
+                                       err)) {
+                    return false;
+                }
             }
             if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
                 ALOGI("Qwen3Omni audio encoder ready: bf16_elems=%zu", emb.size());
@@ -2297,17 +2687,39 @@ bool VisionModule::EncodeForContent(const Content& content,
                 }
                 std::vector<unsigned short> emb;
                 if (type_ == VLMType::Qwen3Omni) {
-                    if (!encode_block_normalized_float(impl_->encoder,
-                                                       devid,
-                                                       impl_->encoder_output_is_bf16,
-                                                       pixel_values[0],
-                                                       emb,
-                                                       0.5f,
-                                                       0.5f,
-                                                       0,
-                                                       nullptr,
-                                                       err)) {
-                        return false;
+                    if (impl_->image_mapper_inited) {
+                        std::vector<float> tower_out;
+                        if (!encode_normalized_float_to_fp32(impl_->encoder,
+                                                             devid,
+                                                             impl_->encoder_output_is_bf16,
+                                                             pixel_values[0],
+                                                             tower_out,
+                                                             0.5f,
+                                                             0.5f,
+                                                             err)) {
+                            return false;
+                        }
+                        if (!run_fp32_model_to_bf16(impl_->image_mapper,
+                                                    impl_->image_mapper.get_devid(),
+                                                    impl_->image_mapper_output_is_bf16,
+                                                    tower_out,
+                                                    emb,
+                                                    err)) {
+                            return false;
+                        }
+                    } else {
+                        if (!encode_block_normalized_float(impl_->encoder,
+                                                           devid,
+                                                           impl_->encoder_output_is_bf16,
+                                                           pixel_values[0],
+                                                           emb,
+                                                           0.5f,
+                                                           0.5f,
+                                                           0,
+                                                           nullptr,
+                                                           err)) {
+                            return false;
+                        }
                     }
                 } else {
                     if (!encode_block_u8(impl_->encoder,
@@ -2419,17 +2831,39 @@ bool VisionModule::EncodeForContent(const Content& content,
                 return false;
             }
             std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder,
-                                               devid,
-                                               impl_->encoder_output_is_bf16,
-                                               pixel_values[0],
-                                               emb,
-                                               0.5f,
-                                               0.5f,
-                                               0,
-                                               nullptr,
-                                               err)) {
-                return false;
+            if (impl_->image_mapper_inited) {
+                std::vector<float> tower_out;
+                if (!encode_normalized_float_to_fp32(impl_->encoder,
+                                                     devid,
+                                                     impl_->encoder_output_is_bf16,
+                                                     pixel_values[0],
+                                                     tower_out,
+                                                     0.5f,
+                                                     0.5f,
+                                                     err)) {
+                    return false;
+                }
+                if (!run_fp32_model_to_bf16(impl_->image_mapper,
+                                            impl_->image_mapper.get_devid(),
+                                            impl_->image_mapper_output_is_bf16,
+                                            tower_out,
+                                            emb,
+                                            err)) {
+                    return false;
+                }
+            } else {
+                if (!encode_block_normalized_float(impl_->encoder,
+                                                   devid,
+                                                   impl_->encoder_output_is_bf16,
+                                                   pixel_values[0],
+                                                   emb,
+                                                   0.5f,
+                                                   0.5f,
+                                                   0,
+                                                   nullptr,
+                                                   err)) {
+                    return false;
+                }
             }
             out_blocks.push_back(std::move(emb));
         }
