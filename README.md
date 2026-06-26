@@ -228,6 +228,37 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 - `vision_height`
 - `full_attention_interval`（Qwen3.5 等混合 linear/full attention 模型需要，用于标记每 N 层为 full-attention）
 
+### 共享基座权重（实验）
+
+部分多任务 Nano / Omni 发布包会把多个任务的 LLM 权重拆成：
+
+- 一个共享的 base axmodel
+- 多个 task-specific adapter axmodel
+
+当前分支已增加对这类配置的实验性支持，配置项如下：
+
+- `shared_base_template_filename_axmodel`
+- `shared_adapter_template_filename_axmodel`（可选，默认回退到 `template_filename_axmodel`）
+- `shared_weight_task_id`（可选，默认回退到 `model_name`）
+- `shared_weight_adapters[]`（可选，用于声明多个 task 的 adapter patch 和 media encoder profile）
+
+说明：
+
+- 这条路径目前只在 **AX650** 后端走 `AX_ENGINE_CreateHandleV4` 的共享权重 bundle。
+- **AXCL 后端暂未接入共享基座**，当前只会告警并回退到单模型初始化。
+- `release_axmodel_buffer_after_init` 对 shared-base 路径同样生效；句柄重建时会按配置重新装载 base buffer。
+- shared-base 配置不允许静默回退到普通 `CreateHandleV2/V3` 路径；如果当前 `libax_engine.so` 不导出 `AX_ENGINE_CreateHandleV4`，服务会在初始化阶段直接失败。
+- `/v1/embeddings` 请求可通过 `task_id`、`adapter_task` 或 `task` 选择 adapter。当前 active adapter 是进程全局状态，不应在同一个服务进程中并发混跑不同 task。
+- 该能力仍属于实验性接口，现有单模型配置不受影响。
+
+当前验证状态：
+
+- `jina-embeddings-v5-omni-nano` full 包已用真实 shared-base split 产物完成 AX650 板端验证，支持 `retrieval` 和 `clustering` 两个 task。
+- runtime 切换 task 时会先用 base weight 恢复上一 task patch 过的 WBT segment，再按目标 task 的 `adapter_delta.bin/json` patch 同一套 handle。
+- task profile 可以切换 task-specific media encoder，例如 retrieval/clustering 各自的 vision/audio encoder。
+- 当前板端系统 `/soc/lib/libax_engine.so` 未导出 `AX_ENGINE_CreateHandleV4` / `AX_ENGINE_PatchHandleWBT`；验证时通过 `LD_LIBRARY_PATH` 临时加载支持 shared-weight patch 的 `libax_engine.so`，未修改 `/soc/lib`。
+- full 包实测：默认 8s audio profile 下 CMM 增量约 `1191296 KB`，RSS 约 `135556 KB`；retrieval/clustering 精度与单任务包对齐。
+
 ### 多槽前缀 KV 缓存（serve 多用户 / 多套提示词加速）
 
 `serve` 为单实例串行处理，但常会有**多个用户**或**多套系统提示词**轮流请求。默认只有一份上下文，一旦请求前缀和上一次不同就会重新跑整段 prefill，非常慢。开启多槽前缀 KV 缓存后，可缓存**多份**前缀 token 及其 KV：每个请求按**最长公共前缀**匹配到对应的槽并复用其 KV（只对新增 token 做 prefill），未命中则覆盖**最久未使用**（LRU）的槽。一次仍只处理一个请求。

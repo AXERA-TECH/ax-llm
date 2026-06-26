@@ -588,6 +588,37 @@ int ax_runner_axcl::init(char *model_buffer, size_t model_size, int devid)
     return sub_init();
 }
 
+int ax_runner_axcl::init_with_shared_weight_bundle(const char *model_file,
+                                                   const char *shared_base_model_file,
+                                                   const char *shared_base_weight_file,
+                                                   const char *shared_adapter_weight_file,
+                                                   const char *shared_adapter_patch_manifest_file,
+                                                   const char *task_id,
+                                                   int devid)
+{
+    (void)shared_adapter_patch_manifest_file;
+    if (((shared_base_model_file && shared_base_model_file[0]) ||
+         (shared_base_weight_file && shared_base_weight_file[0]) ||
+         (shared_adapter_weight_file && shared_adapter_weight_file[0])) &&
+        task_id && task_id[0])
+    {
+        ALOGE("shared base weight bundle is not supported by AXCL backend");
+        return -1;
+    }
+    return init(model_file, devid);
+}
+
+int ax_runner_axcl::switch_shared_weight_task(const char *shared_adapter_weight_file,
+                                              const char *shared_adapter_patch_manifest_file,
+                                              const char *task_id)
+{
+    (void)shared_adapter_weight_file;
+    (void)shared_adapter_patch_manifest_file;
+    (void)task_id;
+    ALOGE("dynamic shared adapter switching is not supported by AXCL backend");
+    return -1;
+}
+
 void ax_runner_axcl::deinit()
 {
     if (m_handle)

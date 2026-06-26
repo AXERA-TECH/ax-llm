@@ -74,6 +74,18 @@ static inline bool profile_embedding_enabled()
     return std::getenv("AXLLM_PROFILE_EMBEDDING") != nullptr;
 }
 
+static inline std::string format_path_pattern(const std::string &pattern, int index)
+{
+    if (pattern.find('%') == std::string::npos)
+    {
+        return pattern;
+    }
+
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf), pattern.c_str(), index);
+    return std::string(buf);
+}
+
 template <typename RunnerT>
 const ax_runner_tensor_t *try_get_group_input_tensor(RunnerT &runner, int grpid, const std::string &name)
 {
@@ -437,6 +449,11 @@ struct LLM::Impl {
     std::vector<int> dynamic_layer_devids_;
     std::vector<unsigned char> dynamic_layer_loaded_;
     std::deque<int> dynamic_layer_lru_;
+    std::string active_shared_weight_task_;
+    std::string active_image_encoder_axmodel_;
+    std::string active_audio_encoder_axmodel_5s_;
+    std::string active_audio_encoder_axmodel_30s_;
+    int active_vision_num_frames_ = -1;
 
     int decode_grpid = 0;
     std::vector<int> decode_grpids_;             // sorted by decode capacity (ascending)
@@ -456,6 +473,157 @@ struct LLM::Impl {
     bool dynamic_layer_load_enabled() const
     {
         return dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ > 0;
+    }
+
+    const LLMSharedWeightAdapter *find_shared_weight_adapter(const std::string &task_id) const
+    {
+        for (const auto &adapter : _attr.shared_weight_adapters)
+        {
+            if (adapter.task_id == task_id)
+            {
+                return &adapter;
+            }
+        }
+        return nullptr;
+    }
+
+    bool ReinitVisionForAdapter(const LLMSharedWeightAdapter &adapter)
+    {
+        if (!vision || !vision->enabled())
+        {
+            return true;
+        }
+
+        const std::string image_encoder =
+            adapter.image_encoder_axmodel.empty() ? _attr.filename_image_encoder_axmodel : adapter.image_encoder_axmodel;
+        const std::string audio_5s =
+            adapter.audio_encoder_axmodel_5s.empty() ? _attr.filename_audio_encoder_axmodel_5s : adapter.audio_encoder_axmodel_5s;
+        const std::string audio_30s =
+            adapter.audio_encoder_axmodel_30s.empty() ? _attr.filename_audio_encoder_axmodel_30s : adapter.audio_encoder_axmodel_30s;
+        const int video_num_frames =
+            adapter.vision_num_frames > 0 ? adapter.vision_num_frames : _attr.vision_num_frames;
+
+        if (image_encoder == active_image_encoder_axmodel_ &&
+            audio_5s == active_audio_encoder_axmodel_5s_ &&
+            audio_30s == active_audio_encoder_axmodel_30s_ &&
+            video_num_frames == active_vision_num_frames_)
+        {
+            return true;
+        }
+
+        std::string err;
+        int vdevid =
+#ifdef USE_AXCL
+            llama_layers.empty() ? 0 : llama_layers[0].layer.get_devid();
+#else
+            -1;
+#endif
+        if (!vision->Init(_attr.vlm_type,
+                          image_encoder,
+                          _attr.vision_cache_dir,
+                          _attr.tokens_embed_size,
+                          vdevid,
+                          tokenizer,
+                          _attr.vision_width,
+                          _attr.vision_height,
+                          _attr.vision_temporal_patch_size,
+                          _attr.vision_spatial_merge_size,
+                          _attr.vision_patch_size,
+                          _attr.vision_fps,
+                          _attr.vision_tokens_per_second,
+                          video_num_frames,
+                          _attr.vision_do_sample_frames,
+                          audio_5s,
+                          audio_30s,
+                          err))
+        {
+            set_last_error("failed to switch media encoders for adapter task " + adapter.task_id + ": " + err);
+            ALOGE("switch media encoders failed for task=%s: %s", adapter.task_id.c_str(), err.c_str());
+            return false;
+        }
+
+        active_image_encoder_axmodel_ = image_encoder;
+        active_audio_encoder_axmodel_5s_ = audio_5s;
+        active_audio_encoder_axmodel_30s_ = audio_30s;
+        active_vision_num_frames_ = video_num_frames;
+        ALOGI("active media encoders switched for task=%s image=%s audio_5s=%s audio_30s=%s video_num_frames=%d",
+              adapter.task_id.c_str(),
+              active_image_encoder_axmodel_.c_str(),
+              active_audio_encoder_axmodel_5s_.c_str(),
+              active_audio_encoder_axmodel_30s_.c_str(),
+              active_vision_num_frames_);
+        return true;
+    }
+
+    bool SetSharedWeightTask(const std::string &task_id)
+    {
+        if (task_id.empty() || task_id == active_shared_weight_task_)
+        {
+            return true;
+        }
+
+        const LLMSharedWeightAdapter *adapter = find_shared_weight_adapter(task_id);
+        if (!adapter)
+        {
+            set_last_error("unknown shared weight adapter task: " + task_id);
+            ALOGE("unknown shared weight adapter task: %s", task_id.c_str());
+            return false;
+        }
+        if (adapter->adapter_weight_template_filename.empty() ||
+            adapter->adapter_patch_manifest_template_filename.empty())
+        {
+            set_last_error("shared weight adapter task is incomplete: " + task_id);
+            ALOGE("shared weight adapter task(%s) requires layer adapter weight and manifest templates", task_id.c_str());
+            return false;
+        }
+
+        for (int i = 0; i < _attr.axmodel_num; ++i)
+        {
+            const std::string weight_file = format_path_pattern(adapter->adapter_weight_template_filename, i);
+            const std::string manifest_file =
+                format_path_pattern(adapter->adapter_patch_manifest_template_filename, i);
+            const int ret = llama_layers[(size_t)i].layer.switch_shared_weight_task(weight_file.c_str(),
+                                                                                   manifest_file.c_str(),
+                                                                                   task_id.c_str());
+            if (ret != 0)
+            {
+                set_last_error("failed to switch shared weight adapter layer " + std::to_string(i) +
+                               " to task: " + task_id);
+                ALOGE("switch shared adapter failed: task=%s layer=%d ret=0x%x", task_id.c_str(), i, ret);
+                return false;
+            }
+        }
+
+        const bool post_shared_enabled = !_attr.shared_base_weight_filename_post.empty() ||
+                                         !_attr.shared_base_filename_post_axmodel.empty();
+        if (post_shared_enabled)
+        {
+            if (adapter->adapter_weight_filename_post.empty() ||
+                adapter->adapter_patch_manifest_filename_post.empty())
+            {
+                set_last_error("shared weight adapter task misses post patch: " + task_id);
+                ALOGE("shared adapter task(%s) requires post adapter weight and manifest", task_id.c_str());
+                return false;
+            }
+            const int ret = llama_post.switch_shared_weight_task(adapter->adapter_weight_filename_post.c_str(),
+                                                                adapter->adapter_patch_manifest_filename_post.c_str(),
+                                                                task_id.c_str());
+            if (ret != 0)
+            {
+                set_last_error("failed to switch shared weight adapter post to task: " + task_id);
+                ALOGE("switch shared adapter post failed: task=%s ret=0x%x", task_id.c_str(), ret);
+                return false;
+            }
+        }
+
+        active_shared_weight_task_ = task_id;
+        if (!ReinitVisionForAdapter(*adapter))
+        {
+            return false;
+        }
+        ResetKVCache();
+        ALOGI("active shared weight adapter task: %s", active_shared_weight_task_.c_str());
+        return true;
     }
 
     int layer_devid_for(int layer_idx) const
@@ -2490,6 +2658,7 @@ struct LLM::Impl {
     {
         ALOGI("LLM init start");
         this->_attr = attr;
+        active_shared_weight_task_ = _attr.shared_weight_task_id;
         set_ax650_model_buffer_release_env(_attr.b_release_axmodel_buffer_after_init);
         dynamic_layer_load_enabled_ = _attr.dynamic_load_enable;
         dynamic_layer_pool_size_ = _attr.dynamic_load_pool_size;
@@ -2577,6 +2746,60 @@ struct LLM::Impl {
         tokenizer->set_generation_thinking_mode(this->_attr.generation_thinking_mode);
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
 
+        const bool shared_layer_split_enabled = !_attr.shared_base_weight_template_filename.empty() &&
+                                                !_attr.shared_adapter_weight_template_filename.empty();
+        const bool shared_weight_bundle_enabled = !_attr.shared_base_template_filename_axmodel.empty() ||
+                                                  shared_layer_split_enabled;
+        const std::string adapter_template_filename =
+            _attr.shared_adapter_template_filename_axmodel.empty() ? _attr.template_filename_axmodel
+                                                                   : _attr.shared_adapter_template_filename_axmodel;
+        auto layer_model_file = [&](int idx) -> std::string { return format_path_pattern(adapter_template_filename, idx); };
+        auto base_model_file = [&](int idx) -> std::string { return format_path_pattern(_attr.shared_base_template_filename_axmodel, idx); };
+        auto base_weight_file = [&](int idx) -> std::string { return format_path_pattern(_attr.shared_base_weight_template_filename, idx); };
+        auto adapter_weight_file = [&](int idx) -> std::string { return format_path_pattern(_attr.shared_adapter_weight_template_filename, idx); };
+        auto adapter_patch_manifest_file = [&](int idx) -> std::string { return format_path_pattern(_attr.shared_adapter_patch_manifest_template_filename, idx); };
+        auto init_layer_runner = [&](ax_runner_t &runner, int idx, int devid) -> int {
+            const std::string model_file = layer_model_file(idx);
+            if (shared_weight_bundle_enabled)
+            {
+                const std::string base_file = base_model_file(idx);
+                const std::string base_weight = base_weight_file(idx);
+                const std::string adapter_weight = adapter_weight_file(idx);
+                const std::string patch_manifest = adapter_patch_manifest_file(idx);
+                return runner.init_with_shared_weight_bundle(model_file.c_str(),
+                                                             base_file.c_str(),
+                                                             base_weight.c_str(),
+                                                             adapter_weight.c_str(),
+                                                             patch_manifest.c_str(),
+                                                             _attr.shared_weight_task_id.c_str(),
+                                                             devid);
+            }
+            return runner.init(model_file.c_str(), devid);
+        };
+        auto init_post_runner = [&](ax_runner_t &runner, int devid) -> int {
+            const std::string post_model_file = _attr.shared_adapter_filename_post_axmodel.empty()
+                                                    ? _attr.filename_post_axmodel
+                                                    : _attr.shared_adapter_filename_post_axmodel;
+            const bool shared_post_enabled = !_attr.shared_base_filename_post_axmodel.empty() ||
+                                             (!_attr.shared_base_weight_filename_post.empty() &&
+                                              !_attr.shared_adapter_weight_filename_post.empty());
+            if (shared_post_enabled)
+            {
+                return runner.init_with_shared_weight_bundle(post_model_file.c_str(),
+                                                             _attr.shared_base_filename_post_axmodel.c_str(),
+                                                             _attr.shared_base_weight_filename_post.c_str(),
+                                                             _attr.shared_adapter_weight_filename_post.c_str(),
+                                                             _attr.shared_adapter_patch_manifest_filename_post.c_str(),
+                                                             _attr.shared_weight_task_id.c_str(),
+                                                             devid);
+            }
+            if (shared_weight_bundle_enabled)
+            {
+                ALOGW("shared base weight bundle is enabled for LLM layers, but post axmodel shared bundle is not configured; loading post axmodel normally");
+            }
+            return runner.init(post_model_file.c_str(), devid);
+        };
+
 #ifdef USE_AXCL
         llama_layers.resize(attr.axmodel_num);
         auto dev_assign = distributeModels((int)_attr.dev_ids.size(), attr.axmodel_num);
@@ -2586,9 +2809,7 @@ struct LLM::Impl {
         // Prepare filenames first (thread-safe, no I/O).
         for (int i = 0; i < attr.axmodel_num; i++)
         {
-            char path[1024];
-            std::snprintf(path, sizeof(path), attr.template_filename_axmodel.c_str(), i);
-            llama_layers[i].filename = path;
+            llama_layers[i].filename = layer_model_file(i);
             const int dev_idx = (dev_assign.empty() ? 0 : dev_assign[i]);
             if (dev_idx >= 0 && (size_t)dev_idx < _attr.dev_ids.size())
                 dynamic_layer_devids_[(size_t)i] = _attr.dev_ids[(size_t)dev_idx];
@@ -2610,7 +2831,7 @@ struct LLM::Impl {
             const int devid = _attr.dev_ids.front();
             for (int i = 0; i < attr.axmodel_num; i++)
             {
-                const int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
+                const int ret = init_layer_runner(llama_layers[i].layer, i, devid);
                 if (ret != 0)
                 {
                     ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str());
@@ -2628,7 +2849,7 @@ struct LLM::Impl {
             std::fill(dynamic_layer_loaded_.begin(), dynamic_layer_loaded_.end(), 0);
             dynamic_layer_lru_.clear();
 
-            int ret = llama_post.init(attr.filename_post_axmodel.c_str(), devid);
+            int ret = init_post_runner(llama_post, devid);
             if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
             char path[1024];
             sprintf(path, "init post axmodel ok,remain_cmm(%d MB)", axcl_GetCMMRemain(devid));
@@ -2664,7 +2885,7 @@ struct LLM::Impl {
             loaders.emplace_back([&, dev_idx, devid]() {
                 for (const int i : models_per_dev[dev_idx])
                 {
-                    const int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), devid);
+                    const int ret = init_layer_runner(llama_layers[i].layer, i, devid);
                     const int remain = axcl_GetCMMRemain(devid);
 
                     char buf[256];
@@ -2710,7 +2931,7 @@ struct LLM::Impl {
         for (int i = 0; i < attr.axmodel_num; i++) { if (rets[i] != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; } }
         {
             int post_devid = llama_layers.back().layer.get_devid();
-            int ret = llama_post.init(attr.filename_post_axmodel.c_str(), post_devid);
+            int ret = init_post_runner(llama_post, post_devid);
             if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
             char path[1024];
             sprintf(path, "init post axmodel ok,remain_cmm(%d MB)", axcl_GetCMMRemain(post_devid));
@@ -2722,14 +2943,13 @@ struct LLM::Impl {
         char axmodel_path[1024];
         for (int i = 0; i < attr.axmodel_num; i++)
         {
-            sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
-            llama_layers[i].filename = axmodel_path;
+            llama_layers[i].filename = layer_model_file(i);
         }
         if (dynamic_layer_load_enabled())
         {
             for (int i = 0; i < attr.axmodel_num; i++)
             {
-                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), -1);
+                int ret = init_layer_runner(llama_layers[i].layer, i, -1);
                 if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
                 llama_layers[i].layer.set_auto_sync_before_inference(true);
                 llama_layers[i].layer.set_auto_sync_after_inference(true);
@@ -2743,7 +2963,7 @@ struct LLM::Impl {
             std::fill(dynamic_layer_loaded_.begin(), dynamic_layer_loaded_.end(), 0);
             dynamic_layer_lru_.clear();
 
-            int ret = llama_post.init(attr.filename_post_axmodel.c_str(), -1);
+            int ret = init_post_runner(llama_post, -1);
             if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
             llama_post.set_auto_sync_before_inference(true);
             llama_post.set_auto_sync_after_inference(true);
@@ -2755,7 +2975,7 @@ struct LLM::Impl {
         {
             for (int i = 0; i < attr.axmodel_num; i++)
             {
-                int ret = llama_layers[i].layer.init(llama_layers[i].filename.c_str(), -1);
+                int ret = init_layer_runner(llama_layers[i].layer, i, -1);
                 if (ret != 0) { ALOGE("init axmodel(%s) failed", llama_layers[i].filename.c_str()); return false; }
                 llama_layers[i].layer.set_auto_sync_before_inference(true);
                 llama_layers[i].layer.set_auto_sync_after_inference(true);
@@ -2764,7 +2984,7 @@ struct LLM::Impl {
                 update_cqdm(&cqdm, i + 1, "count", axmodel_path);
             }
             {
-                int ret = llama_post.init(attr.filename_post_axmodel.c_str(), -1);
+                int ret = init_post_runner(llama_post, -1);
                 if (ret != 0) { ALOGE("init post axmodel(%s) failed", attr.filename_post_axmodel.c_str()); return false; }
                 llama_post.set_auto_sync_before_inference(true);
                 llama_post.set_auto_sync_after_inference(true);
@@ -2880,6 +3100,10 @@ struct LLM::Impl {
                       verr.c_str());
                 return false;
             }
+            active_image_encoder_axmodel_ = _attr.filename_image_encoder_axmodel;
+            active_audio_encoder_axmodel_5s_ = _attr.filename_audio_encoder_axmodel_5s;
+            active_audio_encoder_axmodel_30s_ = _attr.filename_audio_encoder_axmodel_30s;
+            active_vision_num_frames_ = _attr.vision_num_frames;
         }
 
         if (!this->_attr.post_config_path.empty())
@@ -5448,6 +5672,7 @@ void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->s
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
 void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
+bool LLM::SetSharedWeightTask(const std::string &task_id) { return impl_->SetSharedWeightTask(task_id); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
 bool LLM::Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding) { return impl_->EmbedHistory(history, media_inputs, out_embedding); }

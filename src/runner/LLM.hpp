@@ -22,6 +22,18 @@ struct MediaInputs {
     std::vector<std::string> uris;
 };
 
+struct LLMSharedWeightAdapter {
+    std::string task_id;
+    std::string adapter_weight_template_filename;
+    std::string adapter_patch_manifest_template_filename;
+    std::string adapter_weight_filename_post;
+    std::string adapter_patch_manifest_filename_post;
+    std::string image_encoder_axmodel;
+    std::string audio_encoder_axmodel_5s;
+    std::string audio_encoder_axmodel_30s;
+    int vision_num_frames = -1;
+};
+
 struct LLMAttrType {
     std::string system_prompt;
     std::string template_filename_axmodel = "tinyllama-int8/tinyllama_l%d.axmodel";
@@ -29,6 +41,18 @@ struct LLMAttrType {
 
     bool dynamic_load_enable = false;
     int dynamic_load_pool_size = 0;
+    std::string shared_base_template_filename_axmodel;
+    std::string shared_adapter_template_filename_axmodel;
+    std::string shared_base_weight_template_filename;
+    std::string shared_adapter_weight_template_filename;
+    std::string shared_adapter_patch_manifest_template_filename;
+    std::string shared_base_filename_post_axmodel;
+    std::string shared_adapter_filename_post_axmodel;
+    std::string shared_base_weight_filename_post;
+    std::string shared_adapter_weight_filename_post;
+    std::string shared_adapter_patch_manifest_filename_post;
+    std::string shared_weight_task_id;
+    std::vector<LLMSharedWeightAdapter> shared_weight_adapters;
 
     // Optional: for models with mixed attention layer types (e.g., Qwen3.5).
     // If > 0, every Nth layer (1-indexed) is treated as full-attention and the others as linear-attention.
@@ -136,6 +160,7 @@ public:
     void MarkRequestStart();
     void ClearRequestStart();
     std::string GetLastError() const;
+    bool SetSharedWeightTask(const std::string &task_id);
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
     bool Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding);

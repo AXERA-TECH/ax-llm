@@ -14,6 +14,16 @@ protected:
 public:
     int init(const char *model_file, int devid) override;
     int init(char *model_buffer, size_t model_size, int devid) override;
+    int init_with_shared_weight_bundle(const char *model_file,
+                                       const char *shared_base_model_file,
+                                       const char *shared_base_weight_file,
+                                       const char *shared_adapter_weight_file,
+                                       const char *shared_adapter_patch_manifest_file,
+                                       const char *task_id,
+                                       int devid = -1) override;
+    int switch_shared_weight_task(const char *shared_adapter_weight_file,
+                                  const char *shared_adapter_patch_manifest_file,
+                                  const char *task_id) override;
 
     void deinit() override;
 

@@ -3,11 +3,14 @@
 #include <fstream>
 #include <algorithm>
 #include <memory>
+#include <limits>
 #include <unordered_set> // 用于去重释放物理内存
 #include <ax_sys_api.h>
 #include <ax_ivps_api.h>
 #include <ax_engine_api.h>
+#include <dlfcn.h>
 #include <fcntl.h>
+#include "json.hpp"
 #include "memory_utils.hpp"
 #include "sample_log.h"
 
@@ -20,6 +23,67 @@ typedef enum
     AX_ENGINE_ABST_DEFAULT = 0,
     AX_ENGINE_ABST_CACHED = 1,
 } AX_ENGINE_ALLOC_BUFFER_STRATEGY_T;
+
+typedef struct _AX_ENGINE_BLOB_PATCH_T
+{
+    AX_U32 offset;
+    AX_U32 size;
+    AX_U32 patchOffset;
+    AX_U32 reserve;
+} AX_ENGINE_BLOB_PATCH_T;
+
+typedef struct _AX_ENGINE_BLOB_T
+{
+    const AX_VOID* pBlob;
+    AX_U64 phyAddr;
+    AX_U32 nSize;
+    AX_CHAR* pTaskId;
+    const AX_ENGINE_BLOB_PATCH_T* pPatchList;
+    AX_U32 nPatchCount;
+    AX_U32 reserve[5];
+} AX_ENGINE_BLOB_T;
+
+typedef struct _AX_ENGINE_BLOB_BUNDLE_T
+{
+    const AX_ENGINE_BLOB_T* pBaseBlob;
+    const AX_ENGINE_BLOB_T* pAdapterBlobs;
+    AX_U32 nAdapterCount;
+    AX_CHAR* pTaskId;
+    const AX_VOID* pBaseGraph;
+    AX_U32 nBaseGraphSize;
+    AX_U32 reserve[4];
+} AX_ENGINE_BLOB_BUNDLE_T;
+
+using AX_ENGINE_CreateHandleV4_Fn = AX_S32 (*)(AX_ENGINE_HANDLE*,
+                                               const AX_VOID*,
+                                               AX_U32,
+                                               const AX_ENGINE_BLOB_BUNDLE_T*,
+                                               AX_ENGINE_HANDLE_EXTRA_T*);
+using AX_ENGINE_PatchHandleWBT_Fn = AX_S32 (*)(AX_ENGINE_HANDLE, const AX_ENGINE_BLOB_T*);
+
+static AX_ENGINE_CreateHandleV4_Fn resolve_create_handle_v4()
+{
+    static AX_ENGINE_CreateHandleV4_Fn fn = nullptr;
+    static bool resolved = false;
+    if (!resolved)
+    {
+        resolved = true;
+        fn = reinterpret_cast<AX_ENGINE_CreateHandleV4_Fn>(dlsym(RTLD_DEFAULT, "AX_ENGINE_CreateHandleV4"));
+    }
+    return fn;
+}
+
+static AX_ENGINE_PatchHandleWBT_Fn resolve_patch_handle_wbt()
+{
+    static AX_ENGINE_PatchHandleWBT_Fn fn = nullptr;
+    static bool resolved = false;
+    if (!resolved)
+    {
+        resolved = true;
+        fn = reinterpret_cast<AX_ENGINE_PatchHandleWBT_Fn>(dlsym(RTLD_DEFAULT, "AX_ENGINE_PatchHandleWBT"));
+    }
+    return fn;
+}
 
 // 封装一个结构体来管理内部句柄，方便管理
 struct ax_runner_ax650_handle_t
@@ -155,6 +219,161 @@ static void release_model_buffer_after_init_if_enabled(std::vector<char> &buffer
     const size_t bytes = buffer.size();
     std::vector<char>().swap(buffer);
     ALOGI("released host-side axmodel buffer after init: %.2f MB", bytes / 1024.0 / 1024.0);
+}
+
+static int load_file_to_buffer(const char *model_file, std::vector<char> &buffer)
+{
+    if (!model_file || !model_file[0])
+        return -1;
+    MMap model_buffer;
+    if (!model_buffer.open_file(model_file))
+    {
+        ALOGE("model file(%s) open failed", model_file);
+        return -1;
+    }
+    buffer.assign(reinterpret_cast<const char *>(model_buffer.data()),
+                  reinterpret_cast<const char *>(model_buffer.data()) + model_buffer.size());
+    return 0;
+}
+
+static bool load_patch_manifest(const char *manifest_file, std::vector<ax_runner_shared_patch_t> &patches)
+{
+    patches.clear();
+    if (!manifest_file || !manifest_file[0])
+    {
+        return true;
+    }
+
+    std::ifstream ifs(manifest_file);
+    if (!ifs.is_open())
+    {
+        ALOGE("shared adapter patch manifest(%s) open failed", manifest_file);
+        return false;
+    }
+
+    try
+    {
+        nlohmann::json j;
+        ifs >> j;
+        if (!j.contains("changed_segments") || !j["changed_segments"].is_array())
+        {
+            ALOGE("shared adapter patch manifest(%s) misses array key changed_segments", manifest_file);
+            return false;
+        }
+
+        for (const auto &item : j["changed_segments"])
+        {
+            const auto offset = item.at("offset").get<unsigned long long>();
+            const auto size = item.at("size").get<unsigned long long>();
+            const auto patch_offset = item.at("pack_offset").get<unsigned long long>();
+            if (offset > std::numeric_limits<unsigned int>::max() ||
+                size > std::numeric_limits<unsigned int>::max() ||
+                patch_offset > std::numeric_limits<unsigned int>::max())
+            {
+                ALOGE("shared adapter patch manifest(%s) contains a segment above uint32 range", manifest_file);
+                return false;
+            }
+
+            ax_runner_shared_patch_t patch;
+            patch.offset = static_cast<unsigned int>(offset);
+            patch.size = static_cast<unsigned int>(size);
+            patch.patch_offset = static_cast<unsigned int>(patch_offset);
+            patches.push_back(patch);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        ALOGE("shared adapter patch manifest(%s) parse failed: %s", manifest_file, e.what());
+        return false;
+    }
+
+    return true;
+}
+
+static std::vector<AX_ENGINE_BLOB_PATCH_T> make_engine_patch_list(const std::vector<ax_runner_shared_patch_t> &patches)
+{
+    std::vector<AX_ENGINE_BLOB_PATCH_T> engine_patches;
+    engine_patches.reserve(patches.size());
+    for (const auto &patch : patches)
+    {
+        AX_ENGINE_BLOB_PATCH_T item{};
+        item.offset = patch.offset;
+        item.size = patch.size;
+        item.patchOffset = patch.patch_offset;
+        engine_patches.push_back(item);
+    }
+    return engine_patches;
+}
+
+static bool build_restore_patch_from_base(const std::vector<char> &base_weight,
+                                          const std::vector<ax_runner_shared_patch_t> &patches,
+                                          std::vector<char> &restore_buffer,
+                                          std::vector<ax_runner_shared_patch_t> &restore_patches)
+{
+    restore_buffer.clear();
+    restore_patches.clear();
+    restore_patches.reserve(patches.size());
+
+    for (const auto &patch : patches)
+    {
+        const size_t offset = patch.offset;
+        const size_t size = patch.size;
+        if (size == 0 || offset > base_weight.size() || size > base_weight.size() - offset)
+        {
+            ALOGE("base restore segment out of range: offset=%u size=%u base_size=%zu",
+                  patch.offset,
+                  patch.size,
+                  base_weight.size());
+            return false;
+        }
+
+        ax_runner_shared_patch_t restore = patch;
+        restore.patch_offset = (unsigned int)restore_buffer.size();
+        restore_buffer.insert(restore_buffer.end(),
+                              base_weight.begin() + (ptrdiff_t)offset,
+                              base_weight.begin() + (ptrdiff_t)(offset + size));
+        restore_patches.push_back(restore);
+    }
+
+    return true;
+}
+
+static int apply_wbt_patch(AX_ENGINE_HANDLE handle,
+                           const std::vector<char> &patch_buffer,
+                           const std::vector<ax_runner_shared_patch_t> &patches,
+                           const char *task_id)
+{
+    if (!handle)
+    {
+        ALOGE("apply shared WBT patch failed: empty handle");
+        return -1;
+    }
+    if (patch_buffer.empty() || patches.empty())
+    {
+        return 0;
+    }
+
+    AX_ENGINE_PatchHandleWBT_Fn patch_handle_wbt = resolve_patch_handle_wbt();
+    if (!patch_handle_wbt)
+    {
+        ALOGE("AX_ENGINE_PatchHandleWBT symbol not found; dynamic shared adapter switching is unsupported by current libax_engine.so");
+        return -1;
+    }
+
+    std::vector<AX_ENGINE_BLOB_PATCH_T> engine_patches = make_engine_patch_list(patches);
+    AX_ENGINE_BLOB_T patch_blob{};
+    patch_blob.pBlob = patch_buffer.data();
+    patch_blob.nSize = (AX_U32)patch_buffer.size();
+    patch_blob.pTaskId = const_cast<AX_CHAR *>(task_id ? task_id : "");
+    patch_blob.pPatchList = engine_patches.data();
+    patch_blob.nPatchCount = (AX_U32)engine_patches.size();
+
+    const int ret = patch_handle_wbt(handle, &patch_blob);
+    if (ret != 0)
+    {
+        ALOGE("AX_ENGINE_PatchHandleWBT failed for task(%s): 0x%x", task_id ? task_id : "", ret);
+    }
+    return ret;
 }
 
 int ax_runner_ax650::sub_init()
@@ -456,15 +675,160 @@ int ax_runner_ax650::init(const char *model_file, int /*devid*/)
     if (m_handle)
         deinit();
 
-    MMap model_buffer;
-    if (!model_buffer.open_file(model_file))
+    m_shared_base_model_file.clear();
+    m_shared_base_weight_file.clear();
+    m_shared_adapter_weight_file.clear();
+    m_shared_adapter_patch_manifest_file.clear();
+    m_shared_weight_task_id.clear();
+    if (load_file_to_buffer(model_file, m_model_buffer) != 0)
+        return -1;
+    auto ret = init(m_model_buffer.data(), m_model_buffer.size(), -1);
+    return ret;
+}
+
+int ax_runner_ax650::init_with_shared_weight_bundle(const char *model_file,
+                                                    const char *shared_base_model_file,
+                                                    const char *shared_base_weight_file,
+                                                    const char *shared_adapter_weight_file,
+                                                    const char *shared_adapter_patch_manifest_file,
+                                                    const char *task_id,
+                                                    int devid)
+{
+    const bool has_split_weights = shared_base_weight_file && shared_base_weight_file[0] &&
+                                   shared_adapter_weight_file && shared_adapter_weight_file[0];
+    const bool has_legacy_base_model = shared_base_model_file && shared_base_model_file[0];
+    if ((!has_split_weights && !has_legacy_base_model) || !task_id || !task_id[0])
     {
-        ALOGE("model file(%s) open failed", model_file);
+        return init(model_file, devid);
+    }
+
+    if (m_handle)
+        deinit();
+
+    m_shared_base_model_file = shared_base_model_file ? shared_base_model_file : "";
+    m_shared_base_weight_file = shared_base_weight_file ? shared_base_weight_file : "";
+    m_shared_adapter_weight_file = shared_adapter_weight_file ? shared_adapter_weight_file : "";
+    m_shared_adapter_patch_manifest_file =
+        shared_adapter_patch_manifest_file ? shared_adapter_patch_manifest_file : "";
+    m_shared_weight_task_id = task_id;
+
+    if (load_file_to_buffer(model_file, m_model_buffer) != 0)
+    {
+        m_shared_base_model_file.clear();
+        m_shared_weight_task_id.clear();
         return -1;
     }
-    m_model_buffer.assign(reinterpret_cast<const char *>(model_buffer.data()),
-                          reinterpret_cast<const char *>(model_buffer.data()) + model_buffer.size());
-    auto ret = init(m_model_buffer.data(), m_model_buffer.size(), -1);
+    if (has_split_weights)
+    {
+        if (has_legacy_base_model && load_file_to_buffer(shared_base_model_file, m_shared_base_model_buffer) != 0)
+        {
+            m_model_buffer.clear();
+            m_shared_base_model_buffer.clear();
+            m_shared_base_model_file.clear();
+            m_shared_base_weight_file.clear();
+            m_shared_adapter_weight_file.clear();
+            m_shared_adapter_patch_manifest_file.clear();
+            m_shared_weight_task_id.clear();
+            return -1;
+        }
+        if (load_file_to_buffer(shared_base_weight_file, m_shared_base_weight_buffer) != 0 ||
+            load_file_to_buffer(shared_adapter_weight_file, m_shared_adapter_weight_buffer) != 0 ||
+            !load_patch_manifest(shared_adapter_patch_manifest_file, m_shared_adapter_patches))
+        {
+            m_model_buffer.clear();
+            m_shared_base_weight_buffer.clear();
+            m_shared_adapter_weight_buffer.clear();
+            m_shared_adapter_patches.clear();
+            m_shared_base_model_file.clear();
+            m_shared_base_weight_file.clear();
+            m_shared_adapter_weight_file.clear();
+            m_shared_adapter_patch_manifest_file.clear();
+            m_shared_weight_task_id.clear();
+            return -1;
+        }
+    }
+    else if (load_file_to_buffer(shared_base_model_file, m_shared_base_model_buffer) != 0)
+    {
+        m_model_buffer.clear();
+        m_shared_base_model_file.clear();
+        m_shared_weight_task_id.clear();
+        return -1;
+    }
+
+    m_handle = new ax_runner_ax650_handle_t;
+    AX_ENGINE_HANDLE_EXTRA_T extra{};
+    extra.pName = (AX_S8 *)(AX_CMM_SESSION_NAME);
+
+    AX_ENGINE_BLOB_T base_blob{};
+    base_blob.pBlob = has_split_weights ? m_shared_base_weight_buffer.data() : m_shared_base_model_buffer.data();
+    base_blob.phyAddr = 0;
+    base_blob.nSize = (AX_U32)(has_split_weights ? m_shared_base_weight_buffer.size() : m_shared_base_model_buffer.size());
+    base_blob.pTaskId = nullptr;
+
+    std::vector<AX_ENGINE_BLOB_PATCH_T> engine_patches = make_engine_patch_list(m_shared_adapter_patches);
+    AX_ENGINE_BLOB_T adapter_blob{};
+    adapter_blob.pBlob = has_split_weights ? m_shared_adapter_weight_buffer.data() : m_model_buffer.data();
+    adapter_blob.phyAddr = 0;
+    adapter_blob.nSize = (AX_U32)(has_split_weights ? m_shared_adapter_weight_buffer.size() : m_model_buffer.size());
+    adapter_blob.pTaskId = const_cast<AX_CHAR *>(task_id);
+    adapter_blob.pPatchList = engine_patches.empty() ? nullptr : engine_patches.data();
+    adapter_blob.nPatchCount = (AX_U32)engine_patches.size();
+
+    AX_ENGINE_BLOB_BUNDLE_T bundle{};
+    bundle.pBaseBlob = &base_blob;
+    bundle.pAdapterBlobs = &adapter_blob;
+    bundle.nAdapterCount = 1;
+    bundle.pTaskId = const_cast<AX_CHAR *>(task_id);
+    bundle.pBaseGraph = m_shared_base_model_buffer.empty() ? nullptr : m_shared_base_model_buffer.data();
+    bundle.nBaseGraphSize = (AX_U32)m_shared_base_model_buffer.size();
+
+    AX_ENGINE_CreateHandleV4_Fn create_handle_v4 = resolve_create_handle_v4();
+    if (!create_handle_v4)
+    {
+        ALOGE("AX_ENGINE_CreateHandleV4 symbol not found; shared base weight bundle is unsupported by current libax_engine.so");
+        delete m_handle;
+        m_handle = nullptr;
+        m_model_buffer.clear();
+        m_shared_base_model_buffer.clear();
+        m_shared_base_weight_buffer.clear();
+        m_shared_adapter_weight_buffer.clear();
+        return -1;
+    }
+
+    int ret = create_handle_v4(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &bundle, &extra);
+    if (0 != ret)
+    {
+        ALOGE("AX_ENGINE_CreateHandleV4 failed for shared base weight bundle: 0x%x", ret);
+        delete m_handle;
+        m_handle = nullptr;
+        m_model_buffer.clear();
+        m_shared_base_model_buffer.clear();
+        m_shared_base_weight_buffer.clear();
+        m_shared_adapter_weight_buffer.clear();
+        return ret;
+    }
+
+    ret = AX_ENGINE_CreateContextV2(m_handle->handle, &m_handle->context);
+    if (ret != 0)
+    {
+        ALOGW("AX_ENGINE_CreateContextV2 failed: 0x%x, fallback to AX_ENGINE_CreateContext", ret);
+        ret = AX_ENGINE_CreateContext(m_handle->handle);
+        if (ret != 0)
+        {
+            ALOGE("AX_ENGINE_CreateContext failed: 0x%x", ret);
+            deinit();
+            return ret;
+        }
+        m_handle->context = 0;
+    }
+    ret = sub_init();
+    if (ret == 0)
+    {
+        release_model_buffer_after_init_if_enabled(m_model_buffer);
+        release_model_buffer_after_init_if_enabled(m_shared_base_model_buffer);
+        release_model_buffer_after_init_if_enabled(m_shared_base_weight_buffer);
+        release_model_buffer_after_init_if_enabled(m_shared_adapter_weight_buffer);
+    }
     return ret;
 }
 
@@ -473,6 +837,11 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
     if (m_handle)
         deinit(); // 防止多次 init 导致泄漏
 
+    m_shared_base_model_file.clear();
+    m_shared_base_weight_file.clear();
+    m_shared_adapter_weight_file.clear();
+    m_shared_adapter_patch_manifest_file.clear();
+    m_shared_weight_task_id.clear();
     if (m_model_buffer.data() != model_buffer || m_model_buffer.size() != model_size)
     {
         m_model_buffer.assign(model_buffer, model_buffer + model_size);
@@ -514,6 +883,89 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
     return ret;
 }
 
+int ax_runner_ax650::switch_shared_weight_task(const char *shared_adapter_weight_file,
+                                               const char *shared_adapter_patch_manifest_file,
+                                               const char *task_id)
+{
+    const std::string next_adapter_weight_file = shared_adapter_weight_file ? shared_adapter_weight_file : "";
+    const std::string next_adapter_manifest_file = shared_adapter_patch_manifest_file ? shared_adapter_patch_manifest_file : "";
+    const std::string next_task_id = task_id ? task_id : "";
+
+    if (next_adapter_weight_file.empty() || next_adapter_manifest_file.empty() || next_task_id.empty())
+    {
+        ALOGE("switch_shared_weight_task requires adapter weight, manifest, and task_id");
+        return -1;
+    }
+    if (m_shared_base_weight_file.empty())
+    {
+        ALOGE("switch_shared_weight_task requires a split shared-base model initialized with base weight");
+        return -1;
+    }
+    if (next_task_id == m_shared_weight_task_id &&
+        next_adapter_weight_file == m_shared_adapter_weight_file &&
+        next_adapter_manifest_file == m_shared_adapter_patch_manifest_file)
+    {
+        return 0;
+    }
+
+    std::vector<ax_runner_shared_patch_t> next_patches;
+    std::vector<char> next_patch_buffer;
+    if (load_file_to_buffer(next_adapter_weight_file.c_str(), next_patch_buffer) != 0 ||
+        !load_patch_manifest(next_adapter_manifest_file.c_str(), next_patches))
+    {
+        ALOGE("load shared adapter patch failed for task(%s)", next_task_id.c_str());
+        return -1;
+    }
+
+    if (has_handle_loaded())
+    {
+        if (!m_shared_adapter_patches.empty())
+        {
+            std::vector<char> base_weight;
+            if (load_file_to_buffer(m_shared_base_weight_file.c_str(), base_weight) != 0)
+            {
+                ALOGE("load shared base weight failed for restore: %s", m_shared_base_weight_file.c_str());
+                return -1;
+            }
+
+            std::vector<char> restore_buffer;
+            std::vector<ax_runner_shared_patch_t> restore_patches;
+            if (!build_restore_patch_from_base(base_weight, m_shared_adapter_patches, restore_buffer, restore_patches))
+            {
+                return -1;
+            }
+
+            const int restore_ret = apply_wbt_patch(m_handle->handle,
+                                                    restore_buffer,
+                                                    restore_patches,
+                                                    "base_restore");
+            if (restore_ret != 0)
+            {
+                return restore_ret;
+            }
+        }
+
+        const int patch_ret = apply_wbt_patch(m_handle->handle,
+                                              next_patch_buffer,
+                                              next_patches,
+                                              next_task_id.c_str());
+        if (patch_ret != 0)
+        {
+            return patch_ret;
+        }
+    }
+
+    m_shared_adapter_weight_file = next_adapter_weight_file;
+    m_shared_adapter_patch_manifest_file = next_adapter_manifest_file;
+    m_shared_weight_task_id = next_task_id;
+    m_shared_adapter_patches = std::move(next_patches);
+    m_shared_adapter_weight_buffer.clear();
+    m_shared_adapter_weight_buffer.shrink_to_fit();
+
+    ALOGI("switched shared WBT adapter task to %s", m_shared_weight_task_id.c_str());
+    return 0;
+}
+
 bool ax_runner_ax650::has_handle_loaded() const
 {
     return m_handle && m_handle->handle != nullptr;
@@ -527,6 +979,18 @@ int ax_runner_ax650::load_handle_reuse_io(const char *model_file, int /*devid*/)
     // No prepared IO buffers yet → fall back to full init (allocates IO buffers).
     if (!m_handle || m_handle->io_data.empty() || mgroup_input_tensors.empty() || mgroup_output_tensors.empty())
     {
+        if ((!m_shared_base_model_file.empty() ||
+             (!m_shared_base_weight_file.empty() && !m_shared_adapter_weight_file.empty())) &&
+            !m_shared_weight_task_id.empty())
+        {
+            return init_with_shared_weight_bundle(model_file,
+                                                  m_shared_base_model_file.c_str(),
+                                                  m_shared_base_weight_file.c_str(),
+                                                  m_shared_adapter_weight_file.c_str(),
+                                                  m_shared_adapter_patch_manifest_file.c_str(),
+                                                  m_shared_weight_task_id.c_str(),
+                                                  -1);
+        }
         return init(model_file, -1);
     }
 
@@ -548,13 +1012,94 @@ int ax_runner_ax650::load_handle_reuse_io(const char *model_file, int /*devid*/)
                               reinterpret_cast<const char *>(model_buffer.data()) + model_buffer.size());
     }
 
+    const bool has_split_weights = !m_shared_base_weight_file.empty() && !m_shared_adapter_weight_file.empty();
+    if (has_split_weights)
+    {
+        if (!m_shared_base_model_file.empty() && m_shared_base_model_buffer.empty() &&
+            load_file_to_buffer(m_shared_base_model_file.c_str(), m_shared_base_model_buffer) != 0)
+        {
+            ALOGE("shared base graph file(%s) open failed", m_shared_base_model_file.c_str());
+            return -1;
+        }
+        if (m_shared_base_weight_buffer.empty() &&
+            load_file_to_buffer(m_shared_base_weight_file.c_str(), m_shared_base_weight_buffer) != 0)
+        {
+            ALOGE("shared base weight file(%s) open failed", m_shared_base_weight_file.c_str());
+            return -1;
+        }
+        if (m_shared_adapter_weight_buffer.empty() &&
+            load_file_to_buffer(m_shared_adapter_weight_file.c_str(), m_shared_adapter_weight_buffer) != 0)
+        {
+            ALOGE("shared adapter weight file(%s) open failed", m_shared_adapter_weight_file.c_str());
+            return -1;
+        }
+        if (m_shared_adapter_patches.empty() &&
+            !load_patch_manifest(m_shared_adapter_patch_manifest_file.c_str(), m_shared_adapter_patches))
+        {
+            return -1;
+        }
+    }
+    else if (!m_shared_base_model_file.empty() && m_shared_base_model_buffer.empty())
+    {
+        if (load_file_to_buffer(m_shared_base_model_file.c_str(), m_shared_base_model_buffer) != 0)
+        {
+            ALOGE("shared base model file(%s) open failed", m_shared_base_model_file.c_str());
+            return -1;
+        }
+    }
+
     AX_ENGINE_HANDLE_EXTRA_T extra{};
     extra.pName = (AX_S8 *)(AX_CMM_SESSION_NAME);
 
-    int ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &extra);
+    int ret = 0;
+    if ((!m_shared_base_model_file.empty() || has_split_weights) && !m_shared_weight_task_id.empty())
+    {
+        AX_ENGINE_BLOB_T base_blob{};
+        base_blob.pBlob = has_split_weights ? m_shared_base_weight_buffer.data() : m_shared_base_model_buffer.data();
+        base_blob.phyAddr = 0;
+        base_blob.nSize = (AX_U32)(has_split_weights ? m_shared_base_weight_buffer.size() : m_shared_base_model_buffer.size());
+        base_blob.pTaskId = nullptr;
+
+        std::vector<AX_ENGINE_BLOB_PATCH_T> engine_patches = make_engine_patch_list(m_shared_adapter_patches);
+        AX_ENGINE_BLOB_T adapter_blob{};
+        adapter_blob.pBlob = has_split_weights ? m_shared_adapter_weight_buffer.data() : m_model_buffer.data();
+        adapter_blob.phyAddr = 0;
+        adapter_blob.nSize = (AX_U32)(has_split_weights ? m_shared_adapter_weight_buffer.size() : m_model_buffer.size());
+        adapter_blob.pTaskId = const_cast<AX_CHAR *>(m_shared_weight_task_id.c_str());
+        adapter_blob.pPatchList = engine_patches.empty() ? nullptr : engine_patches.data();
+        adapter_blob.nPatchCount = (AX_U32)engine_patches.size();
+
+        AX_ENGINE_BLOB_BUNDLE_T bundle{};
+        bundle.pBaseBlob = &base_blob;
+        bundle.pAdapterBlobs = &adapter_blob;
+        bundle.nAdapterCount = 1;
+        bundle.pTaskId = const_cast<AX_CHAR *>(m_shared_weight_task_id.c_str());
+        bundle.pBaseGraph = m_shared_base_model_buffer.empty() ? nullptr : m_shared_base_model_buffer.data();
+        bundle.nBaseGraphSize = (AX_U32)m_shared_base_model_buffer.size();
+
+        AX_ENGINE_CreateHandleV4_Fn create_handle_v4 = resolve_create_handle_v4();
+        if (!create_handle_v4)
+        {
+            ALOGE("AX_ENGINE_CreateHandleV4 symbol not found during reload; shared base weight bundle is unsupported by current libax_engine.so");
+            return -1;
+        }
+
+        ret = create_handle_v4(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &bundle, &extra);
+        if (ret != 0)
+        {
+            ALOGE("AX_ENGINE_CreateHandleV4 failed during shared base reload: 0x%x", ret);
+            m_handle->handle = nullptr;
+            return ret;
+        }
+    }
+
     if (ret != 0)
     {
-        ret = AX_ENGINE_CreateHandle(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size());
+        ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &extra);
+        if (ret != 0)
+        {
+            ret = AX_ENGINE_CreateHandle(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size());
+        }
     }
     if (ret != 0)
     {
@@ -584,6 +1129,9 @@ int ax_runner_ax650::load_handle_reuse_io(const char *model_file, int /*devid*/)
     for (auto &p : m_handle->io_info) p = nullptr;
 
     release_model_buffer_after_init_if_enabled(m_model_buffer);
+    release_model_buffer_after_init_if_enabled(m_shared_base_model_buffer);
+    release_model_buffer_after_init_if_enabled(m_shared_base_weight_buffer);
+    release_model_buffer_after_init_if_enabled(m_shared_adapter_weight_buffer);
 
     return 0;
 }
@@ -667,6 +1215,19 @@ void ax_runner_ax650::deinit()
     m_handle = nullptr;
     m_model_buffer.clear();
     m_model_buffer.shrink_to_fit();
+    m_shared_base_model_buffer.clear();
+    m_shared_base_model_buffer.shrink_to_fit();
+    m_shared_base_weight_buffer.clear();
+    m_shared_base_weight_buffer.shrink_to_fit();
+    m_shared_adapter_weight_buffer.clear();
+    m_shared_adapter_weight_buffer.shrink_to_fit();
+    m_shared_adapter_patches.clear();
+    m_shared_adapter_patches.shrink_to_fit();
+    m_shared_base_model_file.clear();
+    m_shared_base_weight_file.clear();
+    m_shared_adapter_weight_file.clear();
+    m_shared_adapter_patch_manifest_file.clear();
+    m_shared_weight_task_id.clear();
 
     // 清空容器
     moutput_tensors.clear();

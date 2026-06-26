@@ -46,6 +46,11 @@ protected:
     std::map<std::string, ax_runner_tensor_t> map_input_tensors;
 
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_output_tensors;
+    std::string m_shared_base_model_file;
+    std::string m_shared_base_weight_file;
+    std::string m_shared_adapter_weight_file;
+    std::string m_shared_adapter_patch_manifest_file;
+    std::string m_shared_weight_task_id;
     std::map<std::string, std::vector<ax_runner_tensor_t>> map_group_input_tensors;
 
     // ---- Multi-slot KV cache (device-resident prefix cache) ----
@@ -98,6 +103,30 @@ public:
     // devid = -1 → AX650（忽略），devid >= 0 → AXCL 设备
     virtual int init(const char *model_file, int devid = -1) = 0;
     virtual int init(char *model_buffer, size_t model_size, int devid = -1) = 0;
+    virtual int init_with_shared_weight_bundle(const char *model_file,
+                                               const char *shared_base_model_file,
+                                               const char *shared_base_weight_file,
+                                               const char *shared_adapter_weight_file,
+                                               const char *shared_adapter_patch_manifest_file,
+                                               const char *task_id,
+                                               int devid = -1)
+    {
+        (void)shared_base_model_file;
+        (void)shared_base_weight_file;
+        (void)shared_adapter_weight_file;
+        (void)shared_adapter_patch_manifest_file;
+        (void)task_id;
+        return init(model_file, devid);
+    }
+    virtual int switch_shared_weight_task(const char *shared_adapter_weight_file,
+                                          const char *shared_adapter_patch_manifest_file,
+                                          const char *task_id)
+    {
+        (void)shared_adapter_weight_file;
+        (void)shared_adapter_patch_manifest_file;
+        (void)task_id;
+        return 0;
+    }
     virtual void deinit() = 0;
 
     int get_devid() const { return dev_id; }

@@ -4,11 +4,22 @@
 
 struct ax_runner_ax650_handle_t;
 
+struct ax_runner_shared_patch_t
+{
+    unsigned int offset = 0;
+    unsigned int size = 0;
+    unsigned int patch_offset = 0;
+};
+
 class ax_runner_ax650 : public ax_runner_base
 {
 protected:
     struct ax_runner_ax650_handle_t *m_handle = nullptr;
     std::vector<char> m_model_buffer;
+    std::vector<char> m_shared_base_model_buffer;
+    std::vector<char> m_shared_base_weight_buffer;
+    std::vector<char> m_shared_adapter_weight_buffer;
+    std::vector<ax_runner_shared_patch_t> m_shared_adapter_patches;
     int sub_init();
 
 public:
@@ -18,6 +29,16 @@ public:
     // devid 对 AX650 片上后端无意义，忽略（保留参数以满足统一接口）
     int init(const char *model_file, int devid = -1) override;
     int init(char *model_buffer, size_t model_size, int devid = -1) override;
+    int init_with_shared_weight_bundle(const char *model_file,
+                                       const char *shared_base_model_file,
+                                       const char *shared_base_weight_file,
+                                       const char *shared_adapter_weight_file,
+                                       const char *shared_adapter_patch_manifest_file,
+                                       const char *task_id,
+                                       int devid = -1) override;
+    int switch_shared_weight_task(const char *shared_adapter_weight_file,
+                                  const char *shared_adapter_patch_manifest_file,
+                                  const char *task_id) override;
 
     void deinit() override;
 

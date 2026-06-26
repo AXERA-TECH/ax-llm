@@ -428,6 +428,103 @@ struct ModelConfig
 
             check_key("template_filename_axmodel");
             attr.template_filename_axmodel = j["template_filename_axmodel"].get<std::string>();
+            if (j.contains("shared_base_template_filename_axmodel"))
+            {
+                attr.shared_base_template_filename_axmodel = j["shared_base_template_filename_axmodel"].get<std::string>();
+            }
+            if (j.contains("shared_adapter_template_filename_axmodel"))
+            {
+                attr.shared_adapter_template_filename_axmodel = j["shared_adapter_template_filename_axmodel"].get<std::string>();
+            }
+            if (j.contains("shared_base_weight_template_filename"))
+            {
+                attr.shared_base_weight_template_filename = j["shared_base_weight_template_filename"].get<std::string>();
+            }
+            if (j.contains("shared_adapter_weight_template_filename"))
+            {
+                attr.shared_adapter_weight_template_filename = j["shared_adapter_weight_template_filename"].get<std::string>();
+            }
+            if (j.contains("shared_adapter_patch_manifest_template_filename"))
+            {
+                attr.shared_adapter_patch_manifest_template_filename =
+                    j["shared_adapter_patch_manifest_template_filename"].get<std::string>();
+            }
+            if (j.contains("shared_base_filename_post_axmodel"))
+            {
+                attr.shared_base_filename_post_axmodel = j["shared_base_filename_post_axmodel"].get<std::string>();
+            }
+            if (j.contains("shared_adapter_filename_post_axmodel"))
+            {
+                attr.shared_adapter_filename_post_axmodel = j["shared_adapter_filename_post_axmodel"].get<std::string>();
+            }
+            if (j.contains("shared_base_weight_filename_post"))
+            {
+                attr.shared_base_weight_filename_post = j["shared_base_weight_filename_post"].get<std::string>();
+            }
+            if (j.contains("shared_adapter_weight_filename_post"))
+            {
+                attr.shared_adapter_weight_filename_post = j["shared_adapter_weight_filename_post"].get<std::string>();
+            }
+            if (j.contains("shared_adapter_patch_manifest_filename_post"))
+            {
+                attr.shared_adapter_patch_manifest_filename_post =
+                    j["shared_adapter_patch_manifest_filename_post"].get<std::string>();
+            }
+            if (j.contains("shared_weight_task_id"))
+            {
+                attr.shared_weight_task_id = j["shared_weight_task_id"].get<std::string>();
+            }
+            if (j.contains("shared_weight_adapters") && j["shared_weight_adapters"].is_array())
+            {
+                attr.shared_weight_adapters.clear();
+                for (const auto &item : j["shared_weight_adapters"])
+                {
+                    if (!item.is_object() || !item.contains("task_id"))
+                    {
+                        ALOGE("shared_weight_adapters item requires task_id");
+                        return false;
+                    }
+                    LLMSharedWeightAdapter adapter;
+                    adapter.task_id = item["task_id"].get<std::string>();
+                    if (item.contains("adapter_weight_template_filename"))
+                    {
+                        adapter.adapter_weight_template_filename =
+                            item["adapter_weight_template_filename"].get<std::string>();
+                    }
+                    if (item.contains("adapter_patch_manifest_template_filename"))
+                    {
+                        adapter.adapter_patch_manifest_template_filename =
+                            item["adapter_patch_manifest_template_filename"].get<std::string>();
+                    }
+                    if (item.contains("adapter_weight_filename_post"))
+                    {
+                        adapter.adapter_weight_filename_post =
+                            item["adapter_weight_filename_post"].get<std::string>();
+                    }
+                    if (item.contains("adapter_patch_manifest_filename_post"))
+                    {
+                        adapter.adapter_patch_manifest_filename_post =
+                            item["adapter_patch_manifest_filename_post"].get<std::string>();
+                    }
+                    if (item.contains("image_encoder_axmodel"))
+                    {
+                        adapter.image_encoder_axmodel = item["image_encoder_axmodel"].get<std::string>();
+                    }
+                    if (item.contains("audio_encoder_axmodel_5s"))
+                    {
+                        adapter.audio_encoder_axmodel_5s = item["audio_encoder_axmodel_5s"].get<std::string>();
+                    }
+                    if (item.contains("audio_encoder_axmodel_30s"))
+                    {
+                        adapter.audio_encoder_axmodel_30s = item["audio_encoder_axmodel_30s"].get<std::string>();
+                    }
+                    if (item.contains("vision_num_frames"))
+                    {
+                        adapter.vision_num_frames = item["vision_num_frames"].get<int>();
+                    }
+                    attr.shared_weight_adapters.push_back(std::move(adapter));
+                }
+            }
 
             check_key("filename_post_axmodel");
             attr.filename_post_axmodel = j["filename_post_axmodel"].get<std::string>();
@@ -776,7 +873,36 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
     }
 
     config.attr.template_filename_axmodel = resolve_path(model_path, config.attr.template_filename_axmodel);
+    config.attr.shared_base_template_filename_axmodel = resolve_path(model_path, config.attr.shared_base_template_filename_axmodel);
+    config.attr.shared_adapter_template_filename_axmodel = resolve_path(model_path, config.attr.shared_adapter_template_filename_axmodel);
+    config.attr.shared_base_weight_template_filename = resolve_path(model_path, config.attr.shared_base_weight_template_filename);
+    config.attr.shared_adapter_weight_template_filename = resolve_path(model_path, config.attr.shared_adapter_weight_template_filename);
+    config.attr.shared_adapter_patch_manifest_template_filename =
+        resolve_path(model_path, config.attr.shared_adapter_patch_manifest_template_filename);
     config.attr.filename_post_axmodel = resolve_path(model_path, config.attr.filename_post_axmodel);
+    config.attr.shared_base_filename_post_axmodel = resolve_path(model_path, config.attr.shared_base_filename_post_axmodel);
+    config.attr.shared_adapter_filename_post_axmodel = resolve_path(model_path, config.attr.shared_adapter_filename_post_axmodel);
+    config.attr.shared_base_weight_filename_post = resolve_path(model_path, config.attr.shared_base_weight_filename_post);
+    config.attr.shared_adapter_weight_filename_post = resolve_path(model_path, config.attr.shared_adapter_weight_filename_post);
+    config.attr.shared_adapter_patch_manifest_filename_post =
+        resolve_path(model_path, config.attr.shared_adapter_patch_manifest_filename_post);
+    for (auto &adapter : config.attr.shared_weight_adapters)
+    {
+        adapter.adapter_weight_template_filename =
+            resolve_path(model_path, adapter.adapter_weight_template_filename);
+        adapter.adapter_patch_manifest_template_filename =
+            resolve_path(model_path, adapter.adapter_patch_manifest_template_filename);
+        adapter.adapter_weight_filename_post =
+            resolve_path(model_path, adapter.adapter_weight_filename_post);
+        adapter.adapter_patch_manifest_filename_post =
+            resolve_path(model_path, adapter.adapter_patch_manifest_filename_post);
+        adapter.image_encoder_axmodel =
+            resolve_path(model_path, adapter.image_encoder_axmodel);
+        adapter.audio_encoder_axmodel_5s =
+            resolve_path(model_path, adapter.audio_encoder_axmodel_5s);
+        adapter.audio_encoder_axmodel_30s =
+            resolve_path(model_path, adapter.audio_encoder_axmodel_30s);
+    }
     if (!is_url(config.attr.url_tokenizer_model))
         config.attr.url_tokenizer_model = resolve_path(model_path, config.attr.url_tokenizer_model);
     config.attr.filename_tokens_embed = resolve_path(model_path, config.attr.filename_tokens_embed);
@@ -788,6 +914,35 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
     config.attr.filename_audio_encoder_axmodel_5s = resolve_path(model_path, config.attr.filename_audio_encoder_axmodel_5s);
     config.attr.filename_audio_encoder_axmodel_30s = resolve_path(model_path, config.attr.filename_audio_encoder_axmodel_30s);
     config.attr.vision_cache_dir = resolve_path(model_path, config.attr.vision_cache_dir);
+    if (!config.attr.shared_base_template_filename_axmodel.empty() ||
+        (!config.attr.shared_base_weight_template_filename.empty() &&
+         !config.attr.shared_adapter_weight_template_filename.empty()))
+    {
+        if (config.attr.shared_adapter_template_filename_axmodel.empty())
+        {
+            config.attr.shared_adapter_template_filename_axmodel = config.attr.template_filename_axmodel;
+        }
+        if (config.attr.shared_weight_task_id.empty())
+        {
+            config.attr.shared_weight_task_id = config.model_name;
+        }
+        if (config.attr.shared_weight_adapters.empty())
+        {
+            LLMSharedWeightAdapter adapter;
+            adapter.task_id = config.attr.shared_weight_task_id;
+            adapter.adapter_weight_template_filename = config.attr.shared_adapter_weight_template_filename;
+            adapter.adapter_patch_manifest_template_filename =
+                config.attr.shared_adapter_patch_manifest_template_filename;
+            adapter.adapter_weight_filename_post = config.attr.shared_adapter_weight_filename_post;
+            adapter.adapter_patch_manifest_filename_post =
+                config.attr.shared_adapter_patch_manifest_filename_post;
+            adapter.image_encoder_axmodel = config.attr.filename_image_encoder_axmodel;
+            adapter.audio_encoder_axmodel_5s = config.attr.filename_audio_encoder_axmodel_5s;
+            adapter.audio_encoder_axmodel_30s = config.attr.filename_audio_encoder_axmodel_30s;
+            adapter.vision_num_frames = config.attr.vision_num_frames;
+            config.attr.shared_weight_adapters.push_back(std::move(adapter));
+        }
+    }
 }
 
 static void load_gemma4_video_defaults(ModelConfig &config, const std::string &model_path)
@@ -880,6 +1035,19 @@ static std::string embedding_prompt_name_from_request(const nlohmann::json &raw)
     if (name.empty()) name = pick("input_type");
     if (name == "document" || name == "doc") return "document";
     return "query";
+}
+
+static std::string embedding_adapter_task_from_request(const nlohmann::json &raw)
+{
+    auto pick = [&](const char *key) -> std::string {
+        if (!raw.contains(key) || !raw[key].is_string()) return {};
+        return trim_copy(raw[key].get<std::string>());
+    };
+
+    std::string task = pick("task_id");
+    if (task.empty()) task = pick("adapter_task");
+    if (task.empty()) task = pick("task");
+    return task;
 }
 
 static std::string embedding_prefix_for_prompt_name(const std::string &prompt_name)
@@ -2323,6 +2491,13 @@ int run_server_mode(const ModelConfig &config, int port)
 
                 if (!req.encoding_format.empty() && req.encoding_format != "float") {
                     ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
+                }
+
+                const std::string adapter_task = embedding_adapter_task_from_request(req.raw);
+                if (!adapter_task.empty() && !llm.SetSharedWeightTask(adapter_task)) {
+                    ALOGE("failed to switch embedding adapter task to '%s'", adapter_task.c_str());
+                    provider->end();
+                    return;
                 }
 
                 if (req.raw.contains("messages") && req.raw["messages"].is_array())
