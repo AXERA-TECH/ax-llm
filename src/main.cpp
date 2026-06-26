@@ -1,9 +1,11 @@
 #include <iostream>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <fstream>
+#include <mutex>
 #include <queue>
 #include <signal.h>
 #include <filesystem>
@@ -87,11 +89,13 @@ public:
     {
         if (!running_) return;
         worker_ = std::thread([this]() {
-            while (running_.load())
+            std::unique_lock<std::mutex> lock(mutex_);
+            while (running_)
             {
-                std::this_thread::sleep_for(interval_);
-                if (!running_.load()) break;
+                if (cv_.wait_for(lock, interval_, [this]() { return !running_; })) break;
+                lock.unlock();
                 provider_->reset_timeout();
+                lock.lock();
             }
         });
     }
@@ -103,19 +107,20 @@ public:
 
     void stop()
     {
-        bool expected = true;
-        if (running_.compare_exchange_strong(expected, false))
         {
-            if (worker_.joinable()) worker_.join();
-            return;
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
         }
+        cv_.notify_all();
         if (worker_.joinable()) worker_.join();
     }
 
 private:
     std::shared_ptr<openai_api::BaseDataProvider> provider_;
     std::chrono::milliseconds interval_;
-    std::atomic<bool> running_{false};
+    bool running_{false};
+    std::mutex mutex_;
+    std::condition_variable cv_;
     std::thread worker_;
 };
 static std::atomic<bool> g_exit_on_sigint{true};
