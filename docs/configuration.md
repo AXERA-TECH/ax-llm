@@ -22,7 +22,7 @@
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `system_prompt` | 空 | 缺省系统提示词,缺失时自动前置 |
+| `system_prompt` | 空 | 缺省系统提示词。**仅 `run`(交互)模式**会在缺失时自动前置;**`serve` 模式不会自动注入**(遵循 OpenAI 语义,system 由请求端控制——请求不带 system 就没有 system 段) |
 | `post_config_path` | `post_config.json` | 采样配置文件 |
 | `bos` / `eos` | `true` / `false` | 是否加 BOS/EOS |
 | `pad_token_id` | 0 | pad token id |
@@ -122,7 +122,7 @@
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `port` | 8000 | 监听端口 |
-| `server_timeout_ms` | 300000 | 请求超时(并发排队也复用该值) |
+| `server_timeout_ms` | 300000 | 请求超时(并发排队也复用该值)。也可用命令行 `--server_timeout_ms <ms>` 覆盖;serve 启动时会打印生效值 `server request/queue timeout: N ms` |
 | `server_default_max_tokens` | 0 | 请求未带 max_tokens 时的默认值(0=用内置默认) |
 | `server_max_output_tokens` | 0 | 输出 token 硬上限(0=不额外限制) |
 | `server_forced_prompt_text` | — | 强制提示词(如 OCR 规整) |

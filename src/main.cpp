@@ -2063,21 +2063,6 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     return true;
 }
 
-static void prepend_config_system_prompt_if_missing(const LLMAttrType &attr,
-                                                    std::vector<Content> &history,
-                                                    std::vector<MediaInputs> &media_inputs)
-{
-    const std::string system_prompt = get_effective_system_prompt(attr);
-    if (system_prompt.empty()) return;
-    if (!history.empty() && history.front().role == SYSTEM) return;
-
-    history.insert(history.begin(), {SYSTEM, TEXT, system_prompt});
-    for (auto &media : media_inputs)
-    {
-        media.content_index += 1;
-    }
-}
-
 static bool normalize_single_image_ocr_request(const ModelConfig &config,
                                                std::vector<Content> &history,
                                                std::vector<MediaInputs> &media_inputs,
@@ -2131,6 +2116,7 @@ static bool normalize_single_image_ocr_request(const ModelConfig &config,
 int run_server_mode(const ModelConfig &config, int port)
 {
     g_exit_on_sigint.store(true, std::memory_order_relaxed);
+    ALOGI("server request/queue timeout: %d ms (config.server_timeout_ms, overridable via --server_timeout_ms)", config.server_timeout_ms);
 
     // Check whether port is available.
     const char *port_error = "unknown";
@@ -2523,7 +2509,9 @@ int run_server_mode(const ModelConfig &config, int port)
                     push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
                 }
-                prepend_config_system_prompt_if_missing(config.attr, history, media_inputs);
+                // serve mode does NOT inject config.system_prompt: the client controls the
+                // system message (OpenAI-compatible — no system message means no system block).
+                // config.system_prompt only applies to interactive `run` mode.
                 int output_max_tokens = resolve_chat_output_max_tokens(config, req, llm.getAttr()->max_token_len);
                 if (hymt_translation_mode) {
                     std::string hymt_err;
@@ -2764,6 +2752,7 @@ void print_usage(const char *program_name)
     printf("\n");
     printf("Serve options:\n");
     printf("  --port <port> Server port (default: 8000)\n");
+    printf("  --server_timeout_ms <ms>  Request/queue timeout; overrides config.server_timeout_ms (default 300000)\n");
     printf("\n");
     printf("Embedding model config:\n");
     printf("  Set \"is_embedding\": true in config.json to enable /v1/embeddings.\n");
@@ -2863,6 +2852,10 @@ int main(int argc, char *argv[])
             if (arg == "--port" && i + 1 < argc)
             {
                 port = std::stoi(argv[++i]);
+            }
+            else if (arg == "--server_timeout_ms" && i + 1 < argc)
+            {
+                config.server_timeout_ms = std::stoi(argv[++i]);
             }
             else if (arg == "--help" || arg == "-h")
             {
