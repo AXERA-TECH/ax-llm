@@ -38,6 +38,7 @@ jobs:
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 15
           name: axcl-x86-artifacts
           path: |
             build_x86/install/**
@@ -100,6 +101,7 @@ jobs:
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 15
           name: axcl-windows-mingw64-artifacts
           path: |
             build_mingw64/axllm.exe
@@ -127,6 +129,7 @@ jobs:
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 15
           name: ax650-aarch64-artifacts
           path: |
             build/install/**
@@ -154,6 +157,7 @@ jobs:
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 15
           name: axcl-aarch64-artifacts
           path: |
             build_aarch64/install/**
@@ -214,6 +218,7 @@ jobs:
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 15
           name: axcl-riscv64-artifacts
           path: |
             build_riscv64/install/**
