@@ -8,7 +8,6 @@ class ax_runner_ax650 : public ax_runner_base
 {
 protected:
     struct ax_runner_ax650_handle_t *m_handle = nullptr;
-    std::vector<char> m_model_buffer;
     int sub_init();
 
 public:

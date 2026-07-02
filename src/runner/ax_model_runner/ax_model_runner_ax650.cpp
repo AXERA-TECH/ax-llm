@@ -449,10 +449,11 @@ int ax_runner_ax650::init(const char *model_file, int /*devid*/)
         ALOGE("model file(%s) open failed", model_file);
         return -1;
     }
-    m_model_buffer.assign(reinterpret_cast<const char *>(model_buffer.data()),
-                          reinterpret_cast<const char *>(model_buffer.data()) + model_buffer.size());
-    auto ret = init(m_model_buffer.data(), m_model_buffer.size(), -1);
-    return ret;
+    // Feed the mmap'd data straight to CreateHandle (in the buffer overload below).
+    // The engine loads it into CMM during init(); we never keep a host-side copy of
+    // the model (that copy was ~= model size per axmodel and dominated host DDR).
+    // MMap stays alive for the duration of this call.
+    return init(reinterpret_cast<char *>(model_buffer.data()), model_buffer.size(), -1);
 }
 
 int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
@@ -460,18 +461,16 @@ int ax_runner_ax650::init(char *model_buffer, size_t model_size, int /*devid*/)
     if (m_handle)
         deinit(); // 防止多次 init 导致泄漏
 
-    if (m_model_buffer.data() != model_buffer || m_model_buffer.size() != model_size)
-    {
-        m_model_buffer.assign(model_buffer, model_buffer + model_size);
-    }
-
+    // CreateHandle loads the model into CMM during this call; we deliberately do NOT
+    // retain a host-side copy of `model_buffer` (the caller owns it and it can be
+    // released right after). This keeps host DDR ~= working set, not model size.
     m_handle = new ax_runner_ax650_handle_t;
     AX_ENGINE_HANDLE_EXTRA_T extra{};
     extra.pName = (AX_S8 *)(AX_CMM_SESSION_NAME);
-    int ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &extra);
+    int ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, model_buffer, model_size, &extra);
     if (0 != ret)
     {
-        ret = AX_ENGINE_CreateHandle(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size());
+        ret = AX_ENGINE_CreateHandle(&m_handle->handle, model_buffer, model_size);
     }
     if (0 != ret)
     {
@@ -512,31 +511,29 @@ int ax_runner_ax650::load_handle_reuse_io(const char *model_file, int /*devid*/)
         return init(model_file, -1);
     }
 
-    if (m_model_buffer.empty())
+    if (!model_file || !model_file[0])
     {
-        if (!model_file || !model_file[0])
-        {
-            ALOGE("load_handle_reuse_io: model buffer empty and model_file is empty");
-            return -1;
-        }
+        ALOGE("load_handle_reuse_io: model_file is empty");
+        return -1;
+    }
 
-        MMap model_buffer;
-        if (!model_buffer.open_file(model_file))
-        {
-            ALOGE("model file(%s) open failed", model_file);
-            return -1;
-        }
-        m_model_buffer.assign(reinterpret_cast<const char *>(model_buffer.data()),
-                              reinterpret_cast<const char *>(model_buffer.data()) + model_buffer.size());
+    // Re-mmap the file on each reload (dynamic layer loading). We keep no persistent
+    // host copy of the model — trading a little reload I/O for much lower host DDR.
+    // MMap stays alive through CreateHandle below, then unmaps on return.
+    MMap model_buffer;
+    if (!model_buffer.open_file(model_file))
+    {
+        ALOGE("model file(%s) open failed", model_file);
+        return -1;
     }
 
     AX_ENGINE_HANDLE_EXTRA_T extra{};
     extra.pName = (AX_S8 *)(AX_CMM_SESSION_NAME);
 
-    int ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size(), &extra);
+    int ret = AX_ENGINE_CreateHandleV2(&m_handle->handle, reinterpret_cast<char *>(model_buffer.data()), model_buffer.size(), &extra);
     if (ret != 0)
     {
-        ret = AX_ENGINE_CreateHandle(&m_handle->handle, m_model_buffer.data(), m_model_buffer.size());
+        ret = AX_ENGINE_CreateHandle(&m_handle->handle, reinterpret_cast<char *>(model_buffer.data()), model_buffer.size());
     }
     if (ret != 0)
     {
@@ -645,8 +642,6 @@ void ax_runner_ax650::deinit()
 
     delete m_handle;
     m_handle = nullptr;
-    m_model_buffer.clear();
-    m_model_buffer.shrink_to_fit();
 
     // 清空容器
     moutput_tensors.clear();
