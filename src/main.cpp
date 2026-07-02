@@ -2474,7 +2474,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     {
                         if (enabled)
                         {
-                            llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p);
+                            llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p, req.has_frequency_penalty, req.frequency_penalty, req.has_presence_penalty, req.presence_penalty);
                         }
                     }
                     ~SamplingOverrideGuard()

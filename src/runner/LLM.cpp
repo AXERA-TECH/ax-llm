@@ -5547,7 +5547,7 @@ void LLM::Stop() { impl_->Stop(); }
 LLMAttrType *LLM::getAttr() { return &impl_->_attr; }
 LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
-void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p); }
+void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p, bool has_frequency_penalty, float frequency_penalty, bool has_presence_penalty, float presence_penalty) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p, has_frequency_penalty, frequency_penalty, has_presence_penalty, presence_penalty); }
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
 void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
 void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }

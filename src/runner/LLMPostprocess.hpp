@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 #include <unordered_set>
+#include <unordered_map>
 #include "utils/bfloat16.hpp"
 #include "utils/json.hpp"
 #include "utils/sample_log.h"
@@ -21,6 +22,10 @@ private:
         float temperature = 1.0f;
         bool has_top_p = false;
         float top_p = 1.0f;
+        bool has_frequency_penalty = false;
+        float frequency_penalty = 0.0f;
+        bool has_presence_penalty = false;
+        float presence_penalty = 0.0f;
         bool force_greedy = false;
     };
 
@@ -31,6 +36,10 @@ private:
         bool enable_repetition_penalty = false;
         float repetition_penalty = 1.0f;
         int penalty_window = 20;
+        bool enable_frequency_penalty = false;
+        float frequency_penalty = 0.0f;
+        bool enable_presence_penalty = false;
+        float presence_penalty = 0.0f;
         bool enable_diversity_penalty = false;
         std::vector<int> common_phrases;
         float diversity_penalty = 1.0f;
@@ -94,6 +103,37 @@ private:
             {
                 logits[token] *= std::sqrt(repetition_penalty);
             }
+        }
+    }
+
+    // OpenAI-style frequency & presence penalties (additive on logits), applied
+    // over the same recent window as repetition_penalty (penalty_window; <=0 means
+    // the whole generated history):
+    //   logit[t] -= frequency_penalty * count(t)   (per occurrence)
+    //   logit[t] -= presence_penalty               (once if t appeared at all)
+    void apply_frequency_presence_penalty(std::vector<float> &logits,
+                                          const std::vector<int> &generated_tokens,
+                                          float frequency_penalty,
+                                          float presence_penalty,
+                                          int penalty_window)
+    {
+        if ((frequency_penalty == 0.0f && presence_penalty == 0.0f) || generated_tokens.empty())
+            return;
+
+        int start_idx = penalty_window > 0
+                            ? std::max(0, (int)generated_tokens.size() - penalty_window)
+                            : 0;
+        std::unordered_map<int, int> counts;
+        for (int i = start_idx; i < (int)generated_tokens.size(); ++i)
+        {
+            const int t = generated_tokens[i];
+            if (t >= 0 && t < (int)logits.size())
+                counts[t]++;
+        }
+        for (const auto &kv : counts)
+        {
+            logits[(size_t)kv.first] -= frequency_penalty * (float)kv.second;
+            logits[(size_t)kv.first] -= presence_penalty;
         }
     }
 
@@ -248,6 +288,14 @@ private:
     // 限制候选 token 数
     int top_k_sampling(const std::vector<float> &logits, int k)
     {
+        if (logits.empty())
+            return 0;
+        // Clamp k to vocab size; k > logits.size() reads past the end in
+        // partial_sort / the copy below (out-of-bounds crash).
+        if (k > (int)logits.size())
+            k = (int)logits.size();
+        if (k < 1)
+            return argmax_index(logits);
         // std::vector<float> probs = softmax(logits);
 
         // 获取 top-k 索引
@@ -286,6 +334,11 @@ private:
     float repetition_penalty = 1.0f;
     int penalty_window = 20;
 
+    bool enable_frequency_penalty = false;
+    float frequency_penalty = 0.0f;
+    bool enable_presence_penalty = false;
+    float presence_penalty = 0.0f;
+
     bool enable_diversity_penalty = false;
     std::vector<int> common_phrases;
     float diversity_penalty = 1.0f;
@@ -313,6 +366,21 @@ private:
         eff.enable_repetition_penalty = enable_repetition_penalty;
         eff.repetition_penalty = repetition_penalty;
         eff.penalty_window = penalty_window;
+        eff.enable_frequency_penalty = enable_frequency_penalty;
+        eff.frequency_penalty = frequency_penalty;
+        eff.enable_presence_penalty = enable_presence_penalty;
+        eff.presence_penalty = presence_penalty;
+        // Per-request overrides (OpenAI API). A value of 0 disables that penalty.
+        if (ov.has_frequency_penalty)
+        {
+            eff.enable_frequency_penalty = (ov.frequency_penalty != 0.0f);
+            eff.frequency_penalty = ov.frequency_penalty;
+        }
+        if (ov.has_presence_penalty)
+        {
+            eff.enable_presence_penalty = (ov.presence_penalty != 0.0f);
+            eff.presence_penalty = ov.presence_penalty;
+        }
         eff.enable_diversity_penalty = enable_diversity_penalty;
         eff.common_phrases = common_phrases;
         eff.diversity_penalty = diversity_penalty;
@@ -358,12 +426,30 @@ private:
         return eff;
     }
 
+    // Multinomial sample over the full softmax distribution (logits already
+    // temperature-scaled). Prevents "temperature enabled but no top_p/top_k"
+    // from silently collapsing to greedy argmax.
+    int sample_from_distribution(const std::vector<float> &logits)
+    {
+        if (logits.empty())
+            return 0;
+        std::vector<float> probs = softmax(logits);
+        static thread_local std::mt19937 gen(std::random_device{}());
+        std::discrete_distribution<int> dist(probs.begin(), probs.end());
+        return dist(gen);
+    }
+
     int apply_logits(std::vector<float> &logits, const std::vector<int> &history, const EffectiveSampling &eff)
     {
         if (eff.enable_temperature)
             apply_temperature(logits, eff.temperature);
         if (eff.enable_repetition_penalty)
             apply_repetition_penalty(logits, history, eff.repetition_penalty, eff.penalty_window);
+        if (eff.enable_frequency_penalty || eff.enable_presence_penalty)
+            apply_frequency_presence_penalty(logits, history,
+                                             eff.enable_frequency_penalty ? eff.frequency_penalty : 0.0f,
+                                             eff.enable_presence_penalty ? eff.presence_penalty : 0.0f,
+                                             eff.penalty_window);
         if (eff.enable_diversity_penalty)
             apply_diversity_penalty(logits, eff.common_phrases, eff.diversity_penalty);
         if (pad_token_id >= 0 && pad_token_id < (int)logits.size())
@@ -373,19 +459,31 @@ private:
             return faster_top_p_sampling(logits, eff.top_p);
         else if (eff.enable_top_k_sampling)
             return top_k_sampling(logits, eff.top_k);
+        else if (eff.enable_temperature)
+            return sample_from_distribution(logits); // temperature set, no top_p/top_k -> sample (not greedy)
         return argmax_index(logits);
     }
 
 public:
     LLMPostprocess() {}
 
-    void set_request_sampling_override(bool has_temperature, float temperature, bool has_top_p, float top_p)
+    void set_request_sampling_override(bool has_temperature, float temperature,
+                                       bool has_top_p, float top_p,
+                                       bool has_frequency_penalty, float frequency_penalty,
+                                       bool has_presence_penalty, float presence_penalty)
     {
         auto &ov = request_override();
         ov.has_temperature = has_temperature;
         ov.temperature = temperature;
         ov.has_top_p = has_top_p;
         ov.top_p = top_p;
+        ov.has_frequency_penalty = has_frequency_penalty;
+        ov.frequency_penalty = frequency_penalty;
+        ov.has_presence_penalty = has_presence_penalty;
+        ov.presence_penalty = presence_penalty;
+        // Penalties are not samplers: a request carrying only freq/presence still
+        // runs greedy (penalties are applied to the argmax) unless it also asks
+        // for temperature/top_p.
         ov.force_greedy = !has_temperature && !has_top_p;
     }
 
@@ -404,6 +502,18 @@ public:
     {
         enable_repetition_penalty = enable;
         this->repetition_penalty = penalty;
+    }
+
+    void set_frequency_penalty(bool enable, float penalty)
+    {
+        enable_frequency_penalty = enable;
+        this->frequency_penalty = penalty;
+    }
+
+    void set_presence_penalty(bool enable, float penalty)
+    {
+        enable_presence_penalty = enable;
+        this->presence_penalty = penalty;
     }
 
     void set_diversity_penalty(bool enable, const std::vector<int> &common_phrases, float penalty)
@@ -462,6 +572,17 @@ public:
         top_k = config["top_k"];
         if (top_k < 1) top_k = 1;
 
+        // Optional OpenAI-style penalties. Backward compatible: absent keys ->
+        // disabled. A non-zero value implies enabled even without the flag.
+        enable_frequency_penalty = config.value("enable_frequency_penalty", false);
+        frequency_penalty = config.value("frequency_penalty", 0.0f);
+        enable_presence_penalty = config.value("enable_presence_penalty", false);
+        presence_penalty = config.value("presence_penalty", 0.0f);
+        if (frequency_penalty != 0.0f) enable_frequency_penalty = true;
+        if (presence_penalty != 0.0f) enable_presence_penalty = true;
+        if (!enable_frequency_penalty) frequency_penalty = 0.0f;
+        if (!enable_presence_penalty) presence_penalty = 0.0f;
+
         // 互斥处理：若同时开启 top_p 与 top_k，则优先 top_p
         if (enable_top_p_sampling && enable_top_k_sampling)
         {
@@ -480,9 +601,12 @@ public:
     {
         const auto eff = resolve_effective_sampling();
         if (!eff.enable_repetition_penalty &&
+            !eff.enable_frequency_penalty &&
+            !eff.enable_presence_penalty &&
             !eff.enable_diversity_penalty &&
             !eff.enable_top_p_sampling &&
-            !eff.enable_top_k_sampling)
+            !eff.enable_top_k_sampling &&
+            !eff.enable_temperature)
         {
             return argmax_index_bf16(logits, n);
         }

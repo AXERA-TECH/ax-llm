@@ -138,7 +138,7 @@ public:
     LLMAttrType *getAttr();
     LLMPostprocess *getPostprocess();
     LLaMaEmbedSelector *getEmbedSelector();
-    void SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p);
+    void SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p, bool has_frequency_penalty, float frequency_penalty, bool has_presence_penalty, float presence_penalty);
     void ClearRequestSamplingOverride();
     void SetRequestThinkingMode(ThinkingMode mode);
     void ClearRequestThinkingMode();
