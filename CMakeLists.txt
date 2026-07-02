@@ -352,4 +352,14 @@ add_executable(tokenizer_smoke tools/tokenizer_smoke.cpp)
 target_link_libraries(tokenizer_smoke tokenizer)
 install(TARGETS tokenizer_smoke DESTINATION bin)
 
+# Vision preprocessing layout regression test (host-runnable; no HW required).
+# Guards the Qwen-VL patchifier (Qwen2VideoProcessor) against channel-planar
+# layout regressions that scramble the vision encoder input.
+add_executable(vision_preprocess_test tools/vision_preprocess_test.cpp
+    src/runner/utils/image_processor.cpp
+    src/runner/utils/files.cpp)
+target_include_directories(vision_preprocess_test PRIVATE src/runner/utils)
+target_link_libraries(vision_preprocess_test ${AXLLM_VISION_LIBS})
+install(TARGETS vision_preprocess_test DESTINATION bin)
+
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)

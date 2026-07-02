@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -1086,6 +1087,70 @@ static bool disk_cache_load(const std::string& cache_dir,
     return true;
 }
 
+// Disk-cache size management. Uses std::filesystem (portable — avoids statvfs,
+// which mingw/Windows CI lacks). Two independent, env-configurable guards:
+//   - AXLLM_VISION_DISK_CACHE_MAX_MB      (default 1024): cap total *.bin size
+//   - AXLLM_VISION_DISK_CACHE_MIN_FREE_MB (default 300):  keep this much free on
+//     the volume; a write that would drop below it triggers eviction / skip.
+// Eviction is oldest-first by last_write_time (mtime LRU). Returns false when,
+// even after evicting everything, the incoming entry still won't fit — the
+// caller then skips the disk write (the in-memory cache still applies).
+static bool disk_cache_enforce_limits(const std::filesystem::path& dir, uint64_t incoming_bytes)
+{
+    static const uint64_t max_total_bytes =
+        (uint64_t)env_size_t(std::getenv("AXLLM_VISION_DISK_CACHE_MAX_MB"), 1024) * 1024ull * 1024ull;
+    static const uint64_t min_free_bytes =
+        (uint64_t)env_size_t(std::getenv("AXLLM_VISION_DISK_CACHE_MIN_FREE_MB"), 300) * 1024ull * 1024ull;
+
+    std::error_code ec;
+
+    struct Entry {
+        std::filesystem::path path;
+        uint64_t size;
+        std::filesystem::file_time_type mtime;
+    };
+    std::vector<Entry> entries;
+    uint64_t total = 0;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code fec;
+        if (!it->is_regular_file(fec)) continue;
+        const auto& p = it->path();
+        if (p.extension() != ".bin") continue;
+        const uint64_t sz = (uint64_t)it->file_size(fec);
+        if (fec) continue;
+        const auto mt = it->last_write_time(fec);
+        entries.push_back({p, sz, mt});
+        total += sz;
+    }
+
+    auto free_available = [&]() -> uint64_t {
+        std::error_code sec;
+        const auto info = std::filesystem::space(dir, sec);
+        if (sec) return UINT64_MAX; // cannot determine -> do not block on free space
+        return (uint64_t)info.available;
+    };
+
+    auto over_cap = [&]() { return (total + incoming_bytes) > max_total_bytes; };
+    auto low_free = [&]() {
+        const uint64_t f = free_available();
+        return f != UINT64_MAX && f < (min_free_bytes + incoming_bytes);
+    };
+
+    if (over_cap() || low_free()) {
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.mtime < b.mtime; });
+        for (const auto& e : entries) {
+            if (!over_cap() && !low_free()) break;
+            std::error_code rec;
+            if (std::filesystem::remove(e.path, rec)) {
+                total -= (e.size <= total) ? e.size : total;
+            }
+        }
+    }
+
+    return !over_cap() && !low_free();
+}
+
 static void disk_cache_save(const std::string& cache_dir,
                             const std::string& key,
                             int tokens_embed_size,
@@ -1101,6 +1166,26 @@ static void disk_cache_save(const std::string& cache_dir,
     // Write to a temp file then atomically replace, so a crash can't leave a corrupted cache file.
     std::filesystem::path tmp = file;
     tmp += ".tmp";
+
+    // Free-space guard + total-size LRU cap. Skip the disk write (memory cache
+    // still applies) rather than risk filling the volume and breaking other
+    // services after a reboot.
+    {
+        uint64_t incoming = (uint64_t)sizeof(DiskHeaderV2) + (uint64_t)key.size()
+                          + (uint64_t)blocks.size() * (uint64_t)sizeof(uint32_t);
+        for (const auto& b : blocks) incoming += (uint64_t)b.size() * (uint64_t)sizeof(unsigned short);
+        for (const auto& v : deepstack) incoming += (uint64_t)v.size() * (uint64_t)sizeof(float);
+        if (!disk_cache_enforce_limits(dir, incoming)) {
+            static std::atomic<bool> warned{false};
+            bool expected = false;
+            if (warned.compare_exchange_strong(expected, true)) {
+                ALOGW("Vision disk cache: low free space or size cap reached; skipping disk write "
+                      "(memory cache still active). Tune AXLLM_VISION_DISK_CACHE_MAX_MB / "
+                      "AXLLM_VISION_DISK_CACHE_MIN_FREE_MB.");
+            }
+            return;
+        }
+    }
 
     std::FILE* fp = std::fopen(tmp.string().c_str(), "wb");
     if (!fp) return;
@@ -1530,7 +1615,7 @@ bool VisionModule::Init(VLMType type,
                         "|fps=" + std::to_string(fps_) +
                         "|tps=" + std::to_string(tokens_per_second_);
     if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni) {
-        cache_key_prefix_ += "|resize=pillow_bicubic";
+        cache_key_prefix_ += "|resize=pillow_bicubic|patch=hwc_v1";
     } else if (type_ == VLMType::PaddleOCRVL) {
         cache_key_prefix_ += "|resize=pillow_bicubic|patch=nchw_v2";
     }

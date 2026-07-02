@@ -31,6 +31,10 @@ jobs:
         run: |
           ./build_x86/install/bin/tokenizer_smoke
 
+      - name: Vision preprocess layout test (AXCL x86)
+        run: |
+          ./build_x86/install/bin/vision_preprocess_test
+
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -87,6 +91,11 @@ jobs:
         shell: msys2 {0}
         run: |
           ./build_mingw64/tokenizer_smoke.exe
+
+      - name: Vision preprocess layout test (Windows mingw64)
+        shell: msys2 {0}
+        run: |
+          ./build_mingw64/vision_preprocess_test.exe
 
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
