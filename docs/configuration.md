@@ -103,6 +103,12 @@
 | `vision_fps` / `vision_tokens_per_second` | 1 / 1 | 视频时间缩放(Qwen2.5-VL mRoPE) |
 | `vision_num_frames` / `vision_do_sample_frames` | 0 / true | 视频抽帧上限 / 是否均匀抽帧 |
 
+> **视觉缓存(vision_cache)环境变量:**
+> - `AXLLM_VISION_CACHE=0`：完全关闭视觉缓存(磁盘+内存)。
+> - `AXLLM_VISION_MEM_CACHE_SIZE=<N>`：内存缓存条数上限(默认 8,LRU 淘汰;保护长跑 serve)。
+> - `AXLLM_VISION_DISK_CACHE_MAX_MB=<MB>`：磁盘缓存目录总量上限(默认 1024),超出按 mtime 最旧优先淘汰 `.bin`。
+> - `AXLLM_VISION_DISK_CACHE_MIN_FREE_MB=<MB>`：写盘前最小剩余空间(默认 300);低于阈值则跳过写盘(仍用内存缓存),避免塞满磁盘拖垮系统服务。
+
 ## Embedding
 
 | 字段 | 默认 | 说明 |
@@ -126,6 +132,29 @@
 | `server_default_max_tokens` | 0 | 请求未带 max_tokens 时的默认值(0=用内置默认) |
 | `server_max_output_tokens` | 0 | 输出 token 硬上限(0=不额外限制) |
 | `server_forced_prompt_text` | — | 强制提示词(如 OCR 规整) |
+
+## 采样 / 后处理（post_config.json）
+
+采样参数放在模型目录的 `post_config.json`(与 `config.json` 同级,由 `post_config_path` 指定)。所有键均可选,缺失即按默认/关闭处理。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `enable_temperature` / `temperature` | false / 1.0 | 温度。**注意**:启用温度但未开 `top_k`/`top_p` 时,会对完整分布做多项式采样(此前会被当成 greedy 忽略);`temperature<=0` 视为 greedy。 |
+| `enable_top_k_sampling` / `top_k` | false / 1 | top-k 采样(k 自动夹到词表大小)。 |
+| `enable_top_p_sampling` / `top_p` | false / 1.0 | nucleus 采样;与 top_k 同开时优先 top_p。 |
+| `enable_repetition_penalty` / `repetition_penalty` / `penalty_window` | false / 1.0 / 20 | 重复惩罚(仅作用于最近 `penalty_window` 个 token)。 |
+| `frequency_penalty` | 0.0 | OpenAI 式频率惩罚:`logit -= frequency_penalty × 出现次数`(在 `penalty_window` 窗口内统计);非 0 即启用。 |
+| `presence_penalty` | 0.0 | OpenAI 式存在惩罚:`logit -= presence_penalty`(窗口内出现过即减一次);非 0 即启用。 |
+
+**每请求覆盖(serve / OpenAI 兼容 API):** 请求体里的 `temperature`、`top_p`、`frequency_penalty`、`presence_penalty` 覆盖该请求的 config 默认,请求结束后自动回落。例:
+
+```json
+POST /v1/chat/completions
+{ "model": "...", "messages": [ ... ],
+  "temperature": 0.7, "frequency_penalty": 0.5, "presence_penalty": 0.3 }
+```
+
+> serve 语义:请求若既不带 `temperature` 也不带 `top_p`,该请求按 greedy 处理(惩罚仍会作用于 argmax)。
 
 ## AXCL（PCIe 多卡）
 
