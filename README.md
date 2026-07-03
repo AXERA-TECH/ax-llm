@@ -43,6 +43,8 @@
 
 本分支统一输出可执行文件名为 `axllm`，根据运行环境自动选择 AX650 片上后端或 AXCL PCIe 后端。
 
+> **已知限制**：`gemma-4`（如 `gemma-4-E2B-it-GPTQ-INT4`）目前仅在 **AX650 片上后端**可正常推理；在 **AXCL PCIe 后端**上会输出乱码/复读（[issue #39](https://github.com/AXERA-TECH/ax-llm/issues/39)）。已定位为 AXCL 运行时执行 gemma-4 跨层 shared-KV（后 20 层复用前层 KV cache）时的数值发散：片上结果正确、两端模型文件 md5 一致、ax-llm 喂数逻辑一致，差异在运行时侧，暂无 ax-llm 侧修复。使用 gemma-4 请走片上 AX650 后端。
+
 ### 安装方式（推荐）
 
 使用根目录的安装脚本：
