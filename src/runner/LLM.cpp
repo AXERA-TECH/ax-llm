@@ -398,6 +398,7 @@ struct LLM::Impl {
     };
 
     std::vector<LLMLayer> llama_layers;
+    bool deinited_ = false; // guards Deinit() against double-invocation (explicit call + destructor path)
     // Optional per-layer attention type (for models like Qwen3.5 that mix linear/full attention).
     std::vector<bool> layer_is_linear_attn;
     std::vector<int> layer_kv_cache_sizes;
@@ -2612,6 +2613,7 @@ struct LLM::Impl {
     {
         ALOGI("LLM init start");
         this->_attr = attr;
+        deinited_ = false;
         dynamic_layer_load_enabled_ = _attr.dynamic_load_enable;
         dynamic_layer_pool_size_ = _attr.dynamic_load_pool_size;
         if (dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ <= 0)
@@ -3052,7 +3054,9 @@ struct LLM::Impl {
 
     void Deinit()
     {
-        for (int i = 0; i < _attr.axmodel_num; i++) llama_layers[i].layer.deinit();
+        if (deinited_) return;
+        deinited_ = true;
+        for (size_t i = 0; i < llama_layers.size(); i++) llama_layers[i].layer.deinit();
         llama_post.deinit();
         embed_selector.Deinit();
         gemma4_per_layer_helper.Deinit();

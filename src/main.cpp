@@ -1064,6 +1064,7 @@ int run_interactive_mode(ModelConfig &config)
     if (!g_llm.Init(config.attr))
     {
         ALOGE("LLM.Init failed");
+        g_llm.Deinit(); // free partial model CMM before engine/SYS teardown (else /dev/ax_cmm closed -> free fails -> leak)
 #if USE_AXCL
         axclFinalize();
 #else
@@ -2159,6 +2160,7 @@ int run_server_mode(const ModelConfig &config, int port)
         if (!generator || !generator->init(config.image_model_dir, err))
         {
             ALOGE("image generator init failed: %s", err.c_str());
+            generator.reset(); // release before engine/SYS teardown (same ordering fix as LLM path)
 #if USE_AXCL
             axclFinalize();
 #else
@@ -2172,6 +2174,7 @@ int run_server_mode(const ModelConfig &config, int port)
         if (variants.empty())
         {
             ALOGE("no image model variants found under %s", config.image_model_dir.c_str());
+            generator.reset(); // release before engine/SYS teardown (same ordering fix as LLM path)
 #if USE_AXCL
             axclFinalize();
 #else
@@ -2294,6 +2297,7 @@ int run_server_mode(const ModelConfig &config, int port)
         if (!llm.Init(config.attr))
         {
             ALOGE("LLM.Init failed");
+            llm.Deinit(); // free partial model CMM before engine/SYS teardown (else /dev/ax_cmm closed -> free fails -> leak)
 #if USE_AXCL
             axclFinalize();
 #else
