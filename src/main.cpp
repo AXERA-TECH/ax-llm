@@ -1205,6 +1205,8 @@ int run_interactive_mode(ModelConfig &config)
         user.data = prompt;
         user.type = (has_media ? media_type : TEXT);
 
+        const size_t hist_before = history.size();
+        const size_t media_before = media_inputs.size();
         const size_t idx = history.size();
         history.push_back(user);
         if (has_media)
@@ -1212,13 +1214,26 @@ int run_interactive_mode(ModelConfig &config)
             media_inputs.push_back({idx, uris});
         }
 
-        if (config.attr.vlm_type != VLMType::None && !media_inputs.empty())
+        std::vector<Content> result =
+            (config.attr.vlm_type != VLMType::None && !media_inputs.empty())
+                ? g_llm.Run(history, media_inputs)
+                : g_llm.Run(history);
+
+        // On a failed turn (e.g. an invalid media path) Run returns the history with no
+        // new assistant reply. Roll this turn back -- the just-added user turn and its
+        // media entry -- so a bad path does not poison later turns: entering a correct
+        // path afterwards just works instead of re-reporting the first wrong path.
+        if (result.empty() || result.back().role != ASSISTANT)
         {
-            history = g_llm.Run(history, media_inputs);
+            history.resize(hist_before);
+            media_inputs.resize(media_before);
+            const std::string err = g_llm.GetLastError();
+            printf("[input rejected] %s\n", err.empty() ? "invalid input (e.g. media path); please try again." : err.c_str());
+            fflush(stdout);
         }
         else
         {
-            history = g_llm.Run(history);
+            history = std::move(result);
         }
     }
 
