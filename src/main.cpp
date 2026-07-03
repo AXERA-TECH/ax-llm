@@ -2612,10 +2612,25 @@ int run_server_mode(const ModelConfig &config, int port)
                     push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
                 }
-                // Native tool calling (Qwen3): append the request's tools to the system prompt.
+                // Native tool calling (Qwen3): honor tool_choice + append tools to the system prompt.
                 const bool req_has_tools = req.raw.contains("tools") && req.raw["tools"].is_array() && !req.raw["tools"].empty();
-                if (req_has_tools) {
-                    const std::string tools_section = render_qwen3_tools_section(req.raw["tools"]);
+                std::string tool_choice_mode = "auto";
+                std::string forced_tool_name;
+                if (req.raw.contains("tool_choice")) {
+                    const auto &tc = req.raw["tool_choice"];
+                    if (tc.is_string()) tool_choice_mode = tc.get<std::string>();
+                    else if (tc.is_object() && tc.contains("function") && tc["function"].is_object()) {
+                        tool_choice_mode = "function";
+                        forced_tool_name = tc["function"].value("name", std::string());
+                    }
+                }
+                const bool tools_active = req_has_tools && tool_choice_mode != "none";
+                if (tools_active) {
+                    std::string tools_section = render_qwen3_tools_section(req.raw["tools"]);
+                    if (tool_choice_mode == "required")
+                        tools_section += "\n\nYou MUST call one of the provided functions to answer. Do not answer in plain text.";
+                    else if (tool_choice_mode == "function" && !forced_tool_name.empty())
+                        tools_section += std::string("\n\nYou MUST call the function \"") + forced_tool_name + "\" to answer. Do not answer in plain text.";
                     if (!history.empty() && history.front().role == SYSTEM)
                         history.front().data += tools_section;
                     else
@@ -2666,6 +2681,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     auto callback = [provider,
                                      model_id = req.model,
                                      emit_thinking_markup,
+                                     tools_active,
                                      &streamed_any,
                                      &thinking_open_emitted,
                                      &streamed_text](std::string str, float token_per_sec, void *reserve) {
@@ -2673,6 +2689,7 @@ int run_server_mode(const ModelConfig &config, int port)
                             ALOGE("provider not writable");
                             return;
                         }
+                        if (tools_active) { streamed_text += str; return; } // buffer; decide after generation
                         std::string out = str;
                         if (emit_thinking_markup)
                         {
@@ -2704,7 +2721,23 @@ int run_server_mode(const ModelConfig &config, int port)
                             provider->push(openai_api::OutputChunk::Error("model_error", llm_error));
                         }
                     }
-                    if (streamed_any) {
+                    if (tools_active) {
+                        if (llm_error.empty()) {
+                            nlohmann::json tcs = parse_tool_calls_from_text(streamed_text);
+                            if (!tcs.empty()) {
+                                auto d = openai_api::OutputChunk::TextDelta("", req.model);
+                                d.obj["tool_calls"] = tcs;
+                                provider->push(d);
+                                auto fin = openai_api::OutputChunk::FinalText("", req.model);
+                                fin.obj["finish_reason"] = "tool_calls";
+                                provider->push(fin);
+                            } else {
+                                std::string out = emit_thinking_markup ? wrap_thinking_text_for_client(streamed_text) : streamed_text;
+                                if (!out.empty()) provider->push(openai_api::OutputChunk::TextDelta(out, req.model));
+                                provider->push(openai_api::OutputChunk::FinalText("", req.model));
+                            }
+                        }
+                    } else if (streamed_any) {
                         if (emit_thinking_markup && thinking_open_emitted && !has_thinking_close_tag(streamed_text))
                         {
                             provider->push(openai_api::OutputChunk::TextDelta("\n</think>", req.model));
@@ -2740,7 +2773,7 @@ int run_server_mode(const ModelConfig &config, int port)
                         final_text = wrap_thinking_text_for_client(final_text);
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
-                    if (req_has_tools) {
+                    if (tools_active) {
                         nlohmann::json tcs = parse_tool_calls_from_text(out_history.back().data);
                         if (!tcs.empty()) chunk.obj["tool_calls"] = tcs;
                     }
