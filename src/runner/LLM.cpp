@@ -2605,6 +2605,13 @@ struct LLM::Impl {
     GuardVerdict running_guard_eval(int devid, int loaded_on_dev) const
     {
         GuardVerdict v;
+        // Test-only seam: force a deterministic mid-load abort after N layers so the
+        // teardown / CMM-reclaim path can be regression-tested (see tools/test_teardown_cmm_leak.sh).
+        if (const char *ta = std::getenv("AXLLM_TEST_ABORT_AFTER_LAYER"))
+        {
+            const int n = std::atoi(ta);
+            if (n >= 0 && loaded_on_dev >= n) { v.ok = false; v.what = "forced test abort (AXLLM_TEST_ABORT_AFTER_LAYER)"; return v; }
+        }
         auto get = [](const std::map<int, int> &m, int k) { auto it = m.find(k); return it == m.end() ? 0 : it->second; };
         if (!_attr.mem_guard_enable || loaded_on_dev <= 0) return v;
         auto bit = rl_baseline_mb_.find(devid);
