@@ -1961,21 +1961,6 @@ static void infer_media_type_from_uri_prefix(std::string &raw_url, ContentType &
 
 // Handle HTTP API messages
 // ---------------- Native tool calling (Qwen3 <tool_call> format) ----------------
-// Render an OpenAI "tools" array into the Qwen3 system-prompt tool section.
-static std::string render_qwen3_tools_section(const nlohmann::json &tools)
-{
-    if (!tools.is_array() || tools.empty()) return {};
-    std::string s;
-    s += "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n";
-    s += "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
-    for (const auto &t : tools) s += "\n" + t.dump();
-    s += "\n</tools>\n\n";
-    s += "For each function call, return a json object with function name and arguments within "
-         "<tool_call></tool_call> XML tags:\n<tool_call>\n"
-         "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
-    return s;
-}
-
 // Extract <tool_call>{...}</tool_call> blocks from model output -> OpenAI tool_calls array.
 static nlohmann::json parse_tool_calls_from_text(const std::string &text)
 {
@@ -2625,16 +2610,19 @@ int run_server_mode(const ModelConfig &config, int port)
                     }
                 }
                 const bool tools_active = req_has_tools && tool_choice_mode != "none";
+                // The tokenizer renders the tool section into the prompt (per-model format);
+                // set/clear it every request so tools don't leak into the next one.
+                llm.SetTools(tools_active ? req.raw["tools"].dump() : std::string());
                 if (tools_active) {
-                    std::string tools_section = render_qwen3_tools_section(req.raw["tools"]);
+                    // tool_choice forcing: append an instruction to the last user turn
+                    // (no history/media-index mutation).
+                    std::string force;
                     if (tool_choice_mode == "required")
-                        tools_section += "\n\nYou MUST call one of the provided functions to answer. Do not answer in plain text.";
+                        force = "\n\nYou MUST call one of the provided functions to answer. Do not answer in plain text.";
                     else if (tool_choice_mode == "function" && !forced_tool_name.empty())
-                        tools_section += std::string("\n\nYou MUST call the function \"") + forced_tool_name + "\" to answer. Do not answer in plain text.";
-                    if (!history.empty() && history.front().role == SYSTEM)
-                        history.front().data += tools_section;
-                    else
-                        history.insert(history.begin(), {SYSTEM, TEXT, std::string("You are a helpful assistant.") + tools_section});
+                        force = std::string("\n\nYou MUST call the function \"") + forced_tool_name + "\" to answer. Do not answer in plain text.";
+                    if (!force.empty() && !history.empty() && history.back().role == USER)
+                        history.back().data += force;
                 }
                 // serve mode does NOT inject config.system_prompt: the client controls the
                 // system message (OpenAI-compatible — no system message means no system block).

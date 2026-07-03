@@ -142,6 +142,7 @@ public:
     void ClearRequestSamplingOverride();
     void SetRequestThinkingMode(ThinkingMode mode);
     void ClearRequestThinkingMode();
+    void SetTools(const std::string &tools_json); // forward the request's OpenAI tools to the tokenizer
     // True if the active tokenizer actually honors think/no_think in its prompt
     // (so callers can warn when a mode is requested but would be ignored).
     bool TokenizerSupportsThinkingToggle() const;
