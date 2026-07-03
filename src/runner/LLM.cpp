@@ -399,6 +399,8 @@ struct LLM::Impl {
 
     std::vector<LLMLayer> llama_layers;
     bool deinited_ = false; // guards Deinit() against double-invocation (explicit call + destructor path)
+    int cmm_sentry_baseline_mb_ = -1;              // free CMM captured at Init start (teardown-balance sentry)
+    static constexpr int kCmmSentryMarginMb = 16;  // tolerate fragmentation / rounding
     // Optional per-layer attention type (for models like Qwen3.5 that mix linear/full attention).
     std::vector<bool> layer_is_linear_attn;
     std::vector<int> layer_kv_cache_sizes;
@@ -2443,6 +2445,39 @@ struct LLM::Impl {
 #endif
     }
 
+    // ---- CMM teardown-balance sentry (automated leak detection) ----
+    // Invariant: after Deinit() the model must return all CMM it took, so free CMM
+    // should return to the value captured at Init start. A persistent shortfall means
+    // a leak (e.g. an Init-failure path freeing against a closed /dev/ax_cmm). Warns
+    // only; disable with AXLLM_CMM_SENTRY=0.
+    static bool cmm_sentry_enabled()
+    {
+        const char *v = std::getenv("AXLLM_CMM_SENTRY");
+        return !(v && v[0] == '0');
+    }
+    int cmm_total_remaining_mb() const
+    {
+#ifdef USE_AXCL
+        int total = 0;
+        for (int d : _attr.dev_ids) { int r = device_remaining_cmm_mb(d); if (r > 0) total += r; }
+        return total;
+#else
+        return device_remaining_cmm_mb(-1);
+#endif
+    }
+    void CheckCmmBalance(const char *tag)
+    {
+        if (cmm_sentry_baseline_mb_ < 0) return; // no baseline -> nothing to check
+        const int now = cmm_total_remaining_mb();
+        if (now <= 0) return;                    // query unavailable (non-AX host) -> skip
+        const int leaked = cmm_sentry_baseline_mb_ - now;
+        if (leaked > kCmmSentryMarginMb)
+            ALOGE("[cmm-sentry] %s: %d MB CMM not reclaimed after teardown (baseline %d MB -> now %d MB) -- suspected leak",
+                  tag, leaked, cmm_sentry_baseline_mb_, now);
+        else
+            ALOGI("[cmm-sentry] %s: CMM balanced (baseline %d MB, now %d MB)", tag, cmm_sentry_baseline_mb_, now);
+    }
+
     // Guard a device (CMM) load. `est_mb` defaults to the model file size.
     bool guard_device_load(const std::string &file, int devid, int est_mb = -1)
     {
@@ -2614,6 +2649,7 @@ struct LLM::Impl {
         ALOGI("LLM init start");
         this->_attr = attr;
         deinited_ = false;
+        if (cmm_sentry_enabled()) cmm_sentry_baseline_mb_ = cmm_total_remaining_mb();
         dynamic_layer_load_enabled_ = _attr.dynamic_load_enable;
         dynamic_layer_pool_size_ = _attr.dynamic_load_pool_size;
         if (dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ <= 0)
@@ -3061,6 +3097,7 @@ struct LLM::Impl {
         embed_selector.Deinit();
         gemma4_per_layer_helper.Deinit();
         if (vision) vision->Deinit();
+        CheckCmmBalance("Deinit"); // automated teardown-balance self-check
 #ifdef USE_AXCL
         for (auto &devid : _attr.dev_ids) axcl_Exit(devid);
 #endif
