@@ -1960,6 +1960,59 @@ static void infer_media_type_from_uri_prefix(std::string &raw_url, ContentType &
 }
 
 // Handle HTTP API messages
+// ---------------- Native tool calling (Qwen3 <tool_call> format) ----------------
+// Render an OpenAI "tools" array into the Qwen3 system-prompt tool section.
+static std::string render_qwen3_tools_section(const nlohmann::json &tools)
+{
+    if (!tools.is_array() || tools.empty()) return {};
+    std::string s;
+    s += "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n";
+    s += "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+    for (const auto &t : tools) s += "\n" + t.dump();
+    s += "\n</tools>\n\n";
+    s += "For each function call, return a json object with function name and arguments within "
+         "<tool_call></tool_call> XML tags:\n<tool_call>\n"
+         "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+    return s;
+}
+
+// Extract <tool_call>{...}</tool_call> blocks from model output -> OpenAI tool_calls array.
+static nlohmann::json parse_tool_calls_from_text(const std::string &text)
+{
+    nlohmann::json calls = nlohmann::json::array();
+    const std::string open = "<tool_call>", close = "</tool_call>";
+    size_t pos = 0; int idx = 0;
+    while (true)
+    {
+        size_t a = text.find(open, pos);
+        if (a == std::string::npos) break;
+        size_t b = text.find(close, a + open.size());
+        if (b == std::string::npos) break;
+        std::string body = text.substr(a + open.size(), b - (a + open.size()));
+        pos = b + close.size();
+        size_t s0 = body.find_first_not_of(" \t\r\n");
+        size_t s1 = body.find_last_not_of(" \t\r\n");
+        if (s0 == std::string::npos) continue;
+        body = body.substr(s0, s1 - s0 + 1);
+        nlohmann::json obj;
+        try { obj = nlohmann::json::parse(body); } catch (...) { continue; }
+        std::string name = obj.value("name", std::string());
+        if (name.empty() && obj.contains("function") && obj["function"].is_object())
+            name = obj["function"].value("name", std::string());
+        if (name.empty()) continue;
+        nlohmann::json args = obj.contains("arguments") ? obj["arguments"]
+                              : (obj.contains("parameters") ? obj["parameters"] : nlohmann::json::object());
+        nlohmann::json call;
+        call["id"] = std::string("call_") + std::to_string(idx) + "_" + name;
+        call["type"] = "function";
+        call["function"]["name"] = name;
+        call["function"]["arguments"] = args.is_string() ? args.get<std::string>() : args.dump(); // OpenAI: string
+        calls.push_back(std::move(call));
+        idx++;
+    }
+    return calls;
+}
+
 bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history,
                          std::vector<MediaInputs> *media_inputs = nullptr,
                          std::vector<std::string> *temp_files = nullptr)
@@ -1981,10 +2034,41 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         {
             content.role = ASSISTANT;
         }
+        else if (item.contains("role") && item["role"] == "tool")
+        {
+            // OpenAI tool result -> Qwen3 renders it as a user turn wrapped in <tool_response>.
+            std::string tc = item.contains("content")
+                                 ? (item["content"].is_string() ? item["content"].get<std::string>() : item["content"].dump())
+                                 : std::string();
+            history.push_back({USER, TEXT, std::string("<tool_response>\n") + tc + "\n</tool_response>"});
+            continue;
+        }
         else
         {
             ALOGE("content type not support");
             return false;
+        }
+        // assistant turn that itself made tool calls -> render them back as <tool_call> text
+        if (content.role == ASSISTANT && item.contains("tool_calls") && item["tool_calls"].is_array())
+        {
+            std::string tc;
+            for (const auto &call : item["tool_calls"])
+            {
+                if (!call.contains("function") || !call["function"].is_object()) continue;
+                nlohmann::json one;
+                one["name"] = call["function"].value("name", std::string());
+                nlohmann::json args = nlohmann::json::object();
+                if (call["function"].contains("arguments"))
+                {
+                    const auto &a = call["function"]["arguments"];
+                    if (a.is_string()) { try { args = nlohmann::json::parse(a.get<std::string>()); } catch (...) {} }
+                    else args = a;
+                }
+                one["arguments"] = args;
+                if (!tc.empty()) tc += "\n";
+                tc += std::string("<tool_call>\n") + one.dump() + "\n</tool_call>";
+            }
+            if (!tc.empty()) { history.push_back({ASSISTANT, TEXT, tc}); continue; }
         }
 
         std::vector<std::string> media_uris;
@@ -2528,6 +2612,15 @@ int run_server_mode(const ModelConfig &config, int port)
                     push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
                 }
+                // Native tool calling (Qwen3): append the request's tools to the system prompt.
+                const bool req_has_tools = req.raw.contains("tools") && req.raw["tools"].is_array() && !req.raw["tools"].empty();
+                if (req_has_tools) {
+                    const std::string tools_section = render_qwen3_tools_section(req.raw["tools"]);
+                    if (!history.empty() && history.front().role == SYSTEM)
+                        history.front().data += tools_section;
+                    else
+                        history.insert(history.begin(), {SYSTEM, TEXT, std::string("You are a helpful assistant.") + tools_section});
+                }
                 // serve mode does NOT inject config.system_prompt: the client controls the
                 // system message (OpenAI-compatible — no system message means no system block).
                 // config.system_prompt only applies to interactive `run` mode.
@@ -2647,6 +2740,10 @@ int run_server_mode(const ModelConfig &config, int port)
                         final_text = wrap_thinking_text_for_client(final_text);
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
+                    if (req_has_tools) {
+                        nlohmann::json tcs = parse_tool_calls_from_text(out_history.back().data);
+                        if (!tcs.empty()) chunk.obj["tool_calls"] = tcs;
+                    }
                     fprintf(stdout, "%s", final_text.c_str());
                     fflush(stdout);
                     provider->push(chunk);
