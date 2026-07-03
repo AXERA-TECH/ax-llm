@@ -2575,14 +2575,18 @@ struct LLM::Impl {
     std::map<int, int> rl_baseline_mb_; // per-device remaining CMM before the loop
     std::map<int, int> rl_total_;       // per-device layer count
     std::map<int, int> rl_tail_mb_;     // per-device post/encoder file MB (loaded after layers)
+    std::map<int, int> guard_settled_;  // devices where the measured guard confidently passed -> stop re-checking
+    static constexpr int kGuardMinSamples = 4;      // layers to load before trusting the extrapolation
+    static constexpr int kGuardSettleMarginMb = 512; // headroom above floor at which we stop re-checking
 
-    struct GuardVerdict { bool ok = true; bool warned = false; std::string what; int projected = 0; int remain = -1; };
+    struct GuardVerdict { bool ok = true; bool warned = false; bool confident = false; std::string what; int projected = 0; int remain = -1; };
 
     void running_guard_init()
     {
         rl_baseline_mb_.clear();
         rl_total_.clear();
         rl_tail_mb_.clear();
+        guard_settled_.clear();
         if (!_attr.mem_guard_enable || _attr.axmodel_num <= 0) return;
         for (int i = 0; i < _attr.axmodel_num; ++i)
             rl_total_[layer_devid_for(i)] += 1;
@@ -2622,11 +2626,35 @@ struct LLM::Impl {
         if (cur < 0 || baseline < 0) return v;
         const int used = baseline - cur;
         if (used <= 0) return v; // no measurable consumption yet -> can't project
+        // Hard safety net: never let a load drive remaining CMM below the floor,
+        // regardless of projection or sample count -- this is the real OOM guard.
+        if (cur < _attr.mem_guard_floor_mb)
+        {
+            char whatf[192];
+            std::snprintf(whatf, sizeof(whatf), "device %d CMM below floor (remain %d MB < floor %d MB)",
+                          devid, cur, _attr.mem_guard_floor_mb);
+            v.what = whatf;
+            if (_attr.mem_guard_on_unsafe == "warn") { v.warned = true; return v; }
+            v.ok = false;
+            return v;
+        }
+        // A single measured layer (loaded==1) is dominated by one-time / shared
+        // allocations and grossly over-projects, which used to false-abort small
+        // models. Require a few samples before trusting the extrapolation; the
+        // hard-floor check above still protects against real OOM meanwhile.
+        if (loaded_on_dev < kGuardMinSamples) return v;
         const double per_layer = (double)used / loaded_on_dev;
         const int left = std::max(0, get(rl_total_, devid) - loaded_on_dev);
         const int tail = (int)(get(rl_tail_mb_, devid) * 1.15 + 0.5);
         v.projected = (int)(per_layer * left + 0.5) + tail;
-        if (cur - v.projected >= _attr.mem_guard_floor_mb) return v; // safe
+        const int headroom = cur - v.projected;
+        if (headroom >= _attr.mem_guard_floor_mb)
+        {
+            // Comfortably safe -> let the caller stop re-checking (avoids a slow
+            // per-layer CMM query for the rest of the load, esp. on AXCL).
+            if (headroom >= _attr.mem_guard_floor_mb + kGuardSettleMarginMb) v.confident = true;
+            return v;
+        }
         char what[192];
         std::snprintf(what, sizeof(what), "device %d CMM (%d more layers @~%.0f MB + tail %d MB, measured)",
                       devid, left, per_layer, tail);
@@ -2640,7 +2668,9 @@ struct LLM::Impl {
     // false to abort. Safe only on the main thread (logs / writes last_error).
     bool running_guard_check(int devid, int loaded_on_dev)
     {
+        if (guard_settled_.count(devid)) return true; // already confidently safe -> skip the CMM query
         const GuardVerdict v = running_guard_eval(devid, loaded_on_dev);
+        if (v.confident) guard_settled_[devid] = 1;
         if (v.warned)
             ALOGW("[mem-guard] WARN(measured): %s (projected +%d MB, remain %d MB) -> continuing",
                   v.what.c_str(), v.projected, v.remain);
