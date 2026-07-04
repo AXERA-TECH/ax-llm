@@ -139,6 +139,8 @@ axllm
 
 模型目录 `config.json` 的**全部字段说明**见 **[docs/configuration.md](docs/configuration.md)**（必填项、动态加载、多槽 KV 缓存、内存安全预检、VLM/视觉、Embedding、服务、AXCL 多卡等）。
 
+> **工具调用（Tool / Function Calling）**：`serve` 支持 OpenAI 兼容的工具调用，**目前仅支持 Qwen3 系模型**（文本与 VLM 均可），用法见 **[docs/tool_calling.md](docs/tool_calling.md)**。
+
 > 默认开启**内存安全预检**(`mem_guard_enable`)：加载模型前按文件大小估算占用并对照剩余 CMM/DDR，放不下会告警/中止（可弹 Y/N 确认），避免强行加载超额模型导致驱动崩溃。详见配置文档。
 
 ### Docker（CI 导出镜像）
