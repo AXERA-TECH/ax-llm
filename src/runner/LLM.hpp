@@ -86,7 +86,7 @@ struct LLMAttrType {
     std::vector<int> prefill_max_kv_cache_num_grp;
     int prefill_grpid = -1;
     std::string post_config_path = "post_config.json";
-    bool b_use_mmap_load_embed = false;
+    bool b_use_mmap_load_embed = true; // default to mmap (demand-paged); avoids loading the whole embed table into host RAM
 
     // ---- vision / VLM (optional, runtime switch by `vlm_type`) ----
     // If `vlm_type != VLMType::None`, vision encoder will be initialized and used.

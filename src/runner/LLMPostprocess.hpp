@@ -59,6 +59,7 @@ private:
     // 	控制随机性
     void apply_temperature(std::vector<float> &logits, float temperature)
     {
+        if (temperature < 1e-2f) temperature = 1e-2f; // avoid inf/NaN from a near-zero temperature
         for (float &logit : logits)
         {
             logit /= temperature;
@@ -555,7 +556,7 @@ public:
 
         enable_temperature = config["enable_temperature"];
         temperature = config["temperature"];
-        if (temperature <= 0.0f) temperature = 1.0f;
+        if (temperature < 0.0f) temperature = 0.0f; // temperature 0 = greedy; do NOT rewrite to 1.0 (that turns a determinism request into random sampling)
 
         enable_repetition_penalty = config["enable_repetition_penalty"];
         repetition_penalty = config["repetition_penalty"];

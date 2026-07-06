@@ -2988,11 +2988,13 @@ int main(int argc, char *argv[])
             std::string arg = argv[i];
             if (arg == "--port" && i + 1 < argc)
             {
-                port = std::stoi(argv[++i]);
+                try { port = std::stoi(argv[++i]); }
+                catch (const std::exception &) { ALOGW("invalid --port value '%s', ignoring", argv[i]); }
             }
             else if (arg == "--server_timeout_ms" && i + 1 < argc)
             {
-                config.server_timeout_ms = std::stoi(argv[++i]);
+                try { config.server_timeout_ms = std::stoi(argv[++i]); }
+                catch (const std::exception &) { ALOGW("invalid --server_timeout_ms value '%s', ignoring", argv[i]); }
             }
             else if (arg == "--help" || arg == "-h")
             {
