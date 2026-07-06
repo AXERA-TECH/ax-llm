@@ -73,8 +73,14 @@
 #endif
 
 // Global variables
+#include <mutex>
 static LLM g_llm;
 static openai_api::Server g_server;
+// serve is single-flight: routeChat/Embedding/ASR run each request on a DETACHED
+// thread, and the HTTP concurrency slot is released early on timeout/disconnect, so
+// two llm.Run calls can otherwise overlap and corrupt the shared engine state.
+// Serialize all engine work here so concurrent requests queue instead of colliding.
+static std::mutex g_engine_mutex;
 static std::atomic<bool> g_running{true};
 // In interactive mode: SIGINT/Ctrl+C stops current generation and returns to prompt.
 // In server mode: SIGINT/Ctrl+C exits the process (by stopping server loop).
@@ -2278,6 +2284,7 @@ int run_server_mode(const ModelConfig &config, int port)
             g_server.registerImageGeneration(variant.model_id, [generator, generated_dir](const openai_api::ImageGenRequest &req,
                                                                                            std::shared_ptr<openai_api::BaseDataProvider> provider)
                                              {
+                std::lock_guard<std::mutex> engine_lock(g_engine_mutex); // single-flight: no overlapping engine work
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
@@ -2374,6 +2381,7 @@ int run_server_mode(const ModelConfig &config, int port)
             timeout_ms = 300000;
         }
         g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms)); // single-flight: queued requests wait up to the request timeout, not 503 after the 5s default
         g_server.run(port);
     }
     else
@@ -2397,6 +2405,7 @@ int run_server_mode(const ModelConfig &config, int port)
             g_server.registerEmbedding(model_name, [&llm, use_jina_prompt_prefix](const openai_api::EmbeddingRequest &req,
                                                                std::shared_ptr<openai_api::BaseDataProvider> provider)
                                        {
+                std::lock_guard<std::mutex> engine_lock(g_engine_mutex); // single-flight: no overlapping engine work
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
@@ -2500,6 +2509,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms)); // single-flight: queued requests wait up to the request timeout, not 503 after the 5s default
             g_server.run(port);
         }
         else
@@ -2521,6 +2531,7 @@ int run_server_mode(const ModelConfig &config, int port)
             g_server.registerChat(model_name, [&llm, config, single_image_ocr_mode, hymt_translation_mode](const openai_api::ChatRequest &req,
                                                                                                             std::shared_ptr<openai_api::BaseDataProvider> provider)
                                   {
+                std::lock_guard<std::mutex> engine_lock(g_engine_mutex); // single-flight: no overlapping engine work
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
@@ -2778,6 +2789,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 g_server.registerASR(model_name, [&llm](const openai_api::ASRRequest &req,
                                                         std::shared_ptr<openai_api::BaseDataProvider> provider)
                                      {
+                    std::lock_guard<std::mutex> engine_lock(g_engine_mutex); // single-flight: no overlapping engine work
                     if (!provider->is_writable()) {
                         ALOGE("provider not writable");
                         return;
@@ -2844,6 +2856,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms)); // single-flight: queued requests wait up to the request timeout, not 503 after the 5s default
             g_server.run(port);
         }
         llm.Deinit();
