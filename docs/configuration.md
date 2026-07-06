@@ -102,6 +102,7 @@
 | `vision_patch_size` / `vision_temporal_patch_size` / `vision_spatial_merge_size` | 14 / 2 / 2 | patchify 参数 |
 | `vision_fps` / `vision_tokens_per_second` | 1 / 1 | 视频时间缩放(Qwen2.5-VL mRoPE) |
 | `vision_num_frames` / `vision_do_sample_frames` | 0 / true | 视频抽帧上限 / 是否均匀抽帧 |
+| `enable_video_context` | false | 允许视频轮次保留在会话上下文中,后续纯文本追问可继续复用该视频的多模态 KV;适合长上下文配置,短上下文模型建议保持关闭 |
 
 > **视觉缓存(vision_cache)环境变量:**
 > - `AXLLM_VISION_CACHE=0`：完全关闭视觉缓存(磁盘+内存)。

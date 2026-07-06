@@ -113,6 +113,9 @@ struct LLMAttrType {
     int vision_tokens_per_second = 1;
     int vision_num_frames = 0;       // for frame-sampled video input
     bool vision_do_sample_frames = true;
+    // Keep video turns in session history so later text-only turns can continue
+    // discussing the same video when the context budget is large enough.
+    bool enable_video_context = false;
 
 #ifndef USE_AXCL
     bool b_use_mmap_load_layer = true;

@@ -495,6 +495,9 @@ struct ModelConfig
                 attr.mem_guard_on_unsafe = j["mem_guard_on_unsafe"].get<std::string>();
             }
 
+            attr.enable_video_context = false;
+            json_bool_value(j, "enable_video_context", attr.enable_video_context);
+
             // Optional: models with mixed linear/full attention layers (e.g., Qwen3.5).
             // Keep config minimal: only an interval is needed (layer count comes from `axmodel_num`).
             attr.full_attention_interval = 0;

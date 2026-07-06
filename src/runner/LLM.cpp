@@ -2182,6 +2182,15 @@ struct LLM::Impl {
                key.find("minicpmv46") != std::string::npos;
     }
 
+    bool allow_minicpmv46_cached_text_turns() const
+    {
+        const std::string key = key_of(_attr.tokenizer_type);
+        if (key.find("minicpmv46") == std::string::npos)
+            return true;
+        return _attr.enable_video_context ||
+               std::getenv("AXLLM_ENABLE_MINICPMV46_TEXT_KV_CACHE") != nullptr;
+    }
+
     std::string cached_im_chat_generation_prompt() const
     {
         const std::string key = key_of(_attr.tokenizer_type);
@@ -5117,7 +5126,7 @@ struct LLM::Impl {
                 select_kv_slot_by_history(history);
         }
 
-        if (request_has_video_media(history, effective_media_inputs))
+        if (!_attr.enable_video_context && request_has_video_media(history, effective_media_inputs))
         {
             const size_t old_history_size = history.size();
             const size_t old_media_size = effective_media_inputs.size();
@@ -5131,6 +5140,10 @@ struct LLM::Impl {
                 ResetKVCache();
                 video_history_isolated = true;
             }
+        }
+        else if (_attr.enable_video_context && request_has_video_media(history, effective_media_inputs))
+        {
+            ALOGI("video context enabled: keep video turns in history for follow-up dialogue");
         }
 
         std::vector<int> new_tokens;
@@ -5159,7 +5172,7 @@ struct LLM::Impl {
         const bool allow_cached_text_turn =
             supports_cached_im_chat_turn_tokens() &&
             (!is_minicpm_v46_cache ||
-             std::getenv("AXLLM_ENABLE_MINICPMV46_TEXT_KV_CACHE") != nullptr);
+             allow_minicpmv46_cached_text_turns());
         const bool no_new_media_input = !has_new_media_input(effective_media_inputs, append_start);
         const bool cached_text_turn_requested = vision && vision->enabled() &&
                                                 allow_cached_text_turn &&
