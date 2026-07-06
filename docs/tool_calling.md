@@ -6,17 +6,22 @@ result back, and the model produces a final answer.
 
 ## Supported models
 
-> **Only the Qwen3 family is supported right now.**
+> **Supported: the Qwen3 family and MiniCPM-V-4.6.**
 > Tool calling uses Qwen3's `<tool_call>{...}</tool_call>` prompt format, so it works for
 > `tokenizer_type` = `Qwen3`, `Qwen3VL`, `Qwen2_5`, `Qwen3_5`, `Qwen3_5VL`, `Qwen3Omni`
-> (i.e. any model handled by the Qwen3 tokenizer). Both text and VLM (image + tools) work.
+> (any model handled by the Qwen3 tokenizer), plus `MiniCPMV46` / `MiniCPMV46VL`
+> (MiniCPM-V-4.6, whose text backbone is Qwen3.5 and shares the same tool convention).
+> Both text and VLM (image + tools) work.
 >
-> **Other model families are not supported.** If you send `tools` to a non-Qwen3 model,
+> **Other model families are not supported.** If you send `tools` to an unsupported model,
 > the tool section is not rendered and the model will simply answer in text (no
 > `tool_calls` will be returned).
 >
 > Practical note for small models: on ≤4B models the model occasionally answers directly
-> instead of calling a tool. Use `tool_choice: "required"` to force a call.
+> instead of calling a tool. Use `tool_choice: "required"` to force a call. Tool calling is
+> also most reliable with **greedy decoding** (sampling disabled) -- under sampling a small
+> model is likelier to chatter instead of emitting a clean `<tool_call>` (e.g. MiniCPM-V-4.6
+> tests: 6/6 greedy vs 2/6 at temperature 0.7).
 
 ## Request
 
@@ -116,7 +121,7 @@ request; tool calling behaves the same as text.
 
 ## Limitations
 
-- Qwen3 `<tool_call>` format only; other model families are not supported.
+- Qwen3 `<tool_call>` format only (Qwen3 family + MiniCPM-V-4.6); other model families are not supported.
 - Streaming tool calls are buffered (not token-incremental).
 - Reliability on ≤4B models is model-dependent (~95%); use `tool_choice: "required"` when a
   tool call is mandatory.

@@ -1981,10 +1981,13 @@ static nlohmann::json parse_tool_calls_from_text(const std::string &text)
         if (b == std::string::npos) break;
         std::string body = text.substr(a + open.size(), b - (a + open.size()));
         pos = b + close.size();
-        size_t s0 = body.find_first_not_of(" \t\r\n");
-        size_t s1 = body.find_last_not_of(" \t\r\n");
-        if (s0 == std::string::npos) continue;
-        body = body.substr(s0, s1 - s0 + 1);
+        // Extract the outermost {...} object. Some models prefix/suffix the JSON
+        // with stray tag artifacts (e.g. a doubled '>' -> "<tool_call>>") or
+        // whitespace; anchoring on the braces keeps those from breaking parsing.
+        size_t j0 = body.find('{');
+        size_t j1 = body.rfind('}');
+        if (j0 == std::string::npos || j1 == std::string::npos || j1 < j0) continue;
+        body = body.substr(j0, j1 - j0 + 1);
         nlohmann::json obj;
         try { obj = nlohmann::json::parse(body); } catch (...) { continue; }
         std::string name = obj.value("name", std::string());
