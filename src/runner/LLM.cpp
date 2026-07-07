@@ -5151,11 +5151,12 @@ struct LLM::Impl {
         size_t append_start = last_history_snapshot.size();
         if (!last_history_snapshot.empty() && !is_history_prefix(last_history_snapshot, history))
         {
-            // For multi-slot requests, the chosen slot may share only a token
-            // prefix (e.g. same system prompt, different question) rather than be
-            // a strict history append. Skip the single-context reset and let the
-            // token-level prefix-reuse logic below keep the shared KV.
-            if (!multi_slot_active_request_)
+            // Non-append TEXT histories (same system prompt, different question) can share a
+            // long common token prefix -- let token-level prefix reuse keep it instead of
+            // wiping the KV and recomputing the shared prefix every time. For VLM, keep the
+            // single-context reset: image placeholder token IDs are identical across different
+            // images, so a token-level prefix match would wrongly reuse a previous image's KV.
+            if (!multi_slot_active_request_ && _attr.vlm_type != VLMType::None)
             {
                 ALOGW("raw history not append. force ResetKVCache before request processing.");
                 ResetKVCache();
@@ -5468,13 +5469,18 @@ struct LLM::Impl {
             }
             else
             {
-                // Cap the reused prefix to what a single prefill can attend to as history;
-                // recompute the few extra tokens instead of failing SetKVCache below.
-                const int max_hist = max_prefill_history_cap();
-                if (max_hist > 0 && keep > max_hist)
+                // Reuse whole prefill chunks only: round the reused prefix down to a
+                // prefill-chunk boundary, and cap to what a single prefill can attend to as
+                // history (max_prefill_history_cap, itself chunk-aligned). Recompute the
+                // remaining tokens (the partial last chunk + the divergent suffix).
+                const int step = std::max(1, _attr.prefill_token_num);
+                const int cap = max_prefill_history_cap();
+                int aligned = (keep / step) * step;
+                if (cap > 0 && aligned > cap) aligned = (cap / step) * step;
+                if (aligned != keep)
                 {
-                    ALOGW("token prefix reuse: cap prefix %d -> %d (max prefill history cap)", keep, max_hist);
-                    keep = max_hist;
+                    ALOGW("token prefix reuse: chunk-align prefix %d -> %d (step=%d cap=%d)", keep, aligned, step, cap);
+                    keep = aligned;
                     offset = keep;
                     tokens_diff.assign(new_tokens.begin() + keep, new_tokens.end());
                 }
