@@ -478,6 +478,45 @@ int PaddleOCRVLImageProcessor(axcv::Mat& src,
     return 0;
 }
 
+int LocateAnythingImageProcessor(axcv::Mat& src,
+                                 std::vector<unsigned char>& output,
+                                 int tgt_h, int tgt_w,
+                                 int patch_size) {
+    // Direct port of infer_locateanything_axengine.py image_to_patches():
+    // Pillow bicubic resize to tgt_w x tgt_h (560x560), then patchify channel-first
+    // per patch into [N, C, pH, pW] (N = grid_h*grid_w). Normalization (pixel/127.5-1)
+    // is applied by the caller via encode_block_normalized_float(mean=0.5, std=0.5).
+    std::vector<unsigned char> rgb;
+    if (!pillow_resize_bgr_to_rgb_u8(src, rgb, tgt_w, tgt_h)) {
+        return -1;
+    }
+
+    const int grid_h = tgt_h / patch_size;
+    const int grid_w = tgt_w / patch_size;
+    const int N = grid_h * grid_w;
+    const int C = 3;
+
+    output.resize((size_t)N * C * patch_size * patch_size);
+
+    size_t idx = 0;
+    for (int n = 0; n < N; n++) {
+        const int gh = n / grid_w;
+        const int gw = n % grid_w;
+        for (int c = 0; c < C; c++) {
+            for (int ph = 0; ph < patch_size; ph++) {
+                const int row = gh * patch_size + ph;
+                const uint8_t* row_ptr = rgb.data() + (size_t)row * (size_t)tgt_w * (size_t)C;
+                for (int pw = 0; pw < patch_size; pw++) {
+                    const int col = gw * patch_size + pw;
+                    output[idx++] = row_ptr[col * C + c];
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 int Gemma4ImageProcessor(axcv::Mat& src,
                          std::vector<unsigned char>& output,
                          int tgt_h, int tgt_w,
