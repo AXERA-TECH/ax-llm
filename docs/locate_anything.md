@@ -78,6 +78,38 @@ Send an image + a task instruction via the OpenAI chat API (one image per reques
 | GUI grounding (box) | `Locate the region that matches the following description: {phrase}.` | box |
 | GUI grounding / pointing | `Point to: {phrase}.` | point |
 
+## WebUI demo
+
+`scripts/locateanything_webui.py` is a small stdlib-only (no extra deps) web front-end for a
+running `serve` instance — real-time detection / phrase grounding with incremental box drawing.
+
+```shell
+AXLLM_SERVE_URL=http://127.0.0.1:8010 \
+AXLLM_IMAGE_DIR=/path/to/sample_images \
+python3 scripts/locateanything_webui.py --port 7861
+```
+
+Open `http://<host>:7861`. Flags: `--host`, `--port`, `--serve-url`, `--image-dir`, `--model`.
+
+- Auto-scrolling thumbnail banner (hover to pause, mouse-wheel to scroll, click to load); **Upload** button.
+- **Task** = *Object detection* (edit colored category chips; one query per category) or
+  *Phrase grounding* (type a description, e.g. `the dog on the left`).
+- **Max targets** slider (16 / 64 / 256); a scanning animation plays during prefill + image
+  encoding, then boxes stream in one by one; status light + **Detect** / **Stop**.
+
+Optional per-image presets — drop a `tags.json` next to the images in `AXLLM_IMAGE_DIR`:
+
+```json
+{
+  "dogs.jpg":   { "tags": ["dog"],               "phrase": "the dog in the center" },
+  "safari.jpg": { "tags": ["zebra", "elephant"], "phrase": "the elephant" }
+}
+```
+
+`tags` are the categories used in detection mode, `phrase` the sentence used in grounding
+mode; clicking a thumbnail loads both and the task selector picks which is used. A bare list
+(`"dogs.jpg": ["dog"]`) is also accepted (category only).
+
 ## Notes
 
 - **Use greedy decoding** (temperature 0 / sampling off) for the most reliable, well-formed
