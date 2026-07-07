@@ -151,6 +151,8 @@ public:
     void MarkRequestStart();
     void ClearRequestStart();
     std::string GetLastError() const;
+    int GetLastPromptTokenNum() const;
+    int GetLastCompletionTokenNum() const;
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
     bool Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding);

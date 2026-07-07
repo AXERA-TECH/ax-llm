@@ -337,6 +337,9 @@ struct LLM::Impl {
     std::vector<int> last_tokens_ids;
     std::vector<int> run_input_token_ids;
     std::vector<int> last_run_generated_token_ids;
+    int last_run_prompt_token_num_ = 0;
+    int get_last_prompt_token_num() const { return last_run_prompt_token_num_; }
+    int get_last_completion_token_num() const { return (int)last_run_generated_token_ids.size(); }
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     struct LinearStateSnapshot {
         int token_len = 0;
@@ -5335,6 +5338,7 @@ struct LLM::Impl {
             new_tokens = tokenizer->encode(history);
         }
 
+        last_run_prompt_token_num_ = (int)new_tokens.size();
         int offset = 0;
         auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
         const bool token_appended = (offset == (int)last_tokens_ids.size() && (int)new_tokens.size() >= (int)last_tokens_ids.size());
@@ -5712,6 +5716,8 @@ bool LLM::TokenizerSupportsThinkingToggle() const { return impl_->tokenizer ? im
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
 void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
+int LLM::GetLastPromptTokenNum() const { return impl_->get_last_prompt_token_num(); }
+int LLM::GetLastCompletionTokenNum() const { return impl_->get_last_completion_token_num(); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
 bool LLM::Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding) { return impl_->EmbedHistory(history, media_inputs, out_embedding); }
