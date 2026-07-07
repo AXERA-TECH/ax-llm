@@ -1107,6 +1107,17 @@ struct LLM::Impl {
         return prefill_history_kv_cache_num_grp[(size_t)idx];
     }
 
+    // Largest history (already-cached KV prefix) a single prefill can attend to. Prefill
+    // shape-groups are sized for chunked prefill, so their max history cap is smaller than
+    // the model's full context. A reused KV prefix longer than this cannot be set up in one
+    // SetKVCache, so the prefix-reuse path must cap to it (and recompute the extra tokens).
+    int max_prefill_history_cap() const
+    {
+        int m = 0;
+        for (int gid : prefill_grpids_) { const int c = prefill_history_capacity_by_gid(gid); if (c > m) m = c; }
+        return m;
+    }
+
     int prefill_symbolic_capacity_by_gid(int gid) const
     {
         const int idx = group_index_by_gid(prefill_grpids_, gid);
@@ -5432,7 +5443,11 @@ struct LLM::Impl {
 
             if (has_linear_attention_layers())
             {
-                keep = best_linear_state_snapshot_len(offset);
+                // Cap the reuse target to the max prefill history capacity before snapping to
+                // a linear-state snapshot, so the resulting prefix fits a single prefill group.
+                const int max_hist_lin = max_prefill_history_cap();
+                const int want_lin = (max_hist_lin > 0 && offset > max_hist_lin) ? max_hist_lin : offset;
+                keep = best_linear_state_snapshot_len(want_lin);
                 if (keep < 0)
                 {
                     ALOGW("token prefix reuse has no linear state snapshot <= %d. force ResetKVCache and recompute.", offset);
@@ -5466,6 +5481,16 @@ struct LLM::Impl {
             }
             else
             {
+                // Cap the reused prefix to what a single prefill can attend to as history;
+                // recompute the few extra tokens instead of failing SetKVCache below.
+                const int max_hist = max_prefill_history_cap();
+                if (max_hist > 0 && keep > max_hist)
+                {
+                    ALOGW("token prefix reuse: cap prefix %d -> %d (max prefill history cap)", keep, max_hist);
+                    keep = max_hist;
+                    offset = keep;
+                    tokens_diff.assign(new_tokens.begin() + keep, new_tokens.end());
+                }
                 if (prev_tokens != keep)
                 {
                     last_tokens_ids.resize((size_t)keep);
@@ -5520,7 +5545,21 @@ struct LLM::Impl {
             tokens_diff = new_tokens;
             offset = 0;
         }
-        const int kv_ret = SetKVCache(k_caches, v_caches, precompute_len, (int)tokens_diff.size());
+        int kv_ret = SetKVCache(k_caches, v_caches, precompute_len, (int)tokens_diff.size());
+        if (kv_ret != 0 && precompute_len > 0 && !used_cached_text_turn && !used_cached_media_turn)
+        {
+            // The reused prefix could not be set up in a single prefill group. This is NOT a
+            // real context overflow -- fall back to a full chunked recompute instead of
+            // surfacing a misleading "context exceeded" error to the user.
+            ALOGW("prefix-reuse SetKVCache failed (precompute_len=%d suffix=%zu); fall back to full recompute",
+                  precompute_len, (int)tokens_diff.size());
+            clear_last_error();
+            ResetKVCache();
+            tokens_diff = new_tokens;
+            offset = 0;
+            precompute_len = 0;
+            kv_ret = SetKVCache(k_caches, v_caches, 0, (int)tokens_diff.size());
+        }
         if (kv_ret != 0)
         {
             ALOGE("SetKVCache failed");
