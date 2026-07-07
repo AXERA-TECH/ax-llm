@@ -5531,7 +5531,28 @@ struct LLM::Impl {
                 ALOGE("cached media turn has empty token diff; refuse full recompute");
                 return history;
             }
-            if (!new_tokens.empty()) { precompute_len = (int)new_tokens.size() - 1; offset = precompute_len; tokens_diff = {new_tokens.back()}; }
+            if (!new_tokens.empty())
+            {
+                // Identical re-query: the reused prefix is the whole previous input minus one
+                // token. Chunk-align + cap it to the prefill history capacity so it fits a
+                // single prefill group and can be reused (otherwise SetKVCache would fail and
+                // fall back to a full recompute). Linear models keep the exact value and rely
+                // on the fallback (their state is snapshotted, not chunk-addressable).
+                int keep = (int)new_tokens.size() - 1;
+                if (!has_linear_attention_layers())
+                {
+                    const int step = std::max(1, _attr.prefill_token_num);
+                    const int maxh = max_prefill_history_cap();
+                    if (maxh > 0 && keep > maxh) keep = maxh;
+                    keep = (keep / step) * step;
+                    if (keep < 0) keep = 0;
+                }
+                precompute_len = keep;
+                offset = keep;
+                tokens_diff.assign(new_tokens.begin() + keep, new_tokens.end());
+                if ((int)last_tokens_ids.size() > keep) last_tokens_ids.resize((size_t)keep);
+                ALOGI("identical re-query: reuse KV prefix tokens=%d recompute_suffix=%zu", keep, tokens_diff.size());
+            }
             else { ResetKVCache(); precompute_len = 0; }
         }
         if (!not_append && offset != precompute_len && precompute_len > 0)
