@@ -187,7 +187,6 @@ input[type=range]{flex:1;accent-color:var(--accent)}
         <label>Task</label>
         <select id="task">
           <option value="detection">Object detection</option>
-          <option value="ocr">Scene text / OCR</option>
           <option value="grounding">Phrase grounding</option>
         </select>
       </section>
@@ -242,6 +241,7 @@ let thumbs=[], current=null, boxes=[], detecting=false, abortCtrl=null, rafId=nu
 let cats=["person"];
 const colors={};      // label -> bright color, persistent; chips and boxes share it
 const imageTags={};   // image src -> its category tags (seeded from server, updated as user edits)
+const imagePhrases={};// image src -> its phrase-grounding sentence
 function colorFor(lbl){ if(!(lbl in colors)){ const h=Math.floor(Math.random()*360); colors[lbl]="hsl("+h+",90%,62%)"; } return colors[lbl]; }
 
 /* ---------------- carousel (seamless loop) ---------------- */
@@ -249,7 +249,7 @@ const THUMB_W=176, GAP=12, STEP=THUMB_W+GAP;
 let scrollX=0, paused=false, unitWidth=0;
 async function loadThumbs(){
   try{ thumbs=await (await fetch("/api/thumbs")).json(); }catch(e){ thumbs=[]; }
-  thumbs.forEach(t=>{ if(t.tags && t.tags.length) imageTags[t.src]=t.tags.slice(); });
+  thumbs.forEach(t=>{ if(t.tags && t.tags.length) imageTags[t.src]=t.tags.slice(); if(t.phrase) imagePhrases[t.src]=t.phrase; });
   buildTrack();
   if(thumbs.length && !current) selectSrc(thumbs[0].src, null, false);
 }
@@ -285,10 +285,14 @@ function selectSrc(src, node, userInitiated){
   const img=new Image();
   img.onload=()=>{ current={img, src, w:img.naturalWidth, h:img.naturalHeight, b64:toB64(img,src)};
     boxes=[]; $("hint").style.display="none"; $("countbadge").hidden=true; setLight("idle","Ready"); resize(); drawStatic(); markActive();
+    $("phrase").value = imagePhrases[src] || "";   // load this image's phrase (used in Phrase-grounding mode)
     const tags=imageTags[src];
     if(tags && tags.length){
-      if(userInitiated) maybeAskSwitch(tags);      // ask via custom modal
-      else { cats=tags.slice(); renderChips(); }   // initial load -> adopt silently
+      // Always load this image's categories too (so both category + phrase are ready and the
+      // task selector just picks which to use). In detection mode a user click still asks via
+      // the modal before replacing the current categories; otherwise load silently.
+      if(userInitiated && $("task").value==="detection") maybeAskSwitch(tags);
+      else { cats=tags.slice(); renderChips(); }
     }
   };
   img.onerror=()=>setLight("error","Image load failed");
@@ -457,15 +461,24 @@ def list_images(d):
     return out[:48]
 
 def load_tags(d):
-    """Optional per-image categories from <image_dir>/tags.json: {"name.jpg": ["car", ...]}."""
+    """Per-image presets from <image_dir>/tags.json. Each value is either a bare category
+    list (legacy) or {"tags": [...], "phrase": "..."}. Returns {name: {"tags", "phrase"}}."""
     if not d:
         return {}
     try:
         with open(os.path.join(d, "tags.json"), encoding="utf-8") as f:
             m = json.load(f)
-        return {k: v for k, v in m.items() if isinstance(v, list)}
     except Exception:
         return {}
+    out = {}
+    for k, v in m.items():
+        if isinstance(v, list):
+            out[k] = {"tags": v, "phrase": ""}
+        elif isinstance(v, dict):
+            t = v.get("tags"); p = v.get("phrase")
+            out[k] = {"tags": t if isinstance(t, list) else [],
+                      "phrase": p if isinstance(p, str) else ""}
+    return out
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -483,7 +496,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/thumbs":
             names = list_images(IMAGE_DIR)
             tags = load_tags(IMAGE_DIR)
-            data = [{"src": "/thumb/" + n, "name": n, "tags": tags.get(n, [])} for n in names]
+            data = [{"src": "/thumb/" + n, "name": n,
+                     "tags": tags.get(n, {}).get("tags", []),
+                     "phrase": tags.get(n, {}).get("phrase", "")} for n in names]
             return self._send(200, "application/json", json.dumps(data))
         if path.startswith("/thumb/"):
             name = os.path.basename(path[len("/thumb/"):])
