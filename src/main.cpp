@@ -2322,6 +2322,16 @@ int run_server_mode(const ModelConfig &config, int port)
             return -1;
         }
 
+        // Safety net: free the model's CMM pool on every path that unwinds this
+        // scope -- normal return, signal-triggered shutdown, or an uncaught
+        // exception. Deinit() is idempotent (guarded by deinited_), so the
+        // explicit Deinit() on the normal path below stays a no-op here. (#60)
+        struct LlmCmmGuard
+        {
+            LLM &llm;
+            ~LlmCmmGuard() { llm.Deinit(); }
+        } llm_cmm_guard{llm};
+
         if (config.is_embedding_model())
         {
             const bool use_jina_prompt_prefix = normalized_key(config.attr.tokenizer_type) == "qwen3omni";
@@ -2898,7 +2908,17 @@ int main(int argc, char *argv[])
                 return 0;
             }
         }
-        return run_server_mode(config, port);
+        try
+        {
+            return run_server_mode(config, port);
+        }
+        catch (const std::exception &e)
+        {
+            // Unwind the stack (running LlmCmmGuard -> Deinit -> CMM freed)
+            // instead of std::terminate skipping destructors on an uncaught throw.
+            ALOGE("serve terminated by exception: %s", e.what());
+            return -1;
+        }
     }
     else
     {
