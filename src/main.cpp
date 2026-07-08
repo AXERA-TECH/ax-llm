@@ -2797,6 +2797,15 @@ int main(int argc, char *argv[])
     signal(SIGPIPE, SIG_IGN);
 #endif
     signal(SIGINT, __sigExit);
+#ifndef _WIN32
+    // Also shut down gracefully on `kill`/`killall` (SIGTERM), terminal hangup
+    // (SIGHUP) and SIGQUIT so run_server_mode() unwinds to LLM.Deinit() and
+    // frees the CMM pool. On on-chip targets /dev/ax_cmm is not reclaimed on an
+    // ungraceful exit, so an unhandled SIGTERM leaks the pool until reboot (#60).
+    signal(SIGTERM, __sigExit);
+    signal(SIGHUP, __sigExit);
+    signal(SIGQUIT, __sigExit);
+#endif
 #ifdef _WIN32
     SetConsoleCtrlHandler(__ConsoleCtrlHandler, TRUE);
     // Initialize logger early so Windows console uses UTF-8 (prevents Chinese/box-drawing garbling).
