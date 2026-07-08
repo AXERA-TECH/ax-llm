@@ -2618,7 +2618,11 @@ int run_server_mode(const ModelConfig &config, int port)
                             fprintf(stdout, "%s", "\n</think>");
                             fflush(stdout);
                         }
-                        provider->push(openai_api::OutputChunk::FinalText("", req.model));
+                        auto final_chunk = openai_api::OutputChunk::FinalText("", req.model);
+                        final_chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
+                        final_chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
+                        final_chunk.usage.total_tokens = final_chunk.usage.prompt_tokens + final_chunk.usage.completion_tokens;
+                        provider->push(final_chunk);
                     }
                 } else {
                     llm.getAttr()->runing_callback = nullptr;
@@ -2647,6 +2651,9 @@ int run_server_mode(const ModelConfig &config, int port)
                         final_text = wrap_thinking_text_for_client(final_text);
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
+                    chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
+                    chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
+                    chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
                     fprintf(stdout, "%s", final_text.c_str());
                     fflush(stdout);
                     provider->push(chunk);
