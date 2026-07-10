@@ -554,23 +554,26 @@ public:
         nlohmann::json config = nlohmann::json::parse(config_file);
         ALOGI("load config: \n%s\n", config.dump(4).c_str());
 
-        enable_temperature = config["enable_temperature"];
-        temperature = config["temperature"];
+        // Missing keys must not crash: nlohmann operator[] returns null for an
+        // absent key, and converting null -> bool/number throws type_error.302.
+        // Use value(key, default) so an incomplete post_config.json degrades gracefully.
+        enable_temperature = config.value("enable_temperature", false);
+        temperature = config.value("temperature", 1.0f);
         if (temperature < 0.0f) temperature = 0.0f; // temperature 0 = greedy; do NOT rewrite to 1.0 (that turns a determinism request into random sampling)
 
-        enable_repetition_penalty = config["enable_repetition_penalty"];
-        repetition_penalty = config["repetition_penalty"];
-        penalty_window = config["penalty_window"];
+        enable_repetition_penalty = config.value("enable_repetition_penalty", false);
+        repetition_penalty = config.value("repetition_penalty", 1.0f);
+        penalty_window = config.value("penalty_window", 20);
         if (penalty_window < 0) penalty_window = 0;
         if (repetition_penalty < 0.0f) repetition_penalty = 1.0f;
 
-        enable_top_p_sampling = config["enable_top_p_sampling"];
-        top_p = config["top_p"];
+        enable_top_p_sampling = config.value("enable_top_p_sampling", false);
+        top_p = config.value("top_p", 1.0f);
         if (top_p <= 0.0f) top_p = 0.9f; // reasonable default
         if (top_p > 1.0f) top_p = 1.0f;
 
-        enable_top_k_sampling = config["enable_top_k_sampling"];
-        top_k = config["top_k"];
+        enable_top_k_sampling = config.value("enable_top_k_sampling", false);
+        top_k = config.value("top_k", 1);
         if (top_k < 1) top_k = 1;
 
         // Optional OpenAI-style penalties. Backward compatible: absent keys ->

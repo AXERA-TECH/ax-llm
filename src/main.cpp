@@ -2402,6 +2402,16 @@ int run_server_mode(const ModelConfig &config, int port)
             return -1;
         }
 
+        // Safety net: free the model's CMM pool on every path that unwinds this
+        // scope -- normal return, signal-triggered shutdown, or an uncaught
+        // exception. Deinit() is idempotent (guarded by deinited_), so the
+        // explicit Deinit() on the normal path below stays a no-op here. (#60)
+        struct LlmCmmGuard
+        {
+            LLM &llm;
+            ~LlmCmmGuard() { llm.Deinit(); }
+        } llm_cmm_guard{llm};
+
         if (config.is_embedding_model())
         {
             const bool use_jina_prompt_prefix = normalized_key(config.attr.tokenizer_type) == "qwen3omni";
@@ -2746,7 +2756,11 @@ int run_server_mode(const ModelConfig &config, int port)
                             fprintf(stdout, "%s", "\n</think>");
                             fflush(stdout);
                         }
-                        provider->push(openai_api::OutputChunk::FinalText("", req.model));
+                        auto final_chunk = openai_api::OutputChunk::FinalText("", req.model);
+                        final_chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
+                        final_chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
+                        final_chunk.usage.total_tokens = final_chunk.usage.prompt_tokens + final_chunk.usage.completion_tokens;
+                        provider->push(final_chunk);
                     }
                 } else {
                     llm.getAttr()->runing_callback = nullptr;
@@ -2779,6 +2793,9 @@ int run_server_mode(const ModelConfig &config, int port)
                         nlohmann::json tcs = parse_tool_calls_from_text(out_history.back().data);
                         if (!tcs.empty()) chunk.obj["tool_calls"] = tcs;
                     }
+                    chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
+                    chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
+                    chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
                     fprintf(stdout, "%s", final_text.c_str());
                     fflush(stdout);
                     provider->push(chunk);
@@ -2924,6 +2941,15 @@ int main(int argc, char *argv[])
     signal(SIGPIPE, SIG_IGN);
 #endif
     signal(SIGINT, __sigExit);
+#ifndef _WIN32
+    // Also shut down gracefully on `kill`/`killall` (SIGTERM), terminal hangup
+    // (SIGHUP) and SIGQUIT so run_server_mode() unwinds to LLM.Deinit() and
+    // frees the CMM pool. On on-chip targets /dev/ax_cmm is not reclaimed on an
+    // ungraceful exit, so an unhandled SIGTERM leaks the pool until reboot (#60).
+    signal(SIGTERM, __sigExit);
+    signal(SIGHUP, __sigExit);
+    signal(SIGQUIT, __sigExit);
+#endif
 #ifdef _WIN32
     SetConsoleCtrlHandler(__ConsoleCtrlHandler, TRUE);
     // Initialize logger early so Windows console uses UTF-8 (prevents Chinese/box-drawing garbling).
@@ -3018,7 +3044,17 @@ int main(int argc, char *argv[])
                 return 0;
             }
         }
-        return run_server_mode(config, port);
+        try
+        {
+            return run_server_mode(config, port);
+        }
+        catch (const std::exception &e)
+        {
+            // Unwind the stack (running LlmCmmGuard -> Deinit -> CMM freed)
+            // instead of std::terminate skipping destructors on an uncaught throw.
+            ALOGE("serve terminated by exception: %s", e.what());
+            return -1;
+        }
     }
     else
     {

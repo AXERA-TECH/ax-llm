@@ -25,6 +25,15 @@ int PaddleOCRVLImageProcessor(axcv::Mat& src,
                               int tgt_h, int tgt_w,
                               int patch_size = 14);
 
+// LocateAnything-3B image processor: single Pillow-bicubic resize to tgt (560x560),
+// then patchify to [N, C, pH, pW] (N = (tgt/patch)^2 = 1600). Values stay uint8;
+// caller normalizes with mean/std 0.5 (pixel/127.5-1). Mirrors
+// infer_locateanything_axengine.py image_to_patches().
+int LocateAnythingImageProcessor(axcv::Mat& src,
+                                 std::vector<unsigned char>& output,
+                                 int tgt_h, int tgt_w,
+                                 int patch_size = 14);
+
 // Gemma4 image processor:
 // Resize -> RGB -> patchify to [num_patches, patch_size * patch_size * 3] in HWC order.
 // Values remain uint8 here; callers typically convert to float32 and rescale by 1/255.

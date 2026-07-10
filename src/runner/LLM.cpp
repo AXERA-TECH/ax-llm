@@ -337,6 +337,9 @@ struct LLM::Impl {
     std::vector<int> last_tokens_ids;
     std::vector<int> run_input_token_ids;
     std::vector<int> last_run_generated_token_ids;
+    int last_run_prompt_token_num_ = 0;
+    int get_last_prompt_token_num() const { return last_run_prompt_token_num_; }
+    int get_last_completion_token_num() const { return (int)last_run_generated_token_ids.size(); }
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     struct LinearStateSnapshot {
         int token_len = 0;
@@ -1103,6 +1106,17 @@ struct LLM::Impl {
         const int idx = group_index_by_gid(prefill_grpids_, gid);
         if (idx < 0 || idx >= (int)prefill_history_kv_cache_num_grp.size()) return -1;
         return prefill_history_kv_cache_num_grp[(size_t)idx];
+    }
+
+    // Largest history (already-cached KV prefix) a single prefill can attend to. Prefill
+    // shape-groups are sized for chunked prefill, so their max history cap is smaller than
+    // the model's full context. A reused KV prefix longer than this cannot be set up in one
+    // SetKVCache, so the prefix-reuse path must cap to it (and recompute the extra tokens).
+    int max_prefill_history_cap() const
+    {
+        int m = 0;
+        for (int gid : prefill_grpids_) { const int c = prefill_history_capacity_by_gid(gid); if (c > m) m = c; }
+        return m;
     }
 
     int prefill_symbolic_capacity_by_gid(int gid) const
@@ -5136,11 +5150,12 @@ struct LLM::Impl {
         size_t append_start = last_history_snapshot.size();
         if (!last_history_snapshot.empty() && !is_history_prefix(last_history_snapshot, history))
         {
-            // For multi-slot requests, the chosen slot may share only a token
-            // prefix (e.g. same system prompt, different question) rather than be
-            // a strict history append. Skip the single-context reset and let the
-            // token-level prefix-reuse logic below keep the shared KV.
-            if (!multi_slot_active_request_)
+            // Non-append TEXT histories (same system prompt, different question) can share a
+            // long common token prefix -- let token-level prefix reuse keep it instead of
+            // wiping the KV and recomputing the shared prefix every time. For VLM, keep the
+            // single-context reset: image placeholder token IDs are identical across different
+            // images, so a token-level prefix match would wrongly reuse a previous image's KV.
+            if (!multi_slot_active_request_ && _attr.vlm_type != VLMType::None)
             {
                 ALOGW("raw history not append. force ResetKVCache before request processing.");
                 ResetKVCache();
@@ -5306,6 +5321,7 @@ struct LLM::Impl {
             new_tokens = tokenizer->encode(history);
         }
 
+        last_run_prompt_token_num_ = (int)new_tokens.size();
         int offset = 0;
         auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
         const bool token_appended = (offset == (int)last_tokens_ids.size() && (int)new_tokens.size() >= (int)last_tokens_ids.size());
@@ -5415,7 +5431,11 @@ struct LLM::Impl {
 
             if (has_linear_attention_layers())
             {
-                keep = best_linear_state_snapshot_len(offset);
+                // Cap the reuse target to the max prefill history capacity before snapping to
+                // a linear-state snapshot, so the resulting prefix fits a single prefill group.
+                const int max_hist_lin = max_prefill_history_cap();
+                const int want_lin = (max_hist_lin > 0 && offset > max_hist_lin) ? max_hist_lin : offset;
+                keep = best_linear_state_snapshot_len(want_lin);
                 if (keep < 0)
                 {
                     ALOGW("token prefix reuse has no linear state snapshot <= %d. force ResetKVCache and recompute.", offset);
@@ -5449,6 +5469,21 @@ struct LLM::Impl {
             }
             else
             {
+                // Reuse whole prefill chunks only: round the reused prefix down to a
+                // prefill-chunk boundary, and cap to what a single prefill can attend to as
+                // history (max_prefill_history_cap, itself chunk-aligned). Recompute the
+                // remaining tokens (the partial last chunk + the divergent suffix).
+                const int step = std::max(1, _attr.prefill_token_num);
+                const int cap = max_prefill_history_cap();
+                int aligned = (keep / step) * step;
+                if (cap > 0 && aligned > cap) aligned = (cap / step) * step;
+                if (aligned != keep)
+                {
+                    ALOGW("token prefix reuse: chunk-align prefix %d -> %d (step=%d cap=%d)", keep, aligned, step, cap);
+                    keep = aligned;
+                    offset = keep;
+                    tokens_diff.assign(new_tokens.begin() + keep, new_tokens.end());
+                }
                 if (prev_tokens != keep)
                 {
                     last_tokens_ids.resize((size_t)keep);
@@ -5483,7 +5518,28 @@ struct LLM::Impl {
                 ALOGE("cached media turn has empty token diff; refuse full recompute");
                 return history;
             }
-            if (!new_tokens.empty()) { precompute_len = (int)new_tokens.size() - 1; offset = precompute_len; tokens_diff = {new_tokens.back()}; }
+            if (!new_tokens.empty())
+            {
+                // Identical re-query: the reused prefix is the whole previous input minus one
+                // token. Chunk-align + cap it to the prefill history capacity so it fits a
+                // single prefill group and can be reused (otherwise SetKVCache would fail and
+                // fall back to a full recompute). Linear models keep the exact value and rely
+                // on the fallback (their state is snapshotted, not chunk-addressable).
+                int keep = (int)new_tokens.size() - 1;
+                if (!has_linear_attention_layers())
+                {
+                    const int step = std::max(1, _attr.prefill_token_num);
+                    const int maxh = max_prefill_history_cap();
+                    if (maxh > 0 && keep > maxh) keep = maxh;
+                    keep = (keep / step) * step;
+                    if (keep < 0) keep = 0;
+                }
+                precompute_len = keep;
+                offset = keep;
+                tokens_diff.assign(new_tokens.begin() + keep, new_tokens.end());
+                if ((int)last_tokens_ids.size() > keep) last_tokens_ids.resize((size_t)keep);
+                ALOGI("identical re-query: reuse KV prefix tokens=%d recompute_suffix=%zu", keep, tokens_diff.size());
+            }
             else { ResetKVCache(); precompute_len = 0; }
         }
         if (!not_append && offset != precompute_len && precompute_len > 0)
@@ -5503,7 +5559,21 @@ struct LLM::Impl {
             tokens_diff = new_tokens;
             offset = 0;
         }
-        const int kv_ret = SetKVCache(k_caches, v_caches, precompute_len, (int)tokens_diff.size());
+        int kv_ret = SetKVCache(k_caches, v_caches, precompute_len, (int)tokens_diff.size());
+        if (kv_ret != 0 && precompute_len > 0 && !used_cached_text_turn && !used_cached_media_turn)
+        {
+            // The reused prefix could not be set up in a single prefill group. This is NOT a
+            // real context overflow -- fall back to a full chunked recompute instead of
+            // surfacing a misleading "context exceeded" error to the user.
+            ALOGW("prefix-reuse SetKVCache failed (precompute_len=%d suffix=%zu); fall back to full recompute",
+                  precompute_len, (int)tokens_diff.size());
+            clear_last_error();
+            ResetKVCache();
+            tokens_diff = new_tokens;
+            offset = 0;
+            precompute_len = 0;
+            kv_ret = SetKVCache(k_caches, v_caches, 0, (int)tokens_diff.size());
+        }
         if (kv_ret != 0)
         {
             ALOGE("SetKVCache failed");
@@ -5630,6 +5700,8 @@ bool LLM::TokenizerSupportsThinkingToggle() const { return impl_->tokenizer ? im
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
 void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
+int LLM::GetLastPromptTokenNum() const { return impl_->get_last_prompt_token_num(); }
+int LLM::GetLastCompletionTokenNum() const { return impl_->get_last_completion_token_num(); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
 bool LLM::Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding) { return impl_->EmbedHistory(history, media_inputs, out_embedding); }

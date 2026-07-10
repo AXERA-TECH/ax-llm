@@ -1690,6 +1690,12 @@ bool VisionModule::Init(VLMType type,
         vision_start_id_ = -1;
         ALOGI("MiniCPM-V-4.6 token ids: image_pad=%d video_pad=%d", image_pad_id_, video_pad_id_);
         break;
+    case VLMType::LocateAnythingVL:
+        if (!get_single_token_id(tokenizer_, "<IMG_CONTEXT>", image_pad_id_, err)) return false;
+        video_pad_id_ = image_pad_id_;
+        vision_start_id_ = -1;
+        ALOGI("LocateAnything token ids: image_pad(<IMG_CONTEXT>)=%d", image_pad_id_);
+        break;
     default:
         break;
     }
@@ -2371,6 +2377,20 @@ bool VisionModule::EncodeForContent(const Content& content,
                 std::vector<unsigned short> emb;
                 if (!encode_classic_image(impl_->encoder, devid, impl_->encoder_output_is_bf16,
                                           impl_->input_is_nchw, vision_width_, vision_height_, img, emb, err))
+                    return false;
+                blocks_for_one.push_back(std::move(emb));
+            }
+            else if (type_ == VLMType::LocateAnythingVL) {
+                // LocateAnything: [1600,3,14,14] uint8 patches -> normalize pixel/127.5-1
+                // (mean/std 0.5) -> image_encoder_mlp.axmodel -> 400x2048 tokens.
+                std::vector<unsigned char> pv;
+                if (LocateAnythingImageProcessor(img, pv, vision_height_, vision_width_, patch_size_) != 0) {
+                    err = "LocateAnything image preprocessing failed";
+                    return false;
+                }
+                std::vector<unsigned short> emb;
+                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                                  pv, emb, 0.5f, 0.5f, 0, nullptr, err))
                     return false;
                 blocks_for_one.push_back(std::move(emb));
             }
