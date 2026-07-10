@@ -73,8 +73,14 @@
 #endif
 
 // Global variables
+#include <mutex>
 static LLM g_llm;
 static openai_api::Server g_server;
+// serve is single-flight: routeChat/Embedding/ASR run each request on a DETACHED
+// thread, and the HTTP concurrency slot is released early on timeout/disconnect, so
+// two llm.Run calls can otherwise overlap and corrupt the shared engine state.
+// Serialize all engine work here so concurrent requests queue instead of colliding.
+static std::mutex g_engine_mutex;
 static std::atomic<bool> g_running{true};
 // In interactive mode: SIGINT/Ctrl+C stops current generation and returns to prompt.
 // In server mode: SIGINT/Ctrl+C exits the process (by stopping server loop).
@@ -1960,6 +1966,47 @@ static void infer_media_type_from_uri_prefix(std::string &raw_url, ContentType &
 }
 
 // Handle HTTP API messages
+// ---------------- Native tool calling (Qwen3 <tool_call> format) ----------------
+// Extract <tool_call>{...}</tool_call> blocks from model output -> OpenAI tool_calls array.
+static nlohmann::json parse_tool_calls_from_text(const std::string &text)
+{
+    nlohmann::json calls = nlohmann::json::array();
+    const std::string open = "<tool_call>", close = "</tool_call>";
+    size_t pos = 0; int idx = 0;
+    while (true)
+    {
+        size_t a = text.find(open, pos);
+        if (a == std::string::npos) break;
+        size_t b = text.find(close, a + open.size());
+        if (b == std::string::npos) break;
+        std::string body = text.substr(a + open.size(), b - (a + open.size()));
+        pos = b + close.size();
+        // Extract the outermost {...} object. Some models prefix/suffix the JSON
+        // with stray tag artifacts (e.g. a doubled '>' -> "<tool_call>>") or
+        // whitespace; anchoring on the braces keeps those from breaking parsing.
+        size_t j0 = body.find('{');
+        size_t j1 = body.rfind('}');
+        if (j0 == std::string::npos || j1 == std::string::npos || j1 < j0) continue;
+        body = body.substr(j0, j1 - j0 + 1);
+        nlohmann::json obj;
+        try { obj = nlohmann::json::parse(body); } catch (...) { continue; }
+        std::string name = obj.value("name", std::string());
+        if (name.empty() && obj.contains("function") && obj["function"].is_object())
+            name = obj["function"].value("name", std::string());
+        if (name.empty()) continue;
+        nlohmann::json args = obj.contains("arguments") ? obj["arguments"]
+                              : (obj.contains("parameters") ? obj["parameters"] : nlohmann::json::object());
+        nlohmann::json call;
+        call["id"] = std::string("call_") + std::to_string(idx) + "_" + name;
+        call["type"] = "function";
+        call["function"]["name"] = name;
+        call["function"]["arguments"] = args.is_string() ? args.get<std::string>() : args.dump(); // OpenAI: string
+        calls.push_back(std::move(call));
+        idx++;
+    }
+    return calls;
+}
+
 bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history,
                          std::vector<MediaInputs> *media_inputs = nullptr,
                          std::vector<std::string> *temp_files = nullptr)
@@ -1981,10 +2028,41 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         {
             content.role = ASSISTANT;
         }
+        else if (item.contains("role") && item["role"] == "tool")
+        {
+            // OpenAI tool result -> Qwen3 renders it as a user turn wrapped in <tool_response>.
+            std::string tc = item.contains("content")
+                                 ? (item["content"].is_string() ? item["content"].get<std::string>() : item["content"].dump())
+                                 : std::string();
+            history.push_back({USER, TEXT, std::string("<tool_response>\n") + tc + "\n</tool_response>"});
+            continue;
+        }
         else
         {
             ALOGE("content type not support");
             return false;
+        }
+        // assistant turn that itself made tool calls -> render them back as <tool_call> text
+        if (content.role == ASSISTANT && item.contains("tool_calls") && item["tool_calls"].is_array())
+        {
+            std::string tc;
+            for (const auto &call : item["tool_calls"])
+            {
+                if (!call.contains("function") || !call["function"].is_object()) continue;
+                nlohmann::json one;
+                one["name"] = call["function"].value("name", std::string());
+                nlohmann::json args = nlohmann::json::object();
+                if (call["function"].contains("arguments"))
+                {
+                    const auto &a = call["function"]["arguments"];
+                    if (a.is_string()) { try { args = nlohmann::json::parse(a.get<std::string>()); } catch (...) {} }
+                    else args = a;
+                }
+                one["arguments"] = args;
+                if (!tc.empty()) tc += "\n";
+                tc += std::string("<tool_call>\n") + one.dump() + "\n</tool_call>";
+            }
+            if (!tc.empty()) { history.push_back({ASSISTANT, TEXT, tc}); continue; }
         }
 
         std::vector<std::string> media_uris;
@@ -2209,6 +2287,7 @@ int run_server_mode(const ModelConfig &config, int port)
             g_server.registerImageGeneration(variant.model_id, [generator, generated_dir](const openai_api::ImageGenRequest &req,
                                                                                            std::shared_ptr<openai_api::BaseDataProvider> provider)
                                              {
+                std::lock_guard<std::mutex> engine_lock(g_engine_mutex); // single-flight: no overlapping engine work
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
@@ -2305,6 +2384,7 @@ int run_server_mode(const ModelConfig &config, int port)
             timeout_ms = 300000;
         }
         g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms)); // single-flight: queued requests wait up to the request timeout, not 503 after the 5s default
         g_server.run(port);
     }
     else
@@ -2338,6 +2418,7 @@ int run_server_mode(const ModelConfig &config, int port)
             g_server.registerEmbedding(model_name, [&llm, use_jina_prompt_prefix](const openai_api::EmbeddingRequest &req,
                                                                std::shared_ptr<openai_api::BaseDataProvider> provider)
                                        {
+                std::lock_guard<std::mutex> engine_lock(g_engine_mutex); // single-flight: no overlapping engine work
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
@@ -2441,6 +2522,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms)); // single-flight: queued requests wait up to the request timeout, not 503 after the 5s default
             g_server.run(port);
         }
         else
@@ -2462,6 +2544,7 @@ int run_server_mode(const ModelConfig &config, int port)
             g_server.registerChat(model_name, [&llm, config, single_image_ocr_mode, hymt_translation_mode](const openai_api::ChatRequest &req,
                                                                                                             std::shared_ptr<openai_api::BaseDataProvider> provider)
                                   {
+                std::lock_guard<std::mutex> engine_lock(g_engine_mutex); // single-flight: no overlapping engine work
                 if (!provider->is_writable()) {
                     ALOGE("provider not writable");
                     return;
@@ -2538,6 +2621,33 @@ int run_server_mode(const ModelConfig &config, int port)
                     push_chat_error("invalid_request_error", "Failed to parse chat messages.");
                     return;
                 }
+                // Native tool calling (Qwen3): honor tool_choice + append tools to the system prompt.
+                const bool req_has_tools = req.raw.contains("tools") && req.raw["tools"].is_array() && !req.raw["tools"].empty();
+                std::string tool_choice_mode = "auto";
+                std::string forced_tool_name;
+                if (req.raw.contains("tool_choice")) {
+                    const auto &tc = req.raw["tool_choice"];
+                    if (tc.is_string()) tool_choice_mode = tc.get<std::string>();
+                    else if (tc.is_object() && tc.contains("function") && tc["function"].is_object()) {
+                        tool_choice_mode = "function";
+                        forced_tool_name = tc["function"].value("name", std::string());
+                    }
+                }
+                const bool tools_active = req_has_tools && tool_choice_mode != "none";
+                // The tokenizer renders the tool section into the prompt (per-model format);
+                // set/clear it every request so tools don't leak into the next one.
+                llm.SetTools(tools_active ? req.raw["tools"].dump() : std::string());
+                if (tools_active) {
+                    // tool_choice forcing: append an instruction to the last user turn
+                    // (no history/media-index mutation).
+                    std::string force;
+                    if (tool_choice_mode == "required")
+                        force = "\n\nYou MUST call one of the provided functions to answer. Do not answer in plain text.";
+                    else if (tool_choice_mode == "function" && !forced_tool_name.empty())
+                        force = std::string("\n\nYou MUST call the function \"") + forced_tool_name + "\" to answer. Do not answer in plain text.";
+                    if (!force.empty() && !history.empty() && history.back().role == USER)
+                        history.back().data += force;
+                }
                 // serve mode does NOT inject config.system_prompt: the client controls the
                 // system message (OpenAI-compatible — no system message means no system block).
                 // config.system_prompt only applies to interactive `run` mode.
@@ -2583,6 +2693,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     auto callback = [provider,
                                      model_id = req.model,
                                      emit_thinking_markup,
+                                     tools_active,
                                      &streamed_any,
                                      &thinking_open_emitted,
                                      &streamed_text](std::string str, float token_per_sec, void *reserve) {
@@ -2590,6 +2701,7 @@ int run_server_mode(const ModelConfig &config, int port)
                             ALOGE("provider not writable");
                             return;
                         }
+                        if (tools_active) { streamed_text += str; return; } // buffer; decide after generation
                         std::string out = str;
                         if (emit_thinking_markup)
                         {
@@ -2621,7 +2733,23 @@ int run_server_mode(const ModelConfig &config, int port)
                             provider->push(openai_api::OutputChunk::Error("model_error", llm_error));
                         }
                     }
-                    if (streamed_any) {
+                    if (tools_active) {
+                        if (llm_error.empty()) {
+                            nlohmann::json tcs = parse_tool_calls_from_text(streamed_text);
+                            if (!tcs.empty()) {
+                                auto d = openai_api::OutputChunk::TextDelta("", req.model);
+                                d.obj["tool_calls"] = tcs;
+                                provider->push(d);
+                                auto fin = openai_api::OutputChunk::FinalText("", req.model);
+                                fin.obj["finish_reason"] = "tool_calls";
+                                provider->push(fin);
+                            } else {
+                                std::string out = emit_thinking_markup ? wrap_thinking_text_for_client(streamed_text) : streamed_text;
+                                if (!out.empty()) provider->push(openai_api::OutputChunk::TextDelta(out, req.model));
+                                provider->push(openai_api::OutputChunk::FinalText("", req.model));
+                            }
+                        }
+                    } else if (streamed_any) {
                         if (emit_thinking_markup && thinking_open_emitted && !has_thinking_close_tag(streamed_text))
                         {
                             provider->push(openai_api::OutputChunk::TextDelta("\n</think>", req.model));
@@ -2661,6 +2789,10 @@ int run_server_mode(const ModelConfig &config, int port)
                         final_text = wrap_thinking_text_for_client(final_text);
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
+                    if (tools_active) {
+                        nlohmann::json tcs = parse_tool_calls_from_text(out_history.back().data);
+                        if (!tcs.empty()) chunk.obj["tool_calls"] = tcs;
+                    }
                     chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
                     chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
                     chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
@@ -2677,6 +2809,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 g_server.registerASR(model_name, [&llm](const openai_api::ASRRequest &req,
                                                         std::shared_ptr<openai_api::BaseDataProvider> provider)
                                      {
+                    std::lock_guard<std::mutex> engine_lock(g_engine_mutex); // single-flight: no overlapping engine work
                     if (!provider->is_writable()) {
                         ALOGE("provider not writable");
                         return;
@@ -2743,6 +2876,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms)); // single-flight: queued requests wait up to the request timeout, not 503 after the 5s default
             g_server.run(port);
         }
         llm.Deinit();
@@ -2896,11 +3030,13 @@ int main(int argc, char *argv[])
             std::string arg = argv[i];
             if (arg == "--port" && i + 1 < argc)
             {
-                port = std::stoi(argv[++i]);
+                try { port = std::stoi(argv[++i]); }
+                catch (const std::exception &) { ALOGW("invalid --port value '%s', ignoring", argv[i]); }
             }
             else if (arg == "--server_timeout_ms" && i + 1 < argc)
             {
-                config.server_timeout_ms = std::stoi(argv[++i]);
+                try { config.server_timeout_ms = std::stoi(argv[++i]); }
+                catch (const std::exception &) { ALOGW("invalid --server_timeout_ms value '%s', ignoring", argv[i]); }
             }
             else if (arg == "--help" || arg == "-h")
             {

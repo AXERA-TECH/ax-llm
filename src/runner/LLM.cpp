@@ -396,8 +396,6 @@ struct LLM::Impl {
     struct LLMLayer {
         ax_runner_t layer;
         std::string filename;
-        MMap layer_buffer;
-        std::vector<char> layer_buffer_vec;
     };
 
     std::vector<LLMLayer> llama_layers;
@@ -2533,12 +2531,9 @@ struct LLM::Impl {
         int host_mb = 0;
         if (!_attr.b_use_mmap_load_embed)
             host_mb += estimate_model_mb(_attr.filename_tokens_embed);
-        if (_attr.hidden_size_per_layer_input > 0)
-        {
-            host_mb += estimate_model_mb(_attr.filename_tokens_embed_per_layer);
-            host_mb += estimate_model_mb(_attr.filename_per_layer_model_projection);
-            host_mb += estimate_model_mb(_attr.filename_per_layer_projection_norm);
-        }
+        // Gemma per-layer embed/projection files are mmap'd (demand-paged) by Gemma4PerLayerHelper,
+        // NOT read into resident host RAM, so they must not be counted as a host DDR load (they used to
+        // false-abort gemma-4 on the host path -- the ~4.5GB per-layer embed dwarfs real DDR).
         if (host_mb > 0 && !guard_host_load("host: token-embedding / per-layer weights", host_mb))
             return false;
 
@@ -3768,6 +3763,7 @@ struct LLM::Impl {
 
     void ResetKVCache()
     {
+        gemma4_per_layer_helper.ClearDecodeCache();
         last_tokens_ids.clear(); last_history_snapshot.clear(); run_input_token_ids.clear(); last_run_generated_token_ids.clear(); k_caches.clear(); v_caches.clear(); linear_state_snapshots_.clear(); precompute_len = 0; cached_mrope_next_pos = -1; active_prefill_pos_start = -1; active_token_pos_start = -1; reset_full_cache_slot_state();
         decode_grpid = decode_grpids_.empty() ? 0 : decode_grpids_.back();
         _attr.prefill_grpid = prefill_grpids_.empty() ? 1 : prefill_grpids_.back();
@@ -5698,6 +5694,7 @@ LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
 void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p, bool has_frequency_penalty, float frequency_penalty, bool has_presence_penalty, float presence_penalty) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p, has_frequency_penalty, frequency_penalty, has_presence_penalty, presence_penalty); }
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
 void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
+void LLM::SetTools(const std::string &tools_json) { if (impl_->tokenizer) impl_->tokenizer->set_tools(tools_json); }
 void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }
 bool LLM::TokenizerSupportsThinkingToggle() const { return impl_->tokenizer ? impl_->tokenizer->supports_thinking_toggle() : false; }
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }

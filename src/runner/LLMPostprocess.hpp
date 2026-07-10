@@ -59,6 +59,7 @@ private:
     // 	控制随机性
     void apply_temperature(std::vector<float> &logits, float temperature)
     {
+        if (temperature < 1e-2f) temperature = 1e-2f; // avoid inf/NaN from a near-zero temperature
         for (float &logit : logits)
         {
             logit /= temperature;
@@ -555,11 +556,10 @@ public:
 
         // Missing keys must not crash: nlohmann operator[] returns null for an
         // absent key, and converting null -> bool/number throws type_error.302.
-        // Use value(key, default) so an incomplete post_config.json degrades
-        // gracefully (same approach as the frequency/presence penalties below).
+        // Use value(key, default) so an incomplete post_config.json degrades gracefully.
         enable_temperature = config.value("enable_temperature", false);
         temperature = config.value("temperature", 1.0f);
-        if (temperature <= 0.0f) temperature = 1.0f;
+        if (temperature < 0.0f) temperature = 0.0f; // temperature 0 = greedy; do NOT rewrite to 1.0 (that turns a determinism request into random sampling)
 
         enable_repetition_penalty = config.value("enable_repetition_penalty", false);
         repetition_penalty = config.value("repetition_penalty", 1.0f);

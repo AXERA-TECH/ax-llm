@@ -484,7 +484,7 @@ int ax_runner_axcl::init(const char *model_file, int devid)
     {
         m_handle = new ax_joint_runner_ax650_handle_t;
     }
-    memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
+    *m_handle = ax_joint_runner_ax650_handle_t{}; // value-init: safely resets the std::vector<ios> member (memset would corrupt its control block)
     this->dev_id = devid;
 
     int ret = axcl_EngineLoadFromFile(model_file, &m_handle->handle, dev_id);
@@ -569,7 +569,7 @@ int ax_runner_axcl::init(char *model_buffer, size_t model_size, int devid)
     {
         m_handle = new ax_joint_runner_ax650_handle_t;
     }
-    memset(m_handle, 0, sizeof(ax_joint_runner_ax650_handle_t));
+    *m_handle = ax_joint_runner_ax650_handle_t{}; // value-init: safely resets the std::vector<ios> member (memset would corrupt its control block)
     this->dev_id = devid;
 
     void *devMem = nullptr;

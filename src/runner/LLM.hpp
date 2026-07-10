@@ -86,7 +86,7 @@ struct LLMAttrType {
     std::vector<int> prefill_max_kv_cache_num_grp;
     int prefill_grpid = -1;
     std::string post_config_path = "post_config.json";
-    bool b_use_mmap_load_embed = false;
+    bool b_use_mmap_load_embed = true; // default to mmap (demand-paged); avoids loading the whole embed table into host RAM
 
     // ---- vision / VLM (optional, runtime switch by `vlm_type`) ----
     // If `vlm_type != VLMType::None`, vision encoder will be initialized and used.
@@ -142,6 +142,7 @@ public:
     void ClearRequestSamplingOverride();
     void SetRequestThinkingMode(ThinkingMode mode);
     void ClearRequestThinkingMode();
+    void SetTools(const std::string &tools_json); // forward the request's OpenAI tools to the tokenizer
     // True if the active tokenizer actually honors think/no_think in its prompt
     // (so callers can warn when a mode is requested but would be ignored).
     bool TokenizerSupportsThinkingToggle() const;
