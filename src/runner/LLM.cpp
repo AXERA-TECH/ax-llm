@@ -3049,9 +3049,14 @@ struct LLM::Impl {
             layer_kv_cache_sizes.assign(_attr.axmodel_num, _attr.kv_cache_size);
             for (int i = 0; i < _attr.axmodel_num; ++i)
             {
+                if (is_linear_layer(i)) continue;
                 const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
-                auto &layer_k = llama_layers[(size_t)i].layer.get_input(layer_decode_grpid, "K_cache");
-                const int layer_kv_size = (int)(layer_k.nSize / sizeof(unsigned short) / std::max(1, _attr.kv_cache_num));
+                // `kv_cache_num` is normalized from the discovered group capacity and can
+                // include the decode graph's current-token slot. Deriving the width from
+                // K_cache therefore truncates for layouts such as [511, 256] / capacity 512.
+                // K_cache_out is exactly one KV slice, independent of that capacity.
+                auto &layer_k_out = llama_layers[(size_t)i].layer.get_output(layer_decode_grpid, "K_cache_out");
+                const int layer_kv_size = (int)(layer_k_out.nSize / sizeof(unsigned short));
                 if (layer_kv_size > 0)
                     layer_kv_cache_sizes[(size_t)i] = layer_kv_size;
             }
