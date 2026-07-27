@@ -155,6 +155,8 @@ public:
     bool Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding);
     bool EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::vector<float>> &out_embeddings);
 
+    // Linear-attention K/V entries use these legacy u16 vectors as opaque byte
+    // storage. In particular, a FP32 V state occupies two u16 slots per value.
     int GenerateKVCachePrefill(std::vector<int> &ids,
                                std::vector<std::vector<unsigned short>> &k,
                                std::vector<std::vector<unsigned short>> &v,

@@ -22,6 +22,7 @@ typedef struct
     unsigned int nIdx;
     std::vector<unsigned int> vShape;
     int nSize;
+    int eDataType = 0; // Backend-native dtype value; 0 means unavailable/unknown.
     unsigned long long phyAddr; // 统一 64-bit；AX650 aarch64 上 unsigned long 也是 64-bit
     void *pVirAddr;
 } ax_runner_tensor_t;
