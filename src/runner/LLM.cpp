@@ -599,31 +599,45 @@ struct LLM::Impl {
             }
             return true;
         }
-        if (adapter->adapter_weight_template_filename.empty() ||
-            adapter->adapter_patch_manifest_template_filename.empty())
+        const bool has_shared_weight_file = !adapter->adapter_weight_template_filename.empty();
+        const bool has_shared_manifest = !adapter->adapter_patch_manifest_template_filename.empty();
+        if (has_shared_weight_file != has_shared_manifest)
         {
             set_last_error("shared weight adapter task is incomplete: " + task_id);
-            ALOGE("shared weight adapter task(%s) requires layer adapter weight and manifest templates", task_id.c_str());
+            ALOGE("shared weight adapter task(%s) must provide both layer adapter weight and manifest templates",
+                  task_id.c_str());
+            return false;
+        }
+        const bool switch_shared_weights = has_shared_weight_file && has_shared_manifest;
+        const bool switch_lora = _attr.lora_mode == "matrix_input" &&
+                                 !adapter->lora_adapter_template_filename.empty();
+        if (!switch_shared_weights && !switch_lora)
+        {
+            set_last_error("adapter task has neither shared-weight nor LoRA payload: " + task_id);
+            ALOGE("adapter task(%s) has neither shared-weight nor LoRA payload", task_id.c_str());
             return false;
         }
 
         for (int i = 0; i < _attr.axmodel_num; ++i)
         {
-            const std::string weight_file = format_path_pattern(adapter->adapter_weight_template_filename, i);
-            const std::string manifest_file =
-                format_path_pattern(adapter->adapter_patch_manifest_template_filename, i);
-            const int ret = llama_layers[(size_t)i].layer.switch_shared_weight_task(weight_file.c_str(),
-                                                                                   manifest_file.c_str(),
-                                                                                   task_id.c_str());
-            if (ret != 0)
+            if (switch_shared_weights)
             {
-                set_last_error("failed to switch shared weight adapter layer " + std::to_string(i) +
-                               " to task: " + task_id);
-                ALOGE("switch shared adapter failed: task=%s layer=%d ret=0x%x", task_id.c_str(), i, ret);
-                return false;
+                const std::string weight_file = format_path_pattern(adapter->adapter_weight_template_filename, i);
+                const std::string manifest_file =
+                    format_path_pattern(adapter->adapter_patch_manifest_template_filename, i);
+                const int ret = llama_layers[(size_t)i].layer.switch_shared_weight_task(weight_file.c_str(),
+                                                                                       manifest_file.c_str(),
+                                                                                       task_id.c_str());
+                if (ret != 0)
+                {
+                    set_last_error("failed to switch shared weight adapter layer " + std::to_string(i) +
+                                   " to task: " + task_id);
+                    ALOGE("switch shared adapter failed: task=%s layer=%d ret=0x%x", task_id.c_str(), i, ret);
+                    return false;
+                }
             }
 
-            if (_attr.lora_mode == "matrix_input" && !adapter->lora_adapter_template_filename.empty())
+            if (switch_lora)
             {
                 const std::string lora_file =
                     format_path_pattern(adapter->lora_adapter_template_filename, i);
@@ -640,7 +654,7 @@ struct LLM::Impl {
 
         const bool post_shared_enabled = !_attr.shared_base_weight_filename_post.empty() ||
                                          !_attr.shared_base_filename_post_axmodel.empty();
-        if (post_shared_enabled)
+        if (switch_shared_weights && post_shared_enabled)
         {
             if (adapter->adapter_weight_filename_post.empty() ||
                 adapter->adapter_patch_manifest_filename_post.empty())

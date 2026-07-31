@@ -1088,6 +1088,11 @@ int ax_runner_ax650::load_lora_adapter(const char *lora_bin_file)
         return -1;
     }
     std::streamsize file_size = ifs.tellg();
+    if (file_size <= 0)
+    {
+        ALOGE("load_lora_adapter: invalid file size %lld for %s", (long long)file_size, lora_bin_file);
+        return -1;
+    }
     ifs.seekg(0, std::ios::beg);
 
     std::vector<char> buffer(file_size);
@@ -1112,40 +1117,52 @@ int ax_runner_ax650::load_lora_adapter(const char *lora_bin_file)
     auto &g0_io_info = m_handle->io_info[0];
     auto &g0_io_data = m_handle->io_data[0];
 
+    std::vector<int> input_indices(kNumLora, -1);
+    std::vector<AX_U32> input_sizes(kNumLora, 0);
+    uint64_t expected_file_size = 0;
+    for (int li = 0; li < kNumLora; ++li)
+    {
+        const char *canon = kLoraCanonical[li];
+        size_t canon_len = strlen(canon);
+        for (size_t i = 0; i < g0_io_info->nInputSize; ++i)
+        {
+            const char *name = g0_io_info->pInputs[i].pName;
+            if (name && strncmp(name, canon, canon_len) == 0 && name[canon_len] == '\0')
+            {
+                if (input_indices[li] >= 0)
+                {
+                    ALOGE("load_lora_adapter: duplicate graph input %s", canon);
+                    return -1;
+                }
+                input_indices[li] = (int)i;
+                input_sizes[li] = g0_io_info->pInputs[i].nSize;
+            }
+        }
+        if (input_indices[li] < 0)
+        {
+            ALOGE("load_lora_adapter: graph is missing required input %s", canon);
+            return -1;
+        }
+        expected_file_size += input_sizes[li];
+    }
+
+    if ((uint64_t)file_size != expected_file_size)
+    {
+        ALOGE("load_lora_adapter: %s has invalid size: expected %llu bytes for 14 tensors, got %lld",
+              lora_bin_file,
+              (unsigned long long)expected_file_size,
+              (long long)file_size);
+        return -1;
+    }
+
     const char *cursor = buffer.data();
     const char *buf_end = buffer.data() + file_size;
 
     for (int li = 0; li < kNumLora; ++li)
     {
-        // Find the tensor in group 0 by name (may have per-group suffix in
-        // the io_info; we match the canonical prefix).
         const char *canon = kLoraCanonical[li];
-        size_t canon_len = strlen(canon);
-
-        int found_idx = -1;
-        AX_U32 tensor_size = 0;
-        for (size_t i = 0; i < g0_io_info->nInputSize; ++i)
-        {
-            const char *name = g0_io_info->pInputs[i].pName;
-            if (name && strncmp(name, canon, canon_len) == 0)
-            {
-                // Make sure this is the canonical name or an exact suffix match
-                // (names like lora_q_proj_a may appear with _1, _2 suffixes in
-                // intermediate groups, but group 0 uses the canonical bare name).
-                if (name[canon_len] == '\0')
-                {
-                    found_idx = (int)i;
-                    tensor_size = g0_io_info->pInputs[i].nSize;
-                    break;
-                }
-            }
-        }
-        if (found_idx < 0)
-        {
-            // Not every axmodel necessarily has all 14 LoRA inputs (e.g.
-            // first PoC only had q_proj). Skip without error.
-            continue;
-        }
+        const int found_idx = input_indices[li];
+        const AX_U32 tensor_size = input_sizes[li];
 
         if (cursor + tensor_size > buf_end)
         {
@@ -1163,6 +1180,12 @@ int ax_runner_ax650::load_lora_adapter(const char *lora_bin_file)
         memcpy(dst, cursor, tensor_size);
         AX_SYS_MflushCache(g0_io_data.pInputs[found_idx].phyAddr, dst, tensor_size);
         cursor += tensor_size;
+    }
+
+    if (cursor != buf_end)
+    {
+        ALOGE("load_lora_adapter: internal size mismatch for %s", lora_bin_file);
+        return -1;
     }
 
     ALOGI("load_lora_adapter: loaded %s (%lld bytes)", lora_bin_file, (long long)file_size);
