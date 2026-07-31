@@ -475,6 +475,24 @@ int ax_runner_ax650::sub_init()
     mgroup_output_tensors.resize(io_count);
 
     std::vector<std::string> skip_alloc_names = {"K_cache", "V_cache"};
+
+    // Collect LoRA matrix-input tensor names (lora_*). They are shared
+    // across all groups — allocate once in group 0, alias from other groups.
+    {
+        AX_ENGINE_IO_INFO_T *io_info0 = nullptr;
+        int ret0 = io_count == 1 ? AX_ENGINE_GetIOInfo(m_handle->handle, &io_info0)
+                                 : AX_ENGINE_GetGroupIOInfo(m_handle->handle, 0, &io_info0);
+        if (ret0 == 0 && io_info0)
+        {
+            for (size_t i = 0; i < io_info0->nInputSize; ++i)
+            {
+                const char *name = io_info0->pInputs[i].pName;
+                if (name && strncmp(name, "lora_", 5) == 0)
+                    skip_alloc_names.push_back(name);
+            }
+        }
+    }
+
     // 1. 分配 IO 资源
     for (size_t grpid = 0; grpid < io_count; grpid++)
     {
@@ -1052,6 +1070,102 @@ int ax_runner_ax650::switch_shared_weight_task(const char *shared_adapter_weight
     m_shared_adapter_weight_buffer.shrink_to_fit();
 
     ALOGI("switched shared WBT adapter task to %s", m_shared_weight_task_id.c_str());
+    return 0;
+}
+
+int ax_runner_ax650::load_lora_adapter(const char *lora_bin_file)
+{
+    if (!lora_bin_file || !lora_bin_file[0])
+    {
+        ALOGE("load_lora_adapter: empty file path");
+        return -1;
+    }
+
+    std::ifstream ifs(lora_bin_file, std::ios::binary | std::ios::ate);
+    if (!ifs.is_open())
+    {
+        ALOGE("load_lora_adapter: cannot open %s", lora_bin_file);
+        return -1;
+    }
+    std::streamsize file_size = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+
+    std::vector<char> buffer(file_size);
+    if (!ifs.read(buffer.data(), file_size))
+    {
+        ALOGE("load_lora_adapter: failed to read %s", lora_bin_file);
+        return -1;
+    }
+    ifs.close();
+
+    // Canonical order: q/k/v/o/gate/up/down × A/B
+    static const char *kLoraCanonical[] = {
+        "lora_q_proj_a",  "lora_q_proj_b",  "lora_k_proj_a",  "lora_k_proj_b",
+        "lora_v_proj_a",  "lora_v_proj_b",  "lora_o_proj_a",  "lora_o_proj_b",
+        "lora_gate_proj_a", "lora_gate_proj_b", "lora_up_proj_a", "lora_up_proj_b",
+        "lora_down_proj_a", "lora_down_proj_b",
+    };
+    constexpr int kNumLora = sizeof(kLoraCanonical) / sizeof(kLoraCanonical[0]);
+
+    // Group 0 owns the canonical buffer; other groups alias to it.
+    auto &g0_inputs = mgroup_input_tensors.empty() ? minput_tensors : mgroup_input_tensors[0];
+    auto &g0_io_info = m_handle->io_info[0];
+    auto &g0_io_data = m_handle->io_data[0];
+
+    const char *cursor = buffer.data();
+    const char *buf_end = buffer.data() + file_size;
+
+    for (int li = 0; li < kNumLora; ++li)
+    {
+        // Find the tensor in group 0 by name (may have per-group suffix in
+        // the io_info; we match the canonical prefix).
+        const char *canon = kLoraCanonical[li];
+        size_t canon_len = strlen(canon);
+
+        int found_idx = -1;
+        AX_U32 tensor_size = 0;
+        for (size_t i = 0; i < g0_io_info->nInputSize; ++i)
+        {
+            const char *name = g0_io_info->pInputs[i].pName;
+            if (name && strncmp(name, canon, canon_len) == 0)
+            {
+                // Make sure this is the canonical name or an exact suffix match
+                // (names like lora_q_proj_a may appear with _1, _2 suffixes in
+                // intermediate groups, but group 0 uses the canonical bare name).
+                if (name[canon_len] == '\0')
+                {
+                    found_idx = (int)i;
+                    tensor_size = g0_io_info->pInputs[i].nSize;
+                    break;
+                }
+            }
+        }
+        if (found_idx < 0)
+        {
+            // Not every axmodel necessarily has all 14 LoRA inputs (e.g.
+            // first PoC only had q_proj). Skip without error.
+            continue;
+        }
+
+        if (cursor + tensor_size > buf_end)
+        {
+            ALOGE("load_lora_adapter: %s: file too small for tensor %s (need %u, have %td)",
+                  lora_bin_file, canon, tensor_size, buf_end - cursor);
+            return -1;
+        }
+
+        void *dst = g0_io_data.pInputs[found_idx].pVirAddr;
+        if (!dst)
+        {
+            ALOGE("load_lora_adapter: %s: no virtual address for tensor %s", lora_bin_file, canon);
+            return -1;
+        }
+        memcpy(dst, cursor, tensor_size);
+        AX_SYS_MflushCache(g0_io_data.pInputs[found_idx].phyAddr, dst, tensor_size);
+        cursor += tensor_size;
+    }
+
+    ALOGI("load_lora_adapter: loaded %s (%lld bytes)", lora_bin_file, (long long)file_size);
     return 0;
 }
 

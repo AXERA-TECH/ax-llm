@@ -622,6 +622,20 @@ struct LLM::Impl {
                 ALOGE("switch shared adapter failed: task=%s layer=%d ret=0x%x", task_id.c_str(), i, ret);
                 return false;
             }
+
+            if (_attr.lora_mode == "matrix_input" && !adapter->lora_adapter_template_filename.empty())
+            {
+                const std::string lora_file =
+                    format_path_pattern(adapter->lora_adapter_template_filename, i);
+                const int lora_ret = llama_layers[(size_t)i].layer.load_lora_adapter(lora_file.c_str());
+                if (lora_ret != 0)
+                {
+                    set_last_error("failed to load LoRA adapter layer " + std::to_string(i) +
+                                   " to task: " + task_id);
+                    ALOGE("load lora adapter failed: task=%s layer=%d ret=0x%x", task_id.c_str(), i, lora_ret);
+                    return false;
+                }
+            }
         }
 
         const bool post_shared_enabled = !_attr.shared_base_weight_filename_post.empty() ||
@@ -3150,6 +3164,28 @@ struct LLM::Impl {
             }
         }
         postprocess.set_pad_token_id(_attr.pad_token_id);
+
+        // Load default LoRA matrix-input adapter (if enabled) after all layer
+        // IO buffers are allocated so the persistent lora_* tensors exist.
+        if (_attr.lora_mode == "matrix_input" && !_attr.shared_weight_task_id.empty())
+        {
+            const LLMSharedWeightAdapter *init_adapter = find_shared_weight_adapter(_attr.shared_weight_task_id);
+            if (init_adapter && !init_adapter->lora_adapter_template_filename.empty())
+            {
+                for (int i = 0; i < _attr.axmodel_num; ++i)
+                {
+                    const std::string lora_file =
+                        format_path_pattern(init_adapter->lora_adapter_template_filename, i);
+                    const int ret = llama_layers[(size_t)i].layer.load_lora_adapter(lora_file.c_str());
+                    if (ret != 0)
+                    {
+                        ALOGE("failed to load default LoRA adapter layer %d: %s", i, lora_file.c_str());
+                        return false;
+                    }
+                }
+                ALOGI("loaded default LoRA adapter for task %s", _attr.shared_weight_task_id.c_str());
+            }
+        }
 
         init_kv_slots();
 

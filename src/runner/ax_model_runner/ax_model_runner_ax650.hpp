@@ -40,6 +40,8 @@ public:
                                   const char *shared_adapter_patch_manifest_file,
                                   const char *task_id) override;
 
+    int load_lora_adapter(const char *lora_bin_file);
+
     void deinit() override;
 
     bool has_handle_loaded() const;

@@ -479,6 +479,10 @@ struct ModelConfig
             {
                 attr.shared_weight_task_id = j["shared_weight_task_id"].get<std::string>();
             }
+            if (j.contains("lora_mode"))
+            {
+                attr.lora_mode = j["lora_mode"].get<std::string>();
+            }
             if (j.contains("shared_weight_adapters") && j["shared_weight_adapters"].is_array())
             {
                 attr.shared_weight_adapters.clear();
@@ -538,6 +542,11 @@ struct ModelConfig
                     if (item.contains("vision_num_frames"))
                     {
                         adapter.vision_num_frames = item["vision_num_frames"].get<int>();
+                    }
+                    if (item.contains("lora_adapter_template_filename"))
+                    {
+                        adapter.lora_adapter_template_filename =
+                            item["lora_adapter_template_filename"].get<std::string>();
                     }
                     attr.shared_weight_adapters.push_back(std::move(adapter));
                 }

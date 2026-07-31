@@ -28,6 +28,7 @@ struct LLMSharedWeightAdapter {
     std::string adapter_patch_manifest_template_filename;
     std::string adapter_weight_filename_post;
     std::string adapter_patch_manifest_filename_post;
+    std::string lora_adapter_template_filename; // matrix-input LoRA binary per layer
     std::string image_encoder_axmodel;
     std::string image_mapper_axmodel;
     std::string audio_encoder_axmodel_5s;
@@ -56,6 +57,7 @@ struct LLMAttrType {
     std::string shared_adapter_patch_manifest_filename_post;
     std::string shared_weight_task_id;
     std::vector<LLMSharedWeightAdapter> shared_weight_adapters;
+    std::string lora_mode; // "matrix_input" or empty/absent
 
     // Optional: for models with mixed attention layer types (e.g., Qwen3.5).
     // If > 0, every Nth layer (1-indexed) is treated as full-attention and the others as linear-attention.
