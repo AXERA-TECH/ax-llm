@@ -7,8 +7,6 @@
 #include "BaseTokenizer.hpp"  // for Content/RoleType definitions
 #include "VLMType.hpp"
 
-enum class ThinkingMode { Unspecified = 0, Think = 1, NoThink = 2 };
-
 class LLMPostprocess;
 class LLaMaEmbedSelector;
 

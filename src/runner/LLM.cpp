@@ -2787,7 +2787,7 @@ struct LLM::Impl {
             }
         }
         tokenizer->set_think_in_prompt(!tokenizer_uses_hidden_channel_markup(this->_attr.tokenizer_type));
-        tokenizer->set_generation_thinking_mode((int)this->_attr.generation_thinking_mode);
+        tokenizer->set_generation_thinking_mode(this->_attr.generation_thinking_mode);
         update_cqdm(&cqdm, 0, "count", "tokenizer init ok");
 
         const bool shared_layer_split_enabled = !_attr.shared_base_weight_template_filename.empty() &&
@@ -5739,8 +5739,8 @@ LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
 void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p); }
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
-void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode((int)mode); }
-void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode((int)impl_->_attr.generation_thinking_mode); }
+void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
+void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
 void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
