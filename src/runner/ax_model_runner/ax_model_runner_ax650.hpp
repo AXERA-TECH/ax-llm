@@ -41,6 +41,7 @@ public:
                                   const char *task_id) override;
 
     int load_lora_adapter(const char *lora_bin_file);
+    int validate_lora_adapter(const char *lora_bin_file) override;
 
     void deinit() override;
 

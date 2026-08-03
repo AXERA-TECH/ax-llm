@@ -490,6 +490,37 @@ struct LLM::Impl {
         return nullptr;
     }
 
+    bool PreflightConfiguredLoraAdapters()
+    {
+        if (_attr.lora_mode != "matrix_input")
+        {
+            return true;
+        }
+        for (const auto &adapter : _attr.shared_weight_adapters)
+        {
+            if (adapter.lora_adapter_template_filename.empty())
+            {
+                continue;
+            }
+            for (int i = 0; i < _attr.axmodel_num; ++i)
+            {
+                const std::string lora_file =
+                    format_path_pattern(adapter.lora_adapter_template_filename, i);
+                const int ret = llama_layers[(size_t)i].layer.validate_lora_adapter(lora_file.c_str());
+                if (ret != 0)
+                {
+                    set_last_error("LoRA adapter startup preflight failed at layer " + std::to_string(i) +
+                                   " for task: " + adapter.task_id);
+                    ALOGE("LoRA adapter startup preflight failed: task=%s layer=%d ret=0x%x file=%s",
+                          adapter.task_id.c_str(), i, ret, lora_file.c_str());
+                    return false;
+                }
+            }
+            ALOGI("LoRA adapter startup preflight passed for task %s", adapter.task_id.c_str());
+        }
+        return true;
+    }
+
     bool ReinitVisionForAdapter(const LLMSharedWeightAdapter &adapter)
     {
         if (!vision || !vision->enabled())
@@ -617,6 +648,14 @@ struct LLM::Impl {
             ALOGE("adapter task(%s) has neither shared-weight nor LoRA payload", task_id.c_str());
             return false;
         }
+
+        // From here on we mutate on-device adapter state layer by layer. A
+        // failure partway through leaves a mixed adapter (some layers switched,
+        // some not). Invalidate the active task first so that ANY early return
+        // below forces the next request — even one for the previously active
+        // task — to fall through the same-task short-circuit above and fully
+        // reload, rather than trusting a half-written device state.
+        active_shared_weight_task_.clear();
 
         for (int i = 0; i < _attr.axmodel_num; ++i)
         {
@@ -3178,6 +3217,14 @@ struct LLM::Impl {
             }
         }
         postprocess.set_pad_token_id(_attr.pad_token_id);
+
+        // Validate every configured LoRA package once during startup, after
+        // layer IO exists but before the server accepts task-switch requests.
+        // Runtime switching therefore does no separate preflight scan.
+        if (!PreflightConfiguredLoraAdapters())
+        {
+            return false;
+        }
 
         // Load default LoRA matrix-input adapter (if enabled) after all layer
         // IO buffers are allocated so the persistent lora_* tensors exist.

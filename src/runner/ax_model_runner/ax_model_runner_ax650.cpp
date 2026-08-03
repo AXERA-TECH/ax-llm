@@ -1073,6 +1073,75 @@ int ax_runner_ax650::switch_shared_weight_task(const char *shared_adapter_weight
     return 0;
 }
 
+int ax_runner_ax650::validate_lora_adapter(const char *lora_bin_file)
+{
+    if (!lora_bin_file || !lora_bin_file[0])
+    {
+        ALOGE("validate_lora_adapter: empty file path");
+        return -1;
+    }
+
+    std::ifstream ifs(lora_bin_file, std::ios::binary | std::ios::ate);
+    if (!ifs.is_open())
+    {
+        ALOGE("validate_lora_adapter: cannot open %s", lora_bin_file);
+        return -1;
+    }
+    const std::streamsize file_size = ifs.tellg();
+    if (file_size <= 0)
+    {
+        ALOGE("validate_lora_adapter: invalid file size %lld for %s", (long long)file_size, lora_bin_file);
+        return -1;
+    }
+
+    if (!m_handle || m_handle->io_info.empty() || !m_handle->io_info[0])
+    {
+        ALOGE("validate_lora_adapter: model IO is not initialized");
+        return -1;
+    }
+
+    static const char *kLoraCanonical[] = {
+        "lora_q_proj_a",  "lora_q_proj_b",  "lora_k_proj_a",  "lora_k_proj_b",
+        "lora_v_proj_a",  "lora_v_proj_b",  "lora_o_proj_a",  "lora_o_proj_b",
+        "lora_gate_proj_a", "lora_gate_proj_b", "lora_up_proj_a", "lora_up_proj_b",
+        "lora_down_proj_a", "lora_down_proj_b",
+    };
+    constexpr int kNumLora = sizeof(kLoraCanonical) / sizeof(kLoraCanonical[0]);
+    auto &g0_io_info = m_handle->io_info[0];
+
+    uint64_t expected_file_size = 0;
+    for (int li = 0; li < kNumLora; ++li)
+    {
+        const char *canon = kLoraCanonical[li];
+        const size_t canon_len = strlen(canon);
+        int matches = 0;
+        for (size_t i = 0; i < g0_io_info->nInputSize; ++i)
+        {
+            const char *name = g0_io_info->pInputs[i].pName;
+            if (name && strncmp(name, canon, canon_len) == 0 && name[canon_len] == '\0')
+            {
+                ++matches;
+                expected_file_size += g0_io_info->pInputs[i].nSize;
+            }
+        }
+        if (matches != 1)
+        {
+            ALOGE("validate_lora_adapter: graph input %s occurs %d times (expected once)", canon, matches);
+            return -1;
+        }
+    }
+
+    if ((uint64_t)file_size != expected_file_size)
+    {
+        ALOGE("validate_lora_adapter: %s has invalid size: expected %llu bytes for 14 tensors, got %lld",
+              lora_bin_file,
+              (unsigned long long)expected_file_size,
+              (long long)file_size);
+        return -1;
+    }
+    return 0;
+}
+
 int ax_runner_ax650::load_lora_adapter(const char *lora_bin_file)
 {
     if (!lora_bin_file || !lora_bin_file[0])

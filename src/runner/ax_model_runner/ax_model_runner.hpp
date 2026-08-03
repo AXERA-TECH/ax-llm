@@ -132,6 +132,11 @@ public:
         (void)lora_bin_file;
         return 0;
     }
+    virtual int validate_lora_adapter(const char *lora_bin_file)
+    {
+        (void)lora_bin_file;
+        return 0;
+    }
     virtual void deinit() = 0;
 
     int get_devid() const { return dev_id; }
