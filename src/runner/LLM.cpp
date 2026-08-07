@@ -32,6 +32,7 @@
 #include "vision/vision_module.hpp"
 
 #include "ax_cmm_utils.hpp"  // memory queries + pre-load mem guard (both backends)
+#include "MemGuard.hpp"
 
 #ifdef USE_AXCL
 #include "ax_model_runner/ax_model_runner_axcl.hpp"
@@ -305,6 +306,7 @@ struct LLM::Impl {
     static constexpr int kSlotReuseMinPrefix = 8;
 
     LLMAttrType _attr;
+    MemGuard mem_guard_{_attr}; // CMM/DDR pre-load + running guard + teardown sentry (extracted)
     bool embedding_append_eos = false;
     int embedding_eos_token_id = -1;
 
@@ -324,8 +326,6 @@ struct LLM::Impl {
 
     std::vector<LLMLayer> llama_layers;
     bool deinited_ = false; // guards Deinit() against double-invocation (explicit call + destructor path)
-    int cmm_sentry_baseline_mb_ = -1;              // free CMM captured at Init start (teardown-balance sentry)
-    static constexpr int kCmmSentryMarginMb = 16;  // tolerate fragmentation / rounding
     // Optional per-layer attention type (for models like Qwen3.5 that mix linear/full attention).
     std::vector<bool> layer_is_linear_attn;
     std::vector<int> layer_kv_cache_sizes;
@@ -2370,56 +2370,12 @@ struct LLM::Impl {
         return true;
     }
 
-    // ---- Pre-load memory guard helpers ----
-    int device_remaining_cmm_mb(int devid) const
-    {
-#ifdef USE_AXCL
-        return axcl_GetCMMRemain(devid);
-#else
-        (void)devid;
-        return get_remaining_cmm_size();
-#endif
-    }
-
-    // ---- CMM teardown-balance sentry (automated leak detection) ----
-    // Invariant: after Deinit() the model must return all CMM it took, so free CMM
-    // should return to the value captured at Init start. A persistent shortfall means
-    // a leak (e.g. an Init-failure path freeing against a closed /dev/ax_cmm). Warns
-    // only; disable with AXLLM_CMM_SENTRY=0.
-    static bool cmm_sentry_enabled()
-    {
-        const char *v = std::getenv("AXLLM_CMM_SENTRY");
-        return !(v && v[0] == '0');
-    }
-    int cmm_total_remaining_mb() const
-    {
-#ifdef USE_AXCL
-        int total = 0;
-        for (int d : _attr.dev_ids) { int r = device_remaining_cmm_mb(d); if (r > 0) total += r; }
-        return total;
-#else
-        return device_remaining_cmm_mb(-1);
-#endif
-    }
-    void CheckCmmBalance(const char *tag)
-    {
-        if (cmm_sentry_baseline_mb_ < 0) return; // no baseline -> nothing to check
-        const int now = cmm_total_remaining_mb();
-        if (now <= 0) return;                    // query unavailable (non-AX host) -> skip
-        const int leaked = cmm_sentry_baseline_mb_ - now;
-        if (leaked > kCmmSentryMarginMb)
-            ALOGE("[cmm-sentry] %s: %d MB CMM not reclaimed after teardown (baseline %d MB -> now %d MB) -- suspected leak",
-                  tag, leaked, cmm_sentry_baseline_mb_, now);
-        else
-            ALOGI("[cmm-sentry] %s: CMM balanced (baseline %d MB, now %d MB)", tag, cmm_sentry_baseline_mb_, now);
-    }
-
     // Guard a device (CMM) load. `est_mb` defaults to the model file size.
     bool guard_device_load(const std::string &file, int devid, int est_mb = -1)
     {
         if (!_attr.mem_guard_enable) return true;
         if (est_mb < 0) est_mb = estimate_model_mb(file);
-        const int remain = device_remaining_cmm_mb(devid);
+        const int remain = mem_guard_.device_remaining_cmm_mb(devid);
         if (mem_guard_allow_load(_attr.mem_guard_enable, _attr.mem_guard_floor_mb,
                                  _attr.mem_guard_on_unsafe, file, est_mb, remain))
             return true;
@@ -2501,112 +2457,27 @@ struct LLM::Impl {
     }
 
     // ---- Running (measurement-based) load guard ----
-    // The file-size pre-flight under-counts CMM because the engine also allocates
-    // each layer's KV/IO buffers at load time (~30% above raw weights, growing with
-    // context length). During the layer load we measure ACTUAL per-device CMM
-    // consumption and extrapolate to the not-yet-loaded layers + post/encoder tail,
-    // aborting *before* an allocation that would breach the floor (and crash the
-    // driver). Mid-load never prompts (stage-1 pre-flight already did); under
-    // on_unsafe=prompt this checkpoint degrades to abort.
-    std::map<int, int> rl_baseline_mb_; // per-device remaining CMM before the loop
-    std::map<int, int> rl_total_;       // per-device layer count
-    std::map<int, int> rl_tail_mb_;     // per-device post/encoder file MB (loaded after layers)
-    std::map<int, int> guard_settled_;  // devices where the measured guard confidently passed -> stop re-checking
-    static constexpr int kGuardMinSamples = 4;      // layers to load before trusting the extrapolation
-    static constexpr int kGuardSettleMarginMb = 512; // headroom above floor at which we stop re-checking
+    // The measurement/extrapolation engine + its state now live in MemGuard
+    // (mem_guard_). Impl keeps the topology-aware entry point below.
 
-    struct GuardVerdict { bool ok = true; bool warned = false; bool confident = false; std::string what; int projected = 0; int remain = -1; };
-
+    // Build each layer's device id (via layer_devid_for) and hand it to the guard.
     void running_guard_init()
     {
-        rl_baseline_mb_.clear();
-        rl_total_.clear();
-        rl_tail_mb_.clear();
-        guard_settled_.clear();
-        if (!_attr.mem_guard_enable || _attr.axmodel_num <= 0) return;
-        for (int i = 0; i < _attr.axmodel_num; ++i)
-            rl_total_[layer_devid_for(i)] += 1;
-        for (const auto &kv : rl_total_)
-            rl_baseline_mb_[kv.first] = device_remaining_cmm_mb(kv.first);
-        // tail: post head loads on the last layer's device; vision/audio encoders on the first.
-        rl_tail_mb_[layer_devid_for(_attr.axmodel_num - 1)] += estimate_model_mb(_attr.filename_post_axmodel);
-        if (_attr.vlm_type != VLMType::None)
+        std::vector<int> devid_of_layer;
+        if (_attr.mem_guard_enable && _attr.axmodel_num > 0)
         {
-            const int front_dev = layer_devid_for(0);
-            rl_tail_mb_[front_dev] += estimate_model_mb(_attr.filename_image_encoder_axmodel);
-            rl_tail_mb_[front_dev] += estimate_model_mb(_attr.filename_audio_encoder_axmodel_5s);
-            rl_tail_mb_[front_dev] += estimate_model_mb(_attr.filename_audio_encoder_axmodel_30s);
+            devid_of_layer.reserve((size_t)_attr.axmodel_num);
+            for (int i = 0; i < _attr.axmodel_num; ++i) devid_of_layer.push_back(layer_devid_for(i));
         }
+        mem_guard_.running_guard_init(devid_of_layer);
     }
-
-    // Pure (no logging / no shared-state writes -> safe to call from loader threads).
-    // Call BEFORE initializing a layer on `devid`; `loaded_on_dev` = layers already
-    // loaded on this device. verdict.ok=false means abort.
-    GuardVerdict running_guard_eval(int devid, int loaded_on_dev) const
-    {
-        GuardVerdict v;
-        // Test-only seam: force a deterministic mid-load abort after N layers so the
-        // teardown / CMM-reclaim path can be regression-tested (see tools/test_teardown_cmm_leak.sh).
-        if (const char *ta = std::getenv("AXLLM_TEST_ABORT_AFTER_LAYER"))
-        {
-            const int n = std::atoi(ta);
-            if (n >= 0 && loaded_on_dev >= n) { v.ok = false; v.what = "forced test abort (AXLLM_TEST_ABORT_AFTER_LAYER)"; return v; }
-        }
-        auto get = [](const std::map<int, int> &m, int k) { auto it = m.find(k); return it == m.end() ? 0 : it->second; };
-        if (!_attr.mem_guard_enable || loaded_on_dev <= 0) return v;
-        auto bit = rl_baseline_mb_.find(devid);
-        if (bit == rl_baseline_mb_.end()) return v;
-        const int baseline = bit->second;
-        const int cur = device_remaining_cmm_mb(devid);
-        v.remain = cur;
-        if (cur < 0 || baseline < 0) return v;
-        const int used = baseline - cur;
-        if (used <= 0) return v; // no measurable consumption yet -> can't project
-        // Hard safety net: never let a load drive remaining CMM below the floor,
-        // regardless of projection or sample count -- this is the real OOM guard.
-        if (cur < _attr.mem_guard_floor_mb)
-        {
-            char whatf[192];
-            std::snprintf(whatf, sizeof(whatf), "device %d CMM below floor (remain %d MB < floor %d MB)",
-                          devid, cur, _attr.mem_guard_floor_mb);
-            v.what = whatf;
-            if (_attr.mem_guard_on_unsafe == "warn") { v.warned = true; return v; }
-            v.ok = false;
-            return v;
-        }
-        // A single measured layer (loaded==1) is dominated by one-time / shared
-        // allocations and grossly over-projects, which used to false-abort small
-        // models. Require a few samples before trusting the extrapolation; the
-        // hard-floor check above still protects against real OOM meanwhile.
-        if (loaded_on_dev < kGuardMinSamples) return v;
-        const double per_layer = (double)used / loaded_on_dev;
-        const int left = std::max(0, get(rl_total_, devid) - loaded_on_dev);
-        const int tail = (int)(get(rl_tail_mb_, devid) * 1.15 + 0.5);
-        v.projected = (int)(per_layer * left + 0.5) + tail;
-        const int headroom = cur - v.projected;
-        if (headroom >= _attr.mem_guard_floor_mb)
-        {
-            // Comfortably safe -> let the caller stop re-checking (avoids a slow
-            // per-layer CMM query for the rest of the load, esp. on AXCL).
-            if (headroom >= _attr.mem_guard_floor_mb + kGuardSettleMarginMb) v.confident = true;
-            return v;
-        }
-        char what[192];
-        std::snprintf(what, sizeof(what), "device %d CMM (%d more layers @~%.0f MB + tail %d MB, measured)",
-                      devid, left, per_layer, tail);
-        v.what = what;
-        if (_attr.mem_guard_on_unsafe == "warn") { v.warned = true; return v; } // warn -> proceed
-        v.ok = false; // abort / prompt -> abort mid-load
-        return v;
-    }
-
     // Sequential-path wrapper: evaluate, log, and on abort set last_error. Returns
     // false to abort. Safe only on the main thread (logs / writes last_error).
     bool running_guard_check(int devid, int loaded_on_dev)
     {
-        if (guard_settled_.count(devid)) return true; // already confidently safe -> skip the CMM query
-        const GuardVerdict v = running_guard_eval(devid, loaded_on_dev);
-        if (v.confident) guard_settled_[devid] = 1;
+        if (mem_guard_.is_guard_settled(devid)) return true; // already confidently safe -> skip the CMM query
+        const MemGuard::GuardVerdict v = mem_guard_.running_guard_eval(devid, loaded_on_dev);
+        if (v.confident) mem_guard_.mark_guard_settled(devid);
         if (v.warned)
             ALOGW("[mem-guard] WARN(measured): %s (projected +%d MB, remain %d MB) -> continuing",
                   v.what.c_str(), v.projected, v.remain);
@@ -2622,7 +2493,7 @@ struct LLM::Impl {
         ALOGI("LLM init start");
         this->_attr = attr;
         deinited_ = false;
-        if (cmm_sentry_enabled()) cmm_sentry_baseline_mb_ = cmm_total_remaining_mb();
+        mem_guard_.capture_sentry_baseline();
         dynamic_layer_load_enabled_ = _attr.dynamic_load_enable;
         dynamic_layer_pool_size_ = _attr.dynamic_load_pool_size;
         if (dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ <= 0)
@@ -2800,7 +2671,7 @@ struct LLM::Impl {
                     {
                         // Measured-extrapolation guard (pure -> thread-safe). On abort,
                         // stop this and the other device threads before over-allocating.
-                        const GuardVerdict v = running_guard_eval(devid, loaded_on_dev);
+                        const auto v = mem_guard_.running_guard_eval(devid, loaded_on_dev);
                         if (!v.ok)
                         {
                             load_abort.store(true, std::memory_order_relaxed);
@@ -3070,7 +2941,7 @@ struct LLM::Impl {
         embed_selector.Deinit();
         gemma4_per_layer_helper.Deinit();
         if (vision) vision->Deinit();
-        CheckCmmBalance("Deinit"); // automated teardown-balance self-check
+        mem_guard_.CheckCmmBalance("Deinit"); // automated teardown-balance self-check
 #ifdef USE_AXCL
         for (auto &devid : _attr.dev_ids) axcl_Exit(devid);
 #endif
