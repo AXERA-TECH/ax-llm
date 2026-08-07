@@ -36,16 +36,7 @@
 #include "KvSlotSelect.hpp"
 #include "MemGuard.hpp"
 
-#ifdef USE_AXCL
-#include "ax_model_runner/ax_model_runner_axcl.hpp"
-#include "utils/axcl_manager.h"
-using ax_runner_t = ax_runner_axcl;
-#else
-#include "ax_model_runner/ax_model_runner_ax650.hpp"
-#include "ax_cmm_utils.hpp"
-#include <ax_sys_api.h>
-using ax_runner_t = ax_runner_ax650;
-#endif
+#include "LLMLayer.hpp"
 
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 
@@ -287,13 +278,6 @@ struct LLM::Impl {
     int cached_mrope_next_pos = -1;
     int active_prefill_pos_start = -1;
     int active_token_pos_start = -1;
-
-    struct LLMLayer {
-        ax_runner_t layer;
-        std::string filename;
-        MMap layer_buffer;
-        std::vector<char> layer_buffer_vec;
-    };
 
     std::vector<LLMLayer> llama_layers;
     bool deinited_ = false; // guards Deinit() against double-invocation (explicit call + destructor path)
