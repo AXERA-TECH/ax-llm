@@ -33,6 +33,7 @@
 
 #include "ax_cmm_utils.hpp"  // memory queries + pre-load mem guard (both backends)
 #include "KvSlotTypes.hpp"
+#include "KvSlotSelect.hpp"
 #include "MemGuard.hpp"
 
 #ifdef USE_AXCL
@@ -212,13 +213,6 @@ static inline std::string getenv_string(const char *name)
 {
     const char *v = std::getenv(name);
     return v ? std::string(v) : std::string();
-}
-
-static inline bool same_history_content(const Content &lhs, const Content &rhs)
-{
-    return lhs.role == rhs.role &&
-           lhs.type == rhs.type &&
-           lhs.data == rhs.data;
 }
 
 static inline bool is_history_prefix(const std::vector<Content> &prefix, const std::vector<Content> &full)
@@ -3816,66 +3810,8 @@ struct LLM::Impl {
         multi_slot_active_request_ = false;
         if (!multi_slot_enabled_) return;
         multi_slot_active_request_ = true;
-
-        int best = -1, best_off = 0;
-        uint64_t best_lru = 0;
-        int free_slot = -1;
-        int lru_victim = 0;
-        uint64_t lru_min = 0;
-        bool lru_init = false;
-        for (int i = 0; i < (int)kv_slots_.size(); ++i)
-        {
-            const auto &s = kv_slots_[(size_t)i];
-            if (!s.used)
-            {
-                if (free_slot < 0) free_slot = i;
-                continue;
-            }
-            if (!lru_init || s.lru < lru_min) { lru_min = s.lru; lru_victim = i; lru_init = true; }
-            int off = 0;
-            (void)diff_token_ids(s.last_tokens_ids, sel_tokens, off);
-            if (off > best_off || (off == best_off && s.lru > best_lru))
-            {
-                best_off = off;
-                best = i;
-                best_lru = s.lru;
-            }
-        }
-
-        int chosen;
-        bool fresh;
-        if (best >= 0 && best_off >= kSlotReuseMinPrefix)
-        {
-            chosen = best;            // reuse shared prefix (continuation or same system prompt)
-            fresh = false;
-        }
-        else if (free_slot >= 0)
-        {
-            chosen = free_slot;       // new conversation gets its own slot
-            fresh = true;
-        }
-        else if (best >= 0 && best_off > 0)
-        {
-            chosen = best;            // slots full: still salvage whatever prefix overlaps
-            fresh = false;
-        }
-        else
-        {
-            chosen = lru_victim;      // slots full, nothing shared: evict LRU
-            fresh = true;
-        }
-
-        // Perf: if the whole request fits the cheap (history-less) prefill group, a
-        // fresh prefill is faster than reuse via the model's wider history group
-        // (which attends over its full compiled width regardless of real history).
-        // Keep slot affinity (`chosen`) but re-prefill instead of reusing.
-        if (!fresh && best >= 0)
-        {
-            const int cheap_cap = cheap_prefill_capacity();
-            if (cheap_cap > 0 && (int)sel_tokens.size() <= cheap_cap)
-                fresh = true;
-        }
-        commit_kv_slot_choice(chosen, fresh, best_off, (int)sel_tokens.size());
+        const SlotDecision d = decide_slot_by_tokens(kv_slots_, sel_tokens, cheap_prefill_capacity());
+        commit_kv_slot_choice(d.chosen, d.fresh, d.shared, (int)sel_tokens.size());
     }
 
     // VLM slot selection: tokenizing VLM history needs the (expensive) vision
@@ -3886,56 +3822,8 @@ struct LLM::Impl {
         multi_slot_active_request_ = false;
         if (!multi_slot_enabled_) return;
         multi_slot_active_request_ = true;
-
-        int best = -1, best_common = 0;
-        uint64_t best_lru = 0;
-        int free_slot = -1, lru_victim = 0;
-        uint64_t lru_min = 0;
-        bool lru_init = false;
-        for (int i = 0; i < (int)kv_slots_.size(); ++i)
-        {
-            const auto &s = kv_slots_[(size_t)i];
-            if (!s.used)
-            {
-                if (free_slot < 0) free_slot = i;
-                continue;
-            }
-            if (!lru_init || s.lru < lru_min) { lru_min = s.lru; lru_victim = i; lru_init = true; }
-            const auto &h = s.last_history_snapshot;
-            const int n = (int)std::min(h.size(), history.size());
-            int common = 0;
-            while (common < n && same_history_content(h[(size_t)common], history[(size_t)common])) ++common;
-            if (common > best_common || (common == best_common && s.lru > best_lru))
-            {
-                best_common = common;
-                best = i;
-                best_lru = s.lru;
-            }
-        }
-
-        int chosen;
-        bool fresh;
-        if (best >= 0 && best_common >= 1)   // share at least the system turn
-        {
-            chosen = best;
-            fresh = false;
-        }
-        else if (free_slot >= 0)
-        {
-            chosen = free_slot;
-            fresh = true;
-        }
-        else if (best >= 0 && best_common > 0)
-        {
-            chosen = best;
-            fresh = false;
-        }
-        else
-        {
-            chosen = lru_victim;
-            fresh = true;
-        }
-        commit_kv_slot_choice(chosen, fresh, best_common, (int)history.size());
+        const SlotDecision d = decide_slot_by_history(kv_slots_, history);
+        commit_kv_slot_choice(d.chosen, d.fresh, d.shared, (int)history.size());
     }
 
     void commit_kv_slot_choice(int chosen, bool fresh, int shared, int req_size)

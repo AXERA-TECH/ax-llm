@@ -43,3 +43,11 @@ struct KvCacheSlot {
 // request (covers same-system-prompt requests; avoids clobbering a slot for only
 // the few chat-template header tokens every request trivially shares).
 inline constexpr int kSlotReuseMinPrefix = 8;
+
+// Two chat-history entries are "the same" iff role, type and payload all match.
+// Used for history-prefix reuse (VLM slot selection) and prefix checks.
+inline bool same_history_content(const Content &lhs, const Content &rhs) {
+    return lhs.role == rhs.role &&
+           lhs.type == rhs.type &&
+           lhs.data == rhs.data;
+}

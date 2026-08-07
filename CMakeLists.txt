@@ -378,6 +378,13 @@ add_executable(tokenizer_smoke tools/tokenizer_smoke.cpp)
 target_link_libraries(tokenizer_smoke tokenizer)
 install(TARGETS tokenizer_smoke DESTINATION bin)
 
+# Multi-slot prefix-KV selection policy unit test (host-runnable; no HW required).
+# Pins the 4-strategy + LRU decision used by select_kv_slot / select_kv_slot_by_history.
+add_executable(kv_slot_select_test tools/kv_slot_select_test.cpp)
+target_include_directories(kv_slot_select_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(kv_slot_select_test tokenizer)
+install(TARGETS kv_slot_select_test DESTINATION bin)
+
 # Vision preprocessing layout regression test (host-runnable; no HW required).
 # Guards the Qwen-VL patchifier (Qwen2VideoProcessor) against channel-planar
 # layout regressions that scramble the vision encoder input.
