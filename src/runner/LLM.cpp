@@ -32,6 +32,7 @@
 #include "vision/vision_module.hpp"
 
 #include "ax_cmm_utils.hpp"  // memory queries + pre-load mem guard (both backends)
+#include "KvSlotTypes.hpp"
 #include "MemGuard.hpp"
 
 #ifdef USE_AXCL
@@ -264,11 +265,6 @@ struct LLM::Impl {
     int get_last_prompt_token_num() const { return last_run_prompt_token_num_; }
     int get_last_completion_token_num() const { return (int)last_run_generated_token_ids.size(); }
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
-    struct LinearStateSnapshot {
-        int token_len = 0;
-        std::vector<std::vector<unsigned short>> k;
-        std::vector<std::vector<unsigned short>> v;
-    };
     std::vector<LinearStateSnapshot> linear_state_snapshots_;
     int precompute_len = 0;
     std::vector<int> prefill_history_kv_cache_num_grp;
@@ -279,31 +275,12 @@ struct LLM::Impl {
     // a per-slot device buffer managed by the backend (zero-copy activate). The
     // working fields above (last_*, precompute_len, linear snapshots, full-cache
     // slot bookkeeping) always reflect the currently active slot.
-    enum class KvSlotLocation { Device, Host };
-    struct KvCacheSlot {
-        bool used = false;
-        std::vector<Content> last_history_snapshot;
-        std::vector<int> last_tokens_ids;
-        int precompute_len = 0;
-        std::vector<LinearStateSnapshot> linear_state_snapshots;
-        int cached_mrope_next_pos = -1;
-        std::vector<unsigned char> full_cache_valid_slots;
-        bool full_cache_has_sparse_slots = false;
-        uint64_t lru = 0;
-        // Host-mode only: per-layer host copy of this slot's device K/V. Swapped
-        // in/out of the single engine KV buffer on activation.
-        std::vector<std::vector<unsigned short>> host_k, host_v;
-    };
     std::vector<KvCacheSlot> kv_slots_;
     int kv_active_slot_idx_ = 0;
     bool multi_slot_enabled_ = false;
     bool multi_slot_active_request_ = false; // this request is served from a slot
     KvSlotLocation kv_slot_location_ = KvSlotLocation::Device;
     uint64_t kv_slot_lru_counter_ = 0;
-    // A used slot is reused when it shares at least this many leading tokens with
-    // the request (covers same-system-prompt requests; avoids clobbering a slot
-    // for only the few chat-template header tokens every request trivially shares).
-    static constexpr int kSlotReuseMinPrefix = 8;
 
     LLMAttrType _attr;
     MemGuard mem_guard_{_attr}; // CMM/DDR pre-load + running guard + teardown sentry (extracted)
