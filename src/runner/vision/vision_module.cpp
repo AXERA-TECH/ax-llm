@@ -729,16 +729,7 @@ static bool try_infer_hw_from_4d_shape_with_c3(const ShapeVec& shape, int& out_h
     return false;
 }
 
-static bool get_single_token_id(const std::shared_ptr<BaseTokenizer>& tok, const std::string& s, int& out_id, std::string& err)
-{
-    auto ids = tok->encode(s);
-    if (ids.size() != 1) {
-        err = "special token is not a single id: '" + s + "' size=" + std::to_string(ids.size());
-        return false;
-    }
-    out_id = ids[0];
-    return true;
-}
+// get_single_token_id moved to IVisionAdapter.hpp (shared with vision_adapters.cpp).
 
 static bool parse_gemma4_profile_from_path(const std::string& path, int& out_h, int& out_w, int& out_tokens)
 {
@@ -1635,71 +1626,14 @@ bool VisionModule::Init(VLMType type,
         }
     }
 
-    // Token ids for placeholder locating.
-    switch (type_) {
-    case VLMType::Qwen2_5VL:
-    case VLMType::Qwen3VL:
-    case VLMType::Qwen3Omni:
-        if (!get_single_token_id(tokenizer_, "<|image_pad|>", image_pad_id_, err)) return false;
-        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) return false;
-        if (type_ == VLMType::Qwen3Omni) {
-            if (!get_single_token_id(tokenizer_, "<|audio_pad|>", audio_pad_id_, err)) return false;
-        }
-        if (!get_single_token_id(tokenizer_, "<|vision_start|>", vision_start_id_, err)) return false;
-        ALOGI("Qwen token ids: vision_start=%d image_pad=%d video_pad=%d audio_pad=%d",
-              vision_start_id_, image_pad_id_, video_pad_id_, audio_pad_id_);
-        break;
-    case VLMType::PaddleOCRVL:
-        if (!get_single_token_id(tokenizer_, "<|IMAGE_PLACEHOLDER|>", image_pad_id_, err)) return false;
-        // PaddleOCRVL uses the same placeholder token for both image and video blocks.
-        // Keep `video_pad_id_` aligned with the tokenizer chat template.
-        video_pad_id_ = image_pad_id_;
-        if (!get_single_token_id(tokenizer_, "<|IMAGE_START|>", vision_start_id_, err)) return false;
-        ALOGI("PaddleOCR-VL token ids: vision_start=%d image_pad=%d video_pad=%d", vision_start_id_, image_pad_id_, video_pad_id_);
-        break;
-    case VLMType::InternVL3:
-        if (!get_single_token_id(tokenizer_, "<IMG_CONTEXT>", image_pad_id_, err)) return false;
-        video_pad_id_ = image_pad_id_;
-        if (!get_single_token_id(tokenizer_, "<img>", vision_start_id_, err)) {
-            // Not required for injection; mRoPE not used.
-            vision_start_id_ = -1;
-        }
-        break;
-    case VLMType::FastVLM:
-        if (!get_single_token_id(tokenizer_, "<image>", image_pad_id_, err)) return false;
-        video_pad_id_ = image_pad_id_;
-        vision_start_id_ = -1;
-        break;
-    case VLMType::SmolVLM2:
-        if (!get_single_token_id(tokenizer_, "<image>", image_pad_id_, err)) return false;
-        video_pad_id_ = image_pad_id_;
-        vision_start_id_ = -1;
-        break;
-    case VLMType::Gemma4VL:
-        if (!get_single_token_id(tokenizer_, "<|image|>", image_pad_id_, err)) return false;
-        if (!get_single_token_id(tokenizer_, "<|video|>", video_pad_id_, err)) {
-            video_pad_id_ = -1;
-        }
-        if (!get_single_token_id(tokenizer_, "<|audio|>", audio_pad_id_, err)) return false;
-        vision_start_id_ = -1;
-        ALOGI("Gemma4-VL token ids: image_pad=%d video_pad=%d audio_pad=%d", image_pad_id_, video_pad_id_, audio_pad_id_);
-        break;
-    case VLMType::MiniCPMV46VL:
-        if (!get_single_token_id(tokenizer_, "<|image_pad|>", image_pad_id_, err)) return false;
-        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) {
-            video_pad_id_ = image_pad_id_;
-        }
-        vision_start_id_ = -1;
-        ALOGI("MiniCPM-V-4.6 token ids: image_pad=%d video_pad=%d", image_pad_id_, video_pad_id_);
-        break;
-    case VLMType::LocateAnythingVL:
-        if (!get_single_token_id(tokenizer_, "<IMG_CONTEXT>", image_pad_id_, err)) return false;
-        video_pad_id_ = image_pad_id_;
-        vision_start_id_ = -1;
-        ALOGI("LocateAnything token ids: image_pad(<IMG_CONTEXT>)=%d", image_pad_id_);
-        break;
-    default:
-        break;
+    // Token ids for placeholder locating (delegated to the per-VLM adapter).
+    {
+        TokenIds tids;
+        if (!adapter_->resolveTokenIds(tokenizer_, tids, err)) return false;
+        image_pad_id_ = tids.image_pad;
+        video_pad_id_ = tids.video_pad;
+        audio_pad_id_ = tids.audio_pad;
+        vision_start_id_ = tids.vision_start;
     }
 
     enabled_ = true;

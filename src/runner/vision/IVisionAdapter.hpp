@@ -7,13 +7,35 @@
 // time while every un-migrated path keeps using the existing vision_module.cpp code.
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "VLMType.hpp"
+#include "BaseTokenizer.hpp"
 
 namespace vision {
 
 struct RunState; // defined in vision_module.hpp
+
+// Placeholder / special token ids used to locate vision positions in input_ids.
+struct TokenIds {
+    int image_pad = -1;
+    int video_pad = -1;
+    int audio_pad = -1;
+    int vision_start = -1; // mRoPE only
+};
+
+// Resolve a special token that must map to exactly one id. Shared by adapters.
+inline bool get_single_token_id(const std::shared_ptr<BaseTokenizer>& tok,
+                                const std::string& s, int& out_id, std::string& err) {
+    auto ids = tok->encode(s);
+    if (ids.size() != 1) {
+        err = "special token is not a single id: '" + s + "' size=" + std::to_string(ids.size());
+        return false;
+    }
+    out_id = ids[0];
+    return true;
+}
 
 // Vision geometry / token-id parameters an adapter hook may need, passed per-call so
 // adapters stay free of VisionModule internals.
@@ -43,6 +65,11 @@ public:
                                     const std::vector<std::vector<int>>& /*video_grid_thw*/,
                                     const VisionParams& /*vp*/,
                                     RunState& /*state_out*/) const {}
+
+    // Resolve placeholder/special token ids for this VLM. Default: leave all at -1
+    // (matches the pre-refactor `default:` case). Every concrete adapter overrides this.
+    virtual bool resolveTokenIds(const std::shared_ptr<BaseTokenizer>& /*tok*/,
+                                 TokenIds& /*out*/, std::string& /*err*/) const { return true; }
 };
 
 // Selects the adapter for a VLMType. Returns the base (default behavior) for any type
