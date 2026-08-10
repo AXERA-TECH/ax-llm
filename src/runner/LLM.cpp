@@ -35,28 +35,12 @@
 #include "KvSlotTypes.hpp"
 #include "KvSlotSelect.hpp"
 #include "MemGuard.hpp"
+#include "KvSlotManager.hpp"
 
 #include "LLMLayer.hpp"
 
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 
-#ifdef USE_AXCL
-static inline void llm_memset(void *phy, int val, size_t n, int devid) { axcl_Memset(phy, (uint8_t)val, n, devid); }
-static inline void llm_h2d(void *phy_dst, const void *src, size_t n, int devid) { axcl_Memcpy(phy_dst, src, n, AXCL_MEMCPY_HOST_TO_DEVICE, devid); }
-static inline void llm_d2h(void *dst, const void *phy_src, size_t n, int devid) { axcl_Memcpy(dst, phy_src, n, AXCL_MEMCPY_DEVICE_TO_HOST, devid); }
-static inline void llm_d2d(void *phy_dst, const void *phy_src, size_t n, int devid) { axcl_Memcpy(phy_dst, phy_src, n, AXCL_MEMCPY_DEVICE_TO_DEVICE, devid); }
-#define LLM_WADDR(t)      ((void *)(t).phyAddr)
-#define LLM_RADDR(t)      ((const void *)(t).phyAddr)
-#define LLM_DEVID(layer_obj) ((layer_obj).layer.get_devid())
-#else
-static inline void llm_memset(void *vir, int val, size_t n, int /*devid*/) { memset(vir, val, n); }
-static inline void llm_h2d(void *vir_dst, const void *src, size_t n, int /*devid*/) { memcpy(vir_dst, src, n); }
-static inline void llm_d2h(void *dst, const void *vir_src, size_t n, int /*devid*/) { memcpy(dst, vir_src, n); }
-static inline void llm_d2d(void *vir_dst, const void *vir_src, size_t n, int /*devid*/) { memcpy(vir_dst, vir_src, n); }
-#define LLM_WADDR(t)      ((t).pVirAddr)
-#define LLM_RADDR(t)      ((const void *)(t).pVirAddr)
-#define LLM_DEVID(layer_obj) (0)
-#endif
 
 namespace {
 
@@ -236,7 +220,7 @@ static inline std::string strip_hidden_channel_sections(const std::string &text)
 
 } // namespace
 
-struct LLM::Impl {
+struct LLM::Impl : public IKvSlotHost {
     UTF8Filter utf8_filter;
     std::shared_ptr<BaseTokenizer> tokenizer;
     LLaMaEmbedSelector embed_selector;
@@ -260,12 +244,6 @@ struct LLM::Impl {
     // a per-slot device buffer managed by the backend (zero-copy activate). The
     // working fields above (last_*, precompute_len, linear snapshots, full-cache
     // slot bookkeeping) always reflect the currently active slot.
-    std::vector<KvCacheSlot> kv_slots_;
-    int kv_active_slot_idx_ = 0;
-    bool multi_slot_enabled_ = false;
-    bool multi_slot_active_request_ = false; // this request is served from a slot
-    KvSlotLocation kv_slot_location_ = KvSlotLocation::Device;
-    uint64_t kv_slot_lru_counter_ = 0;
 
     LLMAttrType _attr;
     MemGuard mem_guard_{_attr}; // CMM/DDR pre-load + running guard + teardown sentry (extracted)
@@ -280,6 +258,38 @@ struct LLM::Impl {
     int active_token_pos_start = -1;
 
     std::vector<LLMLayer> llama_layers;
+
+    // ---- Multi-slot prefix KV cache (extracted to KvSlotManager, stage 3b) ----
+    KvSlotManager kv_mgr_{*this, llama_layers, _attr};
+    int  slot_decode_gid_for_layer(int a, int b) const override { return decode_gid_for_layer(a, b); }
+    bool slot_is_linear_layer(int i) const override { return is_linear_layer(i); }
+    int  slot_kv_cache_size_for_layer(int i) const override { return kv_cache_size_for_layer(i); }
+    int  slot_layer_devid_for(int i) const override { return layer_devid_for(i); }
+    int  slot_cheap_prefill_capacity() const override { return cheap_prefill_capacity(); }
+    int  slot_remaining_cmm_mb(int d) const override { return remaining_cmm_mb(d); }
+    bool slot_dynamic_layer_load_enabled() const override { return dynamic_layer_load_enabled(); }
+    int  slot_decode_grpid() const override { return decode_grpid; }
+    int  slot_decode_grpids_back() const override { return decode_grpids_.empty() ? 0 : decode_grpids_.back(); }
+    int  slot_precompute_len() const override { return precompute_len; }
+    void slot_reset_kv_cache() override { ResetKVCache(); }
+    void slot_capture_decode_state(KvCacheSlot &s) override {
+        s.last_history_snapshot = last_history_snapshot;
+        s.last_tokens_ids = last_tokens_ids;
+        s.precompute_len = precompute_len;
+        s.linear_state_snapshots = linear_state_snapshots_;
+        s.cached_mrope_next_pos = cached_mrope_next_pos;
+        s.full_cache_valid_slots = full_cache_valid_slots_;
+        s.full_cache_has_sparse_slots = full_cache_has_sparse_slots_;
+    }
+    void slot_restore_decode_state(const KvCacheSlot &s) override {
+        last_history_snapshot = s.last_history_snapshot;
+        last_tokens_ids = s.last_tokens_ids;
+        precompute_len = s.precompute_len;
+        linear_state_snapshots_ = s.linear_state_snapshots;
+        cached_mrope_next_pos = s.cached_mrope_next_pos;
+        full_cache_valid_slots_ = s.full_cache_valid_slots;
+        full_cache_has_sparse_slots_ = s.full_cache_has_sparse_slots;
+    }
     bool deinited_ = false; // guards Deinit() against double-invocation (explicit call + destructor path)
     // Optional per-layer attention type (for models like Qwen3.5 that mix linear/full attention).
     std::vector<bool> layer_is_linear_attn;
@@ -2881,7 +2891,7 @@ struct LLM::Impl {
         }
         postprocess.set_pad_token_id(_attr.pad_token_id);
 
-        init_kv_slots();
+        kv_mgr_.init_kv_slots();
 
         ALOGI("LLM init ok");
         return true;
@@ -3548,173 +3558,6 @@ struct LLM::Impl {
 #endif
     }
 
-    // ---- Multi-slot prefix KV cache management ----
-    // Called from Init() after layers/groups are ready. Estimates how many slots
-    // actually fit before allocating, reduces to what fits, and warns when the
-    // configured count cannot be satisfied. Safe no-op when slots<=1.
-    void init_kv_slots()
-    {
-        multi_slot_enabled_ = false;
-        multi_slot_active_request_ = false;
-        kv_slots_.clear();
-        kv_active_slot_idx_ = 0;
-        kv_slot_lru_counter_ = 0;
-
-        const int want = _attr.kv_cache_slots;
-        if (want <= 1) return;
-
-        if (dynamic_layer_load_enabled())
-        {
-            ALOGW("kv_cache_slots=%d ignored: not supported together with dynamic_load_enable yet", want);
-            return;
-        }
-
-        std::string loc = _attr.kv_cache_slot_location;
-        std::transform(loc.begin(), loc.end(), loc.begin(), ::tolower);
-        kv_slot_location_ = (loc == "host" || loc == "ddr") ? KvSlotLocation::Host : KvSlotLocation::Device;
-        if (loc != "host" && loc != "ddr" && loc != "device")
-            ALOGW("kv_cache_slot_location='%s' unknown; defaulting to 'device'", _attr.kv_cache_slot_location.c_str());
-
-        const std::string vlm_tag = _attr.vlm_type == VLMType::None ? std::string("no") : std::string(VLMTypeName(_attr.vlm_type));
-        int granted = want;
-
-        if (kv_slot_location_ == KvSlotLocation::Device)
-        {
-            // 1) Build per-layer slot metadata and sum per-slot device bytes by device.
-            std::map<int, size_t> per_dev_bytes;
-            for (int i = 0; i < _attr.axmodel_num; ++i)
-            {
-                const size_t b = llama_layers[i].layer.kv_cache_slots_prepare();
-                if (b == 0)
-                {
-                    ALOGE("layer %d has no slottable KV tensors; disabling multi-slot", i);
-                    for (int j = 0; j <= i; ++j) llama_layers[j].layer.kv_cache_slots_set_count(1);
-                    return;
-                }
-                per_dev_bytes[layer_devid_for(i)] += b;
-            }
-
-            // 2) Budget: keep a safety margin of free CMM for runtime allocations.
-            //    Honor mem_guard_floor_mb when it asks for a larger reserve (never smaller).
-            const long long floor_b = _attr.mem_guard_enable ? (long long)_attr.mem_guard_floor_mb * 1024 * 1024 : 0;
-            const long long margin = std::max(256LL * 1024 * 1024, floor_b);
-            for (const auto &kv : per_dev_bytes)
-            {
-                const int dev = kv.first;
-                const long long per_slot = (long long)kv.second;
-                const long long free_b = (long long)remaining_cmm_mb(dev) * 1024LL * 1024LL;
-                const long long usable = free_b - margin;
-                int fit = 1;
-                if (per_slot > 0 && usable > 0) fit = 1 + (int)(usable / per_slot);
-                ALOGI("kv slot budget: dev=%d per_slot=%lldMB free=%lldMB margin=256MB -> max_slots=%d",
-                      dev, per_slot >> 20, free_b >> 20, fit);
-                granted = std::min(granted, fit);
-            }
-            if (granted < 1) granted = 1;
-            if (granted < want)
-                ALOGW("⚠ kv_cache_slots=%d requested but device CMM only fits %d; reducing to %d", want, granted, granted);
-            if (granted <= 1)
-            {
-                ALOGW("⚠ kv_cache_slots disabled: device CMM cannot fit even one extra slot");
-                for (int i = 0; i < _attr.axmodel_num; ++i) llama_layers[i].layer.kv_cache_slots_set_count(1);
-                return;
-            }
-
-            // 3) Allocate the budgeted count; take the min actually achieved
-            //    (fragmentation may yield less than the estimate), then trim all
-            //    layers to that common count.
-            int achieved = granted;
-            for (int i = 0; i < _attr.axmodel_num; ++i)
-                achieved = std::min(achieved, llama_layers[i].layer.kv_cache_slots_alloc(granted));
-            if (achieved < granted)
-                ALOGW("⚠ kv_cache_slots: allocated %d of estimated %d (CMM fragmentation); using %d", achieved, granted, achieved);
-            for (int i = 0; i < _attr.axmodel_num; ++i) llama_layers[i].layer.kv_cache_slots_set_count(achieved);
-            granted = achieved;
-            if (granted <= 1)
-            {
-                ALOGW("⚠ kv_cache_slots disabled after allocation (only 1 slot available)");
-                return;
-            }
-        }
-        else // Host mode: one device buffer + N host copies; bound by host RAM.
-        {
-            size_t per_slot = 0;
-            const int gid0 = decode_grpids_.empty() ? 0 : decode_grpids_.back();
-            for (int i = 0; i < _attr.axmodel_num; ++i)
-            {
-                const int gid = decode_gid_for_layer(i, gid0);
-                per_slot += (size_t)llama_layers[i].layer.get_input(gid, "K_cache").nSize;
-                per_slot += (size_t)llama_layers[i].layer.get_input(gid, "V_cache").nSize;
-            }
-            long long free_ram = 0;
-#ifndef _WIN32
-            struct sysinfo si;
-            if (sysinfo(&si) == 0) free_ram = (long long)si.freeram * (long long)si.mem_unit;
-#endif
-            const long long host_floor_b = _attr.mem_guard_enable ? (long long)_attr.mem_guard_floor_mb * 1024 * 1024 : 0;
-            const long long margin = std::max(512LL * 1024 * 1024, host_floor_b);
-            int fit = want;
-            if (free_ram > 0 && per_slot > 0)
-            {
-                const long long usable = free_ram - margin;
-                fit = 1;
-                if (usable > 0) fit = 1 + (int)(usable / (long long)per_slot);
-            }
-            ALOGI("kv slot budget (host): per_slot<=%zuMB free_ram=%lldMB -> max_slots=%d",
-                  per_slot >> 20, free_ram >> 20, fit);
-            granted = std::min(want, fit);
-            if (granted < 1) granted = 1;
-            if (granted < want)
-                ALOGW("⚠ kv_cache_slots=%d requested but host RAM only fits ~%d; reducing to %d", want, granted, granted);
-            if (granted <= 1)
-            {
-                ALOGW("⚠ kv_cache_slots disabled: host RAM cannot fit even one extra slot");
-                return;
-            }
-        }
-
-        kv_slots_.resize(granted);
-        kv_active_slot_idx_ = 0;
-        multi_slot_enabled_ = true;
-        if (granted < want)
-            ALOGW("multi-slot prefix KV cache: %d/%d slots enabled (location=%s vlm=%s)", granted, want,
-                  kv_slot_location_ == KvSlotLocation::Host ? "host" : "device", vlm_tag.c_str());
-        else
-            ALOGI("multi-slot prefix KV cache enabled: slots=%d location=%s vlm=%s", granted,
-                  kv_slot_location_ == KvSlotLocation::Host ? "host" : "device", vlm_tag.c_str());
-    }
-
-    // Host mode: copy the active slot's device KV into its host store.
-    void host_dump_active_kv()
-    {
-        if (kv_active_slot_idx_ < 0 || kv_active_slot_idx_ >= (int)kv_slots_.size()) return;
-        auto &s = kv_slots_[(size_t)kv_active_slot_idx_];
-        s.host_k.assign(_attr.axmodel_num, {});
-        s.host_v.assign(_attr.axmodel_num, {});
-        for (int m = 0; m < _attr.axmodel_num; ++m)
-        {
-            auto &lyr = llama_layers[(size_t)m];
-            const int devid = LLM_DEVID(lyr);
-            const int gid = decode_gid_for_layer(m, decode_grpid);
-            auto &t_k = lyr.layer.get_input(gid, "K_cache");
-            auto &t_v = lyr.layer.get_input(gid, "V_cache");
-            size_t k_elems, v_elems;
-            if (is_linear_layer(m))
-            {
-                k_elems = (size_t)t_k.nSize / sizeof(unsigned short);
-                v_elems = (size_t)t_v.nSize / sizeof(unsigned short);
-            }
-            else
-            {
-                const size_t layer_kv = (size_t)kv_cache_size_for_layer(m);
-                k_elems = v_elems = (size_t)std::max(0, precompute_len) * layer_kv;
-            }
-            s.host_k[(size_t)m].resize(k_elems);
-            s.host_v[(size_t)m].resize(v_elems);
-            if (k_elems) llm_d2h(s.host_k[(size_t)m].data(), LLM_RADDR(t_k), std::min(k_elems * sizeof(unsigned short), (size_t)t_k.nSize), devid);
-            if (v_elems) llm_d2h(s.host_v[(size_t)m].data(), LLM_RADDR(t_v), std::min(v_elems * sizeof(unsigned short), (size_t)t_v.nSize), devid);
-        }
-    }
 
     // Diagnostic: FNV-1a over the ACTIVE decode-group KV content (same tensors +
     // element counts host_dump_active_kv reads). Lets golden tests detect KV-content
@@ -3762,118 +3605,6 @@ struct LLM::Impl {
         return h;
     }
 
-    // Host mode: load a slot's host KV into the (shared) device decode-group buffer.
-    void host_load_kv(int idx)
-    {
-        auto &s = kv_slots_[(size_t)idx];
-        if ((int)s.host_k.size() != _attr.axmodel_num) return; // fresh slot, nothing to load
-        for (int m = 0; m < _attr.axmodel_num; ++m)
-        {
-            auto &lyr = llama_layers[(size_t)m];
-            const int devid = LLM_DEVID(lyr);
-            const int gid = decode_gid_for_layer(m, decode_grpid);
-            auto &t_k = lyr.layer.get_input(gid, "K_cache");
-            auto &t_v = lyr.layer.get_input(gid, "V_cache");
-            if (!s.host_k[(size_t)m].empty())
-                llm_h2d(LLM_WADDR(t_k), s.host_k[(size_t)m].data(), std::min(s.host_k[(size_t)m].size() * sizeof(unsigned short), (size_t)t_k.nSize), devid);
-            if (!s.host_v[(size_t)m].empty())
-                llm_h2d(LLM_WADDR(t_v), s.host_v[(size_t)m].data(), std::min(s.host_v[(size_t)m].size() * sizeof(unsigned short), (size_t)t_v.nSize), devid);
-        }
-    }
-
-    void save_active_kv_slot()
-    {
-        if (!multi_slot_enabled_) return;
-        if (kv_active_slot_idx_ < 0 || kv_active_slot_idx_ >= (int)kv_slots_.size()) return;
-        auto &s = kv_slots_[(size_t)kv_active_slot_idx_];
-        s.last_history_snapshot = last_history_snapshot;
-        s.last_tokens_ids = last_tokens_ids;
-        s.precompute_len = precompute_len;
-        s.linear_state_snapshots = linear_state_snapshots_;
-        s.cached_mrope_next_pos = cached_mrope_next_pos;
-        s.full_cache_valid_slots = full_cache_valid_slots_;
-        s.full_cache_has_sparse_slots = full_cache_has_sparse_slots_;
-        s.used = (precompute_len > 0) || !last_tokens_ids.empty();
-        if (kv_slot_location_ == KvSlotLocation::Host && s.used)
-            host_dump_active_kv();
-    }
-
-    bool activate_kv_slot(int idx)
-    {
-        if (!multi_slot_enabled_) return false;
-        if (idx < 0 || idx >= (int)kv_slots_.size()) return false;
-        if (kv_slot_location_ == KvSlotLocation::Device)
-        {
-            for (int i = 0; i < _attr.axmodel_num; ++i)
-            {
-                if (llama_layers[i].layer.kv_cache_slots_activate(idx) != 0)
-                {
-                    ALOGE("kv_cache_slots_activate(layer=%d slot=%d) failed", i, idx);
-                    return false;
-                }
-            }
-        }
-        else
-        {
-            host_load_kv(idx); // copy this slot's host KV onto the single device buffer
-        }
-        auto &s = kv_slots_[(size_t)idx];
-        last_history_snapshot = s.last_history_snapshot;
-        last_tokens_ids = s.last_tokens_ids;
-        precompute_len = s.precompute_len;
-        linear_state_snapshots_ = s.linear_state_snapshots;
-        cached_mrope_next_pos = s.cached_mrope_next_pos;
-        full_cache_valid_slots_ = s.full_cache_valid_slots;
-        full_cache_has_sparse_slots_ = s.full_cache_has_sparse_slots;
-        kv_active_slot_idx_ = idx;
-        return true;
-    }
-
-    // Pick the slot to serve `sel_tokens`. Choose the used slot sharing the
-    // longest leading-token prefix (>= kSlotReuseMinPrefix): the existing
-    // token-level reuse logic then keeps that prefix's KV and recomputes only the
-    // divergent tail. With no usable match, a free slot (or the LRU victim) is
-    // reset for a full prefill. Output correctness holds for any choice because a
-    // matched prefix is, by construction, an identical token sequence.
-    void select_kv_slot(const std::vector<int> &sel_tokens)
-    {
-        multi_slot_active_request_ = false;
-        if (!multi_slot_enabled_) return;
-        multi_slot_active_request_ = true;
-        const SlotDecision d = decide_slot_by_tokens(kv_slots_, sel_tokens, cheap_prefill_capacity());
-        commit_kv_slot_choice(d.chosen, d.fresh, d.shared, (int)sel_tokens.size());
-    }
-
-    // VLM slot selection: tokenizing VLM history needs the (expensive) vision
-    // Prepare, so match on the chat history (Content) prefix instead. The chosen
-    // slot's token-level reuse logic still refines actual KV reuse afterwards.
-    void select_kv_slot_by_history(const std::vector<Content> &history)
-    {
-        multi_slot_active_request_ = false;
-        if (!multi_slot_enabled_) return;
-        multi_slot_active_request_ = true;
-        const SlotDecision d = decide_slot_by_history(kv_slots_, history);
-        commit_kv_slot_choice(d.chosen, d.fresh, d.shared, (int)history.size());
-    }
-
-    void commit_kv_slot_choice(int chosen, bool fresh, int shared, int req_size)
-    {
-        if (chosen != kv_active_slot_idx_)
-        {
-            save_active_kv_slot();
-            activate_kv_slot(chosen);
-        }
-        if (fresh)
-        {
-            ResetKVCache();
-            kv_slots_[(size_t)chosen].used = false;
-            kv_slots_[(size_t)chosen].host_k.clear();
-            kv_slots_[(size_t)chosen].host_v.clear();
-        }
-        kv_slots_[(size_t)chosen].lru = ++kv_slot_lru_counter_;
-        ALOGI("kv slot select: chosen=%d reuse=%d shared=%d req=%d (slots=%zu)",
-              chosen, fresh ? 0 : 1, fresh ? 0 : shared, req_size, kv_slots_.size());
-    }
 
     std::string Run(std::vector<unsigned short> &test_embed, int output_max_token = -1)
     {
@@ -4811,12 +4542,12 @@ struct LLM::Impl {
         // history-prefix reset below so the chosen slot's snapshot is in place when
         // the existing reuse logic runs. Text LLM matches on tokens; VLM matches on
         // chat history (tokenizing VLM history needs the expensive vision Prepare).
-        if (multi_slot_enabled_)
+        if (kv_mgr_.multi_slot_enabled())
         {
             if (_attr.vlm_type == VLMType::None)
-                select_kv_slot(tokenizer->encode(history));
+                kv_mgr_.select_kv_slot(tokenizer->encode(history));
             else
-                select_kv_slot_by_history(history);
+                kv_mgr_.select_kv_slot_by_history(history);
         }
 
         if (request_has_video_media(history, effective_media_inputs))
@@ -4847,7 +4578,7 @@ struct LLM::Impl {
             // wiping the KV and recomputing the shared prefix every time. For VLM, keep the
             // single-context reset: image placeholder token IDs are identical across different
             // images, so a token-level prefix match would wrongly reuse a previous image's KV.
-            if (!multi_slot_active_request_ && _attr.vlm_type != VLMType::None)
+            if (!kv_mgr_.multi_slot_active_request() && _attr.vlm_type != VLMType::None)
             {
                 ALOGW("raw history not append. force ResetKVCache before request processing.");
                 ResetKVCache();
@@ -5365,7 +5096,7 @@ struct LLM::Impl {
         // Persist the updated working state back into the active slot so the next
         // request can match/continue it. Device KV already lives in the slot's
         // own buffer (zero copy).
-        save_active_kv_slot();
+        kv_mgr_.save_active_kv_slot();
 
         return history;
     }
