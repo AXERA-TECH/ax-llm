@@ -3605,6 +3605,19 @@ struct LLM::Impl : public IKvSlotHost {
         return h;
     }
 
+    // Diagnostic: FNV-1a over the last Prepare()'s vision encoder output
+    // (vision_state.vision_embed). Golden fingerprint for VLM image preprocessing.
+    uint64_t hash_last_vision_embed()
+    {
+        if (!has_vision_state || vision_state.vision_embed.empty()) return 0;
+        const auto &ve = vision_state.vision_embed;
+        uint64_t h = 1469598103934665603ULL;
+        const unsigned char *b = (const unsigned char *)ve.data();
+        const size_t n = ve.size() * sizeof(unsigned short);
+        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+        return h;
+    }
+
 
     std::string Run(std::vector<unsigned short> &test_embed, int output_max_token = -1)
     {
@@ -5132,6 +5145,7 @@ bool LLM::EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::ve
 int LLM::GenerateKVCachePrefill(std::vector<int> &ids, std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int &pre_len) { return impl_->GenerateKVCachePrefill(ids, k, v, pre_len); }
 int LLM::GetKVCache(std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int &pre_len) { return impl_->GetKVCache(k, v, pre_len); }
 uint64_t LLM::HashActiveKV() { return impl_->hash_active_kv(); }
+uint64_t LLM::HashLastVisionEmbed() { return impl_->hash_last_vision_embed(); }
 int LLM::SetKVCache(std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int pre_len, int in_tokens) { return impl_->SetKVCache(k, v, pre_len, in_tokens); }
 void LLM::ResetKVCache() { impl_->ResetKVCache(); }
 
