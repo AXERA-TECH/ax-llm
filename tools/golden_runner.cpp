@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -122,6 +123,7 @@ int main(int argc, char **argv) {
     std::string model_dir = argv[1];
     std::string convo_path, save_path, compare_path;
     int cli_max_tokens = -1;
+    int cli_kv_slots = -1;
     bool kv_hash = true;
     std::optional<std::vector<int>> devices_override;
     for (int i = 2; i < argc; ++i) {
@@ -130,6 +132,7 @@ int main(int argc, char **argv) {
         else if (a == "--save" && i + 1 < argc) save_path = argv[++i];
         else if (a == "--compare" && i + 1 < argc) compare_path = argv[++i];
         else if (a == "--max-tokens" && i + 1 < argc) cli_max_tokens = std::atoi(argv[++i]);
+        else if (a == "--kv-slots" && i + 1 < argc) cli_kv_slots = std::atoi(argv[++i]);
         else if (a == "--no-kv-hash") kv_hash = false;
         else if (a == "--devices" && i + 1 < argc) {
             std::string s = argv[++i]; std::vector<int> devs; std::string cur;
@@ -150,12 +153,16 @@ int main(int argc, char **argv) {
     std::string system_prompt = convo.value("system", std::string("You are a helpful assistant."));
     int max_tokens = cli_max_tokens > 0 ? cli_max_tokens : convo.value("max_tokens", 64);
     std::vector<std::string> turns;
-    for (const auto &t : convo.at("turns")) turns.push_back(t.get<std::string>());
-    if (turns.empty()) { std::cerr << "convo has no turns\n"; return 2; }
+    if (!convo.contains("conversations")) {
+        for (const auto &t : convo.at("turns")) turns.push_back(t.get<std::string>());
+        if (turns.empty()) { std::cerr << "convo has no turns\n"; return 2; }
+    }
 
     // ---- config + system init ----
     LLMAttrType attr;
     if (!load_config(model_dir, attr, devices_override)) return 2;
+    if (cli_kv_slots > 0) attr.kv_cache_slots = cli_kv_slots;
+    else if (convo.value("kv_cache_slots", 0) > 0) attr.kv_cache_slots = convo.value("kv_cache_slots", 0);
 #ifdef USE_AXCL
     if (int r = axclInit(nullptr)) { std::cerr << "axclInit failed: " << r << "\n"; return r; }
 #else
@@ -171,34 +178,63 @@ int main(int argc, char **argv) {
     std::string turn_out;
     llm.getAttr()->runing_callback = [&turn_out](std::string s, float, void *) { turn_out += s; };
 
-    // ---- drive the conversation (persistent KV, greedy, feed reply back) ----
-    std::vector<Content> history;
-    history.push_back({SYSTEM, TEXT, system_prompt});
+    // ---- drive: run one turn (persistent KV, greedy, feed reply back), record it ----
     json out_turns = json::array();
-    for (size_t i = 0; i < turns.size(); ++i) {
-        history.push_back({USER, TEXT, turns[i]});
+    int step = 0;
+    auto run_step = [&](std::vector<Content> &hist, const std::string &user, json extra) {
+        hist.push_back({USER, TEXT, user});
         turn_out.clear();
         llm.MarkRequestStart();
         llm.SetRequestSamplingOverride(true, 0.0f, false, 0.0f, false, 0.0f, false, 0.0f); // greedy
-        history = llm.Run(history, max_tokens);
+        hist = llm.Run(hist, max_tokens);
         llm.ClearRequestSamplingOverride();
         llm.ClearRequestStart();
-
         int pre_len = -1;
         uint64_t kvh = kv_hash ? kv_fingerprint(llm, pre_len) : 0;
-        json rec = {
-            {"i", (int)i},
-            {"user", turns[i]},
-            {"output", turn_out},
-            {"prompt_tokens", llm.GetLastPromptTokenNum()},
-            {"completion_tokens", llm.GetLastCompletionTokenNum()},
-            {"kv_pre_len", pre_len},
-            {"kv_hash", kv_hash ? hex64(kvh) : std::string("off")},
-        };
-        out_turns.push_back(rec);
-        std::cout << "[turn " << i << "] comp_tokens=" << llm.GetLastCompletionTokenNum()
-                  << " kv_pre_len=" << pre_len << " kv=" << (kv_hash ? hex64(kvh) : "off")
-                  << "\n           out: " << turn_out.substr(0, 80) << (turn_out.size() > 80 ? "..." : "") << "\n";
+        extra["step"] = step;
+        extra["user"] = user;
+        extra["output"] = turn_out;
+        extra["prompt_tokens"] = llm.GetLastPromptTokenNum();
+        extra["completion_tokens"] = llm.GetLastCompletionTokenNum();
+        extra["kv_pre_len"] = pre_len;
+        extra["kv_hash"] = kv_hash ? hex64(kvh) : std::string("off");
+        out_turns.push_back(extra);
+        std::cout << "[step " << step << "] "
+                  << (out_turns.back().contains("conv") ? out_turns.back()["conv"].get<std::string>() : std::string("-"))
+                  << " comp=" << llm.GetLastCompletionTokenNum() << " kv_pre=" << pre_len
+                  << " kv=" << (kv_hash ? hex64(kvh) : "off")
+                  << "  out: " << turn_out.substr(0, 64) << (turn_out.size() > 64 ? "..." : "") << "\n";
+        ++step;
+    };
+
+    if (convo.contains("conversations")) {
+        // interleaved multi-slot mode: named conversations + an `order` list; each
+        // occurrence of a name advances that conversation's next turn. Exercises
+        // select_kv_slot / activate / save / evict / LRU on one persistent instance.
+        struct Conv { std::string system; std::vector<std::string> turns; std::vector<Content> hist; size_t next = 0; bool started = false; };
+        std::map<std::string, Conv> convs;
+        for (auto it = convo["conversations"].begin(); it != convo["conversations"].end(); ++it) {
+            Conv c;
+            c.system = it.value().value("system", system_prompt);
+            for (const auto &t : it.value().at("turns")) c.turns.push_back(t.get<std::string>());
+            convs[it.key()] = std::move(c);
+        }
+        for (const auto &o : convo.at("order")) {
+            const std::string name = o.get<std::string>();
+            auto ci = convs.find(name);
+            if (ci == convs.end()) { std::cerr << "order references unknown conv: " << name << "\n"; continue; }
+            Conv &c = ci->second;
+            if (!c.started) { c.hist.push_back({SYSTEM, TEXT, c.system}); c.started = true; }
+            if (c.next >= c.turns.size()) { std::cerr << "conv " << name << " out of turns, skipping\n"; continue; }
+            run_step(c.hist, c.turns[c.next], json{{"conv", name}, {"turn", (int)c.next}});
+            c.next++;
+        }
+    } else {
+        // linear single-conversation mode (original)
+        std::vector<Content> history;
+        history.push_back({SYSTEM, TEXT, system_prompt});
+        for (size_t i = 0; i < turns.size(); ++i)
+            run_step(history, turns[i], json{{"turn", (int)i}});
     }
 
     llm.Deinit();
