@@ -237,6 +237,7 @@ set(COMMON_SOURCES
     src/runner/LLM.cpp
     src/runner/LLM_embed.cpp
     src/runner/LLM_init.cpp
+    src/runner/LLM_decode.cpp
     src/runner/image/sd15_image_generator.cpp
     src/runner/utils/files.cpp
     src/runner/utils/image_processor.cpp
