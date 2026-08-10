@@ -3716,6 +3716,52 @@ struct LLM::Impl {
         }
     }
 
+    // Diagnostic: FNV-1a over the ACTIVE decode-group KV content (same tensors +
+    // element counts host_dump_active_kv reads). Lets golden tests detect KV-content
+    // corruption from KV/slot refactors; GetKVCache only exposes precompute_len.
+    uint64_t hash_active_kv()
+    {
+        uint64_t h = 1469598103934665603ULL;
+        auto fold = [&h](const void *p, size_t n) {
+            const unsigned char *b = (const unsigned char *)p;
+            for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+        };
+        fold(&precompute_len, sizeof(precompute_len));
+        std::vector<unsigned short> tmp;
+        for (int m = 0; m < _attr.axmodel_num; ++m)
+        {
+            auto &lyr = llama_layers[(size_t)m];
+            const int devid = LLM_DEVID(lyr);
+            const int gid = decode_gid_for_layer(m, decode_grpid);
+            auto &t_k = lyr.layer.get_input(gid, "K_cache");
+            auto &t_v = lyr.layer.get_input(gid, "V_cache");
+            size_t k_elems, v_elems;
+            if (is_linear_layer(m))
+            {
+                k_elems = (size_t)t_k.nSize / sizeof(unsigned short);
+                v_elems = (size_t)t_v.nSize / sizeof(unsigned short);
+            }
+            else
+            {
+                const size_t layer_kv = (size_t)kv_cache_size_for_layer(m);
+                k_elems = v_elems = (size_t)std::max(0, precompute_len) * layer_kv;
+            }
+            if (k_elems)
+            {
+                tmp.resize(k_elems);
+                llm_d2h(tmp.data(), LLM_RADDR(t_k), std::min(k_elems * sizeof(unsigned short), (size_t)t_k.nSize), devid);
+                fold(tmp.data(), k_elems * sizeof(unsigned short));
+            }
+            if (v_elems)
+            {
+                tmp.resize(v_elems);
+                llm_d2h(tmp.data(), LLM_RADDR(t_v), std::min(v_elems * sizeof(unsigned short), (size_t)t_v.nSize), devid);
+                fold(tmp.data(), v_elems * sizeof(unsigned short));
+            }
+        }
+        return h;
+    }
+
     // Host mode: load a slot's host KV into the (shared) device decode-group buffer.
     void host_load_kv(int idx)
     {
@@ -5354,6 +5400,7 @@ bool LLM::EmbedBatch(const std::vector<std::string> &inputs, std::vector<std::ve
 
 int LLM::GenerateKVCachePrefill(std::vector<int> &ids, std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int &pre_len) { return impl_->GenerateKVCachePrefill(ids, k, v, pre_len); }
 int LLM::GetKVCache(std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int &pre_len) { return impl_->GetKVCache(k, v, pre_len); }
+uint64_t LLM::HashActiveKV() { return impl_->hash_active_kv(); }
 int LLM::SetKVCache(std::vector<std::vector<unsigned short>> &k, std::vector<std::vector<unsigned short>> &v, int pre_len, int in_tokens) { return impl_->SetKVCache(k, v, pre_len, in_tokens); }
 void LLM::ResetKVCache() { impl_->ResetKVCache(); }
 

@@ -93,23 +93,15 @@ static bool load_config(const std::string &model_dir, LLMAttrType &attr,
     return true;
 }
 
-// 64-bit FNV-1a over raw bytes (order-sensitive -> good state fingerprint).
-static uint64_t fnv1a(const void *data, size_t n, uint64_t h = 1469598103934665603ULL) {
-    const unsigned char *p = static_cast<const unsigned char *>(data);
-    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
-    return h;
-}
-
-// Fingerprint the live KV cache (per-layer K/V tensors + precompute length).
+// Fingerprint the ACTIVE decode-group KV *content* via the engine hook (real K/V
+// tensor bytes). GetKVCache only sets precompute_len, so we call it for pre_len
+// then hash actual KV via LLM::HashActiveKV().
 static uint64_t kv_fingerprint(LLM &llm, int &pre_len_out) {
     std::vector<std::vector<unsigned short>> k, v;
     int pre_len = -1;
     llm.GetKVCache(k, v, pre_len);
     pre_len_out = pre_len;
-    uint64_t h = fnv1a(&pre_len, sizeof(pre_len));
-    for (const auto &kk : k) if (!kk.empty()) h = fnv1a(kk.data(), kk.size() * sizeof(unsigned short), h);
-    for (const auto &vv : v) if (!vv.empty()) h = fnv1a(vv.data(), vv.size() * sizeof(unsigned short), h);
-    return h;
+    return llm.HashActiveKV();
 }
 
 static std::string hex64(uint64_t x) { char b[19]; std::snprintf(b, sizeof(b), "0x%016llx", (unsigned long long)x); return b; }
