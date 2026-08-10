@@ -1,4 +1,5 @@
 #include "vision_module.hpp"
+#include "IVisionAdapter.hpp"
 
 #include <cctype>
 #include <algorithm>
@@ -1284,6 +1285,7 @@ bool VisionModule::Init(VLMType type,
     tokenizer_ = tokenizer;
     cache_dir_ = cache_dir;
     type_ = type;
+    adapter_ = make_vision_adapter(type_);
 
     // Debug switch: disable both disk+memory vision cache.
     cache_enabled_ = !env_flag_false(std::getenv("AXLLM_VISION_CACHE"));
@@ -2950,38 +2952,21 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
     }
     if (!BuildInjectionState(input_ids_out, all_blocks, all_deepstack, state_out, err)) return false;
 
-    // Optional: mRoPE (Qwen-VL). PaddleOCR-VL axmodels are exported with
-    // sequential position ids, matching python/infer_axmodel.py.
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
-        mrope::Config cfg;
-        cfg.vision_config.temporal_patch_size = temporal_patch_size_;
-        cfg.vision_config.tokens_per_second = tokens_per_second_;
-        cfg.vision_config.spatial_merge_size = spatial_merge_size_;
-        cfg.vision_config.patch_size = patch_size_;
-        cfg.vision_config.width = vision_width_;
-        cfg.vision_config.height = vision_height_;
-        cfg.vision_config.fps = fps_;
-        cfg.image_token_id = image_pad_id_;
-        cfg.video_token_id = video_pad_id_;
-        cfg.vision_start_token_id = vision_start_id_;
-
-        if (type_ == VLMType::Qwen2_5VL) {
-            std::vector<double> second_per_grid_ts;
-            second_per_grid_ts.reserve(video_grid_thw.size());
-            for (size_t i = 0; i < video_grid_thw.size(); ++i) {
-                second_per_grid_ts.push_back(double(temporal_patch_size_) / double(std::max(1, fps_)));
-            }
-            state_out.position_ids = mrope::get_rope_index_qwen2_5(cfg, input_ids_out, image_grid_thw, video_grid_thw, second_per_grid_ts);
-        } else {
-            state_out.position_ids = mrope::get_rope_index_qwen3(cfg, input_ids_out, image_grid_thw, video_grid_thw);
-        }
-
-        int max_pos = -1;
-        for (const auto& row : state_out.position_ids) {
-            for (int v : row) max_pos = std::max(max_pos, v);
-        }
-        if (max_pos >= 0) state_out.decode_start = max_pos + 1;
-    }
+    // Optional: mRoPE (Qwen-VL). PaddleOCR-VL axmodels are exported with sequential
+    // position ids, matching python/infer_axmodel.py. Delegated to the per-VLM adapter:
+    // base = no-op (sequential); Qwen2_5VL/Qwen3VL override. Qwen3Omni stays sequential.
+    VisionParams vp;
+    vp.temporal_patch_size = temporal_patch_size_;
+    vp.tokens_per_second = tokens_per_second_;
+    vp.spatial_merge_size = spatial_merge_size_;
+    vp.patch_size = patch_size_;
+    vp.width = vision_width_;
+    vp.height = vision_height_;
+    vp.fps = fps_;
+    vp.image_pad_id = image_pad_id_;
+    vp.video_pad_id = video_pad_id_;
+    vp.vision_start_id = vision_start_id_;
+    adapter_->computePositionIds(input_ids_out, image_grid_thw, video_grid_thw, vp, state_out);
 
     return true;
 }

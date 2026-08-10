@@ -54,6 +54,10 @@ struct PrepareMetadata {
     int fresh_video_frames = -1;
 };
 
+// Per-VLM strategy (defined in IVisionAdapter.hpp). Holds the parts of preprocessing
+// that differ by model; migrated incrementally out of the type_== dispatch below.
+class IVisionAdapter;
+
 class VisionModule {
 public:
     VisionModule();
@@ -148,6 +152,10 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
+    // Per-VLM strategy, selected by type_ in Init(). Owns model-specific preprocessing
+    // behavior extracted from the type_== dispatch.
+    std::unique_ptr<IVisionAdapter> adapter_;
 
     bool EncodeForContent(const Content& content,
                           const MediaInputs& media,

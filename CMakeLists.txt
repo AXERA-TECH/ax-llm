@@ -243,6 +243,7 @@ set(COMMON_SOURCES
     src/runner/utils/image_processor.cpp
     src/runner/utils/mrope.cpp
     src/runner/vision/vision_module.cpp
+    src/runner/vision/vision_adapters.cpp
 )
 
 # ---------------------------------------------------------------------------
