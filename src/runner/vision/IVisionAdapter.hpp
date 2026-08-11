@@ -143,6 +143,19 @@ public:
     // Number of deepstack feature layers this VLM's encoder provides, given its output
     // tensor count. Default: 0. Only Qwen3VL (min(3, num_outputs-1)).
     virtual int deepstackLayerCount(int /*num_encoder_outputs*/) const { return 0; }
+
+    // Auto-resolve vision width/height (+ classic NCHW/NHWC flag) from the encoder INPUT
+    // tensor. io carries width/height (read old + write new) and patch/temporal params.
+    // Default: keep configured geometry (MiniCPM/LocateAnything don't auto-infer).
+    virtual bool resolveInputGeometry(size_t /*in_nSize*/, const std::vector<unsigned int>& /*in_vShape*/,
+                                      const std::string& /*encoder_path*/, VisionParams& /*io*/,
+                                      int& /*io_input_is_nchw*/, std::string& /*err*/) const { return true; }
+
+    // Resolve tokens_per_block + encoder output dtype from the encoder OUTPUT tensor.
+    // Returns false to fall back to VisionModule's generic vShape/nSize path.
+    virtual bool resolveOutputTokens(size_t /*out_nSize*/, const std::string& /*encoder_path*/,
+                                     int /*tokens_embed_size*/, const VisionParams& /*vp*/,
+                                     int& /*out_tokens_per_block*/, int& /*out_is_bf16*/) const { return false; }
 };
 
 // Selects the adapter for a VLMType. Returns the base (default behavior) for any type

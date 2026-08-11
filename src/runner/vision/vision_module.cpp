@@ -643,103 +643,7 @@ static size_t env_size_t(const char* v, size_t fallback)
     return (size_t)n;
 }
 
-static bool try_infer_qwen_hw_from_input_bytes(size_t input_nbytes,
-                                               int temporal_patch_size,
-                                               int channels,
-                                               int patch_size,
-                                               int& io_h,
-                                               int& io_w,
-                                               std::string& note)
-{
-    if (temporal_patch_size <= 0 || channels <= 0) return false;
-    const size_t denom = (size_t)temporal_patch_size * (size_t)channels;
-    if (denom == 0 || (input_nbytes % denom) != 0) return false;
-
-    const size_t hw = input_nbytes / denom; // H*W
-    if (hw == 0) return false;
-
-    // Prefer square if possible.
-    const int side = (int)(std::sqrt((double)hw) + 0.5);
-    if ((size_t)side * (size_t)side == hw) {
-        if (patch_size > 0 && (side % patch_size) != 0) {
-            note = "perfect square but not divisible by patch_size";
-            return false;
-        }
-        io_h = side;
-        io_w = side;
-        note = "square";
-        return true;
-    }
-
-    // Try keep configured height and solve width.
-    if (io_h > 0 && (hw % (size_t)io_h) == 0) {
-        int w = (int)(hw / (size_t)io_h);
-        if (patch_size <= 0 || ((io_h % patch_size) == 0 && (w % patch_size) == 0)) {
-            io_w = w;
-            note = "matched config height";
-            return true;
-        }
-    }
-
-    // Fallback: search a reasonable factor pair close to sqrt, honoring patch_size divisibility.
-    size_t best_diff = (size_t)-1;
-    int best_h = -1, best_w = -1;
-    for (size_t h = 1; h * h <= hw; ++h) {
-        if (hw % h) continue;
-        size_t w = hw / h;
-        if (patch_size > 0) {
-            if (((int)h % patch_size) != 0) continue;
-            if (((int)w % patch_size) != 0) continue;
-        }
-        size_t diff = (w > h) ? (w - h) : (h - w);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best_h = (int)h;
-            best_w = (int)w;
-        }
-    }
-    if (best_h > 0 && best_w > 0) {
-        io_h = best_h;
-        io_w = best_w;
-        note = "factor-search";
-        return true;
-    }
-
-    return false;
-}
-
-template <typename ShapeVec>
-static bool try_infer_hw_from_4d_shape_with_c3(const ShapeVec& shape, int& out_h, int& out_w, int* out_is_nchw = nullptr)
-{
-    if (shape.size() != 4) return false;
-    // NCHW
-    if ((int)shape[1] == 3) {
-        out_h = (int)shape[2];
-        out_w = (int)shape[3];
-        if (out_is_nchw) *out_is_nchw = 1;
-        return (out_h > 0 && out_w > 0);
-    }
-    // NHWC
-    if ((int)shape[3] == 3) {
-        out_h = (int)shape[1];
-        out_w = (int)shape[2];
-        if (out_is_nchw) *out_is_nchw = 0;
-        return (out_h > 0 && out_w > 0);
-    }
-    return false;
-}
-
 // get_single_token_id moved to IVisionAdapter.hpp (shared with vision_adapters.cpp).
-
-static bool parse_gemma4_profile_from_path(const std::string& path, int& out_h, int& out_w, int& out_tokens)
-{
-    std::smatch m;
-    if (!std::regex_search(path, m, std::regex("_h(\\d+)_w(\\d+)_t(\\d+)"))) return false;
-    out_h = std::stoi(m[1].str());
-    out_w = std::stoi(m[2].str());
-    out_tokens = std::stoi(m[3].str());
-    return true;
-}
 
 static bool try_pick_tokens_by_output_bytes(const ax_runner_tensor_t& out0,
                                             int tokens_embed_size,
@@ -1323,220 +1227,34 @@ bool VisionModule::Init(VLMType type,
 
     const auto& in0 = impl_->encoder.get_input(0);
 
-    // Auto-resolve vision width/height from encoder input shape/size, so users don't need to manually set them.
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) {
-        const int old_w = vision_width_;
-        const int old_h = vision_height_;
-
-        // PaddleOCRVL VIT takes float32 input (not uint8 like Qwen-VL);
-        // divide nSize by sizeof(float) to get the effective element count.
-        size_t eff_nSize = (size_t)in0.nSize;
-        if (type_ == VLMType::PaddleOCRVL && (eff_nSize % sizeof(float)) == 0) {
-            eff_nSize /= sizeof(float);
-            ALOGI("PaddleOCRVL: encoder input nSize=%zu -> eff_nSize=%zu (float32 input)",
-                  (size_t)in0.nSize, eff_nSize);
-        } else if (type_ == VLMType::Qwen3Omni && (eff_nSize % sizeof(float)) == 0) {
-            // Jina omni vision export consumes float32 patchified pixels, not raw uint8 NHWC bytes.
-            eff_nSize /= sizeof(float);
-            ALOGI("Qwen3Omni: encoder input nSize=%zu -> eff_nSize=%zu (float32 patch input)",
-                  (size_t)in0.nSize, eff_nSize);
-        }
-
-        const size_t cfg_bytes = (size_t)std::max(0, old_h) * (size_t)std::max(0, old_w) *
-                                 (size_t)std::max(1, temporal_patch_size_) * (size_t)3;
-
-        int h = old_h;
-        int w = old_w;
-        std::string note;
-        if (try_infer_qwen_hw_from_input_bytes(eff_nSize,
-                                               std::max(1, temporal_patch_size_),
-                                               3,
-                                               std::max(1, patch_size_),
-                                               h, w, note)) {
-            if (w != old_w || h != old_h) {
-                ALOGW("Qwen-VL vision size override: cfg=%dx%d bytes=%zu, model_input_bytes=%zu -> %dx%d (%s).",
-                      old_w, old_h, cfg_bytes, (size_t)in0.nSize, w, h, note.c_str());
-            }
-            vision_width_ = w;
-            vision_height_ = h;
-        } else {
-            if (vision_width_ <= 0 || vision_height_ <= 0) {
-                err = "failed to infer Qwen-VL vision_width/vision_height from encoder input";
-                return false;
-            }
-            if (cfg_bytes != (size_t)in0.nSize) {
-                ALOGW("Qwen-VL vision size mismatch (cfg=%dx%d bytes=%zu, model_input_bytes=%zu). Will pad/zero input tail.",
-                      vision_width_, vision_height_, cfg_bytes, (size_t)in0.nSize);
-            }
-        }
-    } else if (type_ == VLMType::Gemma4VL) {
-        const int old_w = vision_width_;
-        const int old_h = vision_height_;
-        int parsed_h = 0, parsed_w = 0, parsed_tokens = 0;
-        const bool parsed_profile = parse_gemma4_profile_from_path(encoder_axmodel, parsed_h, parsed_w, parsed_tokens);
-
-        const size_t eff_nsize = ((size_t)in0.nSize % sizeof(float) == 0) ? ((size_t)in0.nSize / sizeof(float)) : (size_t)in0.nSize;
-        const int pixel_dim = std::max(1, patch_size_) * std::max(1, patch_size_) * 3;
-        if (pixel_dim <= 0 || eff_nsize % (size_t)pixel_dim != 0) {
-            err = "failed to infer Gemma4 vision patch layout from encoder input";
+    // Auto-resolve vision width/height (+ classic NCHW/NHWC) from the encoder input (adapter).
+    {
+        VisionParams gvp;
+        gvp.width = vision_width_;
+        gvp.height = vision_height_;
+        gvp.patch_size = patch_size_;
+        gvp.temporal_patch_size = temporal_patch_size_;
+        int nchw = impl_->input_is_nchw;
+        if (!adapter_->resolveInputGeometry((size_t)in0.nSize, in0.vShape, encoder_axmodel, gvp, nchw, err))
             return false;
-        }
-
-        const int patch_count = (int)(eff_nsize / (size_t)pixel_dim);
-        if (parsed_profile) {
-            vision_height_ = parsed_h;
-            vision_width_ = parsed_w;
-        } else if (vision_width_ > 0 && vision_height_ > 0) {
-            const int expected_patch_count = (vision_height_ / std::max(1, patch_size_)) * (vision_width_ / std::max(1, patch_size_));
-            if (expected_patch_count != patch_count) {
-                ALOGW("Gemma4 input patch count mismatch: cfg=%dx%d -> %d patches, model=%d patches",
-                      vision_width_, vision_height_, expected_patch_count, patch_count);
-            }
-        } else {
-            err = "failed to infer Gemma4 vision_width/vision_height from encoder filename; please set config";
-            return false;
-        }
-
-        if (old_w != vision_width_ || old_h != vision_height_) {
-            ALOGW("Gemma4 vision size override: cfg=%dx%d -> model=%dx%d",
-                  old_w, old_h, vision_width_, vision_height_);
-        }
-    } else if (type_ == VLMType::InternVL3 || type_ == VLMType::FastVLM) {
-        // Classic image encoder: detect NCHW/NHWC layout and image size from model input shape.
-        impl_->input_is_nchw = -1;
-        int h = 0, w = 0, is_nchw = -1;
-        const bool got_shape = try_infer_hw_from_4d_shape_with_c3(in0.vShape, h, w, &is_nchw);
-        if (got_shape) {
-            impl_->input_is_nchw = is_nchw;
-            if (vision_width_ > 0 && vision_height_ > 0 && (vision_width_ != w || vision_height_ != h)) {
-                ALOGW("classic vision size override: cfg=%dx%d -> model=%dx%d (from input shape)",
-                      vision_width_, vision_height_, w, h);
-            }
-            vision_width_ = w;
-            vision_height_ = h;
-        } else {
-            // Fallback: if shape cannot be parsed, try layout by config+nSize.
-            if (vision_width_ <= 0 || vision_height_ <= 0) {
-                err = "classic vision encoder input shape missing; please provide valid vision_width/vision_height";
-                return false;
-            }
-            const size_t need_nhwc_u8 = (size_t)vision_width_ * (size_t)vision_height_ * (size_t)3;
-            const size_t need_nchw_f32 = need_nhwc_u8 * sizeof(float);
-            if ((size_t)in0.nSize == need_nchw_f32) impl_->input_is_nchw = 1;
-            else if ((size_t)in0.nSize == need_nhwc_u8) impl_->input_is_nchw = 0;
-            else {
-                err = "classic vision encoder layout not detected from input shape/nSize";
-                return false;
-            }
-            ALOGW("classic vision input shape unavailable; fallback to cfg size %dx%d by nSize=%zu (layout=%s)",
-                  vision_width_, vision_height_, (size_t)in0.nSize,
-                  (impl_->input_is_nchw == 1 ? "NCHW-fp32" : "NHWC-u8"));
-        }
-    } else if (type_ == VLMType::SmolVLM2) {
-        // SmolVLM2 encoder is usually NHWC u8; try shape first, then infer from nSize.
-        const int old_w = vision_width_;
-        const int old_h = vision_height_;
-        int h = 0, w = 0, tmp_layout = -1;
-        bool inferred = try_infer_hw_from_4d_shape_with_c3(in0.vShape, h, w, &tmp_layout);
-        if (!inferred && ((size_t)in0.nSize % 3u) == 0u) {
-            const size_t hw = (size_t)in0.nSize / 3u;
-            const int side = (int)(std::sqrt((double)hw) + 0.5);
-            if ((size_t)side * (size_t)side == hw) {
-                h = side;
-                w = side;
-                inferred = true;
-            }
-        }
-        if (!inferred) {
-            if (vision_width_ <= 0 || vision_height_ <= 0) {
-                err = "failed to infer SmolVLM2 vision_width/vision_height from encoder input";
-                return false;
-            }
-            ALOGW("SmolVLM2 vision size inference failed; keep cfg=%dx%d", vision_width_, vision_height_);
-        } else {
-            if (old_w != w || old_h != h) {
-                ALOGW("SmolVLM2 vision size override: cfg=%dx%d -> model=%dx%d", old_w, old_h, w, h);
-            }
-            vision_width_ = w;
-            vision_height_ = h;
-        }
+        vision_width_ = gvp.width;
+        vision_height_ = gvp.height;
+        impl_->input_is_nchw = nchw;
     }
 
-    // Detect encoder output dtype + tokens_per_block.
-    // Some AX* runners/models report unreliable vShape for Qwen-VL vision encoders; prefer nSize + config sanity.
+    // Detect encoder output dtype + tokens_per_block (adapter, with generic fallback).
     {
         const auto& out0 = impl_->encoder.get_output(0);
-
-        auto try_pick_by_bytes = [&](int bytes_per_elem, int& out_is_bf16, int& out_tokens_per_block) -> bool {
-            if (bytes_per_elem <= 0) return false;
-            if ((out0.nSize % (size_t)bytes_per_elem) != 0) return false;
-            const size_t elem = (size_t)out0.nSize / (size_t)bytes_per_elem;
-            if (elem % (size_t)tokens_embed_size_ != 0) return false;
-            out_tokens_per_block = (int)(elem / (size_t)tokens_embed_size_);
-            out_is_bf16 = (bytes_per_elem == 2) ? 1 : 0;
-            return true;
-        };
-
-        bool picked = false;
-
-        if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) {
-            const int grid_h = vision_height_ / std::max(1, patch_size_);
-            const int grid_w = vision_width_ / std::max(1, patch_size_);
-            const int llm_grid_h = grid_h / std::max(1, spatial_merge_size_);
-            const int llm_grid_w = grid_w / std::max(1, spatial_merge_size_);
-            const int expected_tokens = std::max(1, llm_grid_h) * std::max(1, llm_grid_w);
-
-            // Prefer fp32 if it matches the expected token count (Qwen3-VL reference branches use fp32 outputs).
-            int out_is_bf16 = -1, tpb = 0;
-            if (try_pick_by_bytes(4, out_is_bf16, tpb) && tpb == expected_tokens) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(2, out_is_bf16, tpb) && tpb == expected_tokens) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(4, out_is_bf16, tpb)) {
-                // Fallback: still prefer fp32 if valid, but warn about unexpected token count.
-                ALOGW("vision encoder tokens_per_block=%d (expected=%d). Using fp32 by nSize inference (out0.nSize=%zu).",
-                      tpb, expected_tokens, (size_t)out0.nSize);
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(2, out_is_bf16, tpb)) {
-                ALOGW("vision encoder tokens_per_block=%d (expected=%d). Using bf16 by nSize inference (out0.nSize=%zu).",
-                      tpb, expected_tokens, (size_t)out0.nSize);
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            }
-        } else if (type_ == VLMType::Gemma4VL) {
-            int expected_h = 0, expected_w = 0, expected_tokens = 0;
-            const bool parsed_profile = parse_gemma4_profile_from_path(encoder_axmodel, expected_h, expected_w, expected_tokens);
-            int out_is_bf16 = -1, tpb = 0;
-            if (try_pick_by_bytes(4, out_is_bf16, tpb) && (!parsed_profile || tpb == expected_tokens)) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(2, out_is_bf16, tpb) && (!parsed_profile || tpb == expected_tokens)) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            }
-        } else if (type_ == VLMType::MiniCPMV46VL) {
-            int out_is_bf16 = -1, tpb = 0;
-            if (try_pick_by_bytes(4, out_is_bf16, tpb)) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(2, out_is_bf16, tpb)) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            }
-        }
-
-        if (!picked) {
+        VisionParams tvp;
+        tvp.width = vision_width_;
+        tvp.height = vision_height_;
+        tvp.patch_size = patch_size_;
+        tvp.spatial_merge_size = spatial_merge_size_;
+        int tpb = 0, is_bf16 = -1;
+        if (adapter_->resolveOutputTokens((size_t)out0.nSize, encoder_axmodel, tokens_embed_size_, tvp, tpb, is_bf16)) {
+            tokens_per_block_ = tpb;
+            impl_->encoder_output_is_bf16 = is_bf16;
+        } else {
             // Generic path: rely on vShape + nSize.
             int elem_count = 1;
             for (auto d : out0.vShape) elem_count *= (int)d;

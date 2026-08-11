@@ -6,6 +6,7 @@
 
 #include "IVisionAdapter.hpp"
 #include "vision_module.hpp"   // for vision::RunState
+#include "vision_infer.hpp"    // encoder-tensor geometry/token inference helpers
 #include "utils/mrope.hpp"
 #include "utils/image_processor.hpp"
 #include "utils/ax_cv.hpp"
@@ -16,6 +17,90 @@
 namespace vision {
 
 namespace {
+
+// Shared Qwen-family (Qwen2_5VL/Qwen3VL/Qwen3Omni) + PaddleOCR input geometry inference.
+// float_input=true for the float32-patch encoders (PaddleOCR, Qwen3Omni).
+bool resolve_qwen_family_geometry(size_t in_nSize, bool float_input, VisionParams& io, std::string& err) {
+    const int old_w = io.width, old_h = io.height;
+    size_t eff_nSize = in_nSize;
+    if (float_input && (eff_nSize % sizeof(float)) == 0) eff_nSize /= sizeof(float);
+    const size_t cfg_bytes = (size_t)std::max(0, old_h) * (size_t)std::max(0, old_w) *
+                             (size_t)std::max(1, io.temporal_patch_size) * (size_t)3;
+    int h = old_h, w = old_w;
+    std::string note;
+    if (try_infer_qwen_hw_from_input_bytes(eff_nSize, std::max(1, io.temporal_patch_size), 3,
+                                           std::max(1, io.patch_size), h, w, note)) {
+        if (w != old_w || h != old_h) {
+            ALOGW("Qwen-VL vision size override: cfg=%dx%d bytes=%zu, model_input_bytes=%zu -> %dx%d (%s).",
+                  old_w, old_h, cfg_bytes, in_nSize, w, h, note.c_str());
+        }
+        io.width = w;
+        io.height = h;
+    } else {
+        if (io.width <= 0 || io.height <= 0) {
+            err = "failed to infer Qwen-VL vision_width/vision_height from encoder input";
+            return false;
+        }
+        if (cfg_bytes != in_nSize) {
+            ALOGW("Qwen-VL vision size mismatch (cfg=%dx%d bytes=%zu, model_input_bytes=%zu). Will pad/zero input tail.",
+                  io.width, io.height, cfg_bytes, in_nSize);
+        }
+    }
+    return true;
+}
+
+// Shared Qwen-family + PaddleOCR output tokens_per_block + dtype (expected grid-merge count).
+bool resolve_qwen_family_tokens(size_t out_nSize, int tokens_embed, const VisionParams& vp,
+                                int& tpb, int& is_bf16) {
+    const int grid_h = vp.height / std::max(1, vp.patch_size);
+    const int grid_w = vp.width / std::max(1, vp.patch_size);
+    const int llm_grid_h = grid_h / std::max(1, vp.spatial_merge_size);
+    const int llm_grid_w = grid_w / std::max(1, vp.spatial_merge_size);
+    const int expected_tokens = std::max(1, llm_grid_h) * std::max(1, llm_grid_w);
+    int b = -1, t = 0;
+    if (pick_tokens_by_bytes(out_nSize, tokens_embed, 4, b, t) && t == expected_tokens) { is_bf16 = b; tpb = t; return true; }
+    if (pick_tokens_by_bytes(out_nSize, tokens_embed, 2, b, t) && t == expected_tokens) { is_bf16 = b; tpb = t; return true; }
+    if (pick_tokens_by_bytes(out_nSize, tokens_embed, 4, b, t)) {
+        ALOGW("vision encoder tokens_per_block=%d (expected=%d). Using fp32 by nSize inference (out0.nSize=%zu).",
+              t, expected_tokens, out_nSize);
+        is_bf16 = b; tpb = t; return true;
+    }
+    if (pick_tokens_by_bytes(out_nSize, tokens_embed, 2, b, t)) {
+        ALOGW("vision encoder tokens_per_block=%d (expected=%d). Using bf16 by nSize inference (out0.nSize=%zu).",
+              t, expected_tokens, out_nSize);
+        is_bf16 = b; tpb = t; return true;
+    }
+    return false;
+}
+
+// Classic encoder (InternVL3 / FastVLM) input geometry + NCHW/NHWC detection.
+bool resolve_classic_geometry(size_t in_nSize, const std::vector<unsigned int>& in_vShape,
+                              VisionParams& io, int& io_input_is_nchw, std::string& err) {
+    io_input_is_nchw = -1;
+    int h = 0, w = 0, is_nchw = -1;
+    const bool got_shape = try_infer_hw_from_4d_shape_with_c3(in_vShape, h, w, &is_nchw);
+    if (got_shape) {
+        io_input_is_nchw = is_nchw;
+        if (io.width > 0 && io.height > 0 && (io.width != w || io.height != h)) {
+            ALOGW("classic vision size override: cfg=%dx%d -> model=%dx%d (from input shape)", io.width, io.height, w, h);
+        }
+        io.width = w;
+        io.height = h;
+    } else {
+        if (io.width <= 0 || io.height <= 0) {
+            err = "classic vision encoder input shape missing; please provide valid vision_width/vision_height";
+            return false;
+        }
+        const size_t need_nhwc_u8 = (size_t)io.width * (size_t)io.height * (size_t)3;
+        const size_t need_nchw_f32 = need_nhwc_u8 * sizeof(float);
+        if (in_nSize == need_nchw_f32) io_input_is_nchw = 1;
+        else if (in_nSize == need_nhwc_u8) io_input_is_nchw = 0;
+        else { err = "classic vision encoder layout not detected from input shape/nSize"; return false; }
+        ALOGW("classic vision input shape unavailable; fallback to cfg size %dx%d by nSize=%zu (layout=%s)",
+              io.width, io.height, in_nSize, (io_input_is_nchw == 1 ? "NCHW-fp32" : "NHWC-u8"));
+    }
+    return true;
+}
 
 // Shared Qwen-family image processor: Qwen2VideoProcessor on a single image -> exactly one
 // pixel block, with the pre-existing min/max sanity log. Encode mode is set by the caller.
@@ -106,6 +191,15 @@ public:
     }
 
     const char* cacheKeySuffix() const override { return "|resize=pillow_bicubic|patch=hwc_v1"; }
+
+    bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>&, const std::string&,
+                              VisionParams& io, int&, std::string& err) const override {
+        return resolve_qwen_family_geometry(in_nSize, /*float_input=*/false, io, err);
+    }
+    bool resolveOutputTokens(size_t out_nSize, const std::string&, int tokens_embed,
+                             const VisionParams& vp, int& tpb, int& is_bf16) const override {
+        return resolve_qwen_family_tokens(out_nSize, tokens_embed, vp, tpb, is_bf16);
+    }
 };
 
 class Qwen2_5VLAdapter : public QwenVLAdapter {
@@ -156,6 +250,12 @@ public:
 
     VideoPlanKind videoPlanKind() const override { return VideoPlanKind::SimpleBudgetFit; }
     const char* displayName() const override { return "Qwen3Omni"; }
+
+    // Qwen3Omni consumes float32 patch input -> divide by sizeof(float). Tokens inherited.
+    bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>&, const std::string&,
+                              VisionParams& io, int&, std::string& err) const override {
+        return resolve_qwen_family_geometry(in_nSize, /*float_input=*/true, io, err);
+    }
 
     // Qwen3Omni image path: same processor, but normalized-float encode, no deepstack.
     bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
@@ -247,6 +347,15 @@ public:
     }
 
     const char* cacheKeySuffix() const override { return "|resize=pillow_bicubic|patch=nchw_v2"; }
+
+    bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>&, const std::string&,
+                              VisionParams& io, int&, std::string& err) const override {
+        return resolve_qwen_family_geometry(in_nSize, /*float_input=*/true, io, err);
+    }
+    bool resolveOutputTokens(size_t out_nSize, const std::string&, int tokens_embed,
+                             const VisionParams& vp, int& tpb, int& is_bf16) const override {
+        return resolve_qwen_family_tokens(out_nSize, tokens_embed, vp, tpb, is_bf16);
+    }
 };
 
 class InternVL3Adapter : public IVisionAdapter {
@@ -267,6 +376,11 @@ public:
         out.mode = ImagePreproc::ClassicMat; // encoded directly from the Mat by VisionModule.
         return true;
     }
+
+    bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>& in_vShape, const std::string&,
+                              VisionParams& io, int& io_input_is_nchw, std::string& err) const override {
+        return resolve_classic_geometry(in_nSize, in_vShape, io, io_input_is_nchw, err);
+    }
 };
 
 class FastVLMAdapter : public IVisionAdapter {
@@ -283,6 +397,11 @@ public:
                          std::string& /*err*/) const override {
         out.mode = ImagePreproc::ClassicMat;
         return true;
+    }
+
+    bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>& in_vShape, const std::string&,
+                              VisionParams& io, int& io_input_is_nchw, std::string& err) const override {
+        return resolve_classic_geometry(in_nSize, in_vShape, io, io_input_is_nchw, err);
     }
 };
 
@@ -313,6 +432,27 @@ public:
         out.num_media_for_tokenizer = (int)out.pixel_blocks.size();
         return true;
     }
+
+    bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>& in_vShape, const std::string&,
+                              VisionParams& io, int&, std::string& err) const override {
+        const int old_w = io.width, old_h = io.height;
+        int h = 0, w = 0, tmp_layout = -1;
+        bool inferred = try_infer_hw_from_4d_shape_with_c3(in_vShape, h, w, &tmp_layout);
+        if (!inferred && (in_nSize % 3u) == 0u) {
+            const size_t hw = in_nSize / 3u;
+            const int side = (int)(std::sqrt((double)hw) + 0.5);
+            if ((size_t)side * (size_t)side == hw) { h = side; w = side; inferred = true; }
+        }
+        if (!inferred) {
+            if (io.width <= 0 || io.height <= 0) { err = "failed to infer SmolVLM2 vision_width/vision_height from encoder input"; return false; }
+            ALOGW("SmolVLM2 vision size inference failed; keep cfg=%dx%d", io.width, io.height);
+        } else {
+            if (old_w != w || old_h != h) ALOGW("SmolVLM2 vision size override: cfg=%dx%d -> model=%dx%d", old_w, old_h, w, h);
+            io.width = w;
+            io.height = h;
+        }
+        return true;
+    }
 };
 
 class Gemma4VLAdapter : public IVisionAdapter {
@@ -332,6 +472,46 @@ public:
 
     VideoPlanKind videoPlanKind() const override { return VideoPlanKind::Gemma4AutoReset; }
     const char* displayName() const override { return "Gemma4"; }
+
+    bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>&, const std::string& encoder_path,
+                              VisionParams& io, int&, std::string& err) const override {
+        const int old_w = io.width, old_h = io.height;
+        int parsed_h = 0, parsed_w = 0, parsed_tokens = 0;
+        const bool parsed_profile = parse_gemma4_profile_from_path(encoder_path, parsed_h, parsed_w, parsed_tokens);
+        const size_t eff_nsize = (in_nSize % sizeof(float) == 0) ? (in_nSize / sizeof(float)) : in_nSize;
+        const int pixel_dim = std::max(1, io.patch_size) * std::max(1, io.patch_size) * 3;
+        if (pixel_dim <= 0 || eff_nsize % (size_t)pixel_dim != 0) {
+            err = "failed to infer Gemma4 vision patch layout from encoder input";
+            return false;
+        }
+        const int patch_count = (int)(eff_nsize / (size_t)pixel_dim);
+        if (parsed_profile) {
+            io.height = parsed_h;
+            io.width = parsed_w;
+        } else if (io.width > 0 && io.height > 0) {
+            const int expected_patch_count = (io.height / std::max(1, io.patch_size)) * (io.width / std::max(1, io.patch_size));
+            if (expected_patch_count != patch_count) {
+                ALOGW("Gemma4 input patch count mismatch: cfg=%dx%d -> %d patches, model=%d patches",
+                      io.width, io.height, expected_patch_count, patch_count);
+            }
+        } else {
+            err = "failed to infer Gemma4 vision_width/vision_height from encoder filename; please set config";
+            return false;
+        }
+        if (old_w != io.width || old_h != io.height) {
+            ALOGW("Gemma4 vision size override: cfg=%dx%d -> model=%dx%d", old_w, old_h, io.width, io.height);
+        }
+        return true;
+    }
+    bool resolveOutputTokens(size_t out_nSize, const std::string& encoder_path, int tokens_embed,
+                             const VisionParams&, int& tpb, int& is_bf16) const override {
+        int expected_h = 0, expected_w = 0, expected_tokens = 0;
+        const bool parsed_profile = parse_gemma4_profile_from_path(encoder_path, expected_h, expected_w, expected_tokens);
+        int b = -1, t = 0;
+        if (pick_tokens_by_bytes(out_nSize, tokens_embed, 4, b, t) && (!parsed_profile || t == expected_tokens)) { is_bf16 = b; tpb = t; return true; }
+        if (pick_tokens_by_bytes(out_nSize, tokens_embed, 2, b, t) && (!parsed_profile || t == expected_tokens)) { is_bf16 = b; tpb = t; return true; }
+        return false;
+    }
 
     bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
                          std::string& /*err*/) const override {
@@ -375,6 +555,14 @@ public:
 
     VideoPlanKind videoPlanKind() const override { return VideoPlanKind::SimpleBudgetFit; }
     const char* displayName() const override { return "MiniCPM-V-4.6"; }
+
+    bool resolveOutputTokens(size_t out_nSize, const std::string&, int tokens_embed,
+                             const VisionParams&, int& tpb, int& is_bf16) const override {
+        int b = -1, t = 0;
+        if (pick_tokens_by_bytes(out_nSize, tokens_embed, 4, b, t)) { is_bf16 = b; tpb = t; return true; }
+        if (pick_tokens_by_bytes(out_nSize, tokens_embed, 2, b, t)) { is_bf16 = b; tpb = t; return true; }
+        return false;
+    }
 
     bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
                          std::string& err) const override {
