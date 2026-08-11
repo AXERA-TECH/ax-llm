@@ -135,6 +135,14 @@ public:
 
     // Human-readable model name for Prepare log/error messages.
     virtual const char* displayName() const { return "VLM"; }
+
+    // Extra suffix appended to the vision cache key (preprocessing variant marker).
+    // Default: none. Qwen family = hwc_v1, PaddleOCR = nchw_v2.
+    virtual const char* cacheKeySuffix() const { return ""; }
+
+    // Number of deepstack feature layers this VLM's encoder provides, given its output
+    // tensor count. Default: 0. Only Qwen3VL (min(3, num_outputs-1)).
+    virtual int deepstackLayerCount(int /*num_encoder_outputs*/) const { return 0; }
 };
 
 // Selects the adapter for a VLMType. Returns the base (default behavior) for any type

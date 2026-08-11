@@ -104,6 +104,8 @@ public:
         out.pixel_blocks = std::move(pixel_values);
         return true;
     }
+
+    const char* cacheKeySuffix() const override { return "|resize=pillow_bicubic|patch=hwc_v1"; }
 };
 
 class Qwen2_5VLAdapter : public QwenVLAdapter {
@@ -134,6 +136,8 @@ public:
         state_out.position_ids = mrope::get_rope_index_qwen3(cfg, input_ids, image_grid_thw, video_grid_thw);
         apply_decode_start_from_max_pos(state_out);
     }
+
+    int deepstackLayerCount(int nout) const override { return nout > 1 ? std::min(3, nout - 1) : 0; }
 };
 
 class Qwen3OmniAdapter : public QwenVLAdapter {
@@ -241,6 +245,8 @@ public:
         out.grid_w = vp.width / vp.patch_size;
         return true;
     }
+
+    const char* cacheKeySuffix() const override { return "|resize=pillow_bicubic|patch=nchw_v2"; }
 };
 
 class InternVL3Adapter : public IVisionAdapter {

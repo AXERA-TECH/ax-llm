@@ -1555,13 +1555,7 @@ bool VisionModule::Init(VLMType type,
     }
 
     // Optional deepstack (Qwen3VL family from older branches): encoder provides extra float outputs.
-    deepstack_layers_ = 0;
-    if (type_ == VLMType::Qwen3VL) {
-        const int nout = impl_->encoder.get_num_outputs();
-        if (nout > 1) {
-            deepstack_layers_ = std::min(3, nout - 1);
-        }
-    }
+    deepstack_layers_ = adapter_->deepstackLayerCount(impl_->encoder.get_num_outputs());
 
     if (type_ == VLMType::Gemma4VL) {
         if (video_num_frames_ <= 0) video_num_frames_ = 32;
@@ -1607,11 +1601,7 @@ bool VisionModule::Init(VLMType type,
                         "|ps=" + std::to_string(patch_size_) +
                         "|fps=" + std::to_string(fps_) +
                         "|tps=" + std::to_string(tokens_per_second_);
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni) {
-        cache_key_prefix_ += "|resize=pillow_bicubic|patch=hwc_v1";
-    } else if (type_ == VLMType::PaddleOCRVL) {
-        cache_key_prefix_ += "|resize=pillow_bicubic|patch=nchw_v2";
-    }
+    cache_key_prefix_ += adapter_->cacheKeySuffix();
     cache_key_prefix_ += "|bf16=rn_even";
 
     // Sanity checks after auto inference.
