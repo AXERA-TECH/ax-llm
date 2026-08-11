@@ -47,6 +47,15 @@ struct VideoPreproc {
     int grid_t = 0, grid_h = 0, grid_w = 0;
 };
 
+// How this VLM plans video frames under a token budget in VisionModule::Prepare. The
+// planning orchestration stays in Prepare (it mutates history/media/meta and cross-refs
+// Prepare-local state); this only replaces the per-VLM type dispatch that selects it.
+enum class VideoPlanKind {
+    None,             // no budget-aware frame planning in Prepare
+    Gemma4AutoReset,  // Gemma4's bespoke fresh-history auto-reset plan
+    SimpleBudgetFit,  // MiniCPM-V / Qwen3Omni shared per-frame budget fit
+};
+
 // Placeholder / special token ids used to locate vision positions in input_ids.
 struct TokenIds {
     int image_pad = -1;
@@ -119,6 +128,13 @@ public:
         err = "VIDEO not supported for this vlm_type";
         return false;
     }
+
+    // Which Prepare video frame-planning path this VLM uses (dispatch only; the planning
+    // logic stays in Prepare). Default: none.
+    virtual VideoPlanKind videoPlanKind() const { return VideoPlanKind::None; }
+
+    // Human-readable model name for Prepare log/error messages.
+    virtual const char* displayName() const { return "VLM"; }
 };
 
 // Selects the adapter for a VLMType. Returns the base (default behavior) for any type

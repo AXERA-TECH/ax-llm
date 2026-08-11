@@ -2417,7 +2417,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
     std::unordered_map<size_t, Gemma4VideoPlan> gemma4_video_plans;
     ScopedTempDirs planned_temp_dirs;
 
-    if (type_ == VLMType::Gemma4VL && budget) {
+    if (adapter_->videoPlanKind() == VideoPlanKind::Gemma4AutoReset && budget) {
         size_t video_count = 0;
         size_t video_index = (size_t)-1;
         for (size_t i = 0; i < history_in.size(); ++i) {
@@ -2541,7 +2541,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
 
         MediaInputs effective_media = it->second;
         ScopedTempDirs temp_dirs;
-        if (type_ == VLMType::Gemma4VL && c.type == VIDEO) {
+        if (adapter_->videoPlanKind() == VideoPlanKind::Gemma4AutoReset && c.type == VIDEO) {
             auto plan_it = gemma4_video_plans.find(i);
             if (plan_it != gemma4_video_plans.end()) {
                 effective_media.uris = plan_it->second.sampled_uris;
@@ -2607,7 +2607,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                       budget ? budget->precompute_len : 0);
             }
         }
-        else if ((type_ == VLMType::MiniCPMV46VL || type_ == VLMType::Qwen3Omni) && c.type == VIDEO) {
+        else if (adapter_->videoPlanKind() == VideoPlanKind::SimpleBudgetFit && c.type == VIDEO) {
             std::vector<std::string> all_frame_files;
             if (!collect_video_frame_paths(it->second.uris, all_frame_files, &temp_dirs, err)) return false;
 
@@ -2616,14 +2616,14 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                                 : (int)all_frame_files.size();
             const int requested_cap = frame_cap;
             if (frame_cap <= 0) {
-                err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") + " video has no usable frames";
+                err = std::string(adapter_->displayName()) + " video has no usable frames";
                 return false;
             }
 
             int fitted_tail_tokens = -1;
             if (budget) {
                 if (budget->max_history_tokens > 0 && budget->precompute_len > budget->max_history_tokens) {
-                    err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                    err = std::string(adapter_->displayName()) +
                           " video prompt exceeds current history budget before frame injection";
                     return false;
                 }
@@ -2636,7 +2636,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                                                        budget->last_tokens,
                                                        budget->max_tail_tokens);
                 if (fit.frame_count <= 0) {
-                    err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                    err = std::string(adapter_->displayName()) +
                           " video prompt exceeds current prefill budget: 1 frame requires " +
                           std::to_string(fit.tail_tokens) + " tail tokens, budget allows " +
                           std::to_string(budget->max_tail_tokens);
@@ -2648,13 +2648,13 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
 
             effective_media.uris = sample_frame_paths(all_frame_files, frame_cap, video_do_sample_frames_);
             if ((int)effective_media.uris.size() != frame_cap) {
-                err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                err = std::string(adapter_->displayName()) +
                       " video frame sampler produced an unexpected frame count";
                 return false;
             }
 
             ALOGI("%s video frames selected: %d/%zu (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
-                  (type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6"),
+                  (adapter_->displayName()),
                   frame_cap,
                   all_frame_files.size(),
                   requested_cap,

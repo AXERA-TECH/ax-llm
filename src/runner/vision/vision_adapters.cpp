@@ -150,6 +150,9 @@ public:
     }
     // No computePositionIds override: Qwen3Omni uses sequential position ids (base no-op).
 
+    VideoPlanKind videoPlanKind() const override { return VideoPlanKind::SimpleBudgetFit; }
+    const char* displayName() const override { return "Qwen3Omni"; }
+
     // Qwen3Omni image path: same processor, but normalized-float encode, no deepstack.
     bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
                          std::string& err) const override {
@@ -321,6 +324,9 @@ public:
         return true;
     }
 
+    VideoPlanKind videoPlanKind() const override { return VideoPlanKind::Gemma4AutoReset; }
+    const char* displayName() const override { return "Gemma4"; }
+
     bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
                          std::string& /*err*/) const override {
         std::vector<unsigned char> pv;
@@ -360,6 +366,9 @@ public:
         ALOGI("MiniCPM-V-4.6 token ids: image_pad=%d video_pad=%d", out.image_pad, out.video_pad);
         return true;
     }
+
+    VideoPlanKind videoPlanKind() const override { return VideoPlanKind::SimpleBudgetFit; }
+    const char* displayName() const override { return "MiniCPM-V-4.6"; }
 
     bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
                          std::string& err) const override {
