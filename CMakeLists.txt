@@ -244,6 +244,7 @@ set(COMMON_SOURCES
     src/runner/utils/mrope.cpp
     src/runner/vision/vision_module.cpp
     src/runner/vision/vision_adapters.cpp
+    src/runner/vision/audio_encoder.cpp
 )
 
 # ---------------------------------------------------------------------------

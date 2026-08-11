@@ -57,6 +57,7 @@ struct PrepareMetadata {
 // Per-VLM strategy (defined in IVisionAdapter.hpp). Holds the parts of preprocessing
 // that differ by model; migrated incrementally out of the type_== dispatch below.
 class IVisionAdapter;
+class AudioEncoder;
 
 class VisionModule {
 public:
@@ -156,6 +157,9 @@ private:
     // Per-VLM strategy, selected by type_ in Init(). Owns model-specific preprocessing
     // behavior extracted from the type_== dispatch.
     std::unique_ptr<IVisionAdapter> adapter_;
+
+    // Audio encoder(s) for audio-capable VLMs (Gemma4 / Qwen3Omni); null otherwise.
+    std::unique_ptr<AudioEncoder> audio_encoder_;
 
     bool EncodeForContent(const Content& content,
                           const MediaInputs& media,

@@ -56,6 +56,14 @@ enum class VideoPlanKind {
     SimpleBudgetFit,  // MiniCPM-V / Qwen3Omni shared per-frame budget fit
 };
 
+// Which audio encoder this VLM uses. Selects/creates the AudioEncoder in VisionModule::Init;
+// the audio machinery lives in audio_encoder.{hpp,cpp}. Only Gemma4VL / Qwen3Omni.
+enum class AudioKind {
+    None,
+    Gemma4Audio,     // dual 5s/30s profiles, select-by-duration
+    Qwen3OmniAudio,  // single Whisper 30s profile
+};
+
 // Placeholder / special token ids used to locate vision positions in input_ids.
 struct TokenIds {
     int image_pad = -1;
@@ -132,6 +140,9 @@ public:
     // Which Prepare video frame-planning path this VLM uses (dispatch only; the planning
     // logic stays in Prepare). Default: none.
     virtual VideoPlanKind videoPlanKind() const { return VideoPlanKind::None; }
+
+    // Which audio encoder this VLM uses (selects/creates the AudioEncoder in Init). Default: none.
+    virtual AudioKind audioKind() const { return AudioKind::None; }
 
     // Human-readable model name for Prepare log/error messages.
     virtual const char* displayName() const { return "VLM"; }

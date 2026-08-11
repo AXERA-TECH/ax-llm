@@ -1,5 +1,6 @@
 #include "vision_module.hpp"
 #include "IVisionAdapter.hpp"
+#include "audio_encoder.hpp"
 
 #include <cctype>
 #include <algorithm>
@@ -36,44 +37,13 @@
 #include "utils/image_processor.hpp"
 #include "utils/mrope.hpp"
 
-#ifdef USE_AXCL
-#include "ax_model_runner/ax_model_runner_axcl.hpp"
-#include "utils/axcl_manager.h"
-using ax_runner_t = ax_runner_axcl;
-static inline void v_h2d(void *phy_dst, const void *src, size_t n, int devid) { axcl_Memcpy(phy_dst, src, n, AXCL_MEMCPY_HOST_TO_DEVICE, devid); }
-static inline void v_d2h(void *dst, const void *phy_src, size_t n, int devid) { axcl_Memcpy(dst, phy_src, n, AXCL_MEMCPY_DEVICE_TO_HOST, devid); }
-#define V_WADDR(t) ((void *)(t).phyAddr)
-#define V_RADDR(t) ((const void *)(t).phyAddr)
-#else
-#include "ax_model_runner/ax_model_runner_ax650.hpp"
-using ax_runner_t = ax_runner_ax650;
-static inline void v_h2d(void *vir_dst, const void *src, size_t n, int /*devid*/) { memcpy(vir_dst, src, n); }
-static inline void v_d2h(void *dst, const void *vir_src, size_t n, int /*devid*/) { memcpy(dst, vir_src, n); }
-#define V_WADDR(t) ((t).pVirAddr)
-#define V_RADDR(t) ((const void *)(t).pVirAddr)
-#endif
+#include "vision_runtime.hpp"  // ax_runner_t + v_h2d/v_d2h + V_WADDR/V_RADDR (backend-selected)
 
 namespace vision {
 
 namespace {
 
 constexpr double kDefaultRawVideoSampleFps = 2.0;
-
-struct AudioEncoderRuntime {
-    enum class ProfileKind {
-        None = 0,
-        Gemma4,
-        Whisper,
-    };
-
-    ax_runner_t encoder;
-    bool encoder_inited = false;
-    int encoder_output_is_bf16 = -1;
-    ProfileKind profile_kind = ProfileKind::None;
-    audio::Gemma4AudioProfile profile;
-    audio::WhisperAudioProfile whisper_profile;
-    std::string axmodel_path;
-};
 
 struct ScopedTempDirs {
     std::vector<std::string> dirs;
@@ -619,9 +589,6 @@ struct VisionModule::Impl {
     bool encoder_inited = false;
     int encoder_output_is_bf16 = -1;
 
-    AudioEncoderRuntime audio_5s;
-    AudioEncoderRuntime audio_30s;
-
     // For "classic image encoder" layout detection.
     int input_is_nchw = -1; // 1=NCHW float32, 0=NHWC u8, -1=unknown
 };
@@ -644,152 +611,6 @@ static size_t env_size_t(const char* v, size_t fallback)
 }
 
 // get_single_token_id moved to IVisionAdapter.hpp (shared with vision_adapters.cpp).
-
-static bool try_pick_tokens_by_output_bytes(const ax_runner_tensor_t& out0,
-                                            int tokens_embed_size,
-                                            int& out_is_bf16,
-                                            int& out_tokens_per_block)
-{
-    for (int bytes_per_elem : {4, 2}) {
-        if ((out0.nSize % bytes_per_elem) != 0) continue;
-        const size_t elem = (size_t)out0.nSize / (size_t)bytes_per_elem;
-        if (elem == 0 || (elem % (size_t)tokens_embed_size) != 0) continue;
-        out_is_bf16 = (bytes_per_elem == 2) ? 1 : 0;
-        out_tokens_per_block = (int)(elem / (size_t)tokens_embed_size);
-        return true;
-    }
-    return false;
-}
-
-static bool init_audio_profile(AudioEncoderRuntime& runtime,
-                               const std::string& axmodel_path,
-                               int devid,
-                               int tokens_embed_size,
-                               std::string& err)
-{
-    audio::Gemma4AudioProfile profile;
-    if (!audio::InferGemma4AudioProfileFromPath(axmodel_path, profile)) {
-        err = "failed to infer Gemma4 audio profile from path: " + axmodel_path;
-        return false;
-    }
-
-    if (runtime.encoder.init(axmodel_path.c_str(), devid) != 0) {
-        err = "init audio encoder axmodel failed: " + axmodel_path;
-        return false;
-    }
-    runtime.encoder_inited = true;
-    runtime.profile_kind = AudioEncoderRuntime::ProfileKind::Gemma4;
-    runtime.profile = profile;
-    runtime.axmodel_path = axmodel_path;
-
-#ifdef USE_AXCL
-    runtime.encoder.set_auto_sync_before_inference(true);
-    runtime.encoder.set_auto_sync_after_inference(true);
-#endif
-
-    const auto& out0 = runtime.encoder.get_output(0);
-    int out_is_bf16 = -1;
-    int tokens_per_block = 0;
-    auto try_pick_expected = [&](int bytes_per_elem) -> bool {
-        if ((out0.nSize % bytes_per_elem) != 0) return false;
-        const size_t elem = (size_t)out0.nSize / (size_t)bytes_per_elem;
-        if (elem == 0 || (elem % (size_t)tokens_embed_size) != 0) return false;
-        const int tokens = (int)(elem / (size_t)tokens_embed_size);
-        if (tokens != runtime.profile.num_audio_tokens) return false;
-        out_is_bf16 = (bytes_per_elem == 2) ? 1 : 0;
-        tokens_per_block = tokens;
-        return true;
-    };
-
-    if (!try_pick_expected(4) && !try_pick_expected(2)) {
-        if (!try_pick_tokens_by_output_bytes(out0, tokens_embed_size, out_is_bf16, tokens_per_block)) {
-            err = "failed to infer Gemma4 audio output layout: " + axmodel_path;
-            return false;
-        }
-        ALOGW("Gemma4 audio profile token count mismatch: expected=%d inferred=%d from %s",
-              runtime.profile.num_audio_tokens, tokens_per_block, axmodel_path.c_str());
-    }
-
-    runtime.encoder_output_is_bf16 = out_is_bf16;
-    runtime.profile.num_audio_tokens = tokens_per_block;
-    ALOGI("Gemma4 audio profile init ok: path=%s duration=%.1fs mel_frames=%d tokens=%d out_dtype=%s",
-          axmodel_path.c_str(),
-          runtime.profile.duration_sec,
-          runtime.profile.num_mel_frames,
-          runtime.profile.num_audio_tokens,
-          (runtime.encoder_output_is_bf16 ? "bf16" : "fp32"));
-    return true;
-}
-
-static bool init_whisper_audio_profile(AudioEncoderRuntime& runtime,
-                                       const std::string& axmodel_path,
-                                       int devid,
-                                       int tokens_embed_size,
-                                       std::string& err)
-{
-    if (runtime.encoder.init(axmodel_path.c_str(), devid) != 0) {
-        err = "init whisper audio encoder axmodel failed: " + axmodel_path;
-        return false;
-    }
-    runtime.encoder_inited = true;
-    runtime.profile_kind = AudioEncoderRuntime::ProfileKind::Whisper;
-    runtime.axmodel_path = axmodel_path;
-
-#ifdef USE_AXCL
-    runtime.encoder.set_auto_sync_before_inference(true);
-    runtime.encoder.set_auto_sync_after_inference(true);
-#endif
-
-    const auto& in0 = runtime.encoder.get_input(0);
-    if (in0.vShape.size() >= 3) {
-        runtime.whisper_profile.feature_size = (int)in0.vShape[in0.vShape.size() - 2];
-        runtime.whisper_profile.num_mel_frames = (int)in0.vShape[in0.vShape.size() - 1];
-    } else {
-        const size_t elem = ((size_t)in0.nSize % sizeof(float) == 0) ? ((size_t)in0.nSize / sizeof(float)) : 0;
-        runtime.whisper_profile.feature_size = 128;
-        runtime.whisper_profile.num_mel_frames =
-            (runtime.whisper_profile.feature_size > 0) ? (int)(elem / (size_t)runtime.whisper_profile.feature_size) : 0;
-    }
-
-    if (runtime.whisper_profile.feature_size <= 0 || runtime.whisper_profile.num_mel_frames <= 0) {
-        err = "failed to infer whisper audio input layout: " + axmodel_path;
-        return false;
-    }
-    runtime.whisper_profile.duration_sec =
-        (float)runtime.whisper_profile.num_mel_frames * (float)runtime.whisper_profile.hop_length /
-        (float)runtime.whisper_profile.sampling_rate;
-
-    const auto& out0 = runtime.encoder.get_output(0);
-    int out_is_bf16 = -1;
-    int tokens_per_block = 0;
-    if (!try_pick_tokens_by_output_bytes(out0, tokens_embed_size, out_is_bf16, tokens_per_block)) {
-        err = "failed to infer whisper audio output layout: " + axmodel_path;
-        return false;
-    }
-
-    runtime.encoder_output_is_bf16 = out_is_bf16;
-    runtime.whisper_profile.num_audio_tokens = tokens_per_block;
-    ALOGI("Whisper audio profile init ok: path=%s duration=%.1fs mel_frames=%d tokens=%d out_dtype=%s",
-          axmodel_path.c_str(),
-          runtime.whisper_profile.duration_sec,
-          runtime.whisper_profile.num_mel_frames,
-          runtime.whisper_profile.num_audio_tokens,
-          (runtime.encoder_output_is_bf16 ? "bf16" : "fp32"));
-    return true;
-}
-
-static AudioEncoderRuntime* select_audio_profile(AudioEncoderRuntime* p5,
-                                                 AudioEncoderRuntime* p30,
-                                                 float duration_sec)
-{
-    if (p5 && !p5->encoder_inited) p5 = nullptr;
-    if (p30 && !p30->encoder_inited) p30 = nullptr;
-
-    if (p5 && duration_sec <= p5->profile.duration_sec + 0.25f) return p5;
-    if (p30) return p30;
-    if (p5) return p5;
-    return nullptr;
-}
 
 static bool file_sig(const std::string& path, uint64_t& size_out, uint64_t& mtime_ns_out)
 {
@@ -1136,8 +957,7 @@ void VisionModule::Deinit()
 {
     if (impl_) {
         if (impl_->encoder_inited) impl_->encoder.deinit();
-        if (impl_->audio_5s.encoder_inited) impl_->audio_5s.encoder.deinit();
-        if (impl_->audio_30s.encoder_inited) impl_->audio_30s.encoder.deinit();
+        audio_encoder_.reset();
         impl_.reset();
     }
     enabled_ = false;
@@ -1275,37 +1095,24 @@ bool VisionModule::Init(VLMType type,
     // Optional deepstack (Qwen3VL family from older branches): encoder provides extra float outputs.
     deepstack_layers_ = adapter_->deepstackLayerCount(impl_->encoder.get_num_outputs());
 
-    if (type_ == VLMType::Gemma4VL) {
+    // Audio-capable VLMs (Gemma4 / Qwen3Omni): per-VLM video-frame default + audio encoder.
+    // Audio machinery lives in AudioEncoder (audio_encoder.hpp); injection stays here.
+    const AudioKind akind = adapter_->audioKind();
+    if (akind == AudioKind::Gemma4Audio) {
         if (video_num_frames_ <= 0) video_num_frames_ = 32;
-        if (!audio_encoder_axmodel_5s.empty() && is_file(audio_encoder_axmodel_5s)) {
-            if (!init_audio_profile(impl_->audio_5s, audio_encoder_axmodel_5s, devid, tokens_embed_size_, err)) {
-                return false;
-            }
-        }
-        if (!audio_encoder_axmodel_30s.empty() && is_file(audio_encoder_axmodel_30s)) {
-            if (!init_audio_profile(impl_->audio_30s, audio_encoder_axmodel_30s, devid, tokens_embed_size_, err)) {
-                return false;
-            }
-        }
-        if (!impl_->audio_5s.encoder_inited && !impl_->audio_30s.encoder_inited) {
-            ALOGW("Gemma4 audio encoders are not configured or missing; AUDIO inputs will be rejected.");
-        }
-        ALOGI("Gemma4 video config: num_frames=%d do_sample_frames=%d",
-              video_num_frames_,
-              video_do_sample_frames_ ? 1 : 0);
-    } else if (type_ == VLMType::Qwen3Omni) {
+    } else if (akind == AudioKind::Qwen3OmniAudio) {
         if (video_num_frames_ <= 0) video_num_frames_ = 8;
-        if (!audio_encoder_axmodel_30s.empty() && is_file(audio_encoder_axmodel_30s)) {
-            if (!init_whisper_audio_profile(impl_->audio_30s, audio_encoder_axmodel_30s, devid, tokens_embed_size_, err)) {
-                return false;
-            }
+    }
+    if (akind != AudioKind::None) {
+        audio_encoder_ = std::make_unique<AudioEncoder>();
+        const AudioEncoder::Kind ek =
+            (akind == AudioKind::Gemma4Audio) ? AudioEncoder::Kind::Gemma4 : AudioEncoder::Kind::Whisper;
+        if (!audio_encoder_->Init(ek, audio_encoder_axmodel_5s, audio_encoder_axmodel_30s,
+                                  devid, tokens_embed_size_, err)) {
+            return false;
         }
-        if (!impl_->audio_30s.encoder_inited) {
-            ALOGW("Qwen3Omni audio encoder is not configured or missing; AUDIO inputs will be rejected.");
-        }
-        ALOGI("Qwen3Omni video config: num_frames=%d do_sample_frames=%d",
-              video_num_frames_,
-              video_do_sample_frames_ ? 1 : 0);
+        ALOGI("%s video config: num_frames=%d do_sample_frames=%d",
+              adapter_->displayName(), video_num_frames_, video_do_sample_frames_ ? 1 : 0);
     }
 
     cache_key_prefix_ = "vlm=" + std::string(VLMTypeName(type_)) + "|enc=" + normalize_path_for_key(encoder_axmodel) +
@@ -1436,68 +1243,6 @@ static bool encode_block_normalized_float(ax_runner_t& enc, int devid, int out_i
         else v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
         for (int i = 0; i < elem_count; ++i) out_bf16[i] = fp32_to_bfloat16_rne(tmp[i]);
     }
-    return true;
-}
-
-static bool encode_block_fp32(ax_runner_t& enc, int devid, int out_is_bf16,
-                              const std::vector<float>& values,
-                              std::vector<unsigned short>& out_bf16,
-                              std::string& err)
-{
-    const auto& in0 = enc.get_input(0);
-    const size_t input_bytes = values.size() * sizeof(float);
-    if ((size_t)in0.nSize < input_bytes) {
-        err = "encoder input tensor too small for float32 input";
-        return false;
-    }
-
-    if (input_bytes == (size_t)in0.nSize) {
-        if (in0.pVirAddr) {
-            std::memcpy(in0.pVirAddr, values.data(), input_bytes);
-        } else {
-            v_h2d(V_WADDR(in0), values.data(), input_bytes, devid);
-        }
-    } else {
-        std::vector<unsigned char> tmp((size_t)in0.nSize, 0);
-        std::memcpy(tmp.data(), values.data(), input_bytes);
-        if (in0.pVirAddr) {
-            std::memcpy(in0.pVirAddr, tmp.data(), tmp.size());
-        } else {
-            v_h2d(V_WADDR(in0), tmp.data(), tmp.size(), devid);
-        }
-    }
-
-    enc.inference();
-
-    const auto& out0 = enc.get_output(0);
-    int elem_count = 0;
-    if (out_is_bf16) {
-        elem_count = (int)((size_t)out0.nSize / sizeof(unsigned short));
-    } else {
-        elem_count = (int)((size_t)out0.nSize / sizeof(float));
-    }
-    if (elem_count <= 0) {
-        err = "audio encoder output elem_count invalid";
-        return false;
-    }
-    out_bf16.resize(elem_count);
-
-    if (out_is_bf16) {
-        if (out0.pVirAddr) {
-            std::memcpy(out_bf16.data(), out0.pVirAddr, (size_t)elem_count * sizeof(unsigned short));
-        } else {
-            v_d2h(out_bf16.data(), V_RADDR(out0), (size_t)elem_count * sizeof(unsigned short), devid);
-        }
-        return true;
-    }
-
-    std::vector<float> tmp(elem_count);
-    if (out0.pVirAddr) {
-        std::memcpy(tmp.data(), out0.pVirAddr, (size_t)elem_count * sizeof(float));
-    } else {
-        v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
-    }
-    for (int i = 0; i < elem_count; ++i) out_bf16[i] = bfloat16(tmp[i]).data;
     return true;
 }
 
@@ -1711,92 +1456,13 @@ bool VisionModule::EncodeForContent(const Content& content,
     const int devid = impl_->encoder.get_devid();
 
     if (content.type == AUDIO) {
-        if (type_ == VLMType::Gemma4VL) {
-            if (media.uris.size() != 1) {
-                err = "Gemma4 audio expects exactly 1 audio file per message";
-                return false;
-            }
-
-            float duration_sec = 0.0f;
-            if (!audio::ReadAudioDurationSeconds(media.uris[0], duration_sec, err)) {
-                return false;
-            }
-
-            auto* runtime = select_audio_profile(&impl_->audio_5s, &impl_->audio_30s, duration_sec);
-            if (!runtime) {
-                err = "Gemma4 audio encoder profile is not initialized";
-                return false;
-            }
-
-            std::vector<float> input_features;
-            if (!audio::LoadGemma4AudioInputFeatures(media.uris[0], runtime->profile, input_features, nullptr, err)) {
-                return false;
-            }
-
+        if (audio_encoder_ && audio_encoder_->enabled()) {
             std::vector<unsigned short> emb;
-            if (!encode_block_fp32(runtime->encoder,
-                                   runtime->encoder.get_devid(),
-                                   runtime->encoder_output_is_bf16,
-                                   input_features,
-                                   emb,
-                                   err)) {
-                return false;
-            }
-
-            out_num_media_for_tokenizer = 1;
-            out_num_media_tokens = runtime->profile.num_audio_tokens;
+            int nmedia = 0, ntok = 0;
+            if (!audio_encoder_->Encode(media.uris, emb, nmedia, ntok, err)) return false;
+            out_num_media_for_tokenizer = nmedia;
+            out_num_media_tokens = ntok;
             out_blocks.push_back(std::move(emb));
-            if (duration_sec > runtime->profile.duration_sec) {
-                ALOGW("Gemma4 audio input %.3fs exceeds selected %.1fs profile; trailing audio will be truncated",
-                      duration_sec, runtime->profile.duration_sec);
-            } else {
-                ALOGI("Gemma4 audio profile selected: %.1fs -> %d tokens (input=%.3fs)",
-                      runtime->profile.duration_sec,
-                      runtime->profile.num_audio_tokens,
-                      duration_sec);
-            }
-            return true;
-        }
-        if (type_ == VLMType::Qwen3Omni) {
-            if (media.uris.size() != 1) {
-                err = "Qwen3Omni audio expects exactly 1 audio file per message";
-                return false;
-            }
-            if (!impl_->audio_30s.encoder_inited) {
-                err = "Qwen3Omni audio encoder is not initialized";
-                return false;
-            }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio begin: uri=%s", media.uris[0].c_str());
-            }
-
-            std::vector<float> input_features;
-            if (!audio::LoadWhisperAudioInputFeatures(media.uris[0], impl_->audio_30s.whisper_profile, input_features, nullptr, err)) {
-                return false;
-            }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio features ready: elems=%zu", input_features.size());
-            }
-
-            std::vector<unsigned short> emb;
-            if (!encode_block_fp32(impl_->audio_30s.encoder,
-                                   impl_->audio_30s.encoder.get_devid(),
-                                   impl_->audio_30s.encoder_output_is_bf16,
-                                   input_features,
-                                   emb,
-                                   err)) {
-                return false;
-            }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio encoder ready: bf16_elems=%zu", emb.size());
-            }
-
-            out_num_media_for_tokenizer = 1;
-            out_num_media_tokens = impl_->audio_30s.whisper_profile.num_audio_tokens;
-            out_blocks.push_back(std::move(emb));
-            ALOGI("Qwen3Omni audio profile selected: %.1fs -> %d tokens",
-                  impl_->audio_30s.whisper_profile.duration_sec,
-                  impl_->audio_30s.whisper_profile.num_audio_tokens);
             return true;
         }
         err = "AUDIO not supported for this vlm_type";

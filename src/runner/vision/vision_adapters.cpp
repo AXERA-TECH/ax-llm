@@ -250,6 +250,7 @@ public:
 
     VideoPlanKind videoPlanKind() const override { return VideoPlanKind::SimpleBudgetFit; }
     const char* displayName() const override { return "Qwen3Omni"; }
+    AudioKind audioKind() const override { return AudioKind::Qwen3OmniAudio; }
 
     // Qwen3Omni consumes float32 patch input -> divide by sizeof(float). Tokens inherited.
     bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>&, const std::string&,
@@ -472,6 +473,7 @@ public:
 
     VideoPlanKind videoPlanKind() const override { return VideoPlanKind::Gemma4AutoReset; }
     const char* displayName() const override { return "Gemma4"; }
+    AudioKind audioKind() const override { return AudioKind::Gemma4Audio; }
 
     bool resolveInputGeometry(size_t in_nSize, const std::vector<unsigned int>&, const std::string& encoder_path,
                               VisionParams& io, int&, std::string& err) const override {
