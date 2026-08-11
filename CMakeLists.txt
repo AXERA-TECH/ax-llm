@@ -393,6 +393,10 @@ install(TARGETS kv_slot_select_test DESTINATION bin)
 # Vision preprocessing layout regression test (host-runnable; no HW required).
 # Guards the Qwen-VL patchifier (Qwen2VideoProcessor) against channel-planar
 # layout regressions that scramble the vision encoder input.
+add_executable(vision_infer_test tools/vision_infer_test.cpp)
+target_include_directories(vision_infer_test PRIVATE src/runner/vision)
+install(TARGETS vision_infer_test DESTINATION bin)
+
 add_executable(vision_preprocess_test tools/vision_preprocess_test.cpp
     src/runner/utils/image_processor.cpp
     src/runner/utils/files.cpp)
