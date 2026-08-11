@@ -2114,6 +2114,13 @@ bool VisionModule::EncodeForContent(const Content& content,
         const int grid_h = vision_height_ / patch_size_;
         const int grid_w = vision_width_ / patch_size_;
 
+        VisionParams vp_img;
+        vp_img.width = vision_width_;
+        vp_img.height = vision_height_;
+        vp_img.patch_size = patch_size_;
+        vp_img.temporal_patch_size = temporal_patch_size_;
+        vp_img.spatial_merge_size = spatial_merge_size_;
+
         out_num_media_for_tokenizer = (int)image_files.size();
         out_num_media_tokens = tokens_per_block_;
         out_image_grid_thw.reserve(image_files.size());
@@ -2170,7 +2177,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                                     (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                                 }
                             }
-                            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+                            if (adapter_->emitsImageGridThw()) out_image_grid_thw.push_back({1, grid_h, grid_w});
                             continue;
                         }
                     }
@@ -2190,7 +2197,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                             (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                         }
                     }
-                    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+                    if (adapter_->emitsImageGridThw()) out_image_grid_thw.push_back({1, grid_h, grid_w});
                     continue;
                 }
             }
@@ -2207,132 +2214,34 @@ bool VisionModule::EncodeForContent(const Content& content,
             std::vector<std::vector<float>> deepstack_for_one;
             if (out_deepstack_append && deepstack_layers_ > 0) deepstack_for_one.resize((size_t)deepstack_layers_);
 
-            if (type_ == VLMType::SmolVLM2) {
-                std::vector<axcv::Mat> one{img};
-                std::vector<std::vector<unsigned char>> pixel_values;
-                Smolvlm2ImageProcessor(one, pixel_values, vision_width_, vision_height_);
-                blocks_for_one.reserve(pixel_values.size()); // expected 5
-                for (auto& pv : pixel_values) {
-                    std::vector<unsigned short> emb;
-                    if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb, 0, nullptr, err)) return false;
-                    blocks_for_one.push_back(std::move(emb));
-                }
-            }
-            else if (type_ == VLMType::PaddleOCRVL) {
-                // PaddleOCR-VL VIT expects patches in [N, C, pH, pW] format (channel-first per patch,
-                // no spatial merge in preprocessing — merge happens inside the VIT model).
-                std::vector<unsigned char> pv;
-                PaddleOCRVLImageProcessor(img, pv, vision_height_, vision_width_, patch_size_);
-                {
-                    unsigned char mn = 255, mx = 0;
-                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
-                    ALOGI("PaddleOCRVL pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
-                          pv.size(), (unsigned)mn, (unsigned)mx,
-                          vision_width_, vision_height_, patch_size_);
-                }
-                std::vector<unsigned short> emb;
-                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                                  pv, emb, 0.5f, 0.5f,
-                                                  0, nullptr, err))
-                    return false;
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::Gemma4VL) {
-                std::vector<unsigned char> pv;
-                Gemma4ImageProcessor(img, pv, vision_height_, vision_width_, patch_size_);
-                std::vector<unsigned short> emb;
-                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                                  pv, emb, 0.0f, 1.0f,
-                                                  0, nullptr, err))
-                    return false;
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::MiniCPMV46VL) {
-                std::vector<unsigned char> pv;
-                if (MiniCPMV46ImageProcessor(img, pv, vision_height_, vision_width_, patch_size_) != 0) {
-                    err = "MiniCPM-V-4.6 image preprocessing failed";
-                    return false;
-                }
-                {
-                    unsigned char mn = 255, mx = 0;
-                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
-                    ALOGI("MiniCPM-V-4.6 pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
-                          pv.size(), (unsigned)mn, (unsigned)mx,
-                          vision_width_, vision_height_, patch_size_);
-                }
-                std::vector<unsigned short> emb;
-                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                                  pv, emb, 0.5f, 0.5f,
-                                                  0, nullptr, err))
-                    return false;
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni) {
-                std::vector<axcv::Mat> one{img};
-                std::vector<std::vector<unsigned char>> pixel_values;
-                Qwen2VideoProcessor(one, pixel_values, vision_height_, vision_width_, temporal_patch_size_, spatial_merge_size_, patch_size_);
-                if (pixel_values.size() != 1) { err = "Qwen2VideoProcessor(image) returned != 1 block"; return false; }
-                {
-                    // Quick sanity: if preprocessing is broken, pixel_values often becomes all zeros.
-                    const auto& pv = pixel_values[0];
-                    unsigned char mn = 255, mx = 0;
-                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
-                    ALOGI("Qwen-VL pixel_values[0] bytes=%zu min=%u max=%u (w=%d h=%d tp=%d ps=%d sm=%d)",
-                          pv.size(), (unsigned)mn, (unsigned)mx,
-                          vision_width_, vision_height_, temporal_patch_size_, patch_size_, spatial_merge_size_);
-                }
-                std::vector<unsigned short> emb;
-                if (type_ == VLMType::Qwen3Omni) {
-                    if (!encode_block_normalized_float(impl_->encoder,
-                                                       devid,
-                                                       impl_->encoder_output_is_bf16,
-                                                       pixel_values[0],
-                                                       emb,
-                                                       0.5f,
-                                                       0.5f,
-                                                       0,
-                                                       nullptr,
-                                                       err)) {
-                        return false;
-                    }
-                } else {
-                    if (!encode_block_u8(impl_->encoder,
-                                         devid,
-                                         impl_->encoder_output_is_bf16,
-                                         pixel_values[0],
-                                         emb,
-                                         deepstack_layers_,
-                                         (out_deepstack_append ? &deepstack_for_one : nullptr),
-                                         err)) {
-                        return false;
-                    }
-                }
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::InternVL3 || type_ == VLMType::FastVLM) {
+            // Per-VLM image preprocessing -> pixel values + encode descriptor (adapter).
+            // The generic encode (encode_block_*/encode_classic_image, which owns the
+            // vision encoder) stays here.
+            ImagePreproc pp;
+            if (!adapter_->preprocessImage(img, vp_img, pp, err)) return false;
+            if (pp.mode == ImagePreproc::ClassicMat) {
                 std::vector<unsigned short> emb;
                 if (!encode_classic_image(impl_->encoder, devid, impl_->encoder_output_is_bf16,
                                           impl_->input_is_nchw, vision_width_, vision_height_, img, emb, err))
                     return false;
                 blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::LocateAnythingVL) {
-                // LocateAnything: [1600,3,14,14] uint8 patches -> normalize pixel/127.5-1
-                // (mean/std 0.5) -> image_encoder_mlp.axmodel -> 400x2048 tokens.
-                std::vector<unsigned char> pv;
-                if (LocateAnythingImageProcessor(img, pv, vision_height_, vision_width_, patch_size_) != 0) {
-                    err = "LocateAnything image preprocessing failed";
-                    return false;
+            } else {
+                blocks_for_one.reserve(pp.pixel_blocks.size());
+                for (auto& pv : pp.pixel_blocks) {
+                    std::vector<unsigned short> emb;
+                    if (pp.mode == ImagePreproc::PixelU8) {
+                        if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb,
+                                             pp.collect_deepstack ? deepstack_layers_ : 0,
+                                             (pp.collect_deepstack && out_deepstack_append) ? &deepstack_for_one : nullptr,
+                                             err))
+                            return false;
+                    } else {
+                        if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                                          pv, emb, pp.norm_mean, pp.norm_std, 0, nullptr, err))
+                            return false;
+                    }
+                    blocks_for_one.push_back(std::move(emb));
                 }
-                std::vector<unsigned short> emb;
-                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                                  pv, emb, 0.5f, 0.5f, 0, nullptr, err))
-                    return false;
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else {
-                err = "IMAGE not supported for this vlm_type";
-                return false;
             }
 
             if (cache_enabled_) {
@@ -2359,7 +2268,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                     (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                 }
             }
-            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+            if (adapter_->emitsImageGridThw()) out_image_grid_thw.push_back({1, grid_h, grid_w});
         }
 
         return true;

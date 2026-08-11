@@ -12,10 +12,27 @@
 
 #include "VLMType.hpp"
 #include "BaseTokenizer.hpp"
+#include "utils/ax_cv.hpp"
 
 namespace vision {
 
 struct RunState; // defined in vision_module.hpp
+
+// Result of the per-VLM image preprocessing: the pixel values to encode + how to encode
+// them. The generic encode step (encode_block_*/encode_classic_image, which owns the
+// vision encoder) stays in VisionModule, so adapters carry only the divergent part.
+struct ImagePreproc {
+    enum Mode {
+        PixelU8,             // encode_block_u8 on each pixel block
+        PixelNormalizedFloat,// encode_block_normalized_float(mean,std) on each pixel block
+        ClassicMat,          // encode_classic_image directly from the source Mat (no pixel blocks)
+    };
+    Mode mode = PixelU8;
+    std::vector<std::vector<unsigned char>> pixel_blocks; // for PixelU8 / PixelNormalizedFloat
+    float norm_mean = 0.0f;   // PixelNormalizedFloat
+    float norm_std = 1.0f;    // PixelNormalizedFloat
+    bool collect_deepstack = false; // Qwen2_5VL/Qwen3VL u8 path only
+};
 
 // Placeholder / special token ids used to locate vision positions in input_ids.
 struct TokenIds {
@@ -70,6 +87,17 @@ public:
     // (matches the pre-refactor `default:` case). Every concrete adapter overrides this.
     virtual bool resolveTokenIds(const std::shared_ptr<BaseTokenizer>& /*tok*/,
                                  TokenIds& /*out*/, std::string& /*err*/) const { return true; }
+
+    // Per-VLM image preprocessing: run this model's image processor and describe how the
+    // result should be encoded. Default: unsupported (matches the pre-refactor `else`).
+    virtual bool preprocessImage(axcv::Mat& /*img*/, const VisionParams& /*vp*/,
+                                 ImagePreproc& /*out*/, std::string& err) const {
+        err = "IMAGE not supported for this vlm_type";
+        return false;
+    }
+
+    // Whether this VLM emits a per-image grid_thw {1, gridH, gridW} (Qwen family + Paddle).
+    virtual bool emitsImageGridThw() const { return false; }
 };
 
 // Selects the adapter for a VLMType. Returns the base (default behavior) for any type

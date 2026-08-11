@@ -7,6 +7,8 @@
 #include "IVisionAdapter.hpp"
 #include "vision_module.hpp"   // for vision::RunState
 #include "utils/mrope.hpp"
+#include "utils/image_processor.hpp"
+#include "utils/ax_cv.hpp"
 #include "sample_log.h"
 
 #include <algorithm>
@@ -14,6 +16,23 @@
 namespace vision {
 
 namespace {
+
+// Shared Qwen-family image processor: Qwen2VideoProcessor on a single image -> exactly one
+// pixel block, with the pre-existing min/max sanity log. Encode mode is set by the caller.
+bool run_qwen_image_processor(axcv::Mat& img, const VisionParams& vp,
+                              std::vector<std::vector<unsigned char>>& pixel_values, std::string& err) {
+    std::vector<axcv::Mat> one{img};
+    Qwen2VideoProcessor(one, pixel_values, vp.height, vp.width, vp.temporal_patch_size,
+                        vp.spatial_merge_size, vp.patch_size);
+    if (pixel_values.size() != 1) { err = "Qwen2VideoProcessor(image) returned != 1 block"; return false; }
+    const auto& pv = pixel_values[0];
+    unsigned char mn = 255, mx = 0;
+    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
+    ALOGI("Qwen-VL pixel_values[0] bytes=%zu min=%u max=%u (w=%d h=%d tp=%d ps=%d sm=%d)",
+          pv.size(), (unsigned)mn, (unsigned)mx, vp.width, vp.height, vp.temporal_patch_size,
+          vp.patch_size, vp.spatial_merge_size);
+    return true;
+}
 
 // ---- mRoPE helpers (shared by the Qwen-VL family) ------------------------------------
 
@@ -56,6 +75,17 @@ public:
               out.vision_start, out.image_pad, out.video_pad, out.audio_pad);
         return true;
     }
+
+    // Qwen2_5VL / Qwen3VL image path: u8 encode, collect deepstack (Qwen3VL has layers>0).
+    bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
+                         std::string& err) const override {
+        if (!run_qwen_image_processor(img, vp, out.pixel_blocks, err)) return false;
+        out.mode = ImagePreproc::PixelU8;
+        out.collect_deepstack = true;
+        return true;
+    }
+
+    bool emitsImageGridThw() const override { return true; }
 };
 
 class Qwen2_5VLAdapter : public QwenVLAdapter {
@@ -101,6 +131,18 @@ public:
         return true;
     }
     // No computePositionIds override: Qwen3Omni uses sequential position ids (base no-op).
+
+    // Qwen3Omni image path: same processor, but normalized-float encode, no deepstack.
+    bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
+                         std::string& err) const override {
+        if (!run_qwen_image_processor(img, vp, out.pixel_blocks, err)) return false;
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.5f;
+        out.norm_std = 0.5f;
+        out.collect_deepstack = false;
+        return true;
+    }
+    // emitsImageGridThw inherited from QwenVLAdapter (true).
 };
 
 // ---- Other VLM families -------------------------------------------------------------
@@ -117,6 +159,27 @@ public:
               out.vision_start, out.image_pad, out.video_pad);
         return true;
     }
+
+    bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
+                         std::string& /*err*/) const override {
+        // PaddleOCR-VL VIT expects patches in [N, C, pH, pW] (channel-first per patch,
+        // no spatial merge in preprocessing -- merge happens inside the VIT model).
+        std::vector<unsigned char> pv;
+        PaddleOCRVLImageProcessor(img, pv, vp.height, vp.width, vp.patch_size);
+        {
+            unsigned char mn = 255, mx = 0;
+            for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
+            ALOGI("PaddleOCRVL pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
+                  pv.size(), (unsigned)mn, (unsigned)mx, vp.width, vp.height, vp.patch_size);
+        }
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.5f;
+        out.norm_std = 0.5f;
+        out.pixel_blocks.push_back(std::move(pv));
+        return true;
+    }
+
+    bool emitsImageGridThw() const override { return true; }
 };
 
 class InternVL3Adapter : public IVisionAdapter {
@@ -131,6 +194,12 @@ public:
         }
         return true;
     }
+
+    bool preprocessImage(axcv::Mat& /*img*/, const VisionParams& /*vp*/, ImagePreproc& out,
+                         std::string& /*err*/) const override {
+        out.mode = ImagePreproc::ClassicMat; // encoded directly from the Mat by VisionModule.
+        return true;
+    }
 };
 
 class FastVLMAdapter : public IVisionAdapter {
@@ -142,6 +211,12 @@ public:
         out.vision_start = -1;
         return true;
     }
+
+    bool preprocessImage(axcv::Mat& /*img*/, const VisionParams& /*vp*/, ImagePreproc& out,
+                         std::string& /*err*/) const override {
+        out.mode = ImagePreproc::ClassicMat;
+        return true;
+    }
 };
 
 class SmolVLM2Adapter : public IVisionAdapter {
@@ -151,6 +226,15 @@ public:
         if (!get_single_token_id(tok, "<image>", out.image_pad, err)) return false;
         out.video_pad = out.image_pad;
         out.vision_start = -1;
+        return true;
+    }
+
+    bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
+                         std::string& /*err*/) const override {
+        std::vector<axcv::Mat> one{img};
+        Smolvlm2ImageProcessor(one, out.pixel_blocks, vp.width, vp.height); // expected 5 blocks
+        out.mode = ImagePreproc::PixelU8;
+        out.collect_deepstack = false;
         return true;
     }
 };
@@ -169,6 +253,17 @@ public:
               out.image_pad, out.video_pad, out.audio_pad);
         return true;
     }
+
+    bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
+                         std::string& /*err*/) const override {
+        std::vector<unsigned char> pv;
+        Gemma4ImageProcessor(img, pv, vp.height, vp.width, vp.patch_size);
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.0f;
+        out.norm_std = 1.0f;
+        out.pixel_blocks.push_back(std::move(pv));
+        return true;
+    }
 };
 
 class MiniCPMV46VLAdapter : public IVisionAdapter {
@@ -183,6 +278,26 @@ public:
         ALOGI("MiniCPM-V-4.6 token ids: image_pad=%d video_pad=%d", out.image_pad, out.video_pad);
         return true;
     }
+
+    bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
+                         std::string& err) const override {
+        std::vector<unsigned char> pv;
+        if (MiniCPMV46ImageProcessor(img, pv, vp.height, vp.width, vp.patch_size) != 0) {
+            err = "MiniCPM-V-4.6 image preprocessing failed";
+            return false;
+        }
+        {
+            unsigned char mn = 255, mx = 0;
+            for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
+            ALOGI("MiniCPM-V-4.6 pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
+                  pv.size(), (unsigned)mn, (unsigned)mx, vp.width, vp.height, vp.patch_size);
+        }
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.5f;
+        out.norm_std = 0.5f;
+        out.pixel_blocks.push_back(std::move(pv));
+        return true;
+    }
 };
 
 class LocateAnythingVLAdapter : public IVisionAdapter {
@@ -193,6 +308,22 @@ public:
         out.video_pad = out.image_pad;
         out.vision_start = -1;
         ALOGI("LocateAnything token ids: image_pad(<IMG_CONTEXT>)=%d", out.image_pad);
+        return true;
+    }
+
+    bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
+                         std::string& err) const override {
+        // LocateAnything: [1600,3,14,14] uint8 patches -> normalize pixel/127.5-1 (mean/std 0.5)
+        // -> image_encoder_mlp.axmodel -> 400x2048 tokens.
+        std::vector<unsigned char> pv;
+        if (LocateAnythingImageProcessor(img, pv, vp.height, vp.width, vp.patch_size) != 0) {
+            err = "LocateAnything image preprocessing failed";
+            return false;
+        }
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.5f;
+        out.norm_std = 0.5f;
+        out.pixel_blocks.push_back(std::move(pv));
         return true;
     }
 };
