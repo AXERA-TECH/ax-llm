@@ -11,7 +11,21 @@ name: host-unit-tests
 
 on:
   push:
+    paths:
+      - 'src/runner/vision/vision_infer.hpp'
+      - 'src/runner/KvSlotSelect.hpp'
+      - 'src/runner/KvSlotTypes.hpp'
+      - 'tools/vision_infer_test.cpp'
+      - 'tools/kv_slot_select_test.cpp'
+      - '.github/workflows/host-unit-tests.yml'
   pull_request:
+    paths:
+      - 'src/runner/vision/vision_infer.hpp'
+      - 'src/runner/KvSlotSelect.hpp'
+      - 'src/runner/KvSlotTypes.hpp'
+      - 'tools/vision_infer_test.cpp'
+      - 'tools/kv_slot_select_test.cpp'
+      - '.github/workflows/host-unit-tests.yml'
   workflow_dispatch: {}
 
 jobs:
