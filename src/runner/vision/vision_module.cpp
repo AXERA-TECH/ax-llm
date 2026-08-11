@@ -2299,137 +2299,36 @@ bool VisionModule::EncodeForContent(const Content& content,
     }
     if (frames.empty()) { err = "no video frames loaded"; return false; }
 
-    if (type_ == VLMType::Gemma4VL) {
-        out_num_media_for_tokenizer = (int)frames.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_blocks.reserve(frames.size());
-        for (auto& frame : frames) {
-            std::vector<unsigned char> pv;
-            Gemma4ImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_);
-            std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                               pv, emb, 0.0f, 1.0f, 0, nullptr, err))
-                return false;
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
+    // Per-VLM video preprocessing -> pixel blocks + encode descriptor + media counts /
+    // optional video_grid_thw (adapter). Generic encode stays here.
+    VisionParams vp_video;
+    vp_video.width = vision_width_;
+    vp_video.height = vision_height_;
+    vp_video.patch_size = patch_size_;
+    vp_video.temporal_patch_size = temporal_patch_size_;
+    vp_video.spatial_merge_size = spatial_merge_size_;
 
-    if (type_ == VLMType::Qwen3Omni) {
-        out_num_media_for_tokenizer = (int)frames.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_blocks.reserve(frames.size());
-        for (auto& frame : frames) {
-            std::vector<axcv::Mat> one{frame};
-            std::vector<std::vector<unsigned char>> pixel_values;
-            Qwen2VideoProcessor(one, pixel_values, vision_height_, vision_width_, temporal_patch_size_, spatial_merge_size_, patch_size_);
-            if (pixel_values.size() != 1) {
-                err = "Qwen2VideoProcessor(video frame) returned != 1 block";
-                return false;
-            }
-            std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder,
-                                               devid,
-                                               impl_->encoder_output_is_bf16,
-                                               pixel_values[0],
-                                               emb,
-                                               0.5f,
-                                               0.5f,
-                                               0,
-                                               nullptr,
-                                               err)) {
-                return false;
-            }
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
-
-    if (type_ == VLMType::SmolVLM2) {
-        std::vector<std::vector<unsigned char>> pixel_values;
-        Smolvlm2VideoProcessor(frames, pixel_values, vision_width_, vision_height_);
-        out_num_media_for_tokenizer = (int)pixel_values.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_blocks.reserve(pixel_values.size());
-        for (auto& pv : pixel_values) {
-            std::vector<unsigned short> emb;
-            if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb, 0, nullptr, err)) return false;
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
-
-    if (type_ == VLMType::PaddleOCRVL) {
-        // PaddleOCR-VL video: process each frame independently with the same VIT as images.
-        const int grid_h = vision_height_ / patch_size_;
-        const int grid_w = vision_width_ / patch_size_;
-
-        out_num_media_for_tokenizer = (int)frames.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_video_grid_thw.push_back({(int)frames.size(), grid_h, grid_w});
-        out_blocks.reserve(frames.size());
-        for (auto& frame : frames) {
-            std::vector<unsigned char> pv;
-            PaddleOCRVLImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_);
-            std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                               pv, emb, 0.5f, 0.5f, 0, nullptr, err))
-                return false;
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
-
-    if (type_ == VLMType::MiniCPMV46VL) {
-        out_num_media_for_tokenizer = (int)frames.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_blocks.reserve(frames.size());
-        for (auto& frame : frames) {
-            std::vector<unsigned char> pv;
-            if (MiniCPMV46ImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_) != 0) {
-                err = "MiniCPM-V-4.6 video frame preprocessing failed";
-                return false;
-            }
-            std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder,
-                                               devid,
-                                               impl_->encoder_output_is_bf16,
-                                               pv,
-                                               emb,
-                                               0.5f,
-                                               0.5f,
-                                               0,
-                                               nullptr,
-                                               err)) {
-                return false;
-            }
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
-
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
-        const int grid_h = vision_height_ / patch_size_;
-        const int grid_w = vision_width_ / patch_size_;
-
-        std::vector<std::vector<unsigned char>> pixel_values;
-        Qwen2VideoProcessor(frames, pixel_values, vision_height_, vision_width_, temporal_patch_size_, spatial_merge_size_, patch_size_);
-        out_num_media_for_tokenizer = (int)pixel_values.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_video_grid_thw.push_back({(int)pixel_values.size(), grid_h, grid_w});
-        out_blocks.reserve(pixel_values.size());
-        for (auto& pv : pixel_values) {
-            std::vector<unsigned short> emb;
+    VideoPreproc vv;
+    if (!adapter_->preprocessVideo(frames, vp_video, vv, err)) return false;
+    out_num_media_for_tokenizer = vv.num_media_for_tokenizer;
+    out_num_media_tokens = tokens_per_block_;
+    if (vv.emit_video_grid_thw) out_video_grid_thw.push_back({vv.grid_t, vv.grid_h, vv.grid_w});
+    out_blocks.reserve(vv.pixel_blocks.size());
+    for (auto& pv : vv.pixel_blocks) {
+        std::vector<unsigned short> emb;
+        if (vv.mode == ImagePreproc::PixelU8) {
             if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb,
-                                 deepstack_layers_, out_deepstack_append, err))
+                                 vv.collect_deepstack ? deepstack_layers_ : 0,
+                                 vv.collect_deepstack ? out_deepstack_append : nullptr, err))
                 return false;
-            out_blocks.push_back(std::move(emb));
+        } else {
+            if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                               pv, emb, vv.norm_mean, vv.norm_std, 0, nullptr, err))
+                return false;
         }
-        return true;
+        out_blocks.push_back(std::move(emb));
     }
-
-    err = "VIDEO not supported for this vlm_type";
-    return false;
+    return true;
 }
 
 bool VisionModule::BuildInjectionState(const std::vector<int>& input_ids,

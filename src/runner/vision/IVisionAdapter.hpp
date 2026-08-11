@@ -34,6 +34,19 @@ struct ImagePreproc {
     bool collect_deepstack = false; // Qwen2_5VL/Qwen3VL u8 path only
 };
 
+// Result of per-VLM video preprocessing. Like ImagePreproc but also carries the media
+// counts + optional per-video grid_thw (Qwen2_5VL/Qwen3VL: {nBlocks,..}; PaddleOCR: {nFrames,..}).
+struct VideoPreproc {
+    ImagePreproc::Mode mode = ImagePreproc::PixelU8; // video uses PixelU8 or PixelNormalizedFloat
+    std::vector<std::vector<unsigned char>> pixel_blocks;
+    float norm_mean = 0.0f;
+    float norm_std = 1.0f;
+    bool collect_deepstack = false;   // Qwen2_5VL/Qwen3VL
+    int num_media_for_tokenizer = 0;  // frame count, or block count for SmolVLM2/Qwen
+    bool emit_video_grid_thw = false;
+    int grid_t = 0, grid_h = 0, grid_w = 0;
+};
+
 // Placeholder / special token ids used to locate vision positions in input_ids.
 struct TokenIds {
     int image_pad = -1;
@@ -98,6 +111,14 @@ public:
 
     // Whether this VLM emits a per-image grid_thw {1, gridH, gridW} (Qwen family + Paddle).
     virtual bool emitsImageGridThw() const { return false; }
+
+    // Per-VLM video preprocessing: run this model's video/frame processor and describe how
+    // to encode + count. Default: unsupported (matches the pre-refactor `else`).
+    virtual bool preprocessVideo(std::vector<axcv::Mat>& /*frames*/, const VisionParams& /*vp*/,
+                                 VideoPreproc& /*out*/, std::string& err) const {
+        err = "VIDEO not supported for this vlm_type";
+        return false;
+    }
 };
 
 // Selects the adapter for a VLMType. Returns the base (default behavior) for any type

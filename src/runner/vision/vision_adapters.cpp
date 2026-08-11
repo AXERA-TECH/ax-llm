@@ -86,6 +86,24 @@ public:
     }
 
     bool emitsImageGridThw() const override { return true; }
+
+    // Qwen2_5VL / Qwen3VL video: Qwen2VideoProcessor over ALL frames -> temporal blocks,
+    // u8 encode + deepstack, video_grid_thw = {nBlocks, gridH, gridW}.
+    bool preprocessVideo(std::vector<axcv::Mat>& frames, const VisionParams& vp, VideoPreproc& out,
+                         std::string& /*err*/) const override {
+        std::vector<std::vector<unsigned char>> pixel_values;
+        Qwen2VideoProcessor(frames, pixel_values, vp.height, vp.width, vp.temporal_patch_size,
+                            vp.spatial_merge_size, vp.patch_size);
+        out.mode = ImagePreproc::PixelU8;
+        out.collect_deepstack = true;
+        out.num_media_for_tokenizer = (int)pixel_values.size();
+        out.emit_video_grid_thw = true;
+        out.grid_t = (int)pixel_values.size();
+        out.grid_h = vp.height / vp.patch_size;
+        out.grid_w = vp.width / vp.patch_size;
+        out.pixel_blocks = std::move(pixel_values);
+        return true;
+    }
 };
 
 class Qwen2_5VLAdapter : public QwenVLAdapter {
@@ -143,6 +161,26 @@ public:
         return true;
     }
     // emitsImageGridThw inherited from QwenVLAdapter (true).
+
+    // Qwen3Omni video: per-frame Qwen2VideoProcessor (1 block/frame), normalized-float, no grid.
+    bool preprocessVideo(std::vector<axcv::Mat>& frames, const VisionParams& vp, VideoPreproc& out,
+                         std::string& err) const override {
+        out.pixel_blocks.reserve(frames.size());
+        for (auto& frame : frames) {
+            std::vector<axcv::Mat> one{frame};
+            std::vector<std::vector<unsigned char>> pv1;
+            Qwen2VideoProcessor(one, pv1, vp.height, vp.width, vp.temporal_patch_size,
+                                vp.spatial_merge_size, vp.patch_size);
+            if (pv1.size() != 1) { err = "Qwen2VideoProcessor(video frame) returned != 1 block"; return false; }
+            out.pixel_blocks.push_back(std::move(pv1[0]));
+        }
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.5f;
+        out.norm_std = 0.5f;
+        out.collect_deepstack = false;
+        out.num_media_for_tokenizer = (int)frames.size();
+        return true;
+    }
 };
 
 // ---- Other VLM families -------------------------------------------------------------
@@ -180,6 +218,26 @@ public:
     }
 
     bool emitsImageGridThw() const override { return true; }
+
+    // PaddleOCR-VL video: each frame independently (same VIT as image), video_grid_thw={nFrames,..}.
+    bool preprocessVideo(std::vector<axcv::Mat>& frames, const VisionParams& vp, VideoPreproc& out,
+                         std::string& /*err*/) const override {
+        out.pixel_blocks.reserve(frames.size());
+        for (auto& frame : frames) {
+            std::vector<unsigned char> pv;
+            PaddleOCRVLImageProcessor(frame, pv, vp.height, vp.width, vp.patch_size);
+            out.pixel_blocks.push_back(std::move(pv));
+        }
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.5f;
+        out.norm_std = 0.5f;
+        out.num_media_for_tokenizer = (int)frames.size();
+        out.emit_video_grid_thw = true;
+        out.grid_t = (int)frames.size();
+        out.grid_h = vp.height / vp.patch_size;
+        out.grid_w = vp.width / vp.patch_size;
+        return true;
+    }
 };
 
 class InternVL3Adapter : public IVisionAdapter {
@@ -237,6 +295,15 @@ public:
         out.collect_deepstack = false;
         return true;
     }
+
+    bool preprocessVideo(std::vector<axcv::Mat>& frames, const VisionParams& vp, VideoPreproc& out,
+                         std::string& /*err*/) const override {
+        Smolvlm2VideoProcessor(frames, out.pixel_blocks, vp.width, vp.height);
+        out.mode = ImagePreproc::PixelU8;
+        out.collect_deepstack = false;
+        out.num_media_for_tokenizer = (int)out.pixel_blocks.size();
+        return true;
+    }
 };
 
 class Gemma4VLAdapter : public IVisionAdapter {
@@ -262,6 +329,21 @@ public:
         out.norm_mean = 0.0f;
         out.norm_std = 1.0f;
         out.pixel_blocks.push_back(std::move(pv));
+        return true;
+    }
+
+    bool preprocessVideo(std::vector<axcv::Mat>& frames, const VisionParams& vp, VideoPreproc& out,
+                         std::string& /*err*/) const override {
+        out.pixel_blocks.reserve(frames.size());
+        for (auto& frame : frames) {
+            std::vector<unsigned char> pv;
+            Gemma4ImageProcessor(frame, pv, vp.height, vp.width, vp.patch_size);
+            out.pixel_blocks.push_back(std::move(pv));
+        }
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.0f;
+        out.norm_std = 1.0f;
+        out.num_media_for_tokenizer = (int)frames.size();
         return true;
     }
 };
@@ -296,6 +378,24 @@ public:
         out.norm_mean = 0.5f;
         out.norm_std = 0.5f;
         out.pixel_blocks.push_back(std::move(pv));
+        return true;
+    }
+
+    bool preprocessVideo(std::vector<axcv::Mat>& frames, const VisionParams& vp, VideoPreproc& out,
+                         std::string& err) const override {
+        out.pixel_blocks.reserve(frames.size());
+        for (auto& frame : frames) {
+            std::vector<unsigned char> pv;
+            if (MiniCPMV46ImageProcessor(frame, pv, vp.height, vp.width, vp.patch_size) != 0) {
+                err = "MiniCPM-V-4.6 video frame preprocessing failed";
+                return false;
+            }
+            out.pixel_blocks.push_back(std::move(pv));
+        }
+        out.mode = ImagePreproc::PixelNormalizedFloat;
+        out.norm_mean = 0.5f;
+        out.norm_std = 0.5f;
+        out.num_media_for_tokenizer = (int)frames.size();
         return true;
     }
 };
