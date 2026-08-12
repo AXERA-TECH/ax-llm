@@ -2790,6 +2790,13 @@ void print_usage(const char *program_name)
     printf("  --port <port> Server port (default: 8000)\n");
     printf("  --server_timeout_ms <ms>  Request/queue timeout; overrides config.server_timeout_ms (default 300000)\n");
     printf("\n");
+#if USE_AXCL
+    printf("Device selection (AXCL multi-card; applies to run and serve):\n");
+    printf("  config.json \"devices\": [0,1]  Device id list to run on (default [0])\n");
+    printf("  AXLLM_DEVICES=0,1             Env var; overrides config.devices without editing config.json\n");
+    printf("                               e.g. AXLLM_DEVICES=2,3 %s serve <model_path>\n", program_name);
+    printf("\n");
+#endif
     printf("Embedding model config:\n");
     printf("  Set \"is_embedding\": true in config.json to enable /v1/embeddings.\n");
     printf("\n");
