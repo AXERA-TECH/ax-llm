@@ -622,6 +622,17 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     if (use_per_layer_input)
         gemma4_per_layer_helper.reset_decode_stats(decode_profile_enabled);
     int last_shared_sync_decode_grpid = -1;
+    // Compute the decode rope/kv start positions up front so the VLM-positions
+    // diagnostic prints BEFORE the first streamed token below, instead of
+    // landing mid-line right after it (it used to be logged just before the
+    // decode loop, after the first token was already emitted). These values are
+    // invariant across the post stage, so the decode loop reuses them as-is.
+    const unsigned int dense_decode_start = (unsigned int)(precompute_len + input_embed_num);
+    unsigned int decode_start = dense_decode_start;
+    if (has_vision_state && vision_state.decode_start > 0) decode_start = (unsigned int)vision_state.decode_start;
+    else if (active_prefill_pos_start >= 0) decode_start = (unsigned int)(active_prefill_pos_start + input_embed_num);
+    if (decode_start != dense_decode_start)
+        ALOGI("VLM decode positions: rope_start=%u dense_kv_start=%u", decode_start, dense_decode_start);
     {
         auto &t_in = llama_post.get_input("input");
         if (debug_prefill) ALOGI("post stage begin: input_bytes=%u device=%d", t_in.nSize, LLM_DEVID(llama_layers.back()));
@@ -683,14 +694,6 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     }
 
     t_cost.start();
-    const unsigned int dense_decode_start = (unsigned int)(precompute_len + input_embed_num);
-    unsigned int decode_start = dense_decode_start;
-    if (has_vision_state && vision_state.decode_start > 0) decode_start = (unsigned int)vision_state.decode_start;
-    else if (active_prefill_pos_start >= 0) decode_start = (unsigned int)(active_prefill_pos_start + input_embed_num);
-    if (decode_start != dense_decode_start)
-    {
-        ALOGI("VLM decode positions: rope_start=%u dense_kv_start=%u", decode_start, dense_decode_start);
-    }
     for (unsigned int decode_pos = decode_start, kv_slot = dense_decode_start;
          !b_hit_eos && decode_pos < (unsigned int)_attr.max_token_len && kv_slot < (unsigned int)_attr.max_token_len;
          ++decode_pos, ++kv_slot)
