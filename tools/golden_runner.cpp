@@ -140,7 +140,7 @@ int main(int argc, char **argv) {
     int cli_max_tokens = -1;
     int cli_kv_slots = -1;
     std::string image_path;
-    bool media_is_video = false;
+    ContentType media_type = IMAGE;
     bool kv_hash = true;
     std::optional<std::vector<int>> devices_override;
     for (int i = 2; i < argc; ++i) {
@@ -150,8 +150,9 @@ int main(int argc, char **argv) {
         else if (a == "--compare" && i + 1 < argc) compare_path = argv[++i];
         else if (a == "--max-tokens" && i + 1 < argc) cli_max_tokens = std::atoi(argv[++i]);
         else if (a == "--kv-slots" && i + 1 < argc) cli_kv_slots = std::atoi(argv[++i]);
-        else if (a == "--image" && i + 1 < argc) image_path = argv[++i];
-        else if (a == "--video" && i + 1 < argc) { image_path = argv[++i]; media_is_video = true; }
+        else if (a == "--image" && i + 1 < argc) { image_path = argv[++i]; media_type = IMAGE; }
+        else if (a == "--video" && i + 1 < argc) { image_path = argv[++i]; media_type = VIDEO; }
+        else if (a == "--audio" && i + 1 < argc) { image_path = argv[++i]; media_type = AUDIO; }
         else if (a == "--no-kv-hash") kv_hash = false;
         else if (a == "--devices" && i + 1 < argc) {
             std::string s = argv[++i]; std::vector<int> devs; std::string cur;
@@ -202,7 +203,7 @@ int main(int argc, char **argv) {
     int step = 0;
     auto run_step = [&](std::vector<Content> &hist, const std::string &user, json extra, const std::string &image) {
         if (image.empty()) hist.push_back({USER, TEXT, user});
-        else hist.push_back({USER, media_is_video ? VIDEO : IMAGE, user});
+        else hist.push_back({USER, media_type, user});
         turn_out.clear();
         llm.MarkRequestStart();
         llm.SetRequestSamplingOverride(true, 0.0f, false, 0.0f, false, 0.0f, false, 0.0f); // greedy
