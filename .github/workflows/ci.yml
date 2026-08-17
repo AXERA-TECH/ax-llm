@@ -44,69 +44,6 @@ jobs:
             build_x86/install/**
             build_x86/main_axcl* 
 
-  build-axcl-windows-mingw64:
-    name: AXCL Windows (mingw64) build
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Setup MSYS2 (mingw64)
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            curl
-            unzip
-
-      - name: Build (AXCL Windows mingw64)
-        shell: msys2 {0}
-        run: |
-          set -euxo pipefail
-
-          build_dir=build_mingw64
-          mkdir -p "${build_dir}"
-          cd "${build_dir}"
-
-          axcl_url="https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/axcl_win_x64_3.12.0.zip"
-          axcl_zip="axcl_win_x64_3.12.0.zip"
-          axcl_root="axcl_win_x64_3.12.0"
-
-          curl -L -o "${axcl_zip}" "${axcl_url}"
-          unzip -q "${axcl_zip}" -d "${axcl_root}"
-
-          cmake -S .. -B . -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_AX650=OFF \
-            -DBUILD_AXCL=ON \
-            -DAXCL_DIR="${PWD}/${axcl_root}"
-          cmake --build . -j 2
-
-      - name: Tokenizer smoke (Windows mingw64)
-        shell: msys2 {0}
-        run: |
-          ./build_mingw64/tokenizer_smoke.exe
-
-      - name: Vision preprocess layout test (Windows mingw64)
-        shell: msys2 {0}
-        run: |
-          ./build_mingw64/vision_preprocess_test.exe
-
-      - name: Archive artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          retention-days: 15
-          name: axcl-windows-mingw64-artifacts
-          path: |
-            build_mingw64/axllm.exe
-            build_mingw64/tokenizer_smoke.exe
-
   build-ax650-aarch64:
     name: AX650 aarch64 cross-build
     runs-on: ubuntu-latest
@@ -227,7 +164,6 @@ jobs:
     name: Publish build artifacts to Release (latest)
     needs:
       - build-axcl-x86
-      - build-axcl-windows-mingw64
       - build-ax650-aarch64
       - build-axcl-aarch64
       - build-axcl-riscv64
@@ -288,11 +224,6 @@ jobs:
           pkg_one artifacts/ax650-aarch64-artifacts axllm-ax650-linux-arm64
           pkg_one artifacts/axcl-riscv64-artifacts axllm-axcl-linux-riscv64
 
-          mkdir -p dist/windows
-          cp -a artifacts/axcl-windows-mingw64-artifacts/axllm.exe dist/windows/
-          cp -a artifacts/axcl-windows-mingw64-artifacts/tokenizer_smoke.exe dist/windows/
-          (cd dist/windows && zip -r ../axllm-axcl-windows-mingw64.zip .)
-          rm -rf dist/windows
 
       - name: Generate release notes
         shell: bash
@@ -361,7 +292,6 @@ jobs:
           - `axllm-axcl-linux-arm64` (standalone binary)
           - `axllm-ax650-linux-arm64` (standalone binary)
           - `axllm-axcl-linux-riscv64` (standalone binary)
-          - `axllm-axcl-windows-mingw64.zip`
 
           Example:
 
@@ -384,4 +314,3 @@ jobs:
             dist/axllm-axcl-linux-arm64
             dist/axllm-ax650-linux-arm64
             dist/axllm-axcl-linux-riscv64
-            dist/axllm-axcl-windows-mingw64.zip
