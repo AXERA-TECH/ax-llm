@@ -14,6 +14,20 @@
 #include <optional>
 #include <ctime>
 
+// The AXera / AXCL SDK headers MUST be included before <windows.h>. The AX SDK
+// headers (ax_engine_type.h / ax_global_type.h / ...) are self-contained (they
+// only pull <stdint.h>/<stddef.h> and use __declspec, no Windows types) and are
+// NOT guarded against windows.h's macro pollution. Including them first keeps
+// their enums/structs (AX_ENGINE_DT_*, AX_POINT_T, ...) out of reach of the
+// macros windows.h defines. Reordering these after windows.h breaks the mingw64
+// (Windows) build. See ci.yml build-axcl-windows-mingw64.
+#ifdef USE_AXCL
+#include <axcl.h>
+#else
+#include <ax_sys_api.h>
+#include <ax_engine_api.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -63,13 +77,6 @@
 #endif
 #ifndef AXLLM_OPENMP
 #define AXLLM_OPENMP "unknown"
-#endif
-
-#ifdef USE_AXCL
-#include <axcl.h>
-#else
-#include <ax_sys_api.h>
-#include <ax_engine_api.h>
 #endif
 
 // Global variables
