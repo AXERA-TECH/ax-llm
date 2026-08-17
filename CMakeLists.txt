@@ -235,11 +235,16 @@ set(COMMON_SOURCES
     src/runner/utils/logger.cpp
     src/runner/utils/net_utils.cpp
     src/runner/LLM.cpp
+    src/runner/LLM_embed.cpp
+    src/runner/LLM_init.cpp
+    src/runner/LLM_decode.cpp
     src/runner/image/sd15_image_generator.cpp
     src/runner/utils/files.cpp
     src/runner/utils/image_processor.cpp
     src/runner/utils/mrope.cpp
     src/runner/vision/vision_module.cpp
+    src/runner/vision/vision_adapters.cpp
+    src/runner/vision/audio_encoder.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -272,12 +277,25 @@ if(BUILD_AX650)
         pthread ${CMAKE_DL_LIBS} tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
+    add_executable(golden_runner tools/golden_runner.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+    )
+    target_include_directories(golden_runner PRIVATE ${BSP_MSP_DIR}/include)
+    target_link_libraries(golden_runner
+        -L${BSP_MSP_DIR}/lib
+        ax_engine ax_interpreter ax_sys
+        pthread ${CMAKE_DL_LIBS} tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
     if(OpenMP_CXX_FOUND)
         target_link_libraries(axllm OpenMP::OpenMP_CXX)
         target_link_libraries(llm_smoke OpenMP::OpenMP_CXX)
+        target_link_libraries(golden_runner OpenMP::OpenMP_CXX)
     endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
+    install(TARGETS golden_runner DESTINATION bin)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -337,12 +355,25 @@ if(BUILD_AXCL)
         ${AXCL_LINK_LIBS}
         ${AXLLM_VISION_LIBS}
     )
+    add_executable(golden_runner tools/golden_runner.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_axcl.cpp
+        src/runner/utils/axcl_manager.cpp
+    )
+    target_include_directories(golden_runner PRIVATE ${AXCL_INCLUDE_DIRS})
+    target_compile_definitions(golden_runner PRIVATE USE_AXCL)
+    target_link_libraries(golden_runner
+        ${AXCL_LINK_LIBS}
+        ${AXLLM_VISION_LIBS}
+    )
     if(NOT WIN32)
         set_target_properties(axllm PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
         set_target_properties(llm_smoke PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
+        set_target_properties(golden_runner PROPERTIES LINK_FLAGS "-Wl,--as-needed -Wl,--unresolved-symbols=ignore-in-shared-libs")
     endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
+    install(TARGETS golden_runner DESTINATION bin)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -352,9 +383,20 @@ add_executable(tokenizer_smoke tools/tokenizer_smoke.cpp)
 target_link_libraries(tokenizer_smoke tokenizer)
 install(TARGETS tokenizer_smoke DESTINATION bin)
 
+# Multi-slot prefix-KV selection policy unit test (host-runnable; no HW required).
+# Pins the 4-strategy + LRU decision used by select_kv_slot / select_kv_slot_by_history.
+add_executable(kv_slot_select_test tools/kv_slot_select_test.cpp)
+target_include_directories(kv_slot_select_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(kv_slot_select_test tokenizer)
+install(TARGETS kv_slot_select_test DESTINATION bin)
+
 # Vision preprocessing layout regression test (host-runnable; no HW required).
 # Guards the Qwen-VL patchifier (Qwen2VideoProcessor) against channel-planar
 # layout regressions that scramble the vision encoder input.
+add_executable(vision_infer_test tools/vision_infer_test.cpp)
+target_include_directories(vision_infer_test PRIVATE src/runner/vision)
+install(TARGETS vision_infer_test DESTINATION bin)
+
 add_executable(vision_preprocess_test tools/vision_preprocess_test.cpp
     src/runner/utils/image_processor.cpp
     src/runner/utils/files.cpp)

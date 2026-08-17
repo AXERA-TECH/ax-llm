@@ -1,0 +1,11 @@
+{
+  "system": "You are a helpful assistant. Answer briefly.",
+  "max_tokens": 48,
+  "turns": [
+    "My name is Qiushui and I work on NPUs. Please remember that.",
+    "What is my name?",
+    "What do I work on?",
+    "Count from 1 to 5.",
+    "Now continue counting from 6 to 10."
+  ]
+}

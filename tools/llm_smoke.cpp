@@ -21,6 +21,13 @@ static std::string resolve_path(const std::string &base, const std::string &p) {
     return base + "/" + p;
 }
 
+// Read an optional string key; missing / null / non-string -> default. Avoids a
+// json type_error on configs that omit e.g. post_config_path (issue #63 class).
+static std::string jstr(const nlohmann::json &j, const char *k, const std::string &def = "") {
+    auto it = j.find(k);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : def;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: llm_smoke <model_dir> [max_tokens] [--image <path>] [--video <frames_dir>] [--audio <path>] [--prompt <text>] [--repeat <N>] [--quiet] [--dynamic-load|--no-dynamic-load] [--dynamic-pool <N>] [--devices <csv>]\n";
@@ -85,12 +92,12 @@ int main(int argc, char** argv) {
     std::ifstream f(cfg); nlohmann::json j; f >> j;
 
     LLMAttrType attr;
-    attr.template_filename_axmodel = resolve_path(model_dir, j["template_filename_axmodel"].get<std::string>());
-    attr.filename_post_axmodel     = resolve_path(model_dir, j["filename_post_axmodel"].get<std::string>());
-    attr.url_tokenizer_model       = resolve_path(model_dir, j["url_tokenizer_model"].get<std::string>());
-    attr.tokenizer_type            = j.contains("tokenizer_type")? j["tokenizer_type"].get<std::string>() : std::string("Qwen2_5");
-    attr.filename_tokens_embed     = resolve_path(model_dir, j["filename_tokens_embed"].get<std::string>());
-    attr.post_config_path          = resolve_path(model_dir, j["post_config_path"].get<std::string>());
+    attr.template_filename_axmodel = resolve_path(model_dir, jstr(j, "template_filename_axmodel"));
+    attr.filename_post_axmodel     = resolve_path(model_dir, jstr(j, "filename_post_axmodel"));
+    attr.url_tokenizer_model       = resolve_path(model_dir, jstr(j, "url_tokenizer_model"));
+    attr.tokenizer_type            = jstr(j, "tokenizer_type", "Qwen2_5");
+    attr.filename_tokens_embed     = resolve_path(model_dir, jstr(j, "filename_tokens_embed"));
+    attr.post_config_path          = resolve_path(model_dir, jstr(j, "post_config_path", "post_config.json"));
     attr.axmodel_num               = j["axmodel_num"].get<int>();
     if (j.contains("dynamic_load_enable")) attr.dynamic_load_enable = j["dynamic_load_enable"].get<bool>();
     if (j.contains("dynamic_load_pool_size")) attr.dynamic_load_pool_size = j["dynamic_load_pool_size"].get<int>();

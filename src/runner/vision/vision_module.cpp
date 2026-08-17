@@ -1,4 +1,6 @@
 #include "vision_module.hpp"
+#include "IVisionAdapter.hpp"
+#include "audio_encoder.hpp"
 
 #include <cctype>
 #include <algorithm>
@@ -35,44 +37,13 @@
 #include "utils/image_processor.hpp"
 #include "utils/mrope.hpp"
 
-#ifdef USE_AXCL
-#include "ax_model_runner/ax_model_runner_axcl.hpp"
-#include "utils/axcl_manager.h"
-using ax_runner_t = ax_runner_axcl;
-static inline void v_h2d(void *phy_dst, const void *src, size_t n, int devid) { axcl_Memcpy(phy_dst, src, n, AXCL_MEMCPY_HOST_TO_DEVICE, devid); }
-static inline void v_d2h(void *dst, const void *phy_src, size_t n, int devid) { axcl_Memcpy(dst, phy_src, n, AXCL_MEMCPY_DEVICE_TO_HOST, devid); }
-#define V_WADDR(t) ((void *)(t).phyAddr)
-#define V_RADDR(t) ((const void *)(t).phyAddr)
-#else
-#include "ax_model_runner/ax_model_runner_ax650.hpp"
-using ax_runner_t = ax_runner_ax650;
-static inline void v_h2d(void *vir_dst, const void *src, size_t n, int /*devid*/) { memcpy(vir_dst, src, n); }
-static inline void v_d2h(void *dst, const void *vir_src, size_t n, int /*devid*/) { memcpy(dst, vir_src, n); }
-#define V_WADDR(t) ((t).pVirAddr)
-#define V_RADDR(t) ((const void *)(t).pVirAddr)
-#endif
+#include "vision_runtime.hpp"  // ax_runner_t + v_h2d/v_d2h + V_WADDR/V_RADDR (backend-selected)
 
 namespace vision {
 
 namespace {
 
 constexpr double kDefaultRawVideoSampleFps = 2.0;
-
-struct AudioEncoderRuntime {
-    enum class ProfileKind {
-        None = 0,
-        Gemma4,
-        Whisper,
-    };
-
-    ax_runner_t encoder;
-    bool encoder_inited = false;
-    int encoder_output_is_bf16 = -1;
-    ProfileKind profile_kind = ProfileKind::None;
-    audio::Gemma4AudioProfile profile;
-    audio::WhisperAudioProfile whisper_profile;
-    std::string axmodel_path;
-};
 
 struct ScopedTempDirs {
     std::vector<std::string> dirs;
@@ -618,9 +589,6 @@ struct VisionModule::Impl {
     bool encoder_inited = false;
     int encoder_output_is_bf16 = -1;
 
-    AudioEncoderRuntime audio_5s;
-    AudioEncoderRuntime audio_30s;
-
     // For "classic image encoder" layout detection.
     int input_is_nchw = -1; // 1=NCHW float32, 0=NHWC u8, -1=unknown
 };
@@ -642,258 +610,7 @@ static size_t env_size_t(const char* v, size_t fallback)
     return (size_t)n;
 }
 
-static bool try_infer_qwen_hw_from_input_bytes(size_t input_nbytes,
-                                               int temporal_patch_size,
-                                               int channels,
-                                               int patch_size,
-                                               int& io_h,
-                                               int& io_w,
-                                               std::string& note)
-{
-    if (temporal_patch_size <= 0 || channels <= 0) return false;
-    const size_t denom = (size_t)temporal_patch_size * (size_t)channels;
-    if (denom == 0 || (input_nbytes % denom) != 0) return false;
-
-    const size_t hw = input_nbytes / denom; // H*W
-    if (hw == 0) return false;
-
-    // Prefer square if possible.
-    const int side = (int)(std::sqrt((double)hw) + 0.5);
-    if ((size_t)side * (size_t)side == hw) {
-        if (patch_size > 0 && (side % patch_size) != 0) {
-            note = "perfect square but not divisible by patch_size";
-            return false;
-        }
-        io_h = side;
-        io_w = side;
-        note = "square";
-        return true;
-    }
-
-    // Try keep configured height and solve width.
-    if (io_h > 0 && (hw % (size_t)io_h) == 0) {
-        int w = (int)(hw / (size_t)io_h);
-        if (patch_size <= 0 || ((io_h % patch_size) == 0 && (w % patch_size) == 0)) {
-            io_w = w;
-            note = "matched config height";
-            return true;
-        }
-    }
-
-    // Fallback: search a reasonable factor pair close to sqrt, honoring patch_size divisibility.
-    size_t best_diff = (size_t)-1;
-    int best_h = -1, best_w = -1;
-    for (size_t h = 1; h * h <= hw; ++h) {
-        if (hw % h) continue;
-        size_t w = hw / h;
-        if (patch_size > 0) {
-            if (((int)h % patch_size) != 0) continue;
-            if (((int)w % patch_size) != 0) continue;
-        }
-        size_t diff = (w > h) ? (w - h) : (h - w);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best_h = (int)h;
-            best_w = (int)w;
-        }
-    }
-    if (best_h > 0 && best_w > 0) {
-        io_h = best_h;
-        io_w = best_w;
-        note = "factor-search";
-        return true;
-    }
-
-    return false;
-}
-
-template <typename ShapeVec>
-static bool try_infer_hw_from_4d_shape_with_c3(const ShapeVec& shape, int& out_h, int& out_w, int* out_is_nchw = nullptr)
-{
-    if (shape.size() != 4) return false;
-    // NCHW
-    if ((int)shape[1] == 3) {
-        out_h = (int)shape[2];
-        out_w = (int)shape[3];
-        if (out_is_nchw) *out_is_nchw = 1;
-        return (out_h > 0 && out_w > 0);
-    }
-    // NHWC
-    if ((int)shape[3] == 3) {
-        out_h = (int)shape[1];
-        out_w = (int)shape[2];
-        if (out_is_nchw) *out_is_nchw = 0;
-        return (out_h > 0 && out_w > 0);
-    }
-    return false;
-}
-
-static bool get_single_token_id(const std::shared_ptr<BaseTokenizer>& tok, const std::string& s, int& out_id, std::string& err)
-{
-    auto ids = tok->encode(s);
-    if (ids.size() != 1) {
-        err = "special token is not a single id: '" + s + "' size=" + std::to_string(ids.size());
-        return false;
-    }
-    out_id = ids[0];
-    return true;
-}
-
-static bool parse_gemma4_profile_from_path(const std::string& path, int& out_h, int& out_w, int& out_tokens)
-{
-    std::smatch m;
-    if (!std::regex_search(path, m, std::regex("_h(\\d+)_w(\\d+)_t(\\d+)"))) return false;
-    out_h = std::stoi(m[1].str());
-    out_w = std::stoi(m[2].str());
-    out_tokens = std::stoi(m[3].str());
-    return true;
-}
-
-static bool try_pick_tokens_by_output_bytes(const ax_runner_tensor_t& out0,
-                                            int tokens_embed_size,
-                                            int& out_is_bf16,
-                                            int& out_tokens_per_block)
-{
-    for (int bytes_per_elem : {4, 2}) {
-        if ((out0.nSize % bytes_per_elem) != 0) continue;
-        const size_t elem = (size_t)out0.nSize / (size_t)bytes_per_elem;
-        if (elem == 0 || (elem % (size_t)tokens_embed_size) != 0) continue;
-        out_is_bf16 = (bytes_per_elem == 2) ? 1 : 0;
-        out_tokens_per_block = (int)(elem / (size_t)tokens_embed_size);
-        return true;
-    }
-    return false;
-}
-
-static bool init_audio_profile(AudioEncoderRuntime& runtime,
-                               const std::string& axmodel_path,
-                               int devid,
-                               int tokens_embed_size,
-                               std::string& err)
-{
-    audio::Gemma4AudioProfile profile;
-    if (!audio::InferGemma4AudioProfileFromPath(axmodel_path, profile)) {
-        err = "failed to infer Gemma4 audio profile from path: " + axmodel_path;
-        return false;
-    }
-
-    if (runtime.encoder.init(axmodel_path.c_str(), devid) != 0) {
-        err = "init audio encoder axmodel failed: " + axmodel_path;
-        return false;
-    }
-    runtime.encoder_inited = true;
-    runtime.profile_kind = AudioEncoderRuntime::ProfileKind::Gemma4;
-    runtime.profile = profile;
-    runtime.axmodel_path = axmodel_path;
-
-#ifdef USE_AXCL
-    runtime.encoder.set_auto_sync_before_inference(true);
-    runtime.encoder.set_auto_sync_after_inference(true);
-#endif
-
-    const auto& out0 = runtime.encoder.get_output(0);
-    int out_is_bf16 = -1;
-    int tokens_per_block = 0;
-    auto try_pick_expected = [&](int bytes_per_elem) -> bool {
-        if ((out0.nSize % bytes_per_elem) != 0) return false;
-        const size_t elem = (size_t)out0.nSize / (size_t)bytes_per_elem;
-        if (elem == 0 || (elem % (size_t)tokens_embed_size) != 0) return false;
-        const int tokens = (int)(elem / (size_t)tokens_embed_size);
-        if (tokens != runtime.profile.num_audio_tokens) return false;
-        out_is_bf16 = (bytes_per_elem == 2) ? 1 : 0;
-        tokens_per_block = tokens;
-        return true;
-    };
-
-    if (!try_pick_expected(4) && !try_pick_expected(2)) {
-        if (!try_pick_tokens_by_output_bytes(out0, tokens_embed_size, out_is_bf16, tokens_per_block)) {
-            err = "failed to infer Gemma4 audio output layout: " + axmodel_path;
-            return false;
-        }
-        ALOGW("Gemma4 audio profile token count mismatch: expected=%d inferred=%d from %s",
-              runtime.profile.num_audio_tokens, tokens_per_block, axmodel_path.c_str());
-    }
-
-    runtime.encoder_output_is_bf16 = out_is_bf16;
-    runtime.profile.num_audio_tokens = tokens_per_block;
-    ALOGI("Gemma4 audio profile init ok: path=%s duration=%.1fs mel_frames=%d tokens=%d out_dtype=%s",
-          axmodel_path.c_str(),
-          runtime.profile.duration_sec,
-          runtime.profile.num_mel_frames,
-          runtime.profile.num_audio_tokens,
-          (runtime.encoder_output_is_bf16 ? "bf16" : "fp32"));
-    return true;
-}
-
-static bool init_whisper_audio_profile(AudioEncoderRuntime& runtime,
-                                       const std::string& axmodel_path,
-                                       int devid,
-                                       int tokens_embed_size,
-                                       std::string& err)
-{
-    if (runtime.encoder.init(axmodel_path.c_str(), devid) != 0) {
-        err = "init whisper audio encoder axmodel failed: " + axmodel_path;
-        return false;
-    }
-    runtime.encoder_inited = true;
-    runtime.profile_kind = AudioEncoderRuntime::ProfileKind::Whisper;
-    runtime.axmodel_path = axmodel_path;
-
-#ifdef USE_AXCL
-    runtime.encoder.set_auto_sync_before_inference(true);
-    runtime.encoder.set_auto_sync_after_inference(true);
-#endif
-
-    const auto& in0 = runtime.encoder.get_input(0);
-    if (in0.vShape.size() >= 3) {
-        runtime.whisper_profile.feature_size = (int)in0.vShape[in0.vShape.size() - 2];
-        runtime.whisper_profile.num_mel_frames = (int)in0.vShape[in0.vShape.size() - 1];
-    } else {
-        const size_t elem = ((size_t)in0.nSize % sizeof(float) == 0) ? ((size_t)in0.nSize / sizeof(float)) : 0;
-        runtime.whisper_profile.feature_size = 128;
-        runtime.whisper_profile.num_mel_frames =
-            (runtime.whisper_profile.feature_size > 0) ? (int)(elem / (size_t)runtime.whisper_profile.feature_size) : 0;
-    }
-
-    if (runtime.whisper_profile.feature_size <= 0 || runtime.whisper_profile.num_mel_frames <= 0) {
-        err = "failed to infer whisper audio input layout: " + axmodel_path;
-        return false;
-    }
-    runtime.whisper_profile.duration_sec =
-        (float)runtime.whisper_profile.num_mel_frames * (float)runtime.whisper_profile.hop_length /
-        (float)runtime.whisper_profile.sampling_rate;
-
-    const auto& out0 = runtime.encoder.get_output(0);
-    int out_is_bf16 = -1;
-    int tokens_per_block = 0;
-    if (!try_pick_tokens_by_output_bytes(out0, tokens_embed_size, out_is_bf16, tokens_per_block)) {
-        err = "failed to infer whisper audio output layout: " + axmodel_path;
-        return false;
-    }
-
-    runtime.encoder_output_is_bf16 = out_is_bf16;
-    runtime.whisper_profile.num_audio_tokens = tokens_per_block;
-    ALOGI("Whisper audio profile init ok: path=%s duration=%.1fs mel_frames=%d tokens=%d out_dtype=%s",
-          axmodel_path.c_str(),
-          runtime.whisper_profile.duration_sec,
-          runtime.whisper_profile.num_mel_frames,
-          runtime.whisper_profile.num_audio_tokens,
-          (runtime.encoder_output_is_bf16 ? "bf16" : "fp32"));
-    return true;
-}
-
-static AudioEncoderRuntime* select_audio_profile(AudioEncoderRuntime* p5,
-                                                 AudioEncoderRuntime* p30,
-                                                 float duration_sec)
-{
-    if (p5 && !p5->encoder_inited) p5 = nullptr;
-    if (p30 && !p30->encoder_inited) p30 = nullptr;
-
-    if (p5 && duration_sec <= p5->profile.duration_sec + 0.25f) return p5;
-    if (p30) return p30;
-    if (p5) return p5;
-    return nullptr;
-}
+// get_single_token_id moved to IVisionAdapter.hpp (shared with vision_adapters.cpp).
 
 static bool file_sig(const std::string& path, uint64_t& size_out, uint64_t& mtime_ns_out)
 {
@@ -1240,8 +957,7 @@ void VisionModule::Deinit()
 {
     if (impl_) {
         if (impl_->encoder_inited) impl_->encoder.deinit();
-        if (impl_->audio_5s.encoder_inited) impl_->audio_5s.encoder.deinit();
-        if (impl_->audio_30s.encoder_inited) impl_->audio_30s.encoder.deinit();
+        audio_encoder_.reset();
         impl_.reset();
     }
     enabled_ = false;
@@ -1284,6 +1000,7 @@ bool VisionModule::Init(VLMType type,
     tokenizer_ = tokenizer;
     cache_dir_ = cache_dir;
     type_ = type;
+    adapter_ = make_vision_adapter(type_);
 
     // Debug switch: disable both disk+memory vision cache.
     cache_enabled_ = !env_flag_false(std::getenv("AXLLM_VISION_CACHE"));
@@ -1330,220 +1047,34 @@ bool VisionModule::Init(VLMType type,
 
     const auto& in0 = impl_->encoder.get_input(0);
 
-    // Auto-resolve vision width/height from encoder input shape/size, so users don't need to manually set them.
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) {
-        const int old_w = vision_width_;
-        const int old_h = vision_height_;
-
-        // PaddleOCRVL VIT takes float32 input (not uint8 like Qwen-VL);
-        // divide nSize by sizeof(float) to get the effective element count.
-        size_t eff_nSize = (size_t)in0.nSize;
-        if (type_ == VLMType::PaddleOCRVL && (eff_nSize % sizeof(float)) == 0) {
-            eff_nSize /= sizeof(float);
-            ALOGI("PaddleOCRVL: encoder input nSize=%zu -> eff_nSize=%zu (float32 input)",
-                  (size_t)in0.nSize, eff_nSize);
-        } else if (type_ == VLMType::Qwen3Omni && (eff_nSize % sizeof(float)) == 0) {
-            // Jina omni vision export consumes float32 patchified pixels, not raw uint8 NHWC bytes.
-            eff_nSize /= sizeof(float);
-            ALOGI("Qwen3Omni: encoder input nSize=%zu -> eff_nSize=%zu (float32 patch input)",
-                  (size_t)in0.nSize, eff_nSize);
-        }
-
-        const size_t cfg_bytes = (size_t)std::max(0, old_h) * (size_t)std::max(0, old_w) *
-                                 (size_t)std::max(1, temporal_patch_size_) * (size_t)3;
-
-        int h = old_h;
-        int w = old_w;
-        std::string note;
-        if (try_infer_qwen_hw_from_input_bytes(eff_nSize,
-                                               std::max(1, temporal_patch_size_),
-                                               3,
-                                               std::max(1, patch_size_),
-                                               h, w, note)) {
-            if (w != old_w || h != old_h) {
-                ALOGW("Qwen-VL vision size override: cfg=%dx%d bytes=%zu, model_input_bytes=%zu -> %dx%d (%s).",
-                      old_w, old_h, cfg_bytes, (size_t)in0.nSize, w, h, note.c_str());
-            }
-            vision_width_ = w;
-            vision_height_ = h;
-        } else {
-            if (vision_width_ <= 0 || vision_height_ <= 0) {
-                err = "failed to infer Qwen-VL vision_width/vision_height from encoder input";
-                return false;
-            }
-            if (cfg_bytes != (size_t)in0.nSize) {
-                ALOGW("Qwen-VL vision size mismatch (cfg=%dx%d bytes=%zu, model_input_bytes=%zu). Will pad/zero input tail.",
-                      vision_width_, vision_height_, cfg_bytes, (size_t)in0.nSize);
-            }
-        }
-    } else if (type_ == VLMType::Gemma4VL) {
-        const int old_w = vision_width_;
-        const int old_h = vision_height_;
-        int parsed_h = 0, parsed_w = 0, parsed_tokens = 0;
-        const bool parsed_profile = parse_gemma4_profile_from_path(encoder_axmodel, parsed_h, parsed_w, parsed_tokens);
-
-        const size_t eff_nsize = ((size_t)in0.nSize % sizeof(float) == 0) ? ((size_t)in0.nSize / sizeof(float)) : (size_t)in0.nSize;
-        const int pixel_dim = std::max(1, patch_size_) * std::max(1, patch_size_) * 3;
-        if (pixel_dim <= 0 || eff_nsize % (size_t)pixel_dim != 0) {
-            err = "failed to infer Gemma4 vision patch layout from encoder input";
+    // Auto-resolve vision width/height (+ classic NCHW/NHWC) from the encoder input (adapter).
+    {
+        VisionParams gvp;
+        gvp.width = vision_width_;
+        gvp.height = vision_height_;
+        gvp.patch_size = patch_size_;
+        gvp.temporal_patch_size = temporal_patch_size_;
+        int nchw = impl_->input_is_nchw;
+        if (!adapter_->resolveInputGeometry((size_t)in0.nSize, in0.vShape, encoder_axmodel, gvp, nchw, err))
             return false;
-        }
-
-        const int patch_count = (int)(eff_nsize / (size_t)pixel_dim);
-        if (parsed_profile) {
-            vision_height_ = parsed_h;
-            vision_width_ = parsed_w;
-        } else if (vision_width_ > 0 && vision_height_ > 0) {
-            const int expected_patch_count = (vision_height_ / std::max(1, patch_size_)) * (vision_width_ / std::max(1, patch_size_));
-            if (expected_patch_count != patch_count) {
-                ALOGW("Gemma4 input patch count mismatch: cfg=%dx%d -> %d patches, model=%d patches",
-                      vision_width_, vision_height_, expected_patch_count, patch_count);
-            }
-        } else {
-            err = "failed to infer Gemma4 vision_width/vision_height from encoder filename; please set config";
-            return false;
-        }
-
-        if (old_w != vision_width_ || old_h != vision_height_) {
-            ALOGW("Gemma4 vision size override: cfg=%dx%d -> model=%dx%d",
-                  old_w, old_h, vision_width_, vision_height_);
-        }
-    } else if (type_ == VLMType::InternVL3 || type_ == VLMType::FastVLM) {
-        // Classic image encoder: detect NCHW/NHWC layout and image size from model input shape.
-        impl_->input_is_nchw = -1;
-        int h = 0, w = 0, is_nchw = -1;
-        const bool got_shape = try_infer_hw_from_4d_shape_with_c3(in0.vShape, h, w, &is_nchw);
-        if (got_shape) {
-            impl_->input_is_nchw = is_nchw;
-            if (vision_width_ > 0 && vision_height_ > 0 && (vision_width_ != w || vision_height_ != h)) {
-                ALOGW("classic vision size override: cfg=%dx%d -> model=%dx%d (from input shape)",
-                      vision_width_, vision_height_, w, h);
-            }
-            vision_width_ = w;
-            vision_height_ = h;
-        } else {
-            // Fallback: if shape cannot be parsed, try layout by config+nSize.
-            if (vision_width_ <= 0 || vision_height_ <= 0) {
-                err = "classic vision encoder input shape missing; please provide valid vision_width/vision_height";
-                return false;
-            }
-            const size_t need_nhwc_u8 = (size_t)vision_width_ * (size_t)vision_height_ * (size_t)3;
-            const size_t need_nchw_f32 = need_nhwc_u8 * sizeof(float);
-            if ((size_t)in0.nSize == need_nchw_f32) impl_->input_is_nchw = 1;
-            else if ((size_t)in0.nSize == need_nhwc_u8) impl_->input_is_nchw = 0;
-            else {
-                err = "classic vision encoder layout not detected from input shape/nSize";
-                return false;
-            }
-            ALOGW("classic vision input shape unavailable; fallback to cfg size %dx%d by nSize=%zu (layout=%s)",
-                  vision_width_, vision_height_, (size_t)in0.nSize,
-                  (impl_->input_is_nchw == 1 ? "NCHW-fp32" : "NHWC-u8"));
-        }
-    } else if (type_ == VLMType::SmolVLM2) {
-        // SmolVLM2 encoder is usually NHWC u8; try shape first, then infer from nSize.
-        const int old_w = vision_width_;
-        const int old_h = vision_height_;
-        int h = 0, w = 0, tmp_layout = -1;
-        bool inferred = try_infer_hw_from_4d_shape_with_c3(in0.vShape, h, w, &tmp_layout);
-        if (!inferred && ((size_t)in0.nSize % 3u) == 0u) {
-            const size_t hw = (size_t)in0.nSize / 3u;
-            const int side = (int)(std::sqrt((double)hw) + 0.5);
-            if ((size_t)side * (size_t)side == hw) {
-                h = side;
-                w = side;
-                inferred = true;
-            }
-        }
-        if (!inferred) {
-            if (vision_width_ <= 0 || vision_height_ <= 0) {
-                err = "failed to infer SmolVLM2 vision_width/vision_height from encoder input";
-                return false;
-            }
-            ALOGW("SmolVLM2 vision size inference failed; keep cfg=%dx%d", vision_width_, vision_height_);
-        } else {
-            if (old_w != w || old_h != h) {
-                ALOGW("SmolVLM2 vision size override: cfg=%dx%d -> model=%dx%d", old_w, old_h, w, h);
-            }
-            vision_width_ = w;
-            vision_height_ = h;
-        }
+        vision_width_ = gvp.width;
+        vision_height_ = gvp.height;
+        impl_->input_is_nchw = nchw;
     }
 
-    // Detect encoder output dtype + tokens_per_block.
-    // Some AX* runners/models report unreliable vShape for Qwen-VL vision encoders; prefer nSize + config sanity.
+    // Detect encoder output dtype + tokens_per_block (adapter, with generic fallback).
     {
         const auto& out0 = impl_->encoder.get_output(0);
-
-        auto try_pick_by_bytes = [&](int bytes_per_elem, int& out_is_bf16, int& out_tokens_per_block) -> bool {
-            if (bytes_per_elem <= 0) return false;
-            if ((out0.nSize % (size_t)bytes_per_elem) != 0) return false;
-            const size_t elem = (size_t)out0.nSize / (size_t)bytes_per_elem;
-            if (elem % (size_t)tokens_embed_size_ != 0) return false;
-            out_tokens_per_block = (int)(elem / (size_t)tokens_embed_size_);
-            out_is_bf16 = (bytes_per_elem == 2) ? 1 : 0;
-            return true;
-        };
-
-        bool picked = false;
-
-        if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) {
-            const int grid_h = vision_height_ / std::max(1, patch_size_);
-            const int grid_w = vision_width_ / std::max(1, patch_size_);
-            const int llm_grid_h = grid_h / std::max(1, spatial_merge_size_);
-            const int llm_grid_w = grid_w / std::max(1, spatial_merge_size_);
-            const int expected_tokens = std::max(1, llm_grid_h) * std::max(1, llm_grid_w);
-
-            // Prefer fp32 if it matches the expected token count (Qwen3-VL reference branches use fp32 outputs).
-            int out_is_bf16 = -1, tpb = 0;
-            if (try_pick_by_bytes(4, out_is_bf16, tpb) && tpb == expected_tokens) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(2, out_is_bf16, tpb) && tpb == expected_tokens) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(4, out_is_bf16, tpb)) {
-                // Fallback: still prefer fp32 if valid, but warn about unexpected token count.
-                ALOGW("vision encoder tokens_per_block=%d (expected=%d). Using fp32 by nSize inference (out0.nSize=%zu).",
-                      tpb, expected_tokens, (size_t)out0.nSize);
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(2, out_is_bf16, tpb)) {
-                ALOGW("vision encoder tokens_per_block=%d (expected=%d). Using bf16 by nSize inference (out0.nSize=%zu).",
-                      tpb, expected_tokens, (size_t)out0.nSize);
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            }
-        } else if (type_ == VLMType::Gemma4VL) {
-            int expected_h = 0, expected_w = 0, expected_tokens = 0;
-            const bool parsed_profile = parse_gemma4_profile_from_path(encoder_axmodel, expected_h, expected_w, expected_tokens);
-            int out_is_bf16 = -1, tpb = 0;
-            if (try_pick_by_bytes(4, out_is_bf16, tpb) && (!parsed_profile || tpb == expected_tokens)) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(2, out_is_bf16, tpb) && (!parsed_profile || tpb == expected_tokens)) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            }
-        } else if (type_ == VLMType::MiniCPMV46VL) {
-            int out_is_bf16 = -1, tpb = 0;
-            if (try_pick_by_bytes(4, out_is_bf16, tpb)) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            } else if (try_pick_by_bytes(2, out_is_bf16, tpb)) {
-                impl_->encoder_output_is_bf16 = out_is_bf16;
-                tokens_per_block_ = tpb;
-                picked = true;
-            }
-        }
-
-        if (!picked) {
+        VisionParams tvp;
+        tvp.width = vision_width_;
+        tvp.height = vision_height_;
+        tvp.patch_size = patch_size_;
+        tvp.spatial_merge_size = spatial_merge_size_;
+        int tpb = 0, is_bf16 = -1;
+        if (adapter_->resolveOutputTokens((size_t)out0.nSize, encoder_axmodel, tokens_embed_size_, tvp, tpb, is_bf16)) {
+            tokens_per_block_ = tpb;
+            impl_->encoder_output_is_bf16 = is_bf16;
+        } else {
             // Generic path: rely on vShape + nSize.
             int elem_count = 1;
             for (auto d : out0.vShape) elem_count *= (int)d;
@@ -1562,45 +1093,26 @@ bool VisionModule::Init(VLMType type,
     }
 
     // Optional deepstack (Qwen3VL family from older branches): encoder provides extra float outputs.
-    deepstack_layers_ = 0;
-    if (type_ == VLMType::Qwen3VL) {
-        const int nout = impl_->encoder.get_num_outputs();
-        if (nout > 1) {
-            deepstack_layers_ = std::min(3, nout - 1);
-        }
-    }
+    deepstack_layers_ = adapter_->deepstackLayerCount(impl_->encoder.get_num_outputs());
 
-    if (type_ == VLMType::Gemma4VL) {
+    // Audio-capable VLMs (Gemma4 / Qwen3Omni): per-VLM video-frame default + audio encoder.
+    // Audio machinery lives in AudioEncoder (audio_encoder.hpp); injection stays here.
+    const AudioKind akind = adapter_->audioKind();
+    if (akind == AudioKind::Gemma4Audio) {
         if (video_num_frames_ <= 0) video_num_frames_ = 32;
-        if (!audio_encoder_axmodel_5s.empty() && is_file(audio_encoder_axmodel_5s)) {
-            if (!init_audio_profile(impl_->audio_5s, audio_encoder_axmodel_5s, devid, tokens_embed_size_, err)) {
-                return false;
-            }
-        }
-        if (!audio_encoder_axmodel_30s.empty() && is_file(audio_encoder_axmodel_30s)) {
-            if (!init_audio_profile(impl_->audio_30s, audio_encoder_axmodel_30s, devid, tokens_embed_size_, err)) {
-                return false;
-            }
-        }
-        if (!impl_->audio_5s.encoder_inited && !impl_->audio_30s.encoder_inited) {
-            ALOGW("Gemma4 audio encoders are not configured or missing; AUDIO inputs will be rejected.");
-        }
-        ALOGI("Gemma4 video config: num_frames=%d do_sample_frames=%d",
-              video_num_frames_,
-              video_do_sample_frames_ ? 1 : 0);
-    } else if (type_ == VLMType::Qwen3Omni) {
+    } else if (akind == AudioKind::Qwen3OmniAudio) {
         if (video_num_frames_ <= 0) video_num_frames_ = 8;
-        if (!audio_encoder_axmodel_30s.empty() && is_file(audio_encoder_axmodel_30s)) {
-            if (!init_whisper_audio_profile(impl_->audio_30s, audio_encoder_axmodel_30s, devid, tokens_embed_size_, err)) {
-                return false;
-            }
+    }
+    if (akind != AudioKind::None) {
+        audio_encoder_ = std::make_unique<AudioEncoder>();
+        const AudioEncoder::Kind ek =
+            (akind == AudioKind::Gemma4Audio) ? AudioEncoder::Kind::Gemma4 : AudioEncoder::Kind::Whisper;
+        if (!audio_encoder_->Init(ek, audio_encoder_axmodel_5s, audio_encoder_axmodel_30s,
+                                  devid, tokens_embed_size_, err)) {
+            return false;
         }
-        if (!impl_->audio_30s.encoder_inited) {
-            ALOGW("Qwen3Omni audio encoder is not configured or missing; AUDIO inputs will be rejected.");
-        }
-        ALOGI("Qwen3Omni video config: num_frames=%d do_sample_frames=%d",
-              video_num_frames_,
-              video_do_sample_frames_ ? 1 : 0);
+        ALOGI("%s video config: num_frames=%d do_sample_frames=%d",
+              adapter_->displayName(), video_num_frames_, video_do_sample_frames_ ? 1 : 0);
     }
 
     cache_key_prefix_ = "vlm=" + std::string(VLMTypeName(type_)) + "|enc=" + normalize_path_for_key(encoder_axmodel) +
@@ -1614,11 +1126,7 @@ bool VisionModule::Init(VLMType type,
                         "|ps=" + std::to_string(patch_size_) +
                         "|fps=" + std::to_string(fps_) +
                         "|tps=" + std::to_string(tokens_per_second_);
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni) {
-        cache_key_prefix_ += "|resize=pillow_bicubic|patch=hwc_v1";
-    } else if (type_ == VLMType::PaddleOCRVL) {
-        cache_key_prefix_ += "|resize=pillow_bicubic|patch=nchw_v2";
-    }
+    cache_key_prefix_ += adapter_->cacheKeySuffix();
     cache_key_prefix_ += "|bf16=rn_even";
 
     // Sanity checks after auto inference.
@@ -1633,71 +1141,14 @@ bool VisionModule::Init(VLMType type,
         }
     }
 
-    // Token ids for placeholder locating.
-    switch (type_) {
-    case VLMType::Qwen2_5VL:
-    case VLMType::Qwen3VL:
-    case VLMType::Qwen3Omni:
-        if (!get_single_token_id(tokenizer_, "<|image_pad|>", image_pad_id_, err)) return false;
-        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) return false;
-        if (type_ == VLMType::Qwen3Omni) {
-            if (!get_single_token_id(tokenizer_, "<|audio_pad|>", audio_pad_id_, err)) return false;
-        }
-        if (!get_single_token_id(tokenizer_, "<|vision_start|>", vision_start_id_, err)) return false;
-        ALOGI("Qwen token ids: vision_start=%d image_pad=%d video_pad=%d audio_pad=%d",
-              vision_start_id_, image_pad_id_, video_pad_id_, audio_pad_id_);
-        break;
-    case VLMType::PaddleOCRVL:
-        if (!get_single_token_id(tokenizer_, "<|IMAGE_PLACEHOLDER|>", image_pad_id_, err)) return false;
-        // PaddleOCRVL uses the same placeholder token for both image and video blocks.
-        // Keep `video_pad_id_` aligned with the tokenizer chat template.
-        video_pad_id_ = image_pad_id_;
-        if (!get_single_token_id(tokenizer_, "<|IMAGE_START|>", vision_start_id_, err)) return false;
-        ALOGI("PaddleOCR-VL token ids: vision_start=%d image_pad=%d video_pad=%d", vision_start_id_, image_pad_id_, video_pad_id_);
-        break;
-    case VLMType::InternVL3:
-        if (!get_single_token_id(tokenizer_, "<IMG_CONTEXT>", image_pad_id_, err)) return false;
-        video_pad_id_ = image_pad_id_;
-        if (!get_single_token_id(tokenizer_, "<img>", vision_start_id_, err)) {
-            // Not required for injection; mRoPE not used.
-            vision_start_id_ = -1;
-        }
-        break;
-    case VLMType::FastVLM:
-        if (!get_single_token_id(tokenizer_, "<image>", image_pad_id_, err)) return false;
-        video_pad_id_ = image_pad_id_;
-        vision_start_id_ = -1;
-        break;
-    case VLMType::SmolVLM2:
-        if (!get_single_token_id(tokenizer_, "<image>", image_pad_id_, err)) return false;
-        video_pad_id_ = image_pad_id_;
-        vision_start_id_ = -1;
-        break;
-    case VLMType::Gemma4VL:
-        if (!get_single_token_id(tokenizer_, "<|image|>", image_pad_id_, err)) return false;
-        if (!get_single_token_id(tokenizer_, "<|video|>", video_pad_id_, err)) {
-            video_pad_id_ = -1;
-        }
-        if (!get_single_token_id(tokenizer_, "<|audio|>", audio_pad_id_, err)) return false;
-        vision_start_id_ = -1;
-        ALOGI("Gemma4-VL token ids: image_pad=%d video_pad=%d audio_pad=%d", image_pad_id_, video_pad_id_, audio_pad_id_);
-        break;
-    case VLMType::MiniCPMV46VL:
-        if (!get_single_token_id(tokenizer_, "<|image_pad|>", image_pad_id_, err)) return false;
-        if (!get_single_token_id(tokenizer_, "<|video_pad|>", video_pad_id_, err)) {
-            video_pad_id_ = image_pad_id_;
-        }
-        vision_start_id_ = -1;
-        ALOGI("MiniCPM-V-4.6 token ids: image_pad=%d video_pad=%d", image_pad_id_, video_pad_id_);
-        break;
-    case VLMType::LocateAnythingVL:
-        if (!get_single_token_id(tokenizer_, "<IMG_CONTEXT>", image_pad_id_, err)) return false;
-        video_pad_id_ = image_pad_id_;
-        vision_start_id_ = -1;
-        ALOGI("LocateAnything token ids: image_pad(<IMG_CONTEXT>)=%d", image_pad_id_);
-        break;
-    default:
-        break;
+    // Token ids for placeholder locating (delegated to the per-VLM adapter).
+    {
+        TokenIds tids;
+        if (!adapter_->resolveTokenIds(tokenizer_, tids, err)) return false;
+        image_pad_id_ = tids.image_pad;
+        video_pad_id_ = tids.video_pad;
+        audio_pad_id_ = tids.audio_pad;
+        vision_start_id_ = tids.vision_start;
     }
 
     enabled_ = true;
@@ -1792,68 +1243,6 @@ static bool encode_block_normalized_float(ax_runner_t& enc, int devid, int out_i
         else v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
         for (int i = 0; i < elem_count; ++i) out_bf16[i] = fp32_to_bfloat16_rne(tmp[i]);
     }
-    return true;
-}
-
-static bool encode_block_fp32(ax_runner_t& enc, int devid, int out_is_bf16,
-                              const std::vector<float>& values,
-                              std::vector<unsigned short>& out_bf16,
-                              std::string& err)
-{
-    const auto& in0 = enc.get_input(0);
-    const size_t input_bytes = values.size() * sizeof(float);
-    if ((size_t)in0.nSize < input_bytes) {
-        err = "encoder input tensor too small for float32 input";
-        return false;
-    }
-
-    if (input_bytes == (size_t)in0.nSize) {
-        if (in0.pVirAddr) {
-            std::memcpy(in0.pVirAddr, values.data(), input_bytes);
-        } else {
-            v_h2d(V_WADDR(in0), values.data(), input_bytes, devid);
-        }
-    } else {
-        std::vector<unsigned char> tmp((size_t)in0.nSize, 0);
-        std::memcpy(tmp.data(), values.data(), input_bytes);
-        if (in0.pVirAddr) {
-            std::memcpy(in0.pVirAddr, tmp.data(), tmp.size());
-        } else {
-            v_h2d(V_WADDR(in0), tmp.data(), tmp.size(), devid);
-        }
-    }
-
-    enc.inference();
-
-    const auto& out0 = enc.get_output(0);
-    int elem_count = 0;
-    if (out_is_bf16) {
-        elem_count = (int)((size_t)out0.nSize / sizeof(unsigned short));
-    } else {
-        elem_count = (int)((size_t)out0.nSize / sizeof(float));
-    }
-    if (elem_count <= 0) {
-        err = "audio encoder output elem_count invalid";
-        return false;
-    }
-    out_bf16.resize(elem_count);
-
-    if (out_is_bf16) {
-        if (out0.pVirAddr) {
-            std::memcpy(out_bf16.data(), out0.pVirAddr, (size_t)elem_count * sizeof(unsigned short));
-        } else {
-            v_d2h(out_bf16.data(), V_RADDR(out0), (size_t)elem_count * sizeof(unsigned short), devid);
-        }
-        return true;
-    }
-
-    std::vector<float> tmp(elem_count);
-    if (out0.pVirAddr) {
-        std::memcpy(tmp.data(), out0.pVirAddr, (size_t)elem_count * sizeof(float));
-    } else {
-        v_d2h(tmp.data(), V_RADDR(out0), (size_t)elem_count * sizeof(float), devid);
-    }
-    for (int i = 0; i < elem_count; ++i) out_bf16[i] = bfloat16(tmp[i]).data;
     return true;
 }
 
@@ -2067,92 +1456,13 @@ bool VisionModule::EncodeForContent(const Content& content,
     const int devid = impl_->encoder.get_devid();
 
     if (content.type == AUDIO) {
-        if (type_ == VLMType::Gemma4VL) {
-            if (media.uris.size() != 1) {
-                err = "Gemma4 audio expects exactly 1 audio file per message";
-                return false;
-            }
-
-            float duration_sec = 0.0f;
-            if (!audio::ReadAudioDurationSeconds(media.uris[0], duration_sec, err)) {
-                return false;
-            }
-
-            auto* runtime = select_audio_profile(&impl_->audio_5s, &impl_->audio_30s, duration_sec);
-            if (!runtime) {
-                err = "Gemma4 audio encoder profile is not initialized";
-                return false;
-            }
-
-            std::vector<float> input_features;
-            if (!audio::LoadGemma4AudioInputFeatures(media.uris[0], runtime->profile, input_features, nullptr, err)) {
-                return false;
-            }
-
+        if (audio_encoder_ && audio_encoder_->enabled()) {
             std::vector<unsigned short> emb;
-            if (!encode_block_fp32(runtime->encoder,
-                                   runtime->encoder.get_devid(),
-                                   runtime->encoder_output_is_bf16,
-                                   input_features,
-                                   emb,
-                                   err)) {
-                return false;
-            }
-
-            out_num_media_for_tokenizer = 1;
-            out_num_media_tokens = runtime->profile.num_audio_tokens;
+            int nmedia = 0, ntok = 0;
+            if (!audio_encoder_->Encode(media.uris, emb, nmedia, ntok, err)) return false;
+            out_num_media_for_tokenizer = nmedia;
+            out_num_media_tokens = ntok;
             out_blocks.push_back(std::move(emb));
-            if (duration_sec > runtime->profile.duration_sec) {
-                ALOGW("Gemma4 audio input %.3fs exceeds selected %.1fs profile; trailing audio will be truncated",
-                      duration_sec, runtime->profile.duration_sec);
-            } else {
-                ALOGI("Gemma4 audio profile selected: %.1fs -> %d tokens (input=%.3fs)",
-                      runtime->profile.duration_sec,
-                      runtime->profile.num_audio_tokens,
-                      duration_sec);
-            }
-            return true;
-        }
-        if (type_ == VLMType::Qwen3Omni) {
-            if (media.uris.size() != 1) {
-                err = "Qwen3Omni audio expects exactly 1 audio file per message";
-                return false;
-            }
-            if (!impl_->audio_30s.encoder_inited) {
-                err = "Qwen3Omni audio encoder is not initialized";
-                return false;
-            }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio begin: uri=%s", media.uris[0].c_str());
-            }
-
-            std::vector<float> input_features;
-            if (!audio::LoadWhisperAudioInputFeatures(media.uris[0], impl_->audio_30s.whisper_profile, input_features, nullptr, err)) {
-                return false;
-            }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio features ready: elems=%zu", input_features.size());
-            }
-
-            std::vector<unsigned short> emb;
-            if (!encode_block_fp32(impl_->audio_30s.encoder,
-                                   impl_->audio_30s.encoder.get_devid(),
-                                   impl_->audio_30s.encoder_output_is_bf16,
-                                   input_features,
-                                   emb,
-                                   err)) {
-                return false;
-            }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio encoder ready: bf16_elems=%zu", emb.size());
-            }
-
-            out_num_media_for_tokenizer = 1;
-            out_num_media_tokens = impl_->audio_30s.whisper_profile.num_audio_tokens;
-            out_blocks.push_back(std::move(emb));
-            ALOGI("Qwen3Omni audio profile selected: %.1fs -> %d tokens",
-                  impl_->audio_30s.whisper_profile.duration_sec,
-                  impl_->audio_30s.whisper_profile.num_audio_tokens);
             return true;
         }
         err = "AUDIO not supported for this vlm_type";
@@ -2177,6 +1487,13 @@ bool VisionModule::EncodeForContent(const Content& content,
 
         const int grid_h = vision_height_ / patch_size_;
         const int grid_w = vision_width_ / patch_size_;
+
+        VisionParams vp_img;
+        vp_img.width = vision_width_;
+        vp_img.height = vision_height_;
+        vp_img.patch_size = patch_size_;
+        vp_img.temporal_patch_size = temporal_patch_size_;
+        vp_img.spatial_merge_size = spatial_merge_size_;
 
         out_num_media_for_tokenizer = (int)image_files.size();
         out_num_media_tokens = tokens_per_block_;
@@ -2234,7 +1551,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                                     (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                                 }
                             }
-                            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+                            if (adapter_->emitsImageGridThw()) out_image_grid_thw.push_back({1, grid_h, grid_w});
                             continue;
                         }
                     }
@@ -2254,7 +1571,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                             (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                         }
                     }
-                    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+                    if (adapter_->emitsImageGridThw()) out_image_grid_thw.push_back({1, grid_h, grid_w});
                     continue;
                 }
             }
@@ -2271,132 +1588,34 @@ bool VisionModule::EncodeForContent(const Content& content,
             std::vector<std::vector<float>> deepstack_for_one;
             if (out_deepstack_append && deepstack_layers_ > 0) deepstack_for_one.resize((size_t)deepstack_layers_);
 
-            if (type_ == VLMType::SmolVLM2) {
-                std::vector<axcv::Mat> one{img};
-                std::vector<std::vector<unsigned char>> pixel_values;
-                Smolvlm2ImageProcessor(one, pixel_values, vision_width_, vision_height_);
-                blocks_for_one.reserve(pixel_values.size()); // expected 5
-                for (auto& pv : pixel_values) {
-                    std::vector<unsigned short> emb;
-                    if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb, 0, nullptr, err)) return false;
-                    blocks_for_one.push_back(std::move(emb));
-                }
-            }
-            else if (type_ == VLMType::PaddleOCRVL) {
-                // PaddleOCR-VL VIT expects patches in [N, C, pH, pW] format (channel-first per patch,
-                // no spatial merge in preprocessing — merge happens inside the VIT model).
-                std::vector<unsigned char> pv;
-                PaddleOCRVLImageProcessor(img, pv, vision_height_, vision_width_, patch_size_);
-                {
-                    unsigned char mn = 255, mx = 0;
-                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
-                    ALOGI("PaddleOCRVL pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
-                          pv.size(), (unsigned)mn, (unsigned)mx,
-                          vision_width_, vision_height_, patch_size_);
-                }
-                std::vector<unsigned short> emb;
-                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                                  pv, emb, 0.5f, 0.5f,
-                                                  0, nullptr, err))
-                    return false;
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::Gemma4VL) {
-                std::vector<unsigned char> pv;
-                Gemma4ImageProcessor(img, pv, vision_height_, vision_width_, patch_size_);
-                std::vector<unsigned short> emb;
-                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                                  pv, emb, 0.0f, 1.0f,
-                                                  0, nullptr, err))
-                    return false;
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::MiniCPMV46VL) {
-                std::vector<unsigned char> pv;
-                if (MiniCPMV46ImageProcessor(img, pv, vision_height_, vision_width_, patch_size_) != 0) {
-                    err = "MiniCPM-V-4.6 image preprocessing failed";
-                    return false;
-                }
-                {
-                    unsigned char mn = 255, mx = 0;
-                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
-                    ALOGI("MiniCPM-V-4.6 pixel_values bytes=%zu min=%u max=%u (w=%d h=%d ps=%d)",
-                          pv.size(), (unsigned)mn, (unsigned)mx,
-                          vision_width_, vision_height_, patch_size_);
-                }
-                std::vector<unsigned short> emb;
-                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                                  pv, emb, 0.5f, 0.5f,
-                                                  0, nullptr, err))
-                    return false;
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni) {
-                std::vector<axcv::Mat> one{img};
-                std::vector<std::vector<unsigned char>> pixel_values;
-                Qwen2VideoProcessor(one, pixel_values, vision_height_, vision_width_, temporal_patch_size_, spatial_merge_size_, patch_size_);
-                if (pixel_values.size() != 1) { err = "Qwen2VideoProcessor(image) returned != 1 block"; return false; }
-                {
-                    // Quick sanity: if preprocessing is broken, pixel_values often becomes all zeros.
-                    const auto& pv = pixel_values[0];
-                    unsigned char mn = 255, mx = 0;
-                    for (unsigned char b : pv) { if (b < mn) mn = b; if (b > mx) mx = b; }
-                    ALOGI("Qwen-VL pixel_values[0] bytes=%zu min=%u max=%u (w=%d h=%d tp=%d ps=%d sm=%d)",
-                          pv.size(), (unsigned)mn, (unsigned)mx,
-                          vision_width_, vision_height_, temporal_patch_size_, patch_size_, spatial_merge_size_);
-                }
-                std::vector<unsigned short> emb;
-                if (type_ == VLMType::Qwen3Omni) {
-                    if (!encode_block_normalized_float(impl_->encoder,
-                                                       devid,
-                                                       impl_->encoder_output_is_bf16,
-                                                       pixel_values[0],
-                                                       emb,
-                                                       0.5f,
-                                                       0.5f,
-                                                       0,
-                                                       nullptr,
-                                                       err)) {
-                        return false;
-                    }
-                } else {
-                    if (!encode_block_u8(impl_->encoder,
-                                         devid,
-                                         impl_->encoder_output_is_bf16,
-                                         pixel_values[0],
-                                         emb,
-                                         deepstack_layers_,
-                                         (out_deepstack_append ? &deepstack_for_one : nullptr),
-                                         err)) {
-                        return false;
-                    }
-                }
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::InternVL3 || type_ == VLMType::FastVLM) {
+            // Per-VLM image preprocessing -> pixel values + encode descriptor (adapter).
+            // The generic encode (encode_block_*/encode_classic_image, which owns the
+            // vision encoder) stays here.
+            ImagePreproc pp;
+            if (!adapter_->preprocessImage(img, vp_img, pp, err)) return false;
+            if (pp.mode == ImagePreproc::ClassicMat) {
                 std::vector<unsigned short> emb;
                 if (!encode_classic_image(impl_->encoder, devid, impl_->encoder_output_is_bf16,
                                           impl_->input_is_nchw, vision_width_, vision_height_, img, emb, err))
                     return false;
                 blocks_for_one.push_back(std::move(emb));
-            }
-            else if (type_ == VLMType::LocateAnythingVL) {
-                // LocateAnything: [1600,3,14,14] uint8 patches -> normalize pixel/127.5-1
-                // (mean/std 0.5) -> image_encoder_mlp.axmodel -> 400x2048 tokens.
-                std::vector<unsigned char> pv;
-                if (LocateAnythingImageProcessor(img, pv, vision_height_, vision_width_, patch_size_) != 0) {
-                    err = "LocateAnything image preprocessing failed";
-                    return false;
+            } else {
+                blocks_for_one.reserve(pp.pixel_blocks.size());
+                for (auto& pv : pp.pixel_blocks) {
+                    std::vector<unsigned short> emb;
+                    if (pp.mode == ImagePreproc::PixelU8) {
+                        if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb,
+                                             pp.collect_deepstack ? deepstack_layers_ : 0,
+                                             (pp.collect_deepstack && out_deepstack_append) ? &deepstack_for_one : nullptr,
+                                             err))
+                            return false;
+                    } else {
+                        if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                                          pv, emb, pp.norm_mean, pp.norm_std, 0, nullptr, err))
+                            return false;
+                    }
+                    blocks_for_one.push_back(std::move(emb));
                 }
-                std::vector<unsigned short> emb;
-                if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                                  pv, emb, 0.5f, 0.5f, 0, nullptr, err))
-                    return false;
-                blocks_for_one.push_back(std::move(emb));
-            }
-            else {
-                err = "IMAGE not supported for this vlm_type";
-                return false;
             }
 
             if (cache_enabled_) {
@@ -2423,7 +1642,7 @@ bool VisionModule::EncodeForContent(const Content& content,
                     (*out_deepstack_append)[li].insert((*out_deepstack_append)[li].end(), v.begin(), v.end());
                 }
             }
-            if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL || type_ == VLMType::Qwen3Omni || type_ == VLMType::PaddleOCRVL) out_image_grid_thw.push_back({1, grid_h, grid_w});
+            if (adapter_->emitsImageGridThw()) out_image_grid_thw.push_back({1, grid_h, grid_w});
         }
 
         return true;
@@ -2454,137 +1673,36 @@ bool VisionModule::EncodeForContent(const Content& content,
     }
     if (frames.empty()) { err = "no video frames loaded"; return false; }
 
-    if (type_ == VLMType::Gemma4VL) {
-        out_num_media_for_tokenizer = (int)frames.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_blocks.reserve(frames.size());
-        for (auto& frame : frames) {
-            std::vector<unsigned char> pv;
-            Gemma4ImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_);
-            std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                               pv, emb, 0.0f, 1.0f, 0, nullptr, err))
-                return false;
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
+    // Per-VLM video preprocessing -> pixel blocks + encode descriptor + media counts /
+    // optional video_grid_thw (adapter). Generic encode stays here.
+    VisionParams vp_video;
+    vp_video.width = vision_width_;
+    vp_video.height = vision_height_;
+    vp_video.patch_size = patch_size_;
+    vp_video.temporal_patch_size = temporal_patch_size_;
+    vp_video.spatial_merge_size = spatial_merge_size_;
 
-    if (type_ == VLMType::Qwen3Omni) {
-        out_num_media_for_tokenizer = (int)frames.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_blocks.reserve(frames.size());
-        for (auto& frame : frames) {
-            std::vector<axcv::Mat> one{frame};
-            std::vector<std::vector<unsigned char>> pixel_values;
-            Qwen2VideoProcessor(one, pixel_values, vision_height_, vision_width_, temporal_patch_size_, spatial_merge_size_, patch_size_);
-            if (pixel_values.size() != 1) {
-                err = "Qwen2VideoProcessor(video frame) returned != 1 block";
-                return false;
-            }
-            std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder,
-                                               devid,
-                                               impl_->encoder_output_is_bf16,
-                                               pixel_values[0],
-                                               emb,
-                                               0.5f,
-                                               0.5f,
-                                               0,
-                                               nullptr,
-                                               err)) {
-                return false;
-            }
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
-
-    if (type_ == VLMType::SmolVLM2) {
-        std::vector<std::vector<unsigned char>> pixel_values;
-        Smolvlm2VideoProcessor(frames, pixel_values, vision_width_, vision_height_);
-        out_num_media_for_tokenizer = (int)pixel_values.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_blocks.reserve(pixel_values.size());
-        for (auto& pv : pixel_values) {
-            std::vector<unsigned short> emb;
-            if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb, 0, nullptr, err)) return false;
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
-
-    if (type_ == VLMType::PaddleOCRVL) {
-        // PaddleOCR-VL video: process each frame independently with the same VIT as images.
-        const int grid_h = vision_height_ / patch_size_;
-        const int grid_w = vision_width_ / patch_size_;
-
-        out_num_media_for_tokenizer = (int)frames.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_video_grid_thw.push_back({(int)frames.size(), grid_h, grid_w});
-        out_blocks.reserve(frames.size());
-        for (auto& frame : frames) {
-            std::vector<unsigned char> pv;
-            PaddleOCRVLImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_);
-            std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
-                                               pv, emb, 0.5f, 0.5f, 0, nullptr, err))
-                return false;
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
-
-    if (type_ == VLMType::MiniCPMV46VL) {
-        out_num_media_for_tokenizer = (int)frames.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_blocks.reserve(frames.size());
-        for (auto& frame : frames) {
-            std::vector<unsigned char> pv;
-            if (MiniCPMV46ImageProcessor(frame, pv, vision_height_, vision_width_, patch_size_) != 0) {
-                err = "MiniCPM-V-4.6 video frame preprocessing failed";
-                return false;
-            }
-            std::vector<unsigned short> emb;
-            if (!encode_block_normalized_float(impl_->encoder,
-                                               devid,
-                                               impl_->encoder_output_is_bf16,
-                                               pv,
-                                               emb,
-                                               0.5f,
-                                               0.5f,
-                                               0,
-                                               nullptr,
-                                               err)) {
-                return false;
-            }
-            out_blocks.push_back(std::move(emb));
-        }
-        return true;
-    }
-
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
-        const int grid_h = vision_height_ / patch_size_;
-        const int grid_w = vision_width_ / patch_size_;
-
-        std::vector<std::vector<unsigned char>> pixel_values;
-        Qwen2VideoProcessor(frames, pixel_values, vision_height_, vision_width_, temporal_patch_size_, spatial_merge_size_, patch_size_);
-        out_num_media_for_tokenizer = (int)pixel_values.size();
-        out_num_media_tokens = tokens_per_block_;
-        out_video_grid_thw.push_back({(int)pixel_values.size(), grid_h, grid_w});
-        out_blocks.reserve(pixel_values.size());
-        for (auto& pv : pixel_values) {
-            std::vector<unsigned short> emb;
+    VideoPreproc vv;
+    if (!adapter_->preprocessVideo(frames, vp_video, vv, err)) return false;
+    out_num_media_for_tokenizer = vv.num_media_for_tokenizer;
+    out_num_media_tokens = tokens_per_block_;
+    if (vv.emit_video_grid_thw) out_video_grid_thw.push_back({vv.grid_t, vv.grid_h, vv.grid_w});
+    out_blocks.reserve(vv.pixel_blocks.size());
+    for (auto& pv : vv.pixel_blocks) {
+        std::vector<unsigned short> emb;
+        if (vv.mode == ImagePreproc::PixelU8) {
             if (!encode_block_u8(impl_->encoder, devid, impl_->encoder_output_is_bf16, pv, emb,
-                                 deepstack_layers_, out_deepstack_append, err))
+                                 vv.collect_deepstack ? deepstack_layers_ : 0,
+                                 vv.collect_deepstack ? out_deepstack_append : nullptr, err))
                 return false;
-            out_blocks.push_back(std::move(emb));
+        } else {
+            if (!encode_block_normalized_float(impl_->encoder, devid, impl_->encoder_output_is_bf16,
+                                               pv, emb, vv.norm_mean, vv.norm_std, 0, nullptr, err))
+                return false;
         }
-        return true;
+        out_blocks.push_back(std::move(emb));
     }
-
-    err = "VIDEO not supported for this vlm_type";
-    return false;
+    return true;
 }
 
 bool VisionModule::BuildInjectionState(const std::vector<int>& input_ids,
@@ -2673,7 +1791,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
     std::unordered_map<size_t, Gemma4VideoPlan> gemma4_video_plans;
     ScopedTempDirs planned_temp_dirs;
 
-    if (type_ == VLMType::Gemma4VL && budget) {
+    if (adapter_->videoPlanKind() == VideoPlanKind::Gemma4AutoReset && budget) {
         size_t video_count = 0;
         size_t video_index = (size_t)-1;
         for (size_t i = 0; i < history_in.size(); ++i) {
@@ -2797,7 +1915,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
 
         MediaInputs effective_media = it->second;
         ScopedTempDirs temp_dirs;
-        if (type_ == VLMType::Gemma4VL && c.type == VIDEO) {
+        if (adapter_->videoPlanKind() == VideoPlanKind::Gemma4AutoReset && c.type == VIDEO) {
             auto plan_it = gemma4_video_plans.find(i);
             if (plan_it != gemma4_video_plans.end()) {
                 effective_media.uris = plan_it->second.sampled_uris;
@@ -2863,7 +1981,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                       budget ? budget->precompute_len : 0);
             }
         }
-        else if ((type_ == VLMType::MiniCPMV46VL || type_ == VLMType::Qwen3Omni) && c.type == VIDEO) {
+        else if (adapter_->videoPlanKind() == VideoPlanKind::SimpleBudgetFit && c.type == VIDEO) {
             std::vector<std::string> all_frame_files;
             if (!collect_video_frame_paths(it->second.uris, all_frame_files, &temp_dirs, err)) return false;
 
@@ -2872,14 +1990,14 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                                 : (int)all_frame_files.size();
             const int requested_cap = frame_cap;
             if (frame_cap <= 0) {
-                err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") + " video has no usable frames";
+                err = std::string(adapter_->displayName()) + " video has no usable frames";
                 return false;
             }
 
             int fitted_tail_tokens = -1;
             if (budget) {
                 if (budget->max_history_tokens > 0 && budget->precompute_len > budget->max_history_tokens) {
-                    err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                    err = std::string(adapter_->displayName()) +
                           " video prompt exceeds current history budget before frame injection";
                     return false;
                 }
@@ -2892,7 +2010,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
                                                        budget->last_tokens,
                                                        budget->max_tail_tokens);
                 if (fit.frame_count <= 0) {
-                    err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                    err = std::string(adapter_->displayName()) +
                           " video prompt exceeds current prefill budget: 1 frame requires " +
                           std::to_string(fit.tail_tokens) + " tail tokens, budget allows " +
                           std::to_string(budget->max_tail_tokens);
@@ -2904,13 +2022,13 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
 
             effective_media.uris = sample_frame_paths(all_frame_files, frame_cap, video_do_sample_frames_);
             if ((int)effective_media.uris.size() != frame_cap) {
-                err = std::string(type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6") +
+                err = std::string(adapter_->displayName()) +
                       " video frame sampler produced an unexpected frame count";
                 return false;
             }
 
             ALOGI("%s video frames selected: %d/%zu (configured_cap=%d, tail_tokens=%d, max_tail=%d, precompute_len=%d)",
-                  (type_ == VLMType::Qwen3Omni ? "Qwen3Omni" : "MiniCPM-V-4.6"),
+                  (adapter_->displayName()),
                   frame_cap,
                   all_frame_files.size(),
                   requested_cap,
@@ -2950,38 +2068,21 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
     }
     if (!BuildInjectionState(input_ids_out, all_blocks, all_deepstack, state_out, err)) return false;
 
-    // Optional: mRoPE (Qwen-VL). PaddleOCR-VL axmodels are exported with
-    // sequential position ids, matching python/infer_axmodel.py.
-    if (type_ == VLMType::Qwen2_5VL || type_ == VLMType::Qwen3VL) {
-        mrope::Config cfg;
-        cfg.vision_config.temporal_patch_size = temporal_patch_size_;
-        cfg.vision_config.tokens_per_second = tokens_per_second_;
-        cfg.vision_config.spatial_merge_size = spatial_merge_size_;
-        cfg.vision_config.patch_size = patch_size_;
-        cfg.vision_config.width = vision_width_;
-        cfg.vision_config.height = vision_height_;
-        cfg.vision_config.fps = fps_;
-        cfg.image_token_id = image_pad_id_;
-        cfg.video_token_id = video_pad_id_;
-        cfg.vision_start_token_id = vision_start_id_;
-
-        if (type_ == VLMType::Qwen2_5VL) {
-            std::vector<double> second_per_grid_ts;
-            second_per_grid_ts.reserve(video_grid_thw.size());
-            for (size_t i = 0; i < video_grid_thw.size(); ++i) {
-                second_per_grid_ts.push_back(double(temporal_patch_size_) / double(std::max(1, fps_)));
-            }
-            state_out.position_ids = mrope::get_rope_index_qwen2_5(cfg, input_ids_out, image_grid_thw, video_grid_thw, second_per_grid_ts);
-        } else {
-            state_out.position_ids = mrope::get_rope_index_qwen3(cfg, input_ids_out, image_grid_thw, video_grid_thw);
-        }
-
-        int max_pos = -1;
-        for (const auto& row : state_out.position_ids) {
-            for (int v : row) max_pos = std::max(max_pos, v);
-        }
-        if (max_pos >= 0) state_out.decode_start = max_pos + 1;
-    }
+    // Optional: mRoPE (Qwen-VL). PaddleOCR-VL axmodels are exported with sequential
+    // position ids, matching python/infer_axmodel.py. Delegated to the per-VLM adapter:
+    // base = no-op (sequential); Qwen2_5VL/Qwen3VL override. Qwen3Omni stays sequential.
+    VisionParams vp;
+    vp.temporal_patch_size = temporal_patch_size_;
+    vp.tokens_per_second = tokens_per_second_;
+    vp.spatial_merge_size = spatial_merge_size_;
+    vp.patch_size = patch_size_;
+    vp.width = vision_width_;
+    vp.height = vision_height_;
+    vp.fps = fps_;
+    vp.image_pad_id = image_pad_id_;
+    vp.video_pad_id = video_pad_id_;
+    vp.vision_start_id = vision_start_id_;
+    adapter_->computePositionIds(input_ids_out, image_grid_thw, video_grid_thw, vp, state_out);
 
     return true;
 }

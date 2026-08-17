@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -163,6 +164,14 @@ public:
     int GetKVCache(std::vector<std::vector<unsigned short>> &k,
                    std::vector<std::vector<unsigned short>> &v,
                    int &pre_len);
+
+    // Diagnostic: FNV-1a hash of the ACTIVE decode-group KV content (K/V
+    // tensors, precompute_len portion) -- for golden regression of the KV/slot
+    // subsystem (GetKVCache reports only precompute_len, not content).
+    uint64_t HashActiveKV();
+    // Diagnostic: FNV-1a of the last Prepare()'s vision encoder output
+    // (RunState.vision_embed) -- golden fingerprint for VLM image preprocessing.
+    uint64_t HashLastVisionEmbed();
 
     int SetKVCache(std::vector<std::vector<unsigned short>> &k,
                    std::vector<std::vector<unsigned short>> &v,

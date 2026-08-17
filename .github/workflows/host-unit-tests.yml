@@ -1,0 +1,54 @@
+name: host-unit-tests
+
+# Pure-logic unit tests for the decoupling refactor: KV-slot selection policy and the
+# vision encoder geometry / token-count inference. These exercise only pure functions,
+# so they run on GitHub-hosted x86 runners with NO NPU / board and catch logic
+# regressions in the extracted code without any hardware.
+#
+# NOTE: the full byte-identical golden net (golden_runner running real VLM/LLM models)
+# is hardware-in-the-loop -- it needs an AX650 / AXCL board and is run pre-merge on a
+# self-hosted setup, not here.
+
+on:
+  push:
+    paths:
+      - 'src/runner/vision/vision_infer.hpp'
+      - 'src/runner/KvSlotSelect.hpp'
+      - 'src/runner/KvSlotTypes.hpp'
+      - 'tools/vision_infer_test.cpp'
+      - 'tools/kv_slot_select_test.cpp'
+      - '.github/workflows/host-unit-tests.yml'
+  pull_request:
+    paths:
+      - 'src/runner/vision/vision_infer.hpp'
+      - 'src/runner/KvSlotSelect.hpp'
+      - 'src/runner/KvSlotTypes.hpp'
+      - 'tools/vision_infer_test.cpp'
+      - 'tools/kv_slot_select_test.cpp'
+      - '.github/workflows/host-unit-tests.yml'
+  workflow_dispatch: {}
+
+jobs:
+  pure-logic-tests:
+    name: Pure-logic unit tests (no NPU)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: vision_infer_test (encoder geometry / token inference)
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -I src/runner/vision \
+            tools/vision_infer_test.cpp -o /tmp/vision_infer_test
+          /tmp/vision_infer_test
+
+      - name: kv_slot_select_test (KV-slot selection policy)
+        run: |
+          TOK_INC="$(dirname "$(find third_party/tokenizer.axera -name BaseTokenizer.hpp | head -1)")"
+          echo "tokenizer include dir: ${TOK_INC:-<not found>}"
+          test -n "$TOK_INC"
+          g++ -std=c++17 -O2 -Wall -I src -I "$TOK_INC" \
+            tools/kv_slot_select_test.cpp -o /tmp/kv_slot_select_test
+          /tmp/kv_slot_select_test
