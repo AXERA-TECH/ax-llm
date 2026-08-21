@@ -87,6 +87,9 @@ public:
               bool video_do_sample_frames,
               const std::string& audio_encoder_axmodel_5s,
               const std::string& audio_encoder_axmodel_30s,
+              float audio_tokens_per_second,
+              int audio_time_marker_every_seconds,
+              bool audio_time_markers_enabled,
               std::string& err);
 
     void Deinit();
@@ -121,6 +124,11 @@ private:
     int tokens_per_second_ = 1;
     int video_num_frames_ = 0;
     bool video_do_sample_frames_ = true;
+
+    float audio_tokens_per_second_ = 12.5f;
+    int audio_time_marker_every_seconds_ = 5;
+    bool audio_time_markers_enabled_ = true;
+    std::vector<int> moss_digit_ids_;
 
     int deepstack_layers_ = 0;
 

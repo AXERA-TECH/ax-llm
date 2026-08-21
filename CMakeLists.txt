@@ -362,4 +362,11 @@ target_include_directories(vision_preprocess_test PRIVATE src/runner/utils)
 target_link_libraries(vision_preprocess_test ${AXLLM_VISION_LIBS})
 install(TARGETS vision_preprocess_test DESTINATION bin)
 
+# Host-runnable MOSS audio frontend/span regression test (no HW required).
+add_executable(moss_audio_test tools/moss_audio_test.cpp
+    src/runner/utils/audio_processor.cpp)
+target_include_directories(moss_audio_test PRIVATE src/runner/utils)
+target_link_libraries(moss_audio_test ${CMAKE_DL_LIBS})
+install(TARGETS moss_audio_test DESTINATION bin)
+
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)

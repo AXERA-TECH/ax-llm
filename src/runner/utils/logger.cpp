@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -28,6 +29,7 @@ std::atomic<int> g_color_mode{static_cast<int>(ColorMode::Auto)};
 std::atomic<int> g_stdout_sticky_color{-1};
 std::mutex g_write_mutex;
 std::once_flag g_init_once;
+FILE *g_log_file = nullptr;
 
 struct InplaceLineState {
     bool active = false;
@@ -160,6 +162,26 @@ static void init_from_env()
         if (GetConsoleScreenBufferInfo(ws.stderr_handle, &info)) ws.stderr_default_attr = info.wAttributes;
     }
 #endif
+
+    const auto log_file = getenv_sv("AXLLM_LOG_FILE");
+    if (!log_file.empty())
+    {
+        std::error_code ec;
+        const std::filesystem::path log_path{std::string(log_file)};
+        if (log_path.has_parent_path())
+        {
+            std::filesystem::create_directories(log_path.parent_path(), ec);
+        }
+        g_log_file = std::fopen(std::string(log_file).c_str(), "a");
+        if (g_log_file)
+        {
+            std::setvbuf(g_log_file, nullptr, _IOLBF, 0);
+        }
+        else
+        {
+            std::fprintf(stderr, "AXLLM_LOG_FILE open failed: %.*s\n", (int)log_file.size(), log_file.data());
+        }
+    }
 }
 
 static inline void ensure_initialized()
@@ -495,10 +517,15 @@ void Logger::log(LogLevel lvl, const char * /*file*/, int line, const char *func
                                              ? std::string_view(msg).substr(start)
                                              : std::string_view(msg).substr(start, pos - start);
         write_log_line(stream, lvl, ts, func, line, line_sv, use_color);
+        if (g_log_file)
+        {
+            write_log_line(g_log_file, lvl, ts, func, line, line_sv, false);
+        }
         if (pos == std::string::npos) break;
         start = pos + 1;
     }
     std::fflush(stream);
+    if (g_log_file) std::fflush(g_log_file);
 }
 
 void Logger::logf(LogLevel level, const char *file, int line, const char *func, const char *fmt, ...)

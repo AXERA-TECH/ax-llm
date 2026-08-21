@@ -94,9 +94,12 @@
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `vlm_type`(别名 `VLM_TYPE`) | `None` | `Qwen2_5VL`/`Qwen3VL`/`InternVL3`/`FastVLM`/`SmolVLM2`/`PaddleOCRVL`/`Gemma4VL`/`MiniCPMV46VL` |
+| `vlm_type`(别名 `VLM_TYPE`) | `None` | `Qwen2_5VL`/`Qwen3VL`/`InternVL3`/`FastVLM`/`SmolVLM2`/`PaddleOCRVL`/`Gemma4VL`/`MiniCPMV46VL`/`Qwen3Omni`/`LocateAnythingVL`/`MossTranscribeDiarizeVL` |
 | `filename_image_encoder_axmodel` | — | 视觉编码器 axmodel(VLM 必填) |
 | `filename_audio_encoder_axmodel_5s` / `_30s` | — | Gemma4 音频编码器(ASR) |
+| `audio_tokens_per_second` | `12.5` | MOSS-Transcribe-Diarize 音频占位符的时间密度 |
+| `audio_time_marker_every_seconds` | `5` | MOSS-Transcribe-Diarize 数字时间锚点间隔(秒) |
+| `audio_time_markers_enabled` | `true` | 是否在 MOSS-Transcribe-Diarize 音频 span 中插入数字时间锚点 |
 | `vision_cache_dir` | 空 | 视觉 embedding 磁盘缓存目录 |
 | `vision_width` / `vision_height` | 448 | 视觉输入尺寸(未配置时按编码器输入形状自动推断) |
 | `vision_patch_size` / `vision_temporal_patch_size` / `vision_spatial_merge_size` | 14 / 2 / 2 | patchify 参数 |

@@ -40,6 +40,7 @@ static std::vector<std::string> required_tokenizers()
         "MiniCPMV46",
         "MiniCPMV46VL",
         "MiniCPM5",
+        "MossTranscribeDiarize",
     };
 }
 

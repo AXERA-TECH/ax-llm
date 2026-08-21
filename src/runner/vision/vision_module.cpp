@@ -1253,6 +1253,10 @@ void VisionModule::Deinit()
     video_pad_id_ = -1;
     audio_pad_id_ = -1;
     vision_start_id_ = -1;
+    audio_tokens_per_second_ = 12.5f;
+    audio_time_marker_every_seconds_ = 5;
+    audio_time_markers_enabled_ = true;
+    moss_digit_ids_.clear();
     image_cache_.clear();
     image_cache_lru_.clear();
     image_cache_lru_pos_.clear();
@@ -1276,6 +1280,9 @@ bool VisionModule::Init(VLMType type,
                         bool video_do_sample_frames,
                         const std::string& audio_encoder_axmodel_5s,
                         const std::string& audio_encoder_axmodel_30s,
+                        float audio_tokens_per_second,
+                        int audio_time_marker_every_seconds,
+                        bool audio_time_markers_enabled,
                         std::string& err)
 {
     Deinit();
@@ -1311,6 +1318,50 @@ bool VisionModule::Init(VLMType type,
     tokens_per_second_ = tokens_per_second;
     video_num_frames_ = video_num_frames;
     video_do_sample_frames_ = video_do_sample_frames;
+
+    audio_tokens_per_second_ = audio_tokens_per_second;
+    audio_time_marker_every_seconds_ = audio_time_marker_every_seconds;
+    audio_time_markers_enabled_ = audio_time_markers_enabled;
+
+    // MOSS-Transcribe-Diarize is audio-only. It does not use the generic image
+    // encoder or any image/video size inference; its only media encoder is the
+    // 30-second Whisper-VQ adaptor.
+    if (type_ == VLMType::MossTranscribeDiarizeVL) {
+        if (!audio_encoder_axmodel_30s.empty() && is_file(audio_encoder_axmodel_30s)) {
+            if (!init_whisper_audio_profile(impl_->audio_30s, audio_encoder_axmodel_30s, devid,
+                                            tokens_embed_size_, err)) {
+                return false;
+            }
+        }
+        if (!impl_->audio_30s.encoder_inited) {
+            err = "MossTranscribeDiarizeVL audio encoder is not configured or missing";
+            return false;
+        }
+        if (!get_single_token_id(tokenizer_, "<|audio_pad|>", audio_pad_id_, err)) return false;
+
+        moss_digit_ids_.clear();
+        moss_digit_ids_.reserve(10);
+        for (int digit = 0; digit <= 9; ++digit) {
+            const std::string text(1, (char)('0' + digit));
+            std::vector<int> ids = tokenizer_->encode(text);
+            if (ids.size() != 1) {
+                err = "MOSS digit '" + text + "' must be a single token, got " +
+                      std::to_string(ids.size());
+                return false;
+            }
+            moss_digit_ids_.push_back(ids[0]);
+        }
+
+        enabled_ = true;
+        ALOGI("VisionModule init ok: type=%s, audio_pad=%d, audio_tokens_per_second=%.4f, "
+              "time_marker_every_seconds=%d, time_markers=%d",
+              std::string(VLMTypeName(type_)).c_str(),
+              audio_pad_id_,
+              (double)audio_tokens_per_second_,
+              audio_time_marker_every_seconds_,
+              audio_time_markers_enabled_ ? 1 : 0);
+        return true;
+    }
 
     // Load encoder axmodel (all supported VLM types in this repo need it).
     if (encoder_axmodel.empty()) {
@@ -2054,7 +2105,12 @@ bool VisionModule::EncodeForContent(const Content& content,
                                     std::vector<std::vector<int>>& out_video_grid_thw,
                                     std::string& err)
 {
-    if (!enabled_ || !impl_ || !impl_->encoder_inited) { err = "vision module not initialized"; return false; }
+    if (!enabled_ || !impl_) { err = "vision module not initialized"; return false; }
+    if (!impl_->encoder_inited &&
+        !(type_ == VLMType::MossTranscribeDiarizeVL && impl_->audio_30s.encoder_inited)) {
+        err = "vision module encoder not initialized";
+        return false;
+    }
     if (content.type != IMAGE && content.type != VIDEO && content.type != AUDIO) { err = "content is not image/video/audio"; return false; }
     if (media.uris.empty()) { err = "media.uris empty"; return false; }
 
@@ -2064,9 +2120,66 @@ bool VisionModule::EncodeForContent(const Content& content,
     out_num_media_for_tokenizer = 0;
     out_num_media_tokens = 0;
 
-    const int devid = impl_->encoder.get_devid();
+    const int devid = type_ == VLMType::MossTranscribeDiarizeVL
+                          ? impl_->audio_30s.encoder.get_devid()
+                          : impl_->encoder.get_devid();
 
     if (content.type == AUDIO) {
+        if (type_ == VLMType::MossTranscribeDiarizeVL) {
+            if (media.uris.size() != 1) {
+                err = "MossTranscribeDiarizeVL audio expects exactly 1 audio file per message";
+                return false;
+            }
+            if (!impl_->audio_30s.encoder_inited) {
+                err = "MossTranscribeDiarizeVL audio encoder is not initialized";
+                return false;
+            }
+
+            std::vector<audio::MossAudioChunk> chunks;
+            if (!audio::LoadMossAudioInputChunks(media.uris[0],
+                                                 impl_->audio_30s.whisper_profile,
+                                                 chunks,
+                                                 err)) {
+                return false;
+            }
+
+            int total_audio_tokens = 0;
+            for (const auto& chunk : chunks) {
+                if (chunk.input_features.empty() || chunk.num_tokens <= 0) {
+                    err = "MossTranscribeDiarizeVL produced an empty audio chunk";
+                    return false;
+                }
+
+                std::vector<unsigned short> emb;
+                if (!encode_block_fp32(impl_->audio_30s.encoder,
+                                       impl_->audio_30s.encoder.get_devid(),
+                                       impl_->audio_30s.encoder_output_is_bf16,
+                                       chunk.input_features,
+                                       emb,
+                                       err)) {
+                    return false;
+                }
+
+                const int keep_elems = chunk.num_tokens * tokens_embed_size_;
+                if (keep_elems <= 0 || (int)emb.size() < keep_elems) {
+                    err = "MossTranscribeDiarizeVL audio output is shorter than its valid token count";
+                    return false;
+                }
+                emb.resize((size_t)keep_elems);
+                out_blocks.push_back(std::move(emb));
+                total_audio_tokens += chunk.num_tokens;
+            }
+
+            // Keep the tokenizer placeholder at exactly one `<|audio_pad|>`.
+            // `Prepare` expands it to the full padded/time-anchor span after
+            // all audio chunks have been encoded.
+            out_num_media_for_tokenizer = 1;
+            out_num_media_tokens = 1;
+            ALOGI("MossTranscribeDiarizeVL audio encoded: chunks=%zu valid_audio_tokens=%d",
+                  chunks.size(),
+                  total_audio_tokens);
+            return true;
+        }
         if (type_ == VLMType::Gemma4VL) {
             if (media.uris.size() != 1) {
                 err = "Gemma4 audio expects exactly 1 audio file per message";
@@ -2948,6 +3061,75 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
     if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
         ALOGI("Prepare tokenizer encode done: tokens=%zu", input_ids_out.size());
     }
+
+    // MOSS tokenization intentionally produces one `<|audio_pad|>` while the
+    // encoder has already produced N audio embeddings. Expand that single
+    // placeholder into N pad tokens with numeric time anchors, then let the
+    // normal injection logic replace every pad position in order.
+    if (type_ == VLMType::MossTranscribeDiarizeVL) {
+        size_t total_elems = 0;
+        for (const auto& block : all_blocks) total_elems += block.size();
+        if (total_elems == 0 || (total_elems % (size_t)tokens_embed_size_) != 0) {
+            err = "MOSS audio blocks total size is not divisible by tokens_embed_size";
+            return false;
+        }
+        const int total_audio_tokens = (int)(total_elems / (size_t)tokens_embed_size_);
+        if (total_audio_tokens <= 0) {
+            err = "MOSS audio produced no valid tokens";
+            return false;
+        }
+
+        std::vector<int> placeholder_positions;
+        for (size_t i = 0; i < input_ids_out.size(); ++i) {
+            if (input_ids_out[i] == audio_pad_id_) placeholder_positions.push_back((int)i);
+        }
+        if (placeholder_positions.size() != 1) {
+            err = "MOSS prompt must contain exactly one audio placeholder, got " +
+                  std::to_string(placeholder_positions.size());
+            return false;
+        }
+
+        std::vector<int> span;
+        if (!audio::BuildMossAudioSpan(audio_pad_id_,
+                                       total_audio_tokens,
+                                       moss_digit_ids_,
+                                       audio_tokens_per_second_,
+                                       audio_time_marker_every_seconds_,
+                                       audio_time_markers_enabled_,
+                                       span,
+                                       err)) {
+            return false;
+        }
+
+        int span_pad_count = 0;
+        for (const int id : span) {
+            if (id == audio_pad_id_) ++span_pad_count;
+        }
+        if (span_pad_count != total_audio_tokens) {
+            err = "MOSS audio span pad count mismatch: span_pads=" +
+                  std::to_string(span_pad_count) +
+                  " embeddings=" + std::to_string(total_audio_tokens);
+            return false;
+        }
+
+        const int placeholder_pos = placeholder_positions[0];
+        std::vector<int> expanded_ids;
+        expanded_ids.reserve(input_ids_out.size() - 1 + span.size());
+        expanded_ids.insert(expanded_ids.end(),
+                            input_ids_out.begin(),
+                            input_ids_out.begin() + placeholder_pos);
+        expanded_ids.insert(expanded_ids.end(), span.begin(), span.end());
+        expanded_ids.insert(expanded_ids.end(),
+                            input_ids_out.begin() + placeholder_pos + 1,
+                            input_ids_out.end());
+        input_ids_out = std::move(expanded_ids);
+
+        ALOGI("MOSS audio placeholder expanded: audio_pads=%d span_tokens=%zu total_prompt_tokens=%zu",
+              total_audio_tokens,
+              span.size(),
+              input_ids_out.size());
+    }
+
     if (!BuildInjectionState(input_ids_out, all_blocks, all_deepstack, state_out, err)) return false;
 
     // Optional: mRoPE (Qwen-VL). PaddleOCR-VL axmodels are exported with
