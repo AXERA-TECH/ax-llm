@@ -24,6 +24,8 @@ void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
 int LLM::GetLastPromptTokenNum() const { return impl_->get_last_prompt_token_num(); }
 int LLM::GetLastCompletionTokenNum() const { return impl_->get_last_completion_token_num(); }
+float LLM::GetLastTtftMs() const { return impl_->get_last_ttft_ms(); }
+float LLM::GetLastDecodeTps() const { return impl_->get_last_decode_tps(); }
 
 bool LLM::Embed(const std::string &text, std::vector<float> &out_embedding) { return impl_->EmbedText(text, out_embedding); }
 bool LLM::Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding) { return impl_->EmbedHistory(history, media_inputs, out_embedding); }

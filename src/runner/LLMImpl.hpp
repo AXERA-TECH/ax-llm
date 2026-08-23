@@ -237,6 +237,12 @@ struct LLM::Impl : public IKvSlotHost {
     int last_run_prompt_token_num_ = 0;
     int get_last_prompt_token_num() const { return last_run_prompt_token_num_; }
     int get_last_completion_token_num() const { return (int)last_run_generated_token_ids.size(); }
+    // Performance metrics for the most recent run. -1 means "not measured this
+    // run"; consumers (OpenAI usage object) treat a negative/zero value as unset.
+    float last_run_ttft_ms_ = -1.0f;
+    float last_run_decode_tps_ = -1.0f;
+    float get_last_ttft_ms() const { return last_run_ttft_ms_; }
+    float get_last_decode_tps() const { return last_run_decode_tps_; }
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     std::vector<LinearStateSnapshot> linear_state_snapshots_;
     int precompute_len = 0;
