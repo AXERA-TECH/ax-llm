@@ -241,8 +241,12 @@ struct LLM::Impl : public IKvSlotHost {
     // run"; consumers (OpenAI usage object) treat a negative/zero value as unset.
     float last_run_ttft_ms_ = -1.0f;
     float last_run_decode_tps_ = -1.0f;
+    float last_run_prefill_tps_ = -1.0f;
+    int last_run_prefill_tokens_ = -1;
     float get_last_ttft_ms() const { return last_run_ttft_ms_; }
     float get_last_decode_tps() const { return last_run_decode_tps_; }
+    float get_last_prefill_tps() const { return last_run_prefill_tps_; }
+    int get_last_prefill_tokens() const { return last_run_prefill_tokens_; }
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     std::vector<LinearStateSnapshot> linear_state_snapshots_;
     int precompute_len = 0;
