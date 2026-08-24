@@ -2641,6 +2641,8 @@ int run_server_mode(const ModelConfig &config, int port)
                         final_chunk.usage.total_tokens = final_chunk.usage.prompt_tokens + final_chunk.usage.completion_tokens;
                         final_chunk.usage.ttft_ms = llm.GetLastTtftMs();
                         final_chunk.usage.decode_tps = llm.GetLastDecodeTps();
+                        final_chunk.usage.prefill_tps = llm.GetLastPrefillTps();
+                        final_chunk.usage.prefill_tokens = llm.GetLastPrefillTokens();
                         provider->push(final_chunk);
                     }
                 } else {
@@ -2675,6 +2677,8 @@ int run_server_mode(const ModelConfig &config, int port)
                     chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
                     chunk.usage.ttft_ms = llm.GetLastTtftMs();
                     chunk.usage.decode_tps = llm.GetLastDecodeTps();
+                    chunk.usage.prefill_tps = llm.GetLastPrefillTps();
+                    chunk.usage.prefill_tokens = llm.GetLastPrefillTokens();
                     fprintf(stdout, "%s", final_text.c_str());
                     fflush(stdout);
                     provider->push(chunk);

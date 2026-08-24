@@ -260,6 +260,8 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     // Reset per-run performance metrics; assigned once measured below.
     last_run_ttft_ms_ = -1.0f;
     last_run_decode_tps_ = -1.0f;
+    last_run_prefill_tps_ = -1.0f;
+    last_run_prefill_tokens_ = -1;
 
     std::vector<int> prefill_grp_list;
     const int default_prefill_gid = prefill_grpids_.empty() ? 1 : prefill_grpids_.front();
@@ -666,6 +668,13 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         // Store the same value reported by the "ttft:" log line above so the
         // OpenAI usage object matches on-device measurements.
         last_run_ttft_ms_ = (ttft_e2e_ms >= 0.0f) ? ttft_e2e_ms : ttft_text_ms;
+        // Prefill throughput: prompt tokens processed this run over the time to
+        // produce the first token (ttft_text_ms ~= prefill compute time, since the
+        // first token comes straight out of the last prefill forward pass).
+        if (ttft_text_ms > 0.0f && input_embed_num > 0)
+            last_run_prefill_tps_ = (float)input_embed_num / (ttft_text_ms / 1000.0f);
+        // Tokens actually prefilled this turn (prompt minus KV-cache-reused prefix).
+        last_run_prefill_tokens_ = input_embed_num;
         if (debug_prefill) ALOGI("first decode token: id=%d", next_token);
         if (next_token < 0 || next_token >= _attr.tokens_embed_num)
         {
