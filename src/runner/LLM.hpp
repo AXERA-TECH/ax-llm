@@ -151,6 +151,9 @@ public:
     std::string GetLastError() const;
     int GetLastPromptTokenNum() const;
     int GetLastCompletionTokenNum() const;
+    // Performance metrics from the most recent Run (negative/zero = not measured).
+    float GetLastTtftMs() const;
+    float GetLastDecodeTps() const;
 
     bool Embed(const std::string &text, std::vector<float> &out_embedding);
     bool Embed(const std::vector<Content> &history, const std::vector<MediaInputs> &media_inputs, std::vector<float> &out_embedding);

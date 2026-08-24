@@ -257,6 +257,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
     timer t_cost, ttft_timer, decode_timer; ttft_timer.start();
     bool decode_timer_started = false;
+    // Reset per-run performance metrics; assigned once measured below.
+    last_run_ttft_ms_ = -1.0f;
+    last_run_decode_tps_ = -1.0f;
 
     std::vector<int> prefill_grp_list;
     const int default_prefill_gid = prefill_grpids_.empty() ? 1 : prefill_grpids_.front();
@@ -660,6 +663,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         {
             ALOGI("ttft: %.2f ms", ttft_text_ms);
         }
+        // Store the same value reported by the "ttft:" log line above so the
+        // OpenAI usage object matches on-device measurements.
+        last_run_ttft_ms_ = (ttft_e2e_ms >= 0.0f) ? ttft_e2e_ms : ttft_text_ms;
         if (debug_prefill) ALOGI("first decode token: id=%d", next_token);
         if (next_token < 0 || next_token >= _attr.tokens_embed_num)
         {
@@ -1042,6 +1048,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         if (decode_tokens > 0 && decode_ms > 0.0f)
             avg_decode_tps = decode_tokens / (decode_ms / 1000.0f);
     }
+    last_run_decode_tps_ = avg_decode_tps;
     if (decode_profile_enabled)
     {
         const int decode_tokens = std::max(0, (int)token_ids.size() - 1);
