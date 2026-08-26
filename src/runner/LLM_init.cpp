@@ -882,6 +882,9 @@ bool LLM::Impl::Init(LLMAttrType attr)
                           _attr.vision_do_sample_frames,
                           _attr.filename_audio_encoder_axmodel_5s,
                           _attr.filename_audio_encoder_axmodel_30s,
+                          _attr.audio_tokens_per_second,
+                          _attr.audio_time_marker_every_seconds,
+                          _attr.audio_time_markers_enabled,
                           verr))
         {
             ALOGE("vision.Init(vlm_type=%s/%d) failed: %s",
@@ -921,4 +924,3 @@ void LLM::Impl::Deinit()
     for (auto &devid : _attr.dev_ids) axcl_Exit(devid);
 #endif
 }
-

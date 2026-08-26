@@ -619,6 +619,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
 
     int next_token = -1; t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
     bool b_hit_eos = false;
+    bool b_hit_output_max_token = false;
+    bool b_hit_context_limit = false;
+    bool b_hit_stop_requested = false;
     if (use_per_layer_input)
         gemma4_per_layer_helper.reset_decode_stats(decode_profile_enabled);
     int last_shared_sync_decode_grpid = -1;
@@ -688,17 +691,22 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             }
             if (output_max_token > 0 && (int)token_ids.size() >= output_max_token)
             {
+                b_hit_output_max_token = true;
                 b_hit_eos = true;
             }
         }
     }
 
     t_cost.start();
+    unsigned int last_decode_pos = decode_start;
+    unsigned int last_kv_slot = dense_decode_start;
     for (unsigned int decode_pos = decode_start, kv_slot = dense_decode_start;
          !b_hit_eos && decode_pos < (unsigned int)_attr.max_token_len && kv_slot < (unsigned int)_attr.max_token_len;
          ++decode_pos, ++kv_slot)
     {
-        if (b_stop.load(std::memory_order_relaxed)) break;
+        last_decode_pos = decode_pos;
+        last_kv_slot = kv_slot;
+        if (b_stop.load(std::memory_order_relaxed)) { b_hit_stop_requested = true; break; }
         bool need_full_shared_sync = false;
         {
             const int want_gid = choose_decode_gid((int)kv_slot + 1);
@@ -1008,8 +1016,16 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (hide_channel_markup) str = channel_filter.filter(str);
             emit_stream_chunk(str, tps);
         }
-        if (output_max_token > 0 && (int)token_ids.size() >= output_max_token) { b_hit_eos = true; break; }
+        if (output_max_token > 0 && (int)token_ids.size() >= output_max_token) { b_hit_output_max_token = true; b_hit_eos = true; break; }
         if (_attr.runing_callback == nullptr) update_cqdm(&cqdm, kv_slot, "token", "");
+    }
+    if (!b_hit_eos && !b_hit_stop_requested &&
+        (decode_start >= (unsigned int)_attr.max_token_len ||
+         dense_decode_start >= (unsigned int)_attr.max_token_len ||
+         last_decode_pos + 1 >= (unsigned int)_attr.max_token_len ||
+         last_kv_slot + 1 >= (unsigned int)_attr.max_token_len))
+    {
+        b_hit_context_limit = true;
     }
 
     const int generated_token_count = (int)token_ids.size();
@@ -1065,7 +1081,22 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             }
         }
     }
-    ALOGN("hit eos,decode avg %.2f token/s\n", avg_decode_tps);
+    const char *stop_reason = "unknown";
+    if (b_hit_output_max_token) stop_reason = "output_max_token";
+    else if (b_hit_context_limit) stop_reason = "context_limit";
+    else if (b_hit_stop_requested) stop_reason = "stop_requested";
+    else if (b_hit_eos) stop_reason = "eos";
+    const int context_remaining = std::max(0, _attr.max_token_len - (int)(dense_decode_start + generated_token_count));
+    ALOGN("decode stop: reason=%s prompt_tokens=%d generated_tokens=%d output_max_token=%d max_token_len=%d dense_decode_start=%u decode_start=%u context_remaining=%d avg %.2f token/s\n",
+          stop_reason,
+          input_embed_num,
+          generated_token_count,
+          output_max_token,
+          _attr.max_token_len,
+          dense_decode_start,
+          decode_start,
+          context_remaining,
+          avg_decode_tps);
     if (generated_token_count >= 0)
     {
         precompute_len = dense_decode_start + generated_token_count;
@@ -1654,4 +1685,3 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
 
     return history;
 }
-

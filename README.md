@@ -33,6 +33,7 @@
 - FastVLM-1.5B-GPTQ-Int4
 - InternVL3_5-1B-GPTQ-INT4
 - PaddleOCR-VL-1.5
+- MOSS-Transcribe-Diarize-0.9B（音频转写 + 说话人分离）
 - ...
 
 ### 获取地址
@@ -206,6 +207,10 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 
 - `vlm_type`
 - `filename_image_encoder_axmodel`
+
+纯音频的 MOSS-Transcribe-Diarize-0.9B 使用 `vlm_type` 为
+`MossTranscribeDiarizeVL`、`tokenizer_type` 为 `MossTranscribeDiarize`，相关配置项见
+[docs/configuration.md](docs/configuration.md)。
 
 ### 动态加载（降低 CMM 占用）
 

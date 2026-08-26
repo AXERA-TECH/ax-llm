@@ -1,4 +1,4 @@
-// AudioEncoder: per-VLM audio encoders (Gemma4 dual 5s/30s, Qwen3Omni Whisper 30s).
+// AudioEncoder: per-VLM audio encoders (Gemma4 dual 5s/30s, Qwen3Omni/MOSS Whisper 30s).
 // Extracted verbatim from vision_module.cpp (the audio machinery does not belong in a
 // vision module). The multimodal injection (audio_pad placeholders) stays in VisionModule.
 #include "audio_encoder.hpp"
@@ -246,6 +246,7 @@ static bool encode_block_fp32(ax_runner_t& enc, int devid, int out_is_bf16,
 
 struct AudioEncoder::Impl {
     Kind kind = Kind::None;
+    int tokens_embed_size = 0;
     AudioEncoderRuntime audio_5s;
     AudioEncoderRuntime audio_30s;
     ~Impl() {
@@ -260,6 +261,7 @@ AudioEncoder::~AudioEncoder() = default;
 bool AudioEncoder::Init(Kind kind, const std::string& enc_5s, const std::string& enc_30s,
                         int devid, int tokens_embed_size, std::string& err) {
     impl_->kind = kind;
+    impl_->tokens_embed_size = tokens_embed_size;
     if (kind == Kind::Gemma4) {
         if (!enc_5s.empty() && is_file(enc_5s)) {
             if (!init_audio_profile(impl_->audio_5s, enc_5s, devid, tokens_embed_size, err)) return false;
@@ -270,11 +272,15 @@ bool AudioEncoder::Init(Kind kind, const std::string& enc_5s, const std::string&
         if (!impl_->audio_5s.encoder_inited && !impl_->audio_30s.encoder_inited) {
             ALOGW("Gemma4 audio encoders are not configured or missing; AUDIO inputs will be rejected.");
         }
-    } else if (kind == Kind::Whisper) {
+    } else if (kind == Kind::Whisper || kind == Kind::Moss) {
         if (!enc_30s.empty() && is_file(enc_30s)) {
             if (!init_whisper_audio_profile(impl_->audio_30s, enc_30s, devid, tokens_embed_size, err)) return false;
         }
         if (!impl_->audio_30s.encoder_inited) {
+            if (kind == Kind::Moss) {
+                err = "MossTranscribeDiarizeVL audio encoder is not configured or missing";
+                return false;
+            }
             ALOGW("Qwen3Omni audio encoder is not configured or missing; AUDIO inputs will be rejected.");
         }
     }
@@ -333,6 +339,71 @@ bool AudioEncoder::Encode(const std::vector<std::string>& uris,
     }
     err = "AUDIO not supported for this vlm_type";
     return false;
+}
+
+bool AudioEncoder::EncodeBlocks(const std::vector<std::string>& uris,
+                                std::vector<std::vector<unsigned short>>& out_blocks,
+                                int& out_num_media_for_tokenizer,
+                                int& out_num_media_tokens,
+                                std::string& err) {
+    out_blocks.clear();
+    out_num_media_for_tokenizer = 0;
+    out_num_media_tokens = 0;
+
+    if (impl_->kind != Kind::Moss) {
+        std::vector<unsigned short> block;
+        if (!Encode(uris, block, out_num_media_for_tokenizer, out_num_media_tokens, err)) return false;
+        out_blocks.push_back(std::move(block));
+        return true;
+    }
+
+    if (uris.size() != 1) {
+        err = "MossTranscribeDiarizeVL audio expects exactly 1 audio file per message";
+        return false;
+    }
+    if (!impl_->audio_30s.encoder_inited) {
+        err = "MossTranscribeDiarizeVL audio encoder is not initialized";
+        return false;
+    }
+
+    std::vector<audio::MossAudioChunk> chunks;
+    if (!audio::LoadMossAudioInputChunks(uris[0], impl_->audio_30s.whisper_profile, chunks, err)) {
+        return false;
+    }
+
+    int total_audio_tokens = 0;
+    for (const auto& chunk : chunks) {
+        if (chunk.input_features.empty() || chunk.num_tokens <= 0) {
+            err = "MossTranscribeDiarizeVL produced an empty audio chunk";
+            return false;
+        }
+
+        std::vector<unsigned short> emb;
+        if (!encode_block_fp32(impl_->audio_30s.encoder,
+                               impl_->audio_30s.encoder.get_devid(),
+                               impl_->audio_30s.encoder_output_is_bf16,
+                               chunk.input_features,
+                               emb,
+                               err)) {
+            return false;
+        }
+
+        const int keep_elems = chunk.num_tokens * impl_->tokens_embed_size;
+        if (keep_elems <= 0 || (int)emb.size() < keep_elems) {
+            err = "MossTranscribeDiarizeVL audio output is shorter than its valid token count";
+            return false;
+        }
+        emb.resize((size_t)keep_elems);
+        out_blocks.push_back(std::move(emb));
+        total_audio_tokens += chunk.num_tokens;
+    }
+
+    out_num_media_for_tokenizer = 1;
+    out_num_media_tokens = 1;
+    ALOGI("MossTranscribeDiarizeVL audio encoded: chunks=%zu valid_audio_tokens=%d",
+          chunks.size(),
+          total_audio_tokens);
+    return true;
 }
 
 } // namespace vision
