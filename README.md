@@ -9,8 +9,10 @@
 
 ### 已支持芯片
 
-- AX650A/AX650N
-  - SDK ≥ v3.6.2
+- AX650A/AX650N/AX8850N/AX8850
+  - SDK ≥ v3.16.0
+- AX637R/AX8190
+  - SDK ≥ v1.12.0
 - AX630C
   - SDK ≥ v3.0.0
 
@@ -21,6 +23,7 @@
 - Qwen3
 - MiniCPM
 - SmolLM2
+- Gemma4
 - Llama3
 - HY-MT1.5-1.8B
 - ...
