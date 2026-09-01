@@ -2474,14 +2474,19 @@ int run_server_mode(const ModelConfig &config, int port)
                     return;
                 }
 
-                const ThinkingMode request_thinking_mode = resolve_chat_thinking_mode(config, req);
-                if (request_thinking_mode != ThinkingMode::Unspecified && !llm.TokenizerSupportsThinkingToggle())
+                const ThinkingMode resolved_thinking_mode = resolve_chat_thinking_mode(config, req);
+                if (resolved_thinking_mode != ThinkingMode::Unspecified && !llm.TokenizerSupportsThinkingToggle())
                 {
                     static std::atomic<bool> warned_unsupported_thinking{false};
                     if (!warned_unsupported_thinking.exchange(true))
                         ALOGW("[thinking] this model's tokenizer does not honor thinking_mode/enable_thinking; request setting ignored "
                               "(currently supported: Qwen3 family, MiniCPM5)");
                 }
+                // 请求和 config 都没指定时, 对支持该开关的模型默认关闭推理输出。
+                const ThinkingMode request_thinking_mode =
+                    (resolved_thinking_mode == ThinkingMode::Unspecified && llm.TokenizerSupportsThinkingToggle())
+                        ? ThinkingMode::NoThink
+                        : resolved_thinking_mode;
 
                 ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f has_enable_thinking=%d thinking_mode=%s messages=%zu stop=%zu",
                       req.model.c_str(),

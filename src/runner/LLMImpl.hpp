@@ -1652,6 +1652,12 @@ struct LLM::Impl : public IKvSlotHost {
         const std::string key = key_of(_attr.tokenizer_type);
         if (key.find("minicpmv46") != std::string::npos)
             return "<think>\n\n</think>\n\n";
+        // 与 tokenizer 的 apply_chat_template 保持一致: 支持 thinking 开关的模板在
+        // NoThink 下也会预置空 think 块, 这条手写 suffix 回退路径必须同样处理,
+        // 否则同一会话里首轮和后续轮的生成提示会不一致。
+        if (tokenizer && tokenizer->supports_thinking_toggle() &&
+            tokenizer->get_generation_thinking_mode() == ThinkingMode::NoThink)
+            return "<think>\n\n</think>\n\n";
         return {};
     }
 

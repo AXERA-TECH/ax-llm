@@ -533,6 +533,11 @@ bool LLM::Impl::Init(LLMAttrType attr)
     if (!tokenizer) { ALOGE("create_tokenizer(%s) failed", this->_attr.tokenizer_type.c_str()); return false; }
     if (!tokenizer->load(attr.url_tokenizer_model)) { ALOGE("tokenizer.init(%s) failed", attr.url_tokenizer_model.c_str()); return false; }
     tokenizer->set_think_in_prompt(!tokenizer_uses_hidden_channel_markup(this->_attr.tokenizer_type));
+    // 未显式配置时, 对支持 thinking 开关的模型默认关闭推理输出: 板端 context 有限,
+    // 放开推理容易把 kv cache 耗尽而拿不到答案。不支持该开关的模型保持原有行为。
+    // 直接落到 _attr, 让每请求的 Set/ClearRequestThinkingMode 也以此为基准。
+    if (this->_attr.generation_thinking_mode == ThinkingMode::Unspecified && tokenizer->supports_thinking_toggle())
+        this->_attr.generation_thinking_mode = ThinkingMode::NoThink;
     tokenizer->set_generation_thinking_mode(this->_attr.generation_thinking_mode);
     if (this->_attr.generation_thinking_mode != ThinkingMode::Unspecified && !tokenizer->supports_thinking_toggle())
         ALOGW("[thinking] tokenizer_type='%s' does not honor thinking_mode/enable_thinking; the setting is ignored "
