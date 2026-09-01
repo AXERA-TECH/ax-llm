@@ -174,6 +174,9 @@ public:
     void ResetKVCache();
 
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1);
+    // The non-const overload updates media_inputs when video-history isolation
+    // remaps the current media turn's content index.
+    std::vector<Content> Run(std::vector<Content> history, std::vector<MediaInputs> &media_inputs, int output_max_token = -1);
     std::vector<Content> Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token = -1);
     std::string Run(std::vector<unsigned short> &embed, int output_max_token = -1);
 

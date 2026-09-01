@@ -23,6 +23,7 @@
 #include "LLMEmbedSelector.hpp"
 #include "LLMPostprocess.hpp"
 #include "Qwen3_5Runtime.hpp"
+#include "MediaHistory.hpp"
 #include "UTF8Filter.hpp"
 #include "cqdm.h"
 #include "timer.hpp"
@@ -528,61 +529,6 @@ struct LLM::Impl {
         const auto now = std::chrono::steady_clock::now();
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - request_start_time_).count();
         return static_cast<float>(us) / 1000.0f;
-    }
-
-    static bool request_has_video_media(const std::vector<Content> &history,
-                                        const std::vector<::MediaInputs> &media_inputs)
-    {
-        for (const auto &media : media_inputs)
-        {
-            if (media.content_index < history.size() && history[media.content_index].type == VIDEO)
-                return true;
-        }
-        return false;
-    }
-
-    static bool normalize_away_video_history(std::vector<Content> &history,
-                                             std::vector<::MediaInputs> &media_inputs)
-    {
-        if (history.empty()) return false;
-
-        size_t current_user_index = history.size();
-        for (size_t i = history.size(); i > 0; --i)
-        {
-            if (history[i - 1].role == USER)
-            {
-                current_user_index = i - 1;
-                break;
-            }
-        }
-        if (current_user_index >= history.size()) return false;
-
-        std::vector<Content> normalized;
-        normalized.reserve(history.size());
-        for (size_t i = 0; i < current_user_index; ++i)
-        {
-            if (history[i].role == SYSTEM)
-                normalized.push_back(history[i]);
-        }
-
-        const size_t new_user_index = normalized.size();
-        normalized.push_back(history[current_user_index]);
-
-        std::vector<::MediaInputs> normalized_media;
-        if (history[current_user_index].type == VIDEO)
-        {
-            for (auto it = media_inputs.rbegin(); it != media_inputs.rend(); ++it)
-            {
-                if (it->content_index == current_user_index && !it->uris.empty())
-                {
-                    normalized_media.push_back({new_user_index, it->uris});
-                    break;
-                }
-            }
-        }
-        media_inputs = std::move(normalized_media);
-        history = std::move(normalized);
-        return true;
     }
 
     void clear_last_error()
@@ -4830,12 +4776,16 @@ struct LLM::Impl {
         return Run(std::move(history), {}, output_max_token);
     }
 
-    std::vector<Content> Run(std::vector<Content> history, const std::vector<::MediaInputs> &media_inputs, int output_max_token = -1)
+    std::vector<Content> Run(std::vector<Content> history,
+                             const std::vector<::MediaInputs> &media_inputs,
+                             int output_max_token = -1,
+                             std::vector<::MediaInputs> *normalized_media_inputs = nullptr)
     {
         clear_last_error();
         has_vision_state = false;
         std::vector<::MediaInputs> effective_media_inputs = media_inputs;
         bool video_history_isolated = false;
+        bool cache_invalidated_after_generation = false;
 
         // Multi-slot prefix KV cache: pick the slot sharing the longest prefix with
         // this request; misses evict the LRU slot. Must run before the single-context
@@ -4864,11 +4814,13 @@ struct LLM::Impl {
             return history;
         }
 
-        if (request_has_video_media(history, effective_media_inputs))
+        // VIDEO_HISTORY_FIX: only isolate when the latest user turn submitted a
+        // new video; retained media belongs to the prior conversation.
+        if (axllm::media_history::current_request_has_video(history, effective_media_inputs))
         {
             const size_t old_history_size = history.size();
             const size_t old_media_size = effective_media_inputs.size();
-            if (normalize_away_video_history(history, effective_media_inputs))
+            if (axllm::media_history::isolate_current_video(history, effective_media_inputs))
             {
                 ALOGW("video history is isolated to current user turn: old_history=%zu new_history=%zu old_media_inputs=%zu new_media_inputs=%zu",
                       old_history_size,
@@ -5376,11 +5328,13 @@ struct LLM::Impl {
         last_tokens_ids.insert(last_tokens_ids.end(), tokens_diff.begin(), tokens_diff.end());
         last_tokens_ids.insert(last_tokens_ids.end(), last_run_generated_token_ids.begin(), last_run_generated_token_ids.end());
 
-        // The device state represents the raw generated token stream.  Qwen
-        // chat templates may normalize assistant text (for example by removing
+        // The device state represents the raw generated token stream. Qwen chat
+        // templates may normalize assistant text (for example by removing
         // hidden thinking sections), so re-encoding returned history can differ
-        // from that raw stream.  Never reuse a KV prefix when the two sequences
-        // disagree: keep the conversation, but force a full recompute next turn.
+        // from that raw stream. For VLM follow-ups, the raw stream is the
+        // authoritative prefix already consumed by the device; the cached-turn
+        // builder will append a freshly encoded user suffix to it. Text-only
+        // LLMs keep the conservative invalidation behavior below.
         const std::vector<int> canonical_history_tokens = tokenizer->encode(history);
         int cached_prefix_len = 0;
         (void)axllm::qwen3_5::Runtime::token_suffix(last_tokens_ids,
@@ -5389,18 +5343,38 @@ struct LLM::Impl {
         if (qwen3_5_runtime.has_linear_attention_layers() &&
             !last_tokens_ids.empty() && cached_prefix_len != static_cast<int>(last_tokens_ids.size()))
         {
-            ALOGW("history/token cache prefix mismatch after generation (history_tokens=%zu cache_tokens=%zu common=%d); invalidate KV reuse",
-                  canonical_history_tokens.size(),
-                  last_tokens_ids.size(),
-                  cached_prefix_len);
-            ResetKVCache();
+            const bool preserve_vlm_raw_cache = vision && vision->enabled() && !video_history_isolated;
+            if (preserve_vlm_raw_cache)
+            {
+                ALOGW("history/token cache prefix mismatch after generation (history_tokens=%zu cache_tokens=%zu common=%d); preserve raw VLM token/KV prefix for follow-up",
+                      canonical_history_tokens.size(),
+                      last_tokens_ids.size(),
+                      cached_prefix_len);
+            }
+            else
+            {
+                ALOGW("history/token cache prefix mismatch after generation (history_tokens=%zu cache_tokens=%zu common=%d); invalidate KV reuse",
+                      canonical_history_tokens.size(),
+                      last_tokens_ids.size(),
+                      cached_prefix_len);
+                ResetKVCache();
+                last_tokens_ids.clear();
+                cache_invalidated_after_generation = true;
+            }
             last_history_snapshot = history;
-            last_tokens_ids.clear();
         }
         if (video_history_isolated)
         {
             ALOGW("drop KV cache after isolated video-history request");
             ResetKVCache();
+        }
+        else if (cache_invalidated_after_generation)
+        {
+            // ResetKVCache already cleared the device state. Do not call
+            // GetKVCache here: its mask-based fallback can infer the old
+            // length from a stale full-attention mask and recreate a bogus
+            // precompute_len for the next request.
+            ALOGI("skip KV cache snapshot after invalidation; next request will recompute");
         }
         else
         {
@@ -5422,6 +5396,12 @@ struct LLM::Impl {
         // request can match/continue it. Device KV already lives in the slot's
         // own buffer (zero copy).
         save_active_kv_slot();
+
+        // Keep the caller's session mapping aligned with normalized history.
+        // This matters after isolating a new video: subsequent text follow-ups
+        // still need the preserved video mapping at its new content index.
+        if (normalized_media_inputs)
+            *normalized_media_inputs = effective_media_inputs;
 
         return history;
     }
@@ -5460,5 +5440,6 @@ int LLM::SetKVCache(std::vector<std::vector<unsigned short>> &k, std::vector<std
 void LLM::ResetKVCache() { impl_->ResetKVCache(); }
 
 std::vector<Content> LLM::Run(std::vector<Content> history, int output_max_token) { return impl_->Run(std::move(history), output_max_token); }
+std::vector<Content> LLM::Run(std::vector<Content> history, std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token, &media_inputs); }
 std::vector<Content> LLM::Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token); }
 std::string LLM::Run(std::vector<unsigned short> &embed, int output_max_token) { return impl_->Run(embed, output_max_token); }

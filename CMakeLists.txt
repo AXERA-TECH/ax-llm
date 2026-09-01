@@ -235,6 +235,7 @@ set(COMMON_SOURCES
     src/runner/utils/logger.cpp
     src/runner/utils/net_utils.cpp
     src/runner/LLM.cpp
+    src/runner/MediaHistory.cpp
     src/runner/Qwen3_5Runtime.cpp
     src/runner/image/sd15_image_generator.cpp
     src/runner/utils/files.cpp
@@ -369,5 +370,12 @@ add_executable(qwen3_5_runtime_test
     src/runner/Qwen3_5Runtime.cpp)
 target_include_directories(qwen3_5_runtime_test PRIVATE src/runner)
 install(TARGETS qwen3_5_runtime_test DESTINATION bin)
+
+# Pure multimodal history policy regression test; no NPU or model files.
+add_executable(media_history_test
+    tools/media_history_test.cpp
+    src/runner/MediaHistory.cpp)
+target_include_directories(media_history_test PRIVATE src/runner)
+install(TARGETS media_history_test DESTINATION bin)
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)
