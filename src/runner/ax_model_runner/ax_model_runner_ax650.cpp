@@ -731,38 +731,6 @@ int ax_runner_ax650::inference(int grpid)
         return -1;
     const bool force_runsync = std::getenv("AXLLM_AX650_FORCE_RUNSYNC") != nullptr;
 
-    if (std::getenv("AXLLM_DEBUG_LAYER0_IO"))
-    {
-        auto *info = m_handle->io_info[(size_t)grpid];
-        auto &io = m_handle->io_data[(size_t)grpid];
-        ALOGI("AX650 inference grpid=%d io_inputs=%u io_outputs=%u", grpid, io.nInputSize, io.nOutputSize);
-        if (info)
-        {
-            for (size_t i = 0; i < io.nInputSize && i < info->nInputSize; ++i)
-            {
-                const char *name = info->pInputs[i].pName ? info->pInputs[i].pName : "(null)";
-                ALOGI("AX650 io_in[%zu] name=%s phy=%p vir=%p data_bytes=%u info_bytes=%u",
-                      i,
-                      name,
-                      (void *)io.pInputs[i].phyAddr,
-                      io.pInputs[i].pVirAddr,
-                      io.pInputs[i].nSize,
-                      info->pInputs[i].nSize);
-            }
-            for (size_t i = 0; i < io.nOutputSize && i < info->nOutputSize; ++i)
-            {
-                const char *name = info->pOutputs[i].pName ? info->pOutputs[i].pName : "(null)";
-                ALOGI("AX650 io_out[%zu] name=%s phy=%p vir=%p data_bytes=%u info_bytes=%u",
-                      i,
-                      name,
-                      (void *)io.pOutputs[i].phyAddr,
-                      io.pOutputs[i].pVirAddr,
-                      io.pOutputs[i].nSize,
-                      info->pOutputs[i].nSize);
-            }
-        }
-    }
-
     if (_auto_sync_before_inference)
     {
         for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
@@ -803,13 +771,6 @@ int ax_runner_ax650::inference(int grpid)
         ALOGE("AX_ENGINE_Run%s failed: 0x%x", m_handle->io_data.size() == 1 ? "Sync" : "GroupIOSync", ret);
         return ret;
     }
-    else if (std::getenv("AXLLM_DEBUG_LAYER0_IO"))
-    {
-        ALOGI("AX_ENGINE_Run%s(grpid=%d) ok",
-              m_handle->io_data.size() == 1 ? "Sync" : "GroupIOSync",
-              grpid);
-    }
-
     if (_auto_sync_after_inference)
     {
         for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)

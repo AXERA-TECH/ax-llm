@@ -242,17 +242,11 @@ static std::vector<float> resample_via_libsamplerate(const std::vector<float>& w
         for (const char* candidate : candidates) {
             handle = axllm_dlopen(candidate);
             if (handle) {
-                if (std::getenv("AXLLM_DEBUG_AUDIO_RESAMPLE")) {
-                    std::fprintf(stderr, "audio resample: loaded libsamplerate from %s\n", candidate);
-                }
                 break;
             }
         }
         if (handle) {
             fn_src_simple = reinterpret_cast<src_simple_fn>(axllm_dlsym(handle, "src_simple"));
-        }
-        if (!fn_src_simple && std::getenv("AXLLM_DEBUG_AUDIO_RESAMPLE")) {
-            std::fprintf(stderr, "audio resample: libsamplerate unavailable, fallback to builtin sinc\n");
         }
     }
 
@@ -276,9 +270,6 @@ static std::vector<float> resample_via_libsamplerate(const std::vector<float>& w
     constexpr int SRC_SINC_BEST_QUALITY = 0;
     const int ret = fn_src_simple(&data, SRC_SINC_BEST_QUALITY, 1);
     if (ret != 0 || data.output_frames_gen <= 0) {
-        if (std::getenv("AXLLM_DEBUG_AUDIO_RESAMPLE")) {
-            std::fprintf(stderr, "audio resample: src_simple failed ret=%d, fallback to builtin sinc\n", ret);
-        }
         return {};
     }
 

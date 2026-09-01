@@ -786,10 +786,13 @@ static bool init_audio_profile(AudioEncoderRuntime& runtime,
     runtime.profile = profile;
     runtime.axmodel_path = axmodel_path;
 
-#ifdef USE_AXCL
+    // [GDN-DETERMINISM-FIX BEGIN]
+    // Vision/audio encoders are also run on native AX650.  Keep host/device
+    // buffers coherent there just as in the AXCL backend; without these
+    // flags, repeated multi-block video encoding can read stale output data.
     runtime.encoder.set_auto_sync_before_inference(true);
     runtime.encoder.set_auto_sync_after_inference(true);
-#endif
+    // [GDN-DETERMINISM-FIX END]
 
     const auto& out0 = runtime.encoder.get_output(0);
     int out_is_bf16 = -1;
@@ -839,10 +842,11 @@ static bool init_whisper_audio_profile(AudioEncoderRuntime& runtime,
     runtime.profile_kind = AudioEncoderRuntime::ProfileKind::Whisper;
     runtime.axmodel_path = axmodel_path;
 
-#ifdef USE_AXCL
+    // [GDN-DETERMINISM-FIX BEGIN] See the Gemma4 profile above: native AX650
+    // must invalidate encoder outputs before the host reads them.
     runtime.encoder.set_auto_sync_before_inference(true);
     runtime.encoder.set_auto_sync_after_inference(true);
-#endif
+    // [GDN-DETERMINISM-FIX END]
 
     const auto& in0 = runtime.encoder.get_input(0);
     if (in0.vShape.size() >= 3) {
@@ -1323,10 +1327,11 @@ bool VisionModule::Init(VLMType type,
     }
     impl_->encoder_inited = true;
 
-#ifdef USE_AXCL
+    // [GDN-DETERMINISM-FIX BEGIN]
+    // Enable cache maintenance for native AX650 vision encoder execution too.
     impl_->encoder.set_auto_sync_before_inference(true);
     impl_->encoder.set_auto_sync_after_inference(true);
-#endif
+    // [GDN-DETERMINISM-FIX END]
 
     const auto& in0 = impl_->encoder.get_input(0);
 
@@ -1740,18 +1745,6 @@ static bool encode_block_normalized_float(ax_runner_t& enc, int devid, int out_i
     for (size_t i = 0; i < expected_float_elems; ++i) {
         fp32[i] = (float)bytes[i] * scale + shift;
     }
-    if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_PATCH_HEAD")) {
-        std::string preview;
-        const size_t limit = std::min<size_t>(16, fp32.size());
-        for (size_t i = 0; i < limit; ++i) {
-            if (i) preview += ",";
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.6f", fp32[i]);
-            preview += buf;
-        }
-        ALOGI("normalized patch head[%zu]: %s", limit, preview.c_str());
-    }
-
     // Copy float32 data to encoder input; zero-pad tail if needed.
     if (expected_float_bytes == (size_t)in0.nSize) {
         if (in0.pVirAddr) {
@@ -2122,18 +2115,10 @@ bool VisionModule::EncodeForContent(const Content& content,
                 err = "Qwen3Omni audio encoder is not initialized";
                 return false;
             }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio begin: uri=%s", media.uris[0].c_str());
-            }
-
             std::vector<float> input_features;
             if (!audio::LoadWhisperAudioInputFeatures(media.uris[0], impl_->audio_30s.whisper_profile, input_features, nullptr, err)) {
                 return false;
             }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio features ready: elems=%zu", input_features.size());
-            }
-
             std::vector<unsigned short> emb;
             if (!encode_block_fp32(impl_->audio_30s.encoder,
                                    impl_->audio_30s.encoder.get_devid(),
@@ -2143,10 +2128,6 @@ bool VisionModule::EncodeForContent(const Content& content,
                                    err)) {
                 return false;
             }
-            if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-                ALOGI("Qwen3Omni audio encoder ready: bf16_elems=%zu", emb.size());
-            }
-
             out_num_media_for_tokenizer = 1;
             out_num_media_tokens = impl_->audio_30s.whisper_profile.num_audio_tokens;
             out_blocks.push_back(std::move(emb));
@@ -2936,18 +2917,7 @@ bool VisionModule::Prepare(const std::vector<Content>& history_in,
         video_grid_thw.insert(video_grid_thw.end(), vid_grid.begin(), vid_grid.end());
     }
 
-    if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-        for (size_t i = 0; i < history_out.size(); ++i) {
-            const auto& c = history_out[i];
-            ALOGI("Prepare history[%zu]: role=%d type=%d num_media=%d num_media_tokens=%d text_len=%zu",
-                  i, (int)c.role, (int)c.type, c.num_media, c.num_media_tokens, c.data.size());
-        }
-        ALOGI("Prepare tokenizer encode start: add_generation_prompt=%d", add_generation_prompt ? 1 : 0);
-    }
     input_ids_out = tokenizer_->encode(history_out, add_generation_prompt);
-    if (std::getenv("AXLLM_DEBUG_QWEN3OMNI_AUDIO")) {
-        ALOGI("Prepare tokenizer encode done: tokens=%zu", input_ids_out.size());
-    }
     if (!BuildInjectionState(input_ids_out, all_blocks, all_deepstack, state_out, err)) return false;
 
     // Optional: mRoPE (Qwen-VL). PaddleOCR-VL axmodels are exported with
