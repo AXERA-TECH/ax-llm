@@ -107,6 +107,12 @@ uninstall.bat
 ./build_axcl_aarch64.sh
 ```
 
+`build_ax650.sh` 默认禁用 OpenCV，使用内置 SimpleCV，避免交叉编译时误链接主机架构的 OpenCV。若已准备好可用于目标架构的 OpenCV，可覆盖该默认值：
+
+```shell
+AXLLM_CMAKE_ARGS="-DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=FALSE" ./build_ax650.sh
+```
+
 编译完成后，`build*/install/bin/` 目录下会生成 `axllm`（本分支已统一命名）。
 
 Windows 下编译 AXCL 后端时，请显式关闭 `BUILD_AX650`，并传入 `AXCL_DIR`：

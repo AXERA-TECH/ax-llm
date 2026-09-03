@@ -61,12 +61,13 @@ if [ ! -f "${BSP_MSP_DIR}/lib/libax_sys.so" ]; then
     exit 1
 fi
 
-# Optional extra CMake arguments (space-separated), e.g.:
-#   AXLLM_CMAKE_ARGS="-DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=TRUE"
-extra_cmake_args=()
+# OpenCV is disabled by default for AX650 cross builds. This avoids accidentally
+# finding/linking a host (x86) OpenCV installation. Additional arguments can be
+# supplied through AXLLM_CMAKE_ARGS; later values override this default.
+extra_cmake_args=(-DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=TRUE)
 if [ -n "${AXLLM_CMAKE_ARGS:-}" ]; then
     # shellcheck disable=SC2206
-    extra_cmake_args=(${AXLLM_CMAKE_ARGS})
+    extra_cmake_args+=( ${AXLLM_CMAKE_ARGS} )
 fi
 
 # 下载失败可以使用其他方式下载并放到在 $build_dir 目录，参考如下命令解压
