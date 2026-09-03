@@ -1103,6 +1103,11 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, int output_max
 std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vector<::MediaInputs> &media_inputs, int output_max_token)
 {
     clear_last_error();
+    // Diagnostic: `prepare` -- everything from request start until Run(out_embed) begins --
+    // dominates TTFT at long prompts (216 s of a 316 s TTFT at 6 k tokens), so time its
+    // stages. Enable with AXLLM_PROFILE_PREPARE=1.
+    const bool prepare_profile = std::getenv("AXLLM_PROFILE_PREPARE") != nullptr;
+    timer t_prep_all;
     has_vision_state = false;
     std::vector<::MediaInputs> effective_media_inputs = media_inputs;
     bool video_history_isolated = false;
@@ -1314,6 +1319,10 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
         new_tokens = tokenizer->encode(history);
     }
 
+    if (prepare_profile)
+    {
+        ALOGI("[prep] tokenize done: %.2f ms cumulative, %zu tokens", t_prep_all.cost(), new_tokens.size());
+    }
     last_run_prompt_token_num_ = (int)new_tokens.size();
     int offset = 0;
     auto tokens_diff = diff_token_ids(last_tokens_ids, new_tokens, offset);
@@ -1589,6 +1598,7 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
               precompute_len,
               tokens_diff.size());
     }
+    timer t_prep_embed;
     std::vector<unsigned short> out_embed(tokens_diff.size() * _attr.tokens_embed_size);
     for (size_t i = 0; i < tokens_diff.size(); i++)
     {
@@ -1605,6 +1615,10 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
             }
         }
         embed_selector.getByIndex(tokens_diff[i], out_embed.data() + i * _attr.tokens_embed_size);
+    }
+    if (prepare_profile)
+    {
+        ALOGI("[prep] embed build: %.2f ms for %zu tokens", t_prep_embed.cost(), tokens_diff.size());
     }
     if (std::getenv("AXLLM_DEBUG_EMBED_TOKEN_IDS"))
     {
@@ -1631,6 +1645,10 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
     }
     last_run_generated_token_ids.clear();
     run_input_token_ids = tokens_diff;
+    if (prepare_profile)
+    {
+        ALOGI("[prep] TOTAL prepare: %.2f ms before Run()", t_prep_all.cost());
+    }
     auto reply = Run(out_embed, output_max_token);
     run_input_token_ids.clear();
     if (!response_prefix.empty())
