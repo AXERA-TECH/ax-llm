@@ -274,7 +274,20 @@ static std::vector<float> resample_via_libsamplerate(const std::vector<float>& w
     data.src_ratio = ratio;
 
     constexpr int SRC_SINC_BEST_QUALITY = 0;
-    const int ret = fn_src_simple(&data, SRC_SINC_BEST_QUALITY, 1);
+    constexpr int SRC_SINC_MEDIUM_QUALITY = 1;
+    // SINC_BEST is pathologically slow for ratios like 44100:16000 (147:160):
+    // measured on AX650, a 30 s clip costs 52.4 s at BEST versus 2.1 s at MEDIUM
+    // and 5.6 s at BEST for an exact 3:1 ratio. That dominated time-to-first-token
+    // by two orders of magnitude over the audio encoder itself (184 ms). MEDIUM
+    // keeps a 97 dB SNR sinc filter at 90 % bandwidth and differs from BEST by
+    // ~1e-4 in the waveform, far below what the log-mel front end and the
+    // encoder's U16 activations can resolve.
+    int quality = SRC_SINC_MEDIUM_QUALITY;
+    if (const char* q = std::getenv("AXLLM_AUDIO_RESAMPLE_QUALITY"); q && *q) {
+        const int parsed = std::atoi(q);
+        if (parsed >= 0 && parsed <= 4) quality = parsed;
+    }
+    const int ret = fn_src_simple(&data, quality, 1);
     if (ret != 0 || data.output_frames_gen <= 0) {
         if (std::getenv("AXLLM_DEBUG_AUDIO_RESAMPLE")) {
             std::fprintf(stderr, "audio resample: src_simple failed ret=%d, fallback to builtin sinc\n", ret);
