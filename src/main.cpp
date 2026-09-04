@@ -2711,15 +2711,13 @@ int run_server_mode(const ModelConfig &config, int port)
                     }
 
                     const std::string response_format = lower_copy(req.response_format.empty() ? "json" : req.response_format);
-                    if (response_format == "json" || response_format == "verbose_json") {
-                        provider->push(openai_api::OutputChunk::Json({
-                            {"text", final_text},
-                            {"model", req.model},
-                        }, req.model));
-                    } else {
-                        provider->push(openai_api::OutputChunk::FinalText(
-                            format_audio_task_text(final_text, response_format), req.model));
-                    }
+                    // Always carry the result in the chunk's text field: the transcription
+                    // route encodes every response_format with ASRJSONEncoder, which reads
+                    // chunk.text and ignores the json payload of OutputChunk::Json. Pushing
+                    // Json here made the default response_format ("json") return
+                    // {"text": ""} even though the model had transcribed correctly.
+                    provider->push(openai_api::OutputChunk::FinalText(
+                        format_audio_task_text(final_text, response_format), req.model));
                     provider->end(); });
             }
 
