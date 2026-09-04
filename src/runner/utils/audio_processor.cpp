@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <numeric>
 #include <complex>
 #include <cstdlib>
 #include <cstdint>
@@ -171,20 +172,68 @@ static std::vector<float> resample_bandlimited(const std::vector<float>& wavefor
     const double cutoff = std::min(1.0, scale);
     const double taps = 32.0;
     const int radius = std::max(1, (int)std::ceil(taps / cutoff));
-    for (size_t i = 0; i < dst_len; ++i) {
-        const double src_pos = (double)i / scale;
-        const int center = (int)std::floor(src_pos);
-        double acc = 0.0;
+    const int tap_count = 2 * radius;
+
+    // The tap weights depend only on the fractional part of src_pos = i*src/dst,
+    // which repeats with period dst_rate / gcd(src_rate, dst_rate) — 160 for
+    // 44.1kHz -> 16kHz. Recomputing them per output sample meant ~171 million
+    // sin() calls for a 30 s clip. Build one table per phase instead; the inner
+    // loop is then multiply-add only and the tap order is unchanged.
+    const int period = dst_rate / std::gcd(src_rate, dst_rate);
+    // Guard against pathological rate pairs (gcd 1 and a large dst_rate) whose
+    // table would be bigger than the work it saves.
+    const long long table_entries = (long long)period * (long long)tap_count;
+    if (period <= 0 || table_entries > (1LL << 22)) {
+        for (size_t i = 0; i < dst_len; ++i) {
+            const double src_pos = (double)i / scale;
+            const int center = (int)std::floor(src_pos);
+            double acc = 0.0;
+            double wsum = 0.0;
+            for (int k = center - radius + 1; k <= center + radius; ++k) {
+                const int idx = std::clamp(k, 0, (int)waveform.size() - 1);
+                const double delta = src_pos - (double)k;
+                const double x = cutoff * delta;
+                if (std::abs(x) >= taps) continue;
+                const double window = sinc(x / taps);
+                const double weight = cutoff * sinc(x) * window;
+                acc += (double)waveform[(size_t)idx] * weight;
+                wsum += weight;
+            }
+            out[i] = (float)(wsum == 0.0 ? 0.0 : (acc / wsum));
+        }
+        return out;
+    }
+
+    std::vector<double> weights((size_t)table_entries, 0.0);
+    std::vector<double> wsums((size_t)period, 0.0);
+    for (int p = 0; p < period; ++p) {
+        const double src_pos = (double)p / scale;
+        const double frac = src_pos - std::floor(src_pos);
         double wsum = 0.0;
-        for (int k = center - radius + 1; k <= center + radius; ++k) {
-            const int idx = std::clamp(k, 0, (int)waveform.size() - 1);
-            const double delta = src_pos - (double)k;
+        for (int t = 0; t < tap_count; ++t) {
+            // k = center - radius + 1 + t, so delta = frac + radius - 1 - t.
+            const double delta = frac + (double)(radius - 1 - t);
             const double x = cutoff * delta;
+            // Skipped taps keep weight 0, which leaves both acc and wsum unchanged.
             if (std::abs(x) >= taps) continue;
             const double window = sinc(x / taps);
             const double weight = cutoff * sinc(x) * window;
-            acc += (double)waveform[(size_t)idx] * weight;
+            weights[(size_t)p * (size_t)tap_count + (size_t)t] = weight;
             wsum += weight;
+        }
+        wsums[(size_t)p] = wsum;
+    }
+
+    const int last_idx = (int)waveform.size() - 1;
+    for (size_t i = 0; i < dst_len; ++i) {
+        const double src_pos = (double)i / scale;
+        const int center = (int)std::floor(src_pos);
+        const double* w = &weights[(size_t)(i % (size_t)period) * (size_t)tap_count];
+        const double wsum = wsums[i % (size_t)period];
+        double acc = 0.0;
+        for (int t = 0; t < tap_count; ++t) {
+            const int idx = std::clamp(center - radius + 1 + t, 0, last_idx);
+            acc += (double)waveform[(size_t)idx] * w[t];
         }
         out[i] = (float)(wsum == 0.0 ? 0.0 : (acc / wsum));
     }
