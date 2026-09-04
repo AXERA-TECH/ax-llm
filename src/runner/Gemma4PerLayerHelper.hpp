@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -621,11 +622,139 @@ public:
         std::vector<int> ids = {token_id};
         if (!Compute(ids, input_bf16, 1, input_hidden_size, out))
             return false;
-        if (enabled_) decode_cache_.emplace(token_id, out);
+        if (enabled_) cache_store(token_id, out.data());
+        return true;
+    }
+
+    // Prefill counterpart of ComputeSingle. Building the per-layer input costs
+    // 42 * 256 dot products of length 2560 per position -- about 27.5 M MAC -- and it
+    // runs before the NPU sees anything, so on AX650 it is roughly half of TTFT. For a
+    // text position the projection input is `text_scale * embed_tokens[token_id]`, a
+    // uniform scalar times a table row, so the result is a pure function of the token
+    // id, exactly as the decode path already assumes. Compute each distinct id once,
+    // reuse it for every repeat, and share the cache with decode.
+    //
+    // `cacheable[i] == 0` marks a position whose embedding comes from the vision or
+    // audio encoder. Those are not a function of any token id and must always be
+    // computed; caching them would silently corrupt multimodal output.
+    bool ComputeCached(const std::vector<int> &token_ids,
+                       const unsigned short *input_bf16,
+                       int num_tokens,
+                       int input_hidden_size,
+                       const std::vector<unsigned char> &cacheable,
+                       std::vector<unsigned short> &out) const
+    {
+        if (!enabled_)
+        {
+            out.clear();
+            return true;
+        }
+        if ((int)cacheable.size() != num_tokens || num_tokens <= 0)
+            return Compute(token_ids, input_bf16, num_tokens, input_hidden_size, out);
+
+        const size_t row = (size_t)num_hidden_layers_ * (size_t)hidden_size_per_layer_input_;
+        const size_t hidden = (size_t)input_hidden_size;
+
+        std::vector<int> batch_ids;
+        std::vector<unsigned short> batch_embed;
+        std::vector<int> batch_cache_id;                       // token id to memoise, else -1
+        std::vector<int> plan((size_t)num_tokens, -1);         // index into the batch
+        std::vector<const std::vector<unsigned short> *> hit((size_t)num_tokens, nullptr);
+        std::unordered_map<int, int> first_in_batch;
+
+        for (int i = 0; i < num_tokens; ++i)
+        {
+            const int id = token_ids[(size_t)i];
+            if (cacheable[(size_t)i])
+            {
+                auto c = decode_cache_.find(id);
+                if (c != decode_cache_.end() && c->second.size() == row)
+                {
+                    hit[(size_t)i] = &c->second;
+                    continue;
+                }
+                auto f = first_in_batch.find(id);
+                if (f != first_in_batch.end())
+                {
+                    plan[(size_t)i] = f->second;
+                    continue;
+                }
+            }
+            const int slot = (int)batch_ids.size();
+            batch_ids.push_back(id);
+            batch_embed.insert(batch_embed.end(),
+                               input_bf16 + (size_t)i * hidden,
+                               input_bf16 + ((size_t)i + 1) * hidden);
+            batch_cache_id.push_back(cacheable[(size_t)i] ? id : -1);
+            if (cacheable[(size_t)i]) first_in_batch.emplace(id, slot);
+            plan[(size_t)i] = slot;
+        }
+
+        std::vector<unsigned short> batch_out;
+        if (!batch_ids.empty() &&
+            !Compute(batch_ids, batch_embed.data(), (int)batch_ids.size(), input_hidden_size, batch_out))
+        {
+            return false;
+        }
+
+        out.assign((size_t)num_tokens * row, 0);
+        for (int i = 0; i < num_tokens; ++i)
+        {
+            const unsigned short *src = hit[(size_t)i]
+                                            ? hit[(size_t)i]->data()
+                                            : batch_out.data() + (size_t)plan[(size_t)i] * row;
+            std::memcpy(out.data() + (size_t)i * row, src, row * sizeof(unsigned short));
+        }
+
+        // Insert after the copies above, so the pointers held in `hit` stay valid.
+        for (size_t s = 0; s < batch_cache_id.size(); ++s)
+        {
+            if (batch_cache_id[s] >= 0)
+                cache_store(batch_cache_id[s], batch_out.data() + s * row);
+        }
+
+        if (decode_stats_enabled_.load(std::memory_order_relaxed))
+        {
+            uint64_t hits = 0;
+            for (int i = 0; i < num_tokens; ++i)
+                if (hit[(size_t)i] || plan[(size_t)i] != i) ++hits;
+            decode_cache_hits_.fetch_add(hits, std::memory_order_relaxed);
+            decode_cache_misses_.fetch_add((uint64_t)batch_ids.size(), std::memory_order_relaxed);
+        }
+        if (std::getenv("AXLLM_PROFILE_PERLAYER"))
+        {
+            ALOGI("[perlayer] positions=%d computed=%zu (%.0f%% reused) cache=%zu/%d",
+                  num_tokens, batch_ids.size(),
+                  100.0 * (1.0 - (double)batch_ids.size() / (double)num_tokens),
+                  decode_cache_.size(), cache_capacity());
+        }
         return true;
     }
 
 private:
+    // Each entry is num_hidden_layers * hidden_size_per_layer_input bf16 values, so
+    // 21.5 KiB for the 42x256 Gemma 4 E4B shape. Bounded so a long session cannot grow
+    // without limit; frequent tokens land in it first, which is what matters.
+    int cache_capacity() const
+    {
+        static const int cap = [] {
+            if (const char *env = std::getenv("AXLLM_GEMMA4_PERLAYER_CACHE"))
+            {
+                const int v = std::atoi(env);
+                if (v >= 0) return v;
+            }
+            return 2048;
+        }();
+        return cap;
+    }
+
+    void cache_store(int token_id, const unsigned short *row_data) const
+    {
+        const size_t row = (size_t)num_hidden_layers_ * (size_t)hidden_size_per_layer_input_;
+        if ((int)decode_cache_.size() >= cache_capacity()) return;
+        decode_cache_.emplace(token_id, std::vector<unsigned short>(row_data, row_data + row));
+    }
+
     mutable std::unordered_map<int, std::vector<unsigned short>> decode_cache_;
     mutable std::atomic<bool> decode_stats_enabled_{false};
     mutable std::atomic<uint64_t> decode_cache_hits_{0};

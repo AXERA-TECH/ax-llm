@@ -300,6 +300,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         std::vector<int> per_layer_token_ids = run_input_token_ids;
         std::vector<unsigned short> per_layer_embed = test_embed;
         scale_all_embeds_inplace(per_layer_embed.data(), input_embed_num);
+        // 1 where the per-layer input is a pure function of the token id, so it can be
+        // memoised; 0 for positions holding a vision/audio embedding, which must be
+        // computed every time.
+        std::vector<unsigned char> per_layer_cacheable((size_t)input_embed_num, 1);
         if (has_vision_state && !vision_state.pos2vision.empty())
         {
             for (int i = 0; i < input_embed_num; ++i)
@@ -308,15 +312,17 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 if ((size_t)abs_pos < vision_state.pos2vision.size() && vision_state.pos2vision[(size_t)abs_pos] >= 0)
                 {
                     per_layer_token_ids[(size_t)i] = gemma4_per_layer_helper.pad_token_id();
+                    per_layer_cacheable[(size_t)i] = 0;
                 }
             }
         }
 
-        if (!gemma4_per_layer_helper.Compute(per_layer_token_ids,
-                                             per_layer_embed.data(),
-                                             input_embed_num,
-                                             _attr.tokens_embed_size,
-                                             prefill_per_layer_inputs))
+        if (!gemma4_per_layer_helper.ComputeCached(per_layer_token_ids,
+                                                  per_layer_embed.data(),
+                                                  input_embed_num,
+                                                  _attr.tokens_embed_size,
+                                                  per_layer_cacheable,
+                                                  prefill_per_layer_inputs))
         {
             ALOGE("Gemma4 prefill per-layer input compute failed");
             return final_out;
