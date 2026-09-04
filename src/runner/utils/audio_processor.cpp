@@ -1,5 +1,7 @@
 #include "audio_processor.hpp"
 
+#include "sample_log.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -177,8 +179,9 @@ static std::vector<float> resample_bandlimited(const std::vector<float>& wavefor
     // The tap weights depend only on the fractional part of src_pos = i*src/dst,
     // which repeats with period dst_rate / gcd(src_rate, dst_rate) — 160 for
     // 44.1kHz -> 16kHz. Recomputing them per output sample meant ~171 million
-    // sin() calls for a 30 s clip. Build one table per phase instead; the inner
-    // loop is then multiply-add only and the tap order is unchanged.
+    // sin() calls for a 30 s clip (49 s on AX650, against 184 ms for the NPU
+    // encoder itself). Build one table per phase instead; the inner loop is then
+    // multiply-add only and the tap order is unchanged.
     const int period = dst_rate / std::gcd(src_rate, dst_rate);
     // Guard against pathological rate pairs (gcd 1 and a large dst_rate) whose
     // table would be bigger than the work it saves.
@@ -806,9 +809,18 @@ bool LoadGemma4AudioInputFeatures(const std::string& audio_path,
 {
     std::vector<float> waveform;
     int source_sample_rate = 0;
+    const bool profile_audio = std::getenv("AXLLM_PROFILE_AUDIO") != nullptr;
+    auto stage_from = std::chrono::steady_clock::now();
+    auto stage_ms = [&stage_from]() {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - stage_from).count();
+        stage_from = now;
+        return ms;
+    };
     if (!read_wav_mono_f32(audio_path, waveform, source_sample_rate, err)) {
         return false;
     }
+    if (profile_audio) ALOGI("[audio]   read_wav: %.1f ms (%zu samples @ %d Hz)", stage_ms(), waveform.size(), source_sample_rate);
 
     if (out_duration_sec) {
         *out_duration_sec = source_sample_rate > 0 ? (float)waveform.size() / (float)source_sample_rate : 0.0f;
@@ -816,6 +828,7 @@ bool LoadGemma4AudioInputFeatures(const std::string& audio_path,
 
     std::vector<float> mono = resample_via_libsamplerate(waveform, source_sample_rate, profile.sampling_rate);
     if (mono.empty()) mono = resample_bandlimited(waveform, source_sample_rate, profile.sampling_rate);
+    if (profile_audio) ALOGI("[audio]   resample: %.1f ms (-> %zu samples)", stage_ms(), mono.size());
     const size_t target_samples = (size_t)std::llround((double)profile.duration_sec * (double)profile.sampling_rate);
     if (mono.size() < target_samples) {
         mono.resize(target_samples, 0.0f);
@@ -834,7 +847,9 @@ bool LoadGemma4AudioInputFeatures(const std::string& audio_path,
         fixed_profile.num_audio_tokens = NumAudioTokens(fixed_profile.num_mel_frames);
     }
 
-    return compute_log_mel_features(mono, fixed_profile, input_features, err);
+    const bool ok = compute_log_mel_features(mono, fixed_profile, input_features, err);
+    if (profile_audio) ALOGI("[audio]   log_mel: %.1f ms", stage_ms());
+    return ok;
 }
 
 bool LoadWhisperAudioInputFeatures(const std::string& audio_path,

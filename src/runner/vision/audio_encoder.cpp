@@ -9,6 +9,7 @@
 #include "bfloat16.hpp"
 #include "sample_log.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -292,15 +293,28 @@ bool AudioEncoder::Encode(const std::vector<std::string>& uris,
                           std::string& err) {
     if (impl_->kind == Kind::Gemma4) {
         if (uris.size() != 1) { err = "Gemma4 audio expects exactly 1 audio file per message"; return false; }
+        // Set AXLLM_PROFILE_AUDIO=1 to break the pre-prefill audio cost into its
+        // stages. The "profile selected" line below is emitted last, so without
+        // this the whole load+resample+mel+encode block is invisible.
+        const bool profile_audio = std::getenv("AXLLM_PROFILE_AUDIO") != nullptr;
+        auto stage_ms = [](const std::chrono::steady_clock::time_point& from) {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
+        };
+        auto t_dur = std::chrono::steady_clock::now();
         float duration_sec = 0.0f;
         if (!audio::ReadAudioDurationSeconds(uris[0], duration_sec, err)) return false;
+        if (profile_audio) ALOGI("[audio] read duration: %.1f ms", stage_ms(t_dur));
         auto* runtime = select_audio_profile(&impl_->audio_5s, &impl_->audio_30s, duration_sec);
         if (!runtime) { err = "Gemma4 audio encoder profile is not initialized"; return false; }
         std::vector<float> input_features;
+        auto t_feat = std::chrono::steady_clock::now();
         if (!audio::LoadGemma4AudioInputFeatures(uris[0], runtime->profile, input_features, nullptr, err)) return false;
+        if (profile_audio) ALOGI("[audio] load features (read+resample+mel): %.1f ms", stage_ms(t_feat));
         std::vector<unsigned short> emb;
+        auto t_enc = std::chrono::steady_clock::now();
         if (!encode_block_fp32(runtime->encoder, runtime->encoder.get_devid(),
                                runtime->encoder_output_is_bf16, input_features, emb, err)) return false;
+        if (profile_audio) ALOGI("[audio] npu encode: %.1f ms", stage_ms(t_enc));
         out_num_media_for_tokenizer = 1;
         out_num_media_tokens = runtime->profile.num_audio_tokens;
         out_block = std::move(emb);
