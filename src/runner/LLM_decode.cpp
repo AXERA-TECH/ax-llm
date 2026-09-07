@@ -102,7 +102,7 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
             {
                 (void)dec_k;
                 (void)dec_v;
-                sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true);
+                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true)) return -1;
             }
             else
             {
@@ -538,7 +538,12 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             {
                 (void)dec_k;
                 (void)dec_v;
-                sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true);
+                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true))
+                {
+                    set_last_error("模型运行失败，请重新尝试。");
+                    ResetKVCache();
+                    return final_out;
+                }
             }
             else
             {
@@ -720,7 +725,12 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (want_gid != decode_grpid)
             {
                 // ALOGI("switch decode_grpid: %d -> %d (kv_ctx=%u rope_pos=%u)", decode_grpid, want_gid, kv_slot + 1, decode_pos);
-                sync_device_kv_cache_from_decode(decode_grpid, want_gid, (int)kv_slot, false);
+                if (!sync_device_kv_cache_from_decode(decode_grpid, want_gid, (int)kv_slot, false))
+                {
+                    set_last_error("模型运行失败，请重新尝试。");
+                    ResetKVCache();
+                    return final_out;
+                }
                 decode_grpid = want_gid;
             }
             need_full_shared_sync = (decode_grpid != last_shared_sync_decode_grpid);
@@ -825,7 +835,12 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             {
                 (void)in_k;
                 (void)in_v;
-                sync_linear_input_state_from_group(m, lyr.layer, layer_decode_grpid, devid, false);
+                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_decode_grpid, devid, false))
+                {
+                    set_last_error("模型运行失败，请重新尝试。");
+                    ResetKVCache();
+                    return final_out;
+                }
             }
             else
             {
@@ -965,7 +980,12 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             {
                 (void)in_k;
                 (void)in_v;
-                sync_linear_input_state_from_group(m, lyr.layer, layer_decode_grpid, 0, false);
+                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_decode_grpid, 0, false))
+                {
+                    set_last_error("模型运行失败，请重新尝试。");
+                    ResetKVCache();
+                    return final_out;
+                }
             }
             else
             {
@@ -1100,12 +1120,16 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, int output_max
     return Run(std::move(history), {}, output_max_token);
 }
 
-std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vector<::MediaInputs> &media_inputs, int output_max_token)
+std::vector<Content> LLM::Impl::Run(std::vector<Content> history,
+                                    const std::vector<::MediaInputs> &media_inputs,
+                                    int output_max_token,
+                                    std::vector<::MediaInputs> *normalized_media_inputs)
 {
     clear_last_error();
     has_vision_state = false;
     std::vector<::MediaInputs> effective_media_inputs = media_inputs;
     bool video_history_isolated = false;
+    bool cache_invalidated_after_generation = false;
 
     // Multi-slot prefix KV cache: pick the slot sharing the longest prefix with
     // this request; misses evict the LRU slot. Must run before the single-context
@@ -1114,17 +1138,17 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
     // chat history (tokenizing VLM history needs the expensive vision Prepare).
     if (kv_mgr_.multi_slot_enabled())
     {
-        if (_attr.vlm_type == VLMType::None)
-            kv_mgr_.select_kv_slot(tokenizer->encode(history));
-        else
-            kv_mgr_.select_kv_slot_by_history(history);
+        const bool slot_ready = _attr.vlm_type == VLMType::None
+                                    ? kv_mgr_.select_kv_slot(tokenizer->encode(history))
+                                    : kv_mgr_.select_kv_slot_by_history(history);
+        if (!slot_ready) return history;
     }
 
-    if (request_has_video_media(history, effective_media_inputs))
+    if (axllm::media_history::current_request_has_video(history, effective_media_inputs))
     {
         const size_t old_history_size = history.size();
         const size_t old_media_size = effective_media_inputs.size();
-        if (normalize_away_video_history(history, effective_media_inputs))
+        if (axllm::media_history::isolate_current_video(history, effective_media_inputs))
         {
             ALOGW("video history is isolated to current user turn: old_history=%zu new_history=%zu old_media_inputs=%zu new_media_inputs=%zu",
                   old_history_size,
@@ -1371,7 +1395,7 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
             else
             {
                 keep = std::max(0, keep);
-                if (!restore_linear_state_snapshot_to_host_cache(keep))
+                if (!restore_linear_state_snapshot_to_device(keep))
                 {
                     ALOGW("failed to restore linear state snapshot at %d. force ResetKVCache and recompute.", keep);
                     ResetKVCache();
@@ -1437,7 +1461,7 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
                 offset = 0;
                 not_append = false;
             }
-            else if (!restore_linear_state_snapshot_to_host_cache(keep))
+            else if (!restore_linear_state_snapshot_to_device(keep))
             {
                 ALOGW("failed to restore linear state snapshot at %d. force ResetKVCache and recompute.", keep);
                 ResetKVCache();
@@ -1642,10 +1666,38 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
     last_tokens_ids = std::move(cached_prefix_tokens);
     last_tokens_ids.insert(last_tokens_ids.end(), tokens_diff.begin(), tokens_diff.end());
     last_tokens_ids.insert(last_tokens_ids.end(), last_run_generated_token_ids.begin(), last_run_generated_token_ids.end());
+    // Chat-template normalization can make the returned history encode to a
+    // different token stream than the raw stream consumed by the device. For
+    // VLM follow-ups preserve that raw prefix (the vision state is authoritative);
+    // text-only linear-attention models conservatively invalidate reuse.
+    const std::vector<int> canonical_history_tokens = tokenizer->encode(history);
+    int cached_prefix_len = 0;
+    (void)axllm::qwen3_5::Runtime::token_suffix(last_tokens_ids, canonical_history_tokens, cached_prefix_len);
+    if (has_linear_attention_layers() && !last_tokens_ids.empty() &&
+        cached_prefix_len != static_cast<int>(last_tokens_ids.size()))
+    {
+        const bool preserve_vlm_raw_cache = vision && vision->enabled() && !video_history_isolated;
+        if (preserve_vlm_raw_cache)
+        {
+            ALOGW("history/token cache prefix mismatch after generation; preserve raw VLM token/KV prefix for follow-up");
+        }
+        else
+        {
+            ALOGW("history/token cache prefix mismatch after generation; invalidate KV reuse");
+            ResetKVCache();
+            last_tokens_ids.clear();
+            cache_invalidated_after_generation = true;
+        }
+        last_history_snapshot = history;
+    }
     if (video_history_isolated)
     {
         ALOGW("drop KV cache after isolated video-history request");
         ResetKVCache();
+    }
+    else if (cache_invalidated_after_generation)
+    {
+        ALOGI("skip KV cache snapshot after invalidation; next request will recompute");
     }
     else
     {
@@ -1668,6 +1720,8 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history, const std::vec
     // own buffer (zero copy).
     kv_mgr_.save_active_kv_slot();
 
+    if (normalized_media_inputs)
+        *normalized_media_inputs = effective_media_inputs;
+
     return history;
 }
-

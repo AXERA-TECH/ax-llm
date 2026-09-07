@@ -22,6 +22,9 @@ typedef struct
     unsigned int nIdx;
     std::vector<unsigned int> vShape;
     int nSize;
+    // Backend-native data type enum when available (AX650); 0 means unknown.
+    // Linear-attention state is opaque and must be copied by byte size.
+    int eDataType = 0;
     unsigned long long phyAddr; // 统一 64-bit；AX650 aarch64 上 unsigned long 也是 64-bit
     void *pVirAddr;
 } ax_runner_tensor_t;

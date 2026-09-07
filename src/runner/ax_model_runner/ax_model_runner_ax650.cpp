@@ -401,6 +401,7 @@ int ax_runner_ax650::sub_init()
             tensor.nIdx = i;
             tensor.sName = io_info->pOutputs[i].pName ? std::string(io_info->pOutputs[i].pName) : "";
             tensor.nSize = io_info->pOutputs[i].nSize;
+            tensor.eDataType = static_cast<int>(io_info->pOutputs[i].eDataType);
             tensor.phyAddr = io_data.pOutputs[i].phyAddr;
             tensor.pVirAddr = io_data.pOutputs[i].pVirAddr;
             for (size_t j = 0; j < io_info->pOutputs[i].nShapeSize; j++)
@@ -417,6 +418,7 @@ int ax_runner_ax650::sub_init()
             tensor.nIdx = i;
             tensor.sName = io_info->pInputs[i].pName ? std::string(io_info->pInputs[i].pName) : "";
             tensor.nSize = io_info->pInputs[i].nSize;
+            tensor.eDataType = static_cast<int>(io_info->pInputs[i].eDataType);
             tensor.phyAddr = io_data.pInputs[i].phyAddr;
             tensor.pVirAddr = io_data.pInputs[i].pVirAddr;
             for (size_t j = 0; j < io_info->pInputs[i].nShapeSize; j++)

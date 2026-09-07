@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "BaseTokenizer.hpp"  // Content
+#include "Qwen3_5Runtime.hpp"
 
 // Value types for the multi-slot prefix KV cache, hoisted verbatim out of
 // LLM::Impl so the KV-slot selection policy + manager (and their host-side unit
@@ -12,11 +13,7 @@
 
 // Snapshot of a linear-attention layer's recurrent K/V state at a token length,
 // used to roll the host-side cache back on a partial reuse.
-struct LinearStateSnapshot {
-    int token_len = 0;
-    std::vector<std::vector<unsigned short>> k;
-    std::vector<std::vector<unsigned short>> v;
-};
+using LinearStateSnapshot = axllm::qwen3_5::LinearStateSnapshot;
 
 // Where a slot's K/V lives: Device (zero-copy pointer switch) or Host (DDR copy).
 enum class KvSlotLocation { Device, Host };
@@ -29,14 +26,16 @@ struct KvCacheSlot {
     std::vector<Content> last_history_snapshot;
     std::vector<int> last_tokens_ids;
     int precompute_len = 0;
-    std::vector<LinearStateSnapshot> linear_state_snapshots;
+    axllm::qwen3_5::LinearStateStore linear_state_snapshots;
     int cached_mrope_next_pos = -1;
     std::vector<unsigned char> full_cache_valid_slots;
     bool full_cache_has_sparse_slots = false;
     uint64_t lru = 0;
     // Host-mode only: per-layer host copy of this slot's device K/V. Swapped
     // in/out of the single engine KV buffer on activation.
-    std::vector<std::vector<unsigned short>> host_k, host_v;
+    // Host-mode copies are opaque bytes for both full-attention BF16 and
+    // linear-attention FP32/FP16 state buffers.
+    std::vector<std::vector<unsigned char>> host_k, host_v;
 };
 
 // A used slot is reused when it shares at least this many leading tokens with the

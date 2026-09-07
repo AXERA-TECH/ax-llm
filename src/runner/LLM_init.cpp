@@ -412,6 +412,13 @@ bool LLM::Impl::init_groups_from_model(ax_runner_t &ref_layer)
 
 void LLM::Impl::init_layer_types()
 {
+    axllm::qwen3_5::AttentionConfig qwen_cfg;
+    qwen_cfg.layer_types = _attr.layer_types;
+    qwen_cfg.full_attention_interval = _attr.full_attention_interval;
+    qwen_cfg.num_kv_shared_layers = _attr.num_kv_shared_layers;
+    qwen_cfg.sliding_window = _attr.sliding_window;
+    qwen3_5_runtime.configure(_attr.axmodel_num, qwen_cfg);
+
     layer_is_linear_attn.assign(_attr.axmodel_num, false);
     if (!_attr.layer_types.empty())
     {
@@ -921,4 +928,3 @@ void LLM::Impl::Deinit()
     for (auto &devid : _attr.dev_ids) axcl_Exit(devid);
 #endif
 }
-

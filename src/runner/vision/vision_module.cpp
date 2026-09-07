@@ -1040,10 +1040,9 @@ bool VisionModule::Init(VLMType type,
     }
     impl_->encoder_inited = true;
 
-#ifdef USE_AXCL
+    // Enable cache maintenance for native AX650 vision encoder execution too.
     impl_->encoder.set_auto_sync_before_inference(true);
     impl_->encoder.set_auto_sync_after_inference(true);
-#endif
 
     const auto& in0 = impl_->encoder.get_input(0);
 
