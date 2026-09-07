@@ -41,6 +41,6 @@ int LLM::SetKVCache(std::vector<std::vector<unsigned short>> &k, std::vector<std
 void LLM::ResetKVCache() { impl_->ResetKVCache(); }
 
 std::vector<Content> LLM::Run(std::vector<Content> history, int output_max_token) { return impl_->Run(std::move(history), output_max_token); }
+std::vector<Content> LLM::Run(std::vector<Content> history, std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token, &media_inputs); }
 std::vector<Content> LLM::Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token); }
 std::string LLM::Run(std::vector<unsigned short> &embed, int output_max_token) { return impl_->Run(embed, output_max_token); }
-

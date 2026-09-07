@@ -181,7 +181,12 @@ bool LLM::Impl::EmbedTokens(const std::vector<int> &token_ids, std::vector<float
             {
                 (void)in_k;
                 (void)in_v;
-                sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true);
+                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true))
+                {
+                    ALOGE("embedding linear state sync failed: layer=%d gid=%d", m, layer_prefill_grpid);
+                    clear_all_group_kv_cache_tensors();
+                    return false;
+                }
             }
             else
             {
@@ -373,4 +378,3 @@ bool LLM::Impl::EmbedBatch(const std::vector<std::string> &inputs, std::vector<s
     }
     return true;
 }
-

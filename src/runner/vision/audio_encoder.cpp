@@ -71,10 +71,9 @@ static bool init_audio_profile(AudioEncoderRuntime& runtime,
     runtime.profile = profile;
     runtime.axmodel_path = axmodel_path;
 
-#ifdef USE_AXCL
+    // Keep host/device buffers coherent on both AXCL and native AX650.
     runtime.encoder.set_auto_sync_before_inference(true);
     runtime.encoder.set_auto_sync_after_inference(true);
-#endif
 
     const auto& out0 = runtime.encoder.get_output(0);
     int out_is_bf16 = -1;
@@ -124,10 +123,9 @@ static bool init_whisper_audio_profile(AudioEncoderRuntime& runtime,
     runtime.profile_kind = AudioEncoderRuntime::ProfileKind::Whisper;
     runtime.axmodel_path = axmodel_path;
 
-#ifdef USE_AXCL
+    // Native AX650 also requires cache maintenance before host reads.
     runtime.encoder.set_auto_sync_before_inference(true);
     runtime.encoder.set_auto_sync_after_inference(true);
-#endif
 
     const auto& in0 = runtime.encoder.get_input(0);
     if (in0.vShape.size() >= 3) {

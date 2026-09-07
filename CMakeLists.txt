@@ -235,6 +235,8 @@ set(COMMON_SOURCES
     src/runner/utils/logger.cpp
     src/runner/utils/net_utils.cpp
     src/runner/LLM.cpp
+    src/runner/MediaHistory.cpp
+    src/runner/Qwen3_5Runtime.cpp
     src/runner/LLM_embed.cpp
     src/runner/LLM_init.cpp
     src/runner/LLM_decode.cpp
@@ -403,5 +405,19 @@ add_executable(vision_preprocess_test tools/vision_preprocess_test.cpp
 target_include_directories(vision_preprocess_test PRIVATE src/runner/utils)
 target_link_libraries(vision_preprocess_test ${AXLLM_VISION_LIBS})
 install(TARGETS vision_preprocess_test DESTINATION bin)
+
+# Pure Qwen3.5 attention/cache policy regression test; no NPU or model files.
+add_executable(qwen3_5_runtime_test
+    tools/qwen3_5_runtime_test.cpp
+    src/runner/Qwen3_5Runtime.cpp)
+target_include_directories(qwen3_5_runtime_test PRIVATE src/runner)
+install(TARGETS qwen3_5_runtime_test DESTINATION bin)
+
+# Pure multimodal history policy regression test; no NPU or model files.
+add_executable(media_history_test
+    tools/media_history_test.cpp
+    src/runner/MediaHistory.cpp)
+target_include_directories(media_history_test PRIVATE src/runner)
+install(TARGETS media_history_test DESTINATION bin)
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)

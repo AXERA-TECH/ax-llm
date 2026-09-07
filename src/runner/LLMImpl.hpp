@@ -39,6 +39,7 @@
 #include "KvSlotSelect.hpp"
 #include "MemGuard.hpp"
 #include "KvSlotManager.hpp"
+#include "MediaHistory.hpp"
 
 #include "LLMLayer.hpp"
 
@@ -248,7 +249,7 @@ struct LLM::Impl : public IKvSlotHost {
     float get_last_prefill_tps() const { return last_run_prefill_tps_; }
     int get_last_prefill_tokens() const { return last_run_prefill_tokens_; }
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
-    std::vector<LinearStateSnapshot> linear_state_snapshots_;
+    axllm::qwen3_5::LinearStateStore linear_state_snapshots_;
     int precompute_len = 0;
     std::vector<int> prefill_history_kv_cache_num_grp;
     std::vector<int> prefill_symbolic_kv_cache_num_grp;
@@ -309,6 +310,10 @@ struct LLM::Impl : public IKvSlotHost {
     std::vector<bool> layer_is_linear_attn;
     std::vector<int> layer_kv_cache_sizes;
     std::vector<int> shared_kv_source_layers;
+    // Backend-neutral Qwen3.5 mixed-attention policy. The existing layer/group
+    // execution remains in this Impl; this object only supplies topology and
+    // opaque-state policy.
+    axllm::qwen3_5::Runtime qwen3_5_runtime;
     // Use a full-attention layer as reference for token-wise KV cache shapes.
     int cache_ref_full_layer_idx = 0;
     ax_runner_t llama_post;
@@ -461,61 +466,6 @@ struct LLM::Impl : public IKvSlotHost {
         const auto now = std::chrono::steady_clock::now();
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - request_start_time_).count();
         return static_cast<float>(us) / 1000.0f;
-    }
-
-    static bool request_has_video_media(const std::vector<Content> &history,
-                                        const std::vector<::MediaInputs> &media_inputs)
-    {
-        for (const auto &media : media_inputs)
-        {
-            if (media.content_index < history.size() && history[media.content_index].type == VIDEO)
-                return true;
-        }
-        return false;
-    }
-
-    static bool normalize_away_video_history(std::vector<Content> &history,
-                                             std::vector<::MediaInputs> &media_inputs)
-    {
-        if (history.empty()) return false;
-
-        size_t current_user_index = history.size();
-        for (size_t i = history.size(); i > 0; --i)
-        {
-            if (history[i - 1].role == USER)
-            {
-                current_user_index = i - 1;
-                break;
-            }
-        }
-        if (current_user_index >= history.size()) return false;
-
-        std::vector<Content> normalized;
-        normalized.reserve(history.size());
-        for (size_t i = 0; i < current_user_index; ++i)
-        {
-            if (history[i].role == SYSTEM)
-                normalized.push_back(history[i]);
-        }
-
-        const size_t new_user_index = normalized.size();
-        normalized.push_back(history[current_user_index]);
-
-        std::vector<::MediaInputs> normalized_media;
-        if (history[current_user_index].type == VIDEO)
-        {
-            for (auto it = media_inputs.rbegin(); it != media_inputs.rend(); ++it)
-            {
-                if (it->content_index == current_user_index && !it->uris.empty())
-                {
-                    normalized_media.push_back({new_user_index, it->uris});
-                    break;
-                }
-            }
-        }
-        media_inputs = std::move(normalized_media);
-        history = std::move(normalized);
-        return true;
     }
 
     void clear_last_error()
@@ -793,24 +743,12 @@ struct LLM::Impl : public IKvSlotHost {
 
     void drop_linear_state_snapshots_after(int token_len)
     {
-        linear_state_snapshots_.erase(
-            std::remove_if(linear_state_snapshots_.begin(),
-                           linear_state_snapshots_.end(),
-                           [token_len](const LinearStateSnapshot &snapshot) {
-                               return snapshot.token_len > token_len;
-                           }),
-            linear_state_snapshots_.end());
+        linear_state_snapshots_.drop_after(token_len);
     }
 
     int best_linear_state_snapshot_len(int token_len) const
     {
-        int best = -1;
-        for (const auto &snapshot : linear_state_snapshots_)
-        {
-            if (snapshot.token_len <= token_len && snapshot.token_len > best)
-                best = snapshot.token_len;
-        }
-        return best;
+        return linear_state_snapshots_.best_len(token_len);
     }
 
     void capture_linear_state_snapshot(int token_len)
@@ -830,43 +768,57 @@ struct LLM::Impl : public IKvSlotHost {
             const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
             auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
             auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
-            snapshot.k[(size_t)i].resize((size_t)t_k.nSize / sizeof(unsigned short));
-            snapshot.v[(size_t)i].resize((size_t)t_v.nSize / sizeof(unsigned short));
+            snapshot.k[(size_t)i].resize((size_t)t_k.nSize);
+            snapshot.v[(size_t)i].resize((size_t)t_v.nSize);
             llm_d2h(snapshot.k[(size_t)i].data(), LLM_RADDR(t_k), t_k.nSize, LLM_DEVID(lyr));
             llm_d2h(snapshot.v[(size_t)i].data(), LLM_RADDR(t_v), t_v.nSize, LLM_DEVID(lyr));
         }
 
-        auto it = std::find_if(linear_state_snapshots_.begin(),
-                               linear_state_snapshots_.end(),
-                               [token_len](const LinearStateSnapshot &existing) {
-                                   return existing.token_len == token_len;
-                               });
-        if (it != linear_state_snapshots_.end())
-            *it = std::move(snapshot);
+        auto *existing = linear_state_snapshots_.find(token_len);
+        if (existing)
+            *existing = std::move(snapshot);
         else
-            linear_state_snapshots_.push_back(std::move(snapshot));
+            linear_state_snapshots_.items().push_back(std::move(snapshot));
     }
 
-    bool restore_linear_state_snapshot_to_host_cache(int token_len)
+    bool restore_linear_state_snapshot_to_device(int token_len)
     {
         if (!has_linear_attention_layers() || token_len <= 0) return true;
 
-        auto it = std::find_if(linear_state_snapshots_.begin(),
-                               linear_state_snapshots_.end(),
-                               [token_len](const LinearStateSnapshot &snapshot) {
-                                   return snapshot.token_len == token_len;
-                               });
-        if (it == linear_state_snapshots_.end())
+        const auto *it = linear_state_snapshots_.find(token_len);
+        if (!it)
             return false;
-
-        if ((int)k_caches.size() != _attr.axmodel_num) k_caches.resize((size_t)_attr.axmodel_num);
-        if ((int)v_caches.size() != _attr.axmodel_num) v_caches.resize((size_t)_attr.axmodel_num);
 
         for (int i = 0; i < _attr.axmodel_num; ++i)
         {
             if (!is_linear_layer(i)) continue;
-            k_caches[(size_t)i] = it->k[(size_t)i];
-            v_caches[(size_t)i] = it->v[(size_t)i];
+
+            auto &lyr = llama_layers[(size_t)i];
+            const int devid = LLM_DEVID(lyr);
+            const int src_gid = decode_gid_for_layer(i, decode_grpid);
+            auto &dst_k = lyr.layer.get_input(src_gid, "K_cache");
+            auto &dst_v = lyr.layer.get_input(src_gid, "V_cache");
+            const auto &snapshot_k = it->k[(size_t)i];
+            const auto &snapshot_v = it->v[(size_t)i];
+            if (snapshot_k.size() != (size_t)dst_k.nSize || snapshot_v.size() != (size_t)dst_v.nSize)
+            {
+                ALOGE("linear snapshot size mismatch: layer=%d token_len=%d K=%zu/%u V=%zu/%u",
+                      i, token_len, snapshot_k.size(), dst_k.nSize, snapshot_v.size(), dst_v.nSize);
+                return false;
+            }
+            if (!LLM_WADDR(dst_k) || !LLM_WADDR(dst_v)) return false;
+            llm_h2d(LLM_WADDR(dst_k), snapshot_k.data(), snapshot_k.size(), devid);
+            llm_h2d(LLM_WADDR(dst_v), snapshot_v.data(), snapshot_v.size(), devid);
+
+            std::vector<int> state_gids = {src_gid};
+            if (i < (int)layer_decode_grpids_.size())
+                state_gids.insert(state_gids.end(), layer_decode_grpids_[(size_t)i].begin(), layer_decode_grpids_[(size_t)i].end());
+            if (i < (int)layer_prefill_grpids_.size())
+                state_gids.insert(state_gids.end(), layer_prefill_grpids_[(size_t)i].begin(), layer_prefill_grpids_[(size_t)i].end());
+            std::sort(state_gids.begin(), state_gids.end());
+            state_gids.erase(std::unique(state_gids.begin(), state_gids.end()), state_gids.end());
+            for (const int dst_gid : state_gids)
+                if (!copy_linear_input_state_to_group(lyr.layer, dst_gid, src_gid, devid)) return false;
         }
         return true;
     }
@@ -1225,8 +1177,17 @@ struct LLM::Impl : public IKvSlotHost {
         {
             auto &dst_k = layer.get_input(gid, "K_cache");
             auto &dst_v = layer.get_input(gid, "V_cache");
-            llm_d2d(LLM_WADDR(dst_k), LLM_RADDR(out_k), std::min((size_t)dst_k.nSize, (size_t)out_k.nSize), devid);
-            llm_d2d(LLM_WADDR(dst_v), LLM_RADDR(out_v), std::min((size_t)dst_v.nSize, (size_t)out_v.nSize), devid);
+            if (dst_k.nSize != out_k.nSize || dst_v.nSize != out_v.nSize ||
+                !axllm::qwen3_5::Runtime::compatible_cache_dtype(out_k.eDataType, dst_k.eDataType) ||
+                !axllm::qwen3_5::Runtime::compatible_cache_dtype(out_v.eDataType, dst_v.eDataType))
+            {
+                ALOGE("linear state layout mismatch for gid=%d: K=%u/%u dtype=%d/%d V=%u/%u dtype=%d/%d",
+                      gid, dst_k.nSize, out_k.nSize, dst_k.eDataType, out_k.eDataType,
+                      dst_v.nSize, out_v.nSize, dst_v.eDataType, out_v.eDataType);
+                return;
+            }
+            llm_d2d(LLM_WADDR(dst_k), LLM_RADDR(out_k), (size_t)dst_k.nSize, devid);
+            llm_d2d(LLM_WADDR(dst_v), LLM_RADDR(out_v), (size_t)dst_v.nSize, devid);
         }
         catch (const std::exception &e)
         {
@@ -1276,7 +1237,7 @@ struct LLM::Impl : public IKvSlotHost {
         sync_linear_state_to_prefill_groups(layer_idx, layer, out_k, out_v, devid, true);
     }
 
-    void sync_linear_input_state_from_group(int layer_idx,
+    bool sync_linear_input_state_from_group(int layer_idx,
                                             ax_runner_t &layer,
                                             int src_gid,
                                             int devid,
@@ -1291,21 +1252,22 @@ struct LLM::Impl : public IKvSlotHost {
         if (layer_idx >= 0 && layer_idx < (int)layer_decode_grpids_.size())
         {
             for (const int gid : layer_decode_grpids_[(size_t)layer_idx])
-                copy_linear_input_state_to_group(layer, gid, src_gid, devid, src_out_k, src_out_v, prefer_outputs);
+                if (!copy_linear_input_state_to_group(layer, gid, src_gid, devid, src_out_k, src_out_v, prefer_outputs)) return false;
         }
         else
         {
             for (const int gid : decode_grpids_)
-                copy_linear_input_state_to_group(layer, gid, src_gid, devid, src_out_k, src_out_v, prefer_outputs);
+                if (!copy_linear_input_state_to_group(layer, gid, src_gid, devid, src_out_k, src_out_v, prefer_outputs)) return false;
         }
 
-        if (!sync_prefill_groups) return;
-        if (layer_idx < 0 || layer_idx >= (int)layer_prefill_grpids_.size()) return;
+        if (!sync_prefill_groups) return true;
+        if (layer_idx < 0 || layer_idx >= (int)layer_prefill_grpids_.size()) return true;
         for (const int gid : layer_prefill_grpids_[(size_t)layer_idx])
-            copy_linear_input_state_to_group(layer, gid, src_gid, devid, src_out_k, src_out_v, prefer_outputs);
+            if (!copy_linear_input_state_to_group(layer, gid, src_gid, devid, src_out_k, src_out_v, prefer_outputs)) return false;
+        return true;
     }
 
-    void copy_linear_input_state_to_group(ax_runner_t &layer,
+    bool copy_linear_input_state_to_group(ax_runner_t &layer,
                                           int dst_gid,
                                           int src_gid,
                                           int devid,
@@ -1313,7 +1275,7 @@ struct LLM::Impl : public IKvSlotHost {
                                           const ax_runner_tensor_t *src_out_v = nullptr,
                                           bool prefer_outputs = false) const
     {
-        if (dst_gid == src_gid && !prefer_outputs) return;
+        if (dst_gid == src_gid && !prefer_outputs) return true;
         try
         {
             auto &dst_k = layer.get_input(dst_gid, "K_cache");
@@ -1327,51 +1289,54 @@ struct LLM::Impl : public IKvSlotHost {
                 src_v = &layer.get_input(src_gid, "V_cache");
             }
 
-            const size_t copy_k_bytes = std::min((size_t)dst_k.nSize, (size_t)src_k->nSize);
-            const size_t copy_v_bytes = std::min((size_t)dst_v.nSize, (size_t)src_v->nSize);
-            const bool same_k_buffer = LLM_WADDR(dst_k) == LLM_RADDR(*src_k);
-            const bool same_v_buffer = LLM_WADDR(dst_v) == LLM_RADDR(*src_v);
+            if (dst_k.nSize != src_k->nSize || dst_v.nSize != src_v->nSize ||
+                !axllm::qwen3_5::Runtime::compatible_cache_dtype(src_k->eDataType, dst_k.eDataType) ||
+                !axllm::qwen3_5::Runtime::compatible_cache_dtype(src_v->eDataType, dst_v.eDataType))
+            {
+                ALOGE("linear input state layout mismatch: src_gid=%d dst_gid=%d K=%u/%u dtype=%d/%d V=%u/%u dtype=%d/%d",
+                      src_gid, dst_gid, src_k->nSize, dst_k.nSize, src_k->eDataType, dst_k.eDataType,
+                      src_v->nSize, dst_v.nSize, src_v->eDataType, dst_v.eDataType);
+                return false;
+            }
+            const size_t copy_k_bytes = (size_t)dst_k.nSize;
+            const size_t copy_v_bytes = (size_t)dst_v.nSize;
+            void *dst_k_addr = LLM_WADDR(dst_k);
+            void *dst_v_addr = LLM_WADDR(dst_v);
+            const void *src_k_addr = LLM_RADDR(*src_k);
+            const void *src_v_addr = LLM_RADDR(*src_v);
+            if ((copy_k_bytes > 0 && (!dst_k_addr || !src_k_addr)) ||
+                (copy_v_bytes > 0 && (!dst_v_addr || !src_v_addr))) return false;
+            const bool same_k_buffer = dst_k_addr == src_k_addr;
+            const bool same_v_buffer = dst_v_addr == src_v_addr;
             if (std::getenv("AXLLM_DEBUG_LINEAR_STATE"))
             {
                 ALOGI("linear state copy: src_gid=%d dst_gid=%d prefer_outputs=%d src_k=%p(%u) dst_k=%p(%u) src_v=%p(%u) dst_v=%p(%u)",
                       src_gid,
                       dst_gid,
                       prefer_outputs ? 1 : 0,
-                      LLM_RADDR(*src_k),
+                      src_k_addr,
                       src_k->nSize,
-                      LLM_WADDR(dst_k),
+                      dst_k_addr,
                       dst_k.nSize,
-                      LLM_RADDR(*src_v),
+                      src_v_addr,
                       src_v->nSize,
-                      LLM_WADDR(dst_v),
+                      dst_v_addr,
                       dst_v.nSize);
             }
             if (!same_k_buffer && copy_k_bytes > 0)
             {
-                if (!LLM_WADDR(dst_k) || !LLM_RADDR(*src_k))
-                {
-                    ALOGW("skip linear K copy due to null buffer: src_gid=%d dst_gid=%d bytes=%zu", src_gid, dst_gid, copy_k_bytes);
-                }
-                else
-                {
-                    llm_d2d(LLM_WADDR(dst_k), LLM_RADDR(*src_k), copy_k_bytes, devid);
-                }
+                llm_d2d(dst_k_addr, src_k_addr, copy_k_bytes, devid);
             }
             if (!same_v_buffer && copy_v_bytes > 0)
             {
-                if (!LLM_WADDR(dst_v) || !LLM_RADDR(*src_v))
-                {
-                    ALOGW("skip linear V copy due to null buffer: src_gid=%d dst_gid=%d bytes=%zu", src_gid, dst_gid, copy_v_bytes);
-                }
-                else
-                {
-                    llm_d2d(LLM_WADDR(dst_v), LLM_RADDR(*src_v), copy_v_bytes, devid);
-                }
+                llm_d2d(dst_v_addr, src_v_addr, copy_v_bytes, devid);
             }
+            return true;
         }
         catch (const std::exception &e)
         {
             ALOGW("skip linear input state copy src_gid=%d dst_gid=%d: %s", src_gid, dst_gid, e.what());
+            return false;
         }
     }
 
@@ -1526,12 +1491,12 @@ struct LLM::Impl : public IKvSlotHost {
             llm_d2d(LLM_WADDR(dst_v), LLM_RADDR(src_v), copy_tokens_v * bytes_per_token, devid);
     }
 
-    void sync_device_kv_cache_from_decode(int src_decode_grpid,
+    bool sync_device_kv_cache_from_decode(int src_decode_grpid,
                                           int dst_decode_grpid,
                                           int valid_tokens,
                                           bool sync_prefill_groups)
     {
-        if (valid_tokens <= 0) return;
+        if (valid_tokens <= 0) return true;
         // ALOGI("sync KV cache from decode: src_gid=%d dst_gid=%d valid_tokens=%d sync_prefill=%d",
         //       src_decode_grpid,
         //       dst_decode_grpid,
@@ -1546,11 +1511,11 @@ struct LLM::Impl : public IKvSlotHost {
 
             if (is_linear_layer(m))
             {
-                copy_linear_input_state_to_group(lyr.layer, dst_layer_decode_gid, src_layer_decode_gid, devid);
+                if (!copy_linear_input_state_to_group(lyr.layer, dst_layer_decode_gid, src_layer_decode_gid, devid)) return false;
                 if (sync_prefill_groups && m >= 0 && m < (int)layer_prefill_grpids_.size())
                 {
                     for (const int gid : layer_prefill_grpids_[(size_t)m])
-                        copy_linear_input_state_to_group(lyr.layer, gid, src_layer_decode_gid, devid);
+                        if (!copy_linear_input_state_to_group(lyr.layer, gid, src_layer_decode_gid, devid)) return false;
                 }
                 continue;
             }
@@ -1565,6 +1530,7 @@ struct LLM::Impl : public IKvSlotHost {
                     copy_full_cache_prefix_to_group(lyr.layer, gid, src_layer_decode_gid, layer_kv, valid_tokens, devid, true);
             }
         }
+        return true;
     }
 
     void init_shared_kv_source_layers();
@@ -1589,35 +1555,22 @@ struct LLM::Impl : public IKvSlotHost {
 
     bool is_linear_layer(int layer_idx) const
     {
-        return layer_idx >= 0 &&
-               layer_idx < (int)layer_is_linear_attn.size() &&
-               layer_is_linear_attn[(size_t)layer_idx];
+        return qwen3_5_runtime.is_linear_layer(layer_idx);
     }
 
     bool has_linear_attention_layers() const
     {
-        for (bool is_linear : layer_is_linear_attn)
-        {
-            if (is_linear) return true;
-        }
-        return false;
+        return qwen3_5_runtime.has_linear_attention_layers();
     }
 
     bool is_sliding_attention_layer(int layer_idx) const
     {
-        return _attr.sliding_window > 0 &&
-               layer_idx >= 0 &&
-               layer_idx < (int)_attr.layer_types.size() &&
-               _attr.layer_types[(size_t)layer_idx] == "sliding_attention";
+        return qwen3_5_runtime.is_sliding_attention_layer(layer_idx);
     }
 
     int first_full_layer_idx() const
     {
-        for (int i = 0; i < (int)layer_is_linear_attn.size(); ++i)
-        {
-            if (!layer_is_linear_attn[(size_t)i]) return i;
-        }
-        return -1;
+        return qwen3_5_runtime.first_full_layer_idx();
     }
 
 #ifdef USE_AXCL
@@ -2115,7 +2068,12 @@ struct LLM::Impl : public IKvSlotHost {
         // slot's own device buffer). Just sync the cached prefix across shape groups.
         (void)kv_k;
         (void)kv_v;
-        sync_device_kv_cache_from_decode(prev_decode_grpid, decode_grpid, _precompute_len, true);
+        if (!sync_device_kv_cache_from_decode(prev_decode_grpid, decode_grpid, _precompute_len, true))
+        {
+            set_last_error("模型运行失败，请重新尝试。");
+            ResetKVCache();
+            return -1;
+        }
         return 0;
     }
 
@@ -2218,7 +2176,8 @@ struct LLM::Impl : public IKvSlotHost {
 
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1);
 
-    std::vector<Content> Run(std::vector<Content> history, const std::vector<::MediaInputs> &media_inputs, int output_max_token = -1);
+    std::vector<Content> Run(std::vector<Content> history,
+                             const std::vector<::MediaInputs> &media_inputs,
+                             int output_max_token = -1,
+                             std::vector<::MediaInputs> *normalized_media_inputs = nullptr);
 };
-
-

@@ -184,23 +184,23 @@ public:
     }
 
     // Pick the slot to serve `sel_tokens` (token path). See KvSlotSelect.hpp.
-    void select_kv_slot(const std::vector<int> &sel_tokens)
+    bool select_kv_slot(const std::vector<int> &sel_tokens)
     {
         multi_slot_active_request_ = false;
-        if (!multi_slot_enabled_) return;
+        if (!multi_slot_enabled_) return true;
         multi_slot_active_request_ = true;
         const SlotDecision d = decide_slot_by_tokens(kv_slots_, sel_tokens, host_.slot_cheap_prefill_capacity());
-        commit_kv_slot_choice(d.chosen, d.fresh, d.shared, (int)sel_tokens.size());
+        return commit_kv_slot_choice(d.chosen, d.fresh, d.shared, (int)sel_tokens.size());
     }
 
     // VLM slot selection: match on the chat history (Content) prefix instead.
-    void select_kv_slot_by_history(const std::vector<Content> &history)
+    bool select_kv_slot_by_history(const std::vector<Content> &history)
     {
         multi_slot_active_request_ = false;
-        if (!multi_slot_enabled_) return;
+        if (!multi_slot_enabled_) return true;
         multi_slot_active_request_ = true;
         const SlotDecision d = decide_slot_by_history(kv_slots_, history);
-        commit_kv_slot_choice(d.chosen, d.fresh, d.shared, (int)history.size());
+        return commit_kv_slot_choice(d.chosen, d.fresh, d.shared, (int)history.size());
     }
 
     void save_active_kv_slot()
@@ -230,29 +230,31 @@ private:
             const int gid = host_.slot_decode_gid_for_layer(m, host_.slot_decode_grpid());
             auto &t_k = lyr.layer.get_input(gid, "K_cache");
             auto &t_v = lyr.layer.get_input(gid, "V_cache");
-            size_t k_elems, v_elems;
+            size_t k_bytes, v_bytes;
             if (host_.slot_is_linear_layer(m))
             {
-                k_elems = (size_t)t_k.nSize / sizeof(unsigned short);
-                v_elems = (size_t)t_v.nSize / sizeof(unsigned short);
+                k_bytes = (size_t)t_k.nSize;
+                v_bytes = (size_t)t_v.nSize;
             }
             else
             {
                 const size_t layer_kv = (size_t)host_.slot_kv_cache_size_for_layer(m);
-                k_elems = v_elems = (size_t)std::max(0, precompute_len) * layer_kv;
+                const size_t prefix_bytes = (size_t)std::max(0, precompute_len) * layer_kv * sizeof(unsigned short);
+                k_bytes = std::min(prefix_bytes, (size_t)t_k.nSize);
+                v_bytes = std::min(prefix_bytes, (size_t)t_v.nSize);
             }
-            s.host_k[(size_t)m].resize(k_elems);
-            s.host_v[(size_t)m].resize(v_elems);
-            if (k_elems) llm_d2h(s.host_k[(size_t)m].data(), LLM_RADDR(t_k), std::min(k_elems * sizeof(unsigned short), (size_t)t_k.nSize), devid);
-            if (v_elems) llm_d2h(s.host_v[(size_t)m].data(), LLM_RADDR(t_v), std::min(v_elems * sizeof(unsigned short), (size_t)t_v.nSize), devid);
+            s.host_k[(size_t)m].resize(k_bytes);
+            s.host_v[(size_t)m].resize(v_bytes);
+            if (k_bytes) llm_d2h(s.host_k[(size_t)m].data(), LLM_RADDR(t_k), k_bytes, devid);
+            if (v_bytes) llm_d2h(s.host_v[(size_t)m].data(), LLM_RADDR(t_v), v_bytes, devid);
         }
     }
 
     // Host mode: load a slot's host KV into the (shared) device decode-group buffer.
-    void host_load_kv(int idx)
+    bool host_load_kv(int idx)
     {
         auto &s = kv_slots_[(size_t)idx];
-        if ((int)s.host_k.size() != attr_.axmodel_num) return; // fresh slot, nothing to load
+        if ((int)s.host_k.size() != attr_.axmodel_num) return true; // fresh slot, nothing to load
         for (int m = 0; m < attr_.axmodel_num; ++m)
         {
             auto &lyr = layers_[(size_t)m];
@@ -260,11 +262,21 @@ private:
             const int gid = host_.slot_decode_gid_for_layer(m, host_.slot_decode_grpid());
             auto &t_k = lyr.layer.get_input(gid, "K_cache");
             auto &t_v = lyr.layer.get_input(gid, "V_cache");
+            if (host_.slot_is_linear_layer(m) &&
+                (s.host_k[(size_t)m].size() != (size_t)t_k.nSize ||
+                 s.host_v[(size_t)m].size() != (size_t)t_v.nSize))
+            {
+                ALOGE("linear host slot size mismatch: slot=%d layer=%d K=%zu/%u V=%zu/%u",
+                      idx, m, s.host_k[(size_t)m].size(), t_k.nSize,
+                      s.host_v[(size_t)m].size(), t_v.nSize);
+                return false;
+            }
             if (!s.host_k[(size_t)m].empty())
-                llm_h2d(LLM_WADDR(t_k), s.host_k[(size_t)m].data(), std::min(s.host_k[(size_t)m].size() * sizeof(unsigned short), (size_t)t_k.nSize), devid);
+                llm_h2d(LLM_WADDR(t_k), s.host_k[(size_t)m].data(), std::min(s.host_k[(size_t)m].size(), (size_t)t_k.nSize), devid);
             if (!s.host_v[(size_t)m].empty())
-                llm_h2d(LLM_WADDR(t_v), s.host_v[(size_t)m].data(), std::min(s.host_v[(size_t)m].size() * sizeof(unsigned short), (size_t)t_v.nSize), devid);
+                llm_h2d(LLM_WADDR(t_v), s.host_v[(size_t)m].data(), std::min(s.host_v[(size_t)m].size(), (size_t)t_v.nSize), devid);
         }
+        return true;
     }
 
     bool activate_kv_slot(int idx)
@@ -284,19 +296,26 @@ private:
         }
         else
         {
-            host_load_kv(idx); // copy this slot's host KV onto the single device buffer
+            if (!host_load_kv(idx)) return false; // copy this slot's host KV onto the single device buffer
         }
         host_.slot_restore_decode_state(kv_slots_[(size_t)idx]);
         kv_active_slot_idx_ = idx;
         return true;
     }
 
-    void commit_kv_slot_choice(int chosen, bool fresh, int shared, int req_size)
+    bool commit_kv_slot_choice(int chosen, bool fresh, int shared, int req_size)
     {
         if (chosen != kv_active_slot_idx_)
         {
             save_active_kv_slot();
-            activate_kv_slot(chosen);
+            if (!activate_kv_slot(chosen))
+            {
+                ALOGE("kv slot activation failed: current=%d chosen=%d", kv_active_slot_idx_, chosen);
+                multi_slot_enabled_ = false;
+                multi_slot_active_request_ = false;
+                host_.slot_reset_kv_cache();
+                return false;
+            }
         }
         if (fresh)
         {
@@ -308,6 +327,7 @@ private:
         kv_slots_[(size_t)chosen].lru = ++kv_slot_lru_counter_;
         ALOGI("kv slot select: chosen=%d reuse=%d shared=%d req=%d (slots=%zu)",
               chosen, fresh ? 0 : 1, fresh ? 0 : shared, req_size, kv_slots_.size());
+        return true;
     }
 
     IKvSlotHost &host_;
