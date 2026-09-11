@@ -1089,7 +1089,7 @@ static std::string embedding_prompt_name_from_request(const nlohmann::json &raw)
     return "query";
 }
 
-static std::string embedding_adapter_task_from_request(const nlohmann::json &raw)
+static std::string adapter_task_from_request(const nlohmann::json &raw)
 {
     auto pick = [&](const char *key) -> std::string {
         if (!raw.contains(key) || !raw[key].is_string()) return {};
@@ -2557,7 +2557,7 @@ int run_server_mode(const ModelConfig &config, int port)
                         provider->end();
                         return;
                     }
-                    const std::string adapter_task = embedding_adapter_task_from_request(req.raw);
+                    const std::string adapter_task = adapter_task_from_request(req.raw);
                     if (!adapter_task.empty() && !llm.SetSharedWeightTask(adapter_task, !media_inputs.empty())) {
                         ALOGE("failed to switch embedding adapter task to '%s'", adapter_task.c_str());
                         cleanup_temp_files(temp_files);
@@ -2587,7 +2587,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     return;
                 }
 
-                const std::string adapter_task = embedding_adapter_task_from_request(req.raw);
+                const std::string adapter_task = adapter_task_from_request(req.raw);
                 if (!adapter_task.empty() && !llm.SetSharedWeightTask(adapter_task, false)) {
                     ALOGE("failed to switch embedding adapter task to '%s'", adapter_task.c_str());
                     provider->end();
@@ -2742,6 +2742,17 @@ int run_server_mode(const ModelConfig &config, int port)
                     ALOGE("handle_body failed");
                     cleanup_temp_files(temp_files);
                     push_chat_error("invalid_request_error", "Failed to parse chat messages.");
+                    return;
+                }
+                const std::string adapter_task = adapter_task_from_request(req.raw);
+                if (!adapter_task.empty() && !llm.SetSharedWeightTask(adapter_task, !media_inputs.empty())) {
+                    const std::string llm_error = llm.GetLastError();
+                    ALOGE("failed to switch chat adapter task to '%s': %s",
+                          adapter_task.c_str(),
+                          llm_error.c_str());
+                    cleanup_temp_files(temp_files);
+                    push_chat_error("model_error",
+                                    llm_error.empty() ? "Failed to switch adapter task." : llm_error);
                     return;
                 }
                 prepend_config_system_prompt_if_missing(config.attr, history, media_inputs);

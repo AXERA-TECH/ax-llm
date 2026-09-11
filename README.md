@@ -248,7 +248,7 @@ VLM 模型的 `config.json` 需包含（或等价字段）：
 - **AXCL 后端暂未接入共享基座**，当前只会告警并回退到单模型初始化。
 - `release_axmodel_buffer_after_init` 对 shared-base 路径同样生效；句柄重建时会按配置重新装载 base buffer。
 - shared-base 配置不允许静默回退到普通 `CreateHandleV2/V3` 路径；如果当前 `libax_engine.so` 不导出 `AX_ENGINE_CreateHandleV4`，服务会在初始化阶段直接失败。
-- `/v1/embeddings` 请求可通过 `task_id`、`adapter_task` 或 `task` 选择 adapter。当前 active adapter 是进程全局状态，不应在同一个服务进程中并发混跑不同 task。
+- `/v1/embeddings` 和 `/v1/chat/completions` 请求可通过 `task_id`、`adapter_task` 或 `task` 选择 adapter。当前 active adapter 是进程全局状态，不应在同一个服务进程中并发混跑不同 task。
 - 该能力仍属于实验性接口，现有单模型配置不受影响。
 
 当前验证状态：
