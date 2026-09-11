@@ -934,6 +934,8 @@ void resolve_config_paths(ModelConfig &config, const std::string &model_path)
             resolve_path(model_path, adapter.adapter_weight_filename_post);
         adapter.adapter_patch_manifest_filename_post =
             resolve_path(model_path, adapter.adapter_patch_manifest_filename_post);
+        adapter.lora_adapter_template_filename =
+            resolve_path(model_path, adapter.lora_adapter_template_filename);
         adapter.image_encoder_axmodel =
             resolve_path(model_path, adapter.image_encoder_axmodel);
         adapter.image_mapper_axmodel =
