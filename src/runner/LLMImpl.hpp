@@ -2117,6 +2117,18 @@ struct LLM::Impl : public IKvSlotHost {
     // corruption from KV/slot refactors; GetKVCache only exposes precompute_len.
     uint64_t hash_active_kv()
     {
+        // AXLLM_DUMP_KV_DIR=<dir>: also dump each layer's active K/V bytes to
+        // <dir>/t<call#>_l<layer>_{k,v}.bin — for byte-diffing two runs when a
+        // fingerprint mismatch needs to be attributed to a concrete row/write.
+        const char *dump_dir = std::getenv("AXLLM_DUMP_KV_DIR");
+        static int dump_call_idx = 0;
+        const int dump_idx = dump_call_idx++;
+        auto dump_blob = [&](int layer, char which, const void *p, size_t n) {
+            if (!dump_dir) return;
+            char path[512];
+            snprintf(path, sizeof(path), "%s/t%03d_l%02d_%c.bin", dump_dir, dump_idx, layer, which);
+            if (FILE *f = fopen(path, "wb")) { fwrite(p, 1, n, f); fclose(f); }
+        };
         uint64_t h = 1469598103934665603ULL;
         auto fold = [&h](const void *p, size_t n) {
             const unsigned char *b = (const unsigned char *)p;
@@ -2147,12 +2159,14 @@ struct LLM::Impl : public IKvSlotHost {
                 tmp.resize(k_elems);
                 llm_d2h(tmp.data(), LLM_RADDR(t_k), std::min(k_elems * sizeof(unsigned short), (size_t)t_k.nSize), devid);
                 fold(tmp.data(), k_elems * sizeof(unsigned short));
+                dump_blob(m, 'k', tmp.data(), k_elems * sizeof(unsigned short));
             }
             if (v_elems)
             {
                 tmp.resize(v_elems);
                 llm_d2h(tmp.data(), LLM_RADDR(t_v), std::min(v_elems * sizeof(unsigned short), (size_t)t_v.nSize), devid);
                 fold(tmp.data(), v_elems * sizeof(unsigned short));
+                dump_blob(m, 'v', tmp.data(), v_elems * sizeof(unsigned short));
             }
         }
         return h;
