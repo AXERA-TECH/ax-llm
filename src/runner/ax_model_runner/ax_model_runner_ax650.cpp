@@ -1,4 +1,5 @@
 #include "ax_model_runner_ax650.hpp"
+#include "../utils/cmm_flush_registry.hpp"
 #include <cstring>
 #include <fstream>
 #include <algorithm>
@@ -236,7 +237,7 @@ int ax_runner_ax650::sub_init()
                 if ((size_t)buf.nSize >= want_bytes) return 0;
                 const AX_U32 old_size = buf.nSize;
 
-                if (buf.phyAddr != 0) AX_SYS_MemFree(buf.phyAddr, buf.pVirAddr);
+                if (buf.phyAddr != 0) { CmmFlushRegistry::instance().unregister_block(buf.pVirAddr); AX_SYS_MemFree(buf.phyAddr, buf.pVirAddr); }
 
                 int ret = force_uncached
                               ? AX_SYS_MemAlloc((AX_U64 *)(&buf.phyAddr),
@@ -667,6 +668,7 @@ int ax_runner_ax650::inference()
         for (size_t i = 0; i < get_num_inputs(); i++)
         {
             auto &tensor = get_input(i);
+            if (is_sync_skip_input(tensor.sName)) continue; // flushed at write site (cmm_flush_registry)
             int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
             if (sync_ret != 0)
             {
@@ -768,6 +770,7 @@ int ax_runner_ax650::inference(int grpid)
         for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
         {
             auto &tensor = mgroup_input_tensors[grpid][i];
+            if (is_sync_skip_input(tensor.sName)) continue; // flushed at write site (cmm_flush_registry)
             int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
             if (sync_ret != 0)
             {
@@ -911,11 +914,17 @@ int ax_runner_ax650::kv_cache_slots_alloc(int num_slots)
             memset(vir, 0, st.bytes);
             st.slot_phy[s] = phy;
             st.slot_vir[s] = vir;
+            // KV slot buffers can be rebound behind K_cache/V_cache, which are
+            // excluded from the pre-inference auto-flush: register so write-site
+            // flushes (llm_h2d/llm_d2d/llm_memset) can resolve them, and clean
+            // the zero-fill above so the NPU never reads stale lines.
+            CmmFlushRegistry::instance().register_block(vir, (unsigned long long)phy, st.bytes);
+            CmmFlushRegistry::instance().flush_written(vir, st.bytes);
         }
         if (!ok)
         {
             for (auto &st : kv_slot_tensors_)
-                if (st.slot_phy[s]) { AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]); st.slot_phy[s] = 0; st.slot_vir[s] = nullptr; }
+                if (st.slot_phy[s]) { CmmFlushRegistry::instance().unregister_block(st.slot_vir[s]); AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]); st.slot_phy[s] = 0; st.slot_vir[s] = nullptr; }
             break;
         }
         achieved = s + 1;
@@ -934,7 +943,7 @@ int ax_runner_ax650::kv_cache_slots_set_count(int n)
     for (auto &st : kv_slot_tensors_)
     {
         for (int s = n; s < (int)st.slot_phy.size(); ++s)
-            if (st.slot_phy[s]) { AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]); st.slot_phy[s] = 0; st.slot_vir[s] = nullptr; }
+            if (st.slot_phy[s]) { CmmFlushRegistry::instance().unregister_block(st.slot_vir[s]); AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]); st.slot_phy[s] = 0; st.slot_vir[s] = nullptr; }
         if ((int)st.slot_phy.size() > n) { st.slot_phy.resize(n); st.slot_vir.resize(n); }
     }
     kv_num_slots_ = n;
@@ -993,6 +1002,7 @@ void ax_runner_ax650::kv_cache_slots_release()
         for (int s = 1; s < (int)st.slot_phy.size(); ++s)
         {
             if (st.slot_phy[s])
+                CmmFlushRegistry::instance().unregister_block(st.slot_vir[s]);
                 AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]);
             st.slot_phy[s] = 0;
             st.slot_vir[s] = nullptr;

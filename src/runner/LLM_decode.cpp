@@ -919,16 +919,34 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     if (visible_past > 0)
                     {
                         const size_t past_bytes = visible_past * (size_t)layer_kv * sizeof(unsigned short);
+#ifndef USE_AXCL
+                        CmmFlushRegistry::instance().invalidate_read(src_k.pVirAddr, std::min(past_bytes, (size_t)src_k.nSize));
+                        CmmFlushRegistry::instance().invalidate_read(src_v.pVirAddr, std::min(past_bytes, (size_t)src_v.nSize));
+#endif
                         memcpy(in_k.pVirAddr, src_k.pVirAddr, std::min(past_bytes, (size_t)src_k.nSize));
                         memcpy(in_v.pVirAddr, src_v.pVirAddr, std::min(past_bytes, (size_t)src_v.nSize));
                     }
+#ifndef USE_AXCL
+                    // K/V_cache skip the runner's auto-flush: clean the whole
+                    // rewritten blocks here (direct-write path, see registry).
+                    CmmFlushRegistry::instance().flush_written(in_k.pVirAddr, (size_t)in_k.nSize);
+                    CmmFlushRegistry::instance().flush_written(in_v.pVirAddr, (size_t)in_v.nSize);
+#endif
                 }
                 if (dst_tokens > 0)
                 {
                     const size_t cur_off = (size_t)kv_slot * (size_t)layer_kv;
                     const size_t dst_off = (dst_tokens - 1) * (size_t)layer_kv;
+#ifndef USE_AXCL
+                    CmmFlushRegistry::instance().invalidate_read((const unsigned short *)src_k.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+                    CmmFlushRegistry::instance().invalidate_read((const unsigned short *)src_v.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                     memcpy(in_k_ptr + dst_off, (const unsigned short *)src_k.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
                     memcpy(in_v_ptr + dst_off, (const unsigned short *)src_v.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+#ifndef USE_AXCL
+                    CmmFlushRegistry::instance().flush_written(in_k_ptr + dst_off, sizeof(unsigned short) * (size_t)layer_kv);
+                    CmmFlushRegistry::instance().flush_written(in_v_ptr + dst_off, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                 }
             }
             if (decode_profile_enabled)

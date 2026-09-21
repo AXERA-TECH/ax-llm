@@ -790,6 +790,26 @@ bool LLM::Impl::Init(LLMAttrType attr)
             update_cqdm(&cqdm, attr.axmodel_num + 1, "count", axmodel_path);
         }
     }
+
+    // Decode fast path (on-chip): exclude the multi-MB K_cache/V_cache inputs
+    // from the per-inference full auto-flush. Their CPU writes all go through
+    // llm_h2d/llm_d2d/llm_memset (LLMLayer.hpp), which clean exactly the bytes
+    // written via CmmFlushRegistry; every other input keeps the full auto-flush.
+    // AXLLM_LEGACY_FULL_SYNC=1 restores the historical flush-everything behavior.
+    if (std::getenv("AXLLM_LEGACY_FULL_SYNC") == nullptr)
+    {
+        auto &reg = CmmFlushRegistry::instance();
+        for (int i = 0; i < attr.axmodel_num; i++)
+        {
+            auto &lyr = llama_layers[i].layer;
+            lyr.set_sync_skip_input("K_cache");
+            lyr.set_sync_skip_input("V_cache");
+            for (const auto &grp : lyr.get_group_input_tensors())
+                for (const auto &t : grp)
+                    if (t.sName == "K_cache" || t.sName == "V_cache")
+                        reg.register_block(t.pVirAddr, t.phyAddr, (size_t)t.nSize);
+        }
+    }
 #endif
     axllm::Logger::finish_inplace_line();
     {
@@ -916,6 +936,10 @@ bool LLM::Impl::Init(LLMAttrType attr)
 
 void LLM::Impl::Deinit()
 {
+#ifndef USE_AXCL
+    // Drop write-site flush mappings before their CMM blocks are freed.
+    CmmFlushRegistry::instance().clear_all();
+#endif
     if (deinited_) return;
     deinited_ = true;
     for (size_t i = 0; i < llama_layers.size(); i++) llama_layers[i].layer.deinit();

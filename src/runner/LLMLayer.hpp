@@ -42,10 +42,33 @@ static inline void llm_d2d(void *phy_dst, const void *phy_src, size_t n, int dev
 #define LLM_RADDR(t)      ((const void *)(t).phyAddr)
 #define LLM_DEVID(layer_obj) ((layer_obj).layer.get_devid())
 #else
-static inline void llm_memset(void *vir, int val, size_t n, int /*devid*/) { memset(vir, val, n); }
-static inline void llm_h2d(void *vir_dst, const void *src, size_t n, int /*devid*/) { memcpy(vir_dst, src, n); }
-static inline void llm_d2h(void *dst, const void *vir_src, size_t n, int /*devid*/) { memcpy(dst, vir_src, n); }
-static inline void llm_d2d(void *vir_dst, const void *vir_src, size_t n, int /*devid*/) { memcpy(vir_dst, vir_src, n); }
+// On-chip: engine IO lives in CACHED CMM. After a CPU write into a tensor that
+// is excluded from the runner's pre-inference auto-flush (K_cache/V_cache, see
+// cmm_flush_registry.hpp), the written range must be cleaned here. The registry
+// only holds those excluded blocks, so writes into any other buffer (host heap,
+// auto-flushed small tensors) resolve to a cheap no-op lookup miss.
+#include "utils/cmm_flush_registry.hpp"
+static inline void llm_memset(void *vir, int val, size_t n, int /*devid*/)
+{
+    memset(vir, val, n);
+    CmmFlushRegistry::instance().flush_written(vir, n);
+}
+static inline void llm_h2d(void *vir_dst, const void *src, size_t n, int /*devid*/)
+{
+    memcpy(vir_dst, src, n);
+    CmmFlushRegistry::instance().flush_written(vir_dst, n);
+}
+static inline void llm_d2h(void *dst, const void *vir_src, size_t n, int /*devid*/)
+{
+    CmmFlushRegistry::instance().invalidate_read(vir_src, n);
+    memcpy(dst, vir_src, n);
+}
+static inline void llm_d2d(void *vir_dst, const void *vir_src, size_t n, int /*devid*/)
+{
+    CmmFlushRegistry::instance().invalidate_read(vir_src, n);
+    memcpy(vir_dst, vir_src, n);
+    CmmFlushRegistry::instance().flush_written(vir_dst, n);
+}
 #define LLM_WADDR(t)      ((t).pVirAddr)
 #define LLM_RADDR(t)      ((const void *)(t).pVirAddr)
 #define LLM_DEVID(layer_obj) (0)
