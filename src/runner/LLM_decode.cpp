@@ -1019,14 +1019,31 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                         const size_t tail_off = (dst_tokens - 1) * (size_t)layer_kv;
                         // See the AXCL branch above: shared layers must retain the
                         // source layer KV in their visible past cache.
+#ifndef USE_AXCL
+                        // K/V_cache skip the runner's auto-flush: invalidate the
+                        // KV rows being read, clean the rows written (registry).
+                        CmmFlushRegistry::instance().invalidate_read(in_k_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+                        CmmFlushRegistry::instance().invalidate_read(in_v_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                         memcpy(in_k_ptr + cur_off, in_k_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
                         memcpy(in_v_ptr + cur_off, in_v_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+#ifndef USE_AXCL
+                        CmmFlushRegistry::instance().flush_written(in_k_ptr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+                        CmmFlushRegistry::instance().flush_written(in_v_ptr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                     }
                 }
                 else
                 {
                     memcpy(in_k_ptr + kv_slot * layer_kv, out_k.pVirAddr, sizeof(unsigned short) * layer_kv);
                     memcpy(in_v_ptr + kv_slot * layer_kv, out_v.pVirAddr, sizeof(unsigned short) * layer_kv);
+#ifndef USE_AXCL
+                    // Bare-memcpy writeback path (embed Run): without these the
+                    // rows sit dirty in CPU cache and the NPU reads stale memory
+                    // nondeterministically (multi-slot golden drift, row-level).
+                    CmmFlushRegistry::instance().flush_written(in_k_ptr + kv_slot * layer_kv, sizeof(unsigned short) * (size_t)layer_kv);
+                    CmmFlushRegistry::instance().flush_written(in_v_ptr + kv_slot * layer_kv, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                 }
             }
             auto &t_out= lyr.layer.get_output(layer_decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
