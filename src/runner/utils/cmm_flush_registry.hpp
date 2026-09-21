@@ -23,6 +23,7 @@
 // full-flush behavior (LLM_init skips the skip-registration).
 
 #include <cstdint>
+#include <cstdio>
 #include <cstddef>
 #include <cstdlib>
 #include <map>
@@ -107,10 +108,18 @@ private:
             phy = b.phy + off;
             vbase = reinterpret_cast<void *>(addr);
         }
-        if (clean)
-            AX_SYS_MflushCache((AX_U64)phy, (AX_VOID *)vbase, (AX_U32)span);
-        else
-            AX_SYS_MinvalidateCache((AX_U64)phy, (AX_VOID *)vbase, (AX_U32)span);
+        const AX_S32 mret = clean
+            ? AX_SYS_MflushCache((AX_U64)phy, (AX_VOID *)vbase, (AX_U32)span)
+            : AX_SYS_MinvalidateCache((AX_U64)phy, (AX_VOID *)vbase, (AX_U32)span);
+        if (mret != 0)
+        {
+            // A silent failure here means the NPU/CPU can see stale KV rows —
+            // exactly the nondeterminism this registry exists to prevent.
+            fprintf(stderr,
+                    "[cmm-flush] %s(phy=0x%llx vir=%p span=%zu) FAILED ret=0x%x\n",
+                    clean ? "MflushCache" : "MinvalidateCache",
+                    (unsigned long long)phy, vbase, span, (unsigned)mret);
+        }
 #else
         (void)vir;
         (void)bytes;
