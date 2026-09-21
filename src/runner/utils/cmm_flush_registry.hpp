@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 
@@ -66,7 +67,10 @@ public:
     // full pre-inference MflushCache used to paper over this; with K/V_cache
     // excluded from it, every CPU read of those blocks must invalidate first.
     // Unknown ranges are ignored (ordinary host memory).
-    void invalidate_read(const void *vir, size_t bytes) { maintain(vir, bytes, false); }
+    void invalidate_read(const void *vir, size_t bytes)
+    {
+        if (!no_invalidate_) maintain(vir, bytes, false);
+    }
 
     // Clean (flush) the CPU-written byte range [vir, vir+bytes) if it falls in
     // a registered cached CMM block. Unknown ranges (host heap, AXCL shadow
@@ -74,8 +78,15 @@ public:
     void flush_written(const void *vir, size_t bytes) { maintain(vir, bytes, true); }
 
 private:
+    // Debug bisection knobs (read once): AXLLM_NO_REGISTRY=1 turns every
+    // maintenance call into a no-op; AXLLM_NO_INVALIDATE=1 disables only the
+    // read-side invalidate. Diagnostics only — not part of the contract.
+    const bool no_registry_ = std::getenv("AXLLM_NO_REGISTRY") != nullptr;
+    const bool no_invalidate_ = std::getenv("AXLLM_NO_INVALIDATE") != nullptr;
+
     void maintain(const void *vir, size_t bytes, bool clean)
     {
+        if (no_registry_) return;
 #ifndef USE_AXCL
         if (!vir || bytes == 0) return;
         const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(vir);
