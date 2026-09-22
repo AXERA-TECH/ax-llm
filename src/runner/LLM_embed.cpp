@@ -159,7 +159,7 @@ bool LLM::Impl::EmbedTokens(const std::vector<int> &token_ids, std::vector<float
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
                 fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
-                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), linear_mask_tmp.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), std::min((size_t)t_mask.nSize, linear_mask_tmp.size() * sizeof(unsigned short)), devid);
             }
             else
             {

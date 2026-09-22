@@ -84,7 +84,7 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
                 fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
-                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), linear_mask_tmp.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), std::min((size_t)t_mask.nSize, linear_mask_tmp.size() * sizeof(unsigned short)), devid);
             }
             else
             {
@@ -418,7 +418,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
                 fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
-                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), linear_mask_tmp.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), std::min((size_t)t_mask.nSize, linear_mask_tmp.size() * sizeof(unsigned short)), devid);
             }
             else
             {
