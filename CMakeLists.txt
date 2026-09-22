@@ -290,10 +290,22 @@ if(BUILD_AX650)
         pthread ${CMAKE_DL_LIBS} tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
+    add_executable(moss_embed_repro tools/moss_embed_repro.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+    )
+    target_include_directories(moss_embed_repro PRIVATE ${BSP_MSP_DIR}/include)
+    target_link_libraries(moss_embed_repro
+        -L${BSP_MSP_DIR}/lib
+        ax_engine ax_interpreter ax_sys
+        pthread ${CMAKE_DL_LIBS} tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
     if(OpenMP_CXX_FOUND)
         target_link_libraries(axllm OpenMP::OpenMP_CXX)
         target_link_libraries(llm_smoke OpenMP::OpenMP_CXX)
         target_link_libraries(golden_runner OpenMP::OpenMP_CXX)
+        target_link_libraries(moss_embed_repro OpenMP::OpenMP_CXX)
     endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
