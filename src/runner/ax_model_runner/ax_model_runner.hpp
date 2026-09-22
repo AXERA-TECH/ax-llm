@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 // ---------------------------------------------------------------------------
@@ -95,6 +96,7 @@ public:
 
     bool _auto_sync_before_inference = false;
     bool _auto_sync_after_inference = false;
+    std::set<std::string> _sync_skip_input_names;
 
     virtual ~ax_runner_base() {}
 
@@ -107,6 +109,18 @@ public:
 
     void set_auto_sync_before_inference(bool v) { _auto_sync_before_inference = v; }
     void set_auto_sync_after_inference(bool v) { _auto_sync_after_inference = v; }
+
+    // Exclude an input tensor (by name, all groups) from the pre-inference
+    // full auto-flush. Used for the multi-MB LLM K_cache/V_cache inputs whose
+    // CPU writes are row-granular and flushed at the write site instead
+    // (see utils/cmm_flush_registry.hpp). On backends without CPU-cache
+    // maintenance (AXCL) the skip set is simply never consulted.
+    const std::vector<std::vector<ax_runner_tensor_t>> &get_group_input_tensors() const { return mgroup_input_tensors; }
+    void set_sync_skip_input(const std::string &name) { _sync_skip_input_names.insert(name); }
+    bool is_sync_skip_input(const std::string &name) const
+    {
+        return _sync_skip_input_names.find(name) != _sync_skip_input_names.end();
+    }
 
     // 图像推理接口（LLM 不使用，提供默认实现避免子类必须重写）
     virtual int get_algo_width() { return 0; }

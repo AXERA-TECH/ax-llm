@@ -84,7 +84,7 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
                 fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
-                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), linear_mask_tmp.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), std::min((size_t)t_mask.nSize, linear_mask_tmp.size() * sizeof(unsigned short)), devid);
             }
             else
             {
@@ -253,6 +253,20 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
     std::vector<int> token_ids;
     int input_embed_num  = (int)(test_embed.size() / _attr.tokens_embed_size);
+    // Context-window guard (issue #72): Run(embed) ACCUMULATES onto the current
+    // KV (prefill continues at precompute_len). Callers streaming independent
+    // segments without ResetKVCache() eventually exhaust the window, and the
+    // failure used to be a SILENT empty string repeated for every later call.
+    // Fail loudly instead so the caller can reset or trim.
+    if (precompute_len + input_embed_num + 1 > _attr.max_token_len)
+    {
+        ALOGE("Run(embed): context overflow: precompute_len=%d + input=%d + 1 > max_token_len=%d. "
+              "Run(embed) appends to the existing KV cache; call ResetKVCache() between independent "
+              "segments (e.g. per audio segment) or shorten the input.",
+              precompute_len, input_embed_num, _attr.max_token_len);
+        set_last_error("上下文已满：Run(embed) 为增量式调用，独立分段间请先调用 ResetKVCache()，或缩短输入。");
+        return final_out;
+    }
     int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
     ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
     timer t_cost, ttft_timer, decode_timer; ttft_timer.start();
@@ -273,7 +287,15 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         int g = select_prefill_group(history_len, chunk_tokens, prefer_symbolic_group);
         if (g < 0)
         {
-            ALOGE("failed to select prefill group for history_len=%d chunk_tokens=%d", history_len, chunk_tokens);
+            // This is where issue #72's "later segments are always empty" died
+            // silently: accumulated KV (no ResetKVCache between independent
+            // Run(embed) segments) exceeds the largest prefill group capacity.
+            // Surface the error so serve/CLI callers can see and recover.
+            ALOGE("failed to select prefill group for history_len=%d chunk_tokens=%d "
+                  "(prefill_max_token_num=%d). Run(embed)/Run() append to the existing KV; "
+                  "call ResetKVCache() between independent segments or shorten the input.",
+                  history_len, chunk_tokens, _attr.prefill_max_token_num);
+            set_last_error("上下文超出 prefill 容量：独立分段间请先调用 ResetKVCache()，或缩短输入。");
             return final_out;
         }
         prefill_grp_list[p] = g;
@@ -418,7 +440,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
                 fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
-                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), linear_mask_tmp.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), std::min((size_t)t_mask.nSize, linear_mask_tmp.size() * sizeof(unsigned short)), devid);
             }
             else
             {
@@ -919,16 +941,34 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     if (visible_past > 0)
                     {
                         const size_t past_bytes = visible_past * (size_t)layer_kv * sizeof(unsigned short);
+#ifndef USE_AXCL
+                        CmmFlushRegistry::instance().invalidate_read(src_k.pVirAddr, std::min(past_bytes, (size_t)src_k.nSize));
+                        CmmFlushRegistry::instance().invalidate_read(src_v.pVirAddr, std::min(past_bytes, (size_t)src_v.nSize));
+#endif
                         memcpy(in_k.pVirAddr, src_k.pVirAddr, std::min(past_bytes, (size_t)src_k.nSize));
                         memcpy(in_v.pVirAddr, src_v.pVirAddr, std::min(past_bytes, (size_t)src_v.nSize));
                     }
+#ifndef USE_AXCL
+                    // K/V_cache skip the runner's auto-flush: clean the whole
+                    // rewritten blocks here (direct-write path, see registry).
+                    CmmFlushRegistry::instance().flush_written(in_k.pVirAddr, (size_t)in_k.nSize);
+                    CmmFlushRegistry::instance().flush_written(in_v.pVirAddr, (size_t)in_v.nSize);
+#endif
                 }
                 if (dst_tokens > 0)
                 {
                     const size_t cur_off = (size_t)kv_slot * (size_t)layer_kv;
                     const size_t dst_off = (dst_tokens - 1) * (size_t)layer_kv;
+#ifndef USE_AXCL
+                    CmmFlushRegistry::instance().invalidate_read((const unsigned short *)src_k.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+                    CmmFlushRegistry::instance().invalidate_read((const unsigned short *)src_v.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                     memcpy(in_k_ptr + dst_off, (const unsigned short *)src_k.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
                     memcpy(in_v_ptr + dst_off, (const unsigned short *)src_v.pVirAddr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+#ifndef USE_AXCL
+                    CmmFlushRegistry::instance().flush_written(in_k_ptr + dst_off, sizeof(unsigned short) * (size_t)layer_kv);
+                    CmmFlushRegistry::instance().flush_written(in_v_ptr + dst_off, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                 }
             }
             if (decode_profile_enabled)
@@ -1001,14 +1041,31 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                         const size_t tail_off = (dst_tokens - 1) * (size_t)layer_kv;
                         // See the AXCL branch above: shared layers must retain the
                         // source layer KV in their visible past cache.
+#ifndef USE_AXCL
+                        // K/V_cache skip the runner's auto-flush: invalidate the
+                        // KV rows being read, clean the rows written (registry).
+                        CmmFlushRegistry::instance().invalidate_read(in_k_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+                        CmmFlushRegistry::instance().invalidate_read(in_v_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                         memcpy(in_k_ptr + cur_off, in_k_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
                         memcpy(in_v_ptr + cur_off, in_v_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+#ifndef USE_AXCL
+                        CmmFlushRegistry::instance().flush_written(in_k_ptr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+                        CmmFlushRegistry::instance().flush_written(in_v_ptr + cur_off, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                     }
                 }
                 else
                 {
                     memcpy(in_k_ptr + kv_slot * layer_kv, out_k.pVirAddr, sizeof(unsigned short) * layer_kv);
                     memcpy(in_v_ptr + kv_slot * layer_kv, out_v.pVirAddr, sizeof(unsigned short) * layer_kv);
+#ifndef USE_AXCL
+                    // Bare-memcpy writeback path (embed Run): without these the
+                    // rows sit dirty in CPU cache and the NPU reads stale memory
+                    // nondeterministically (multi-slot golden drift, row-level).
+                    CmmFlushRegistry::instance().flush_written(in_k_ptr + kv_slot * layer_kv, sizeof(unsigned short) * (size_t)layer_kv);
+                    CmmFlushRegistry::instance().flush_written(in_v_ptr + kv_slot * layer_kv, sizeof(unsigned short) * (size_t)layer_kv);
+#endif
                 }
             }
             auto &t_out= lyr.layer.get_output(layer_decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
