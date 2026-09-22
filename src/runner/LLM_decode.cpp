@@ -253,6 +253,20 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
     std::vector<int> token_ids;
     int input_embed_num  = (int)(test_embed.size() / _attr.tokens_embed_size);
+    // Context-window guard (issue #72): Run(embed) ACCUMULATES onto the current
+    // KV (prefill continues at precompute_len). Callers streaming independent
+    // segments without ResetKVCache() eventually exhaust the window, and the
+    // failure used to be a SILENT empty string repeated for every later call.
+    // Fail loudly instead so the caller can reset or trim.
+    if (precompute_len + input_embed_num + 1 > _attr.max_token_len)
+    {
+        ALOGE("Run(embed): context overflow: precompute_len=%d + input=%d + 1 > max_token_len=%d. "
+              "Run(embed) appends to the existing KV cache; call ResetKVCache() between independent "
+              "segments (e.g. per audio segment) or shorten the input.",
+              precompute_len, input_embed_num, _attr.max_token_len);
+        set_last_error("上下文已满：Run(embed) 为增量式调用，独立分段间请先调用 ResetKVCache()，或缩短输入。");
+        return final_out;
+    }
     int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
     ALOGI("input token num : %d, prefill_split_num : %d", input_embed_num, prefill_split_num);
     timer t_cost, ttft_timer, decode_timer; ttft_timer.start();
