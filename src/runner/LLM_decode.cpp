@@ -287,7 +287,15 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         int g = select_prefill_group(history_len, chunk_tokens, prefer_symbolic_group);
         if (g < 0)
         {
-            ALOGE("failed to select prefill group for history_len=%d chunk_tokens=%d", history_len, chunk_tokens);
+            // This is where issue #72's "later segments are always empty" died
+            // silently: accumulated KV (no ResetKVCache between independent
+            // Run(embed) segments) exceeds the largest prefill group capacity.
+            // Surface the error so serve/CLI callers can see and recover.
+            ALOGE("failed to select prefill group for history_len=%d chunk_tokens=%d "
+                  "(prefill_max_token_num=%d). Run(embed)/Run() append to the existing KV; "
+                  "call ResetKVCache() between independent segments or shorten the input.",
+                  history_len, chunk_tokens, _attr.prefill_max_token_num);
+            set_last_error("上下文超出 prefill 容量：独立分段间请先调用 ResetKVCache()，或缩短输入。");
             return final_out;
         }
         prefill_grp_list[p] = g;
