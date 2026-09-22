@@ -3,7 +3,7 @@
 // Per-VLM audio encoder(s), extracted out of VisionModule (audio doesn't belong in a
 // vision module). Owns its own encoder runner + audio profiles; the multimodal injection
 // (locating audio placeholders in input_ids and injecting embeds) stays in VisionModule.
-// Only Gemma4VL (dual 5s/30s profiles) and Qwen3Omni (Whisper 30s) have audio.
+// Gemma4VL uses dual 5s/30s profiles; Qwen3Omni and MOSS use Whisper-family 30s profiles.
 
 #include <memory>
 #include <string>
@@ -13,7 +13,7 @@ namespace vision {
 
 class AudioEncoder {
 public:
-    enum class Kind { None, Gemma4, Whisper };
+    enum class Kind { None, Gemma4, Whisper, Moss };
 
     AudioEncoder();
     ~AudioEncoder();
@@ -34,6 +34,12 @@ public:
                 int& out_num_media_for_tokenizer,
                 int& out_num_media_tokens,
                 std::string& err);
+
+    bool EncodeBlocks(const std::vector<std::string>& uris,
+                      std::vector<std::vector<unsigned short>>& out_blocks,
+                      int& out_num_media_for_tokenizer,
+                      int& out_num_media_tokens,
+                      std::string& err);
 
 private:
     struct Impl;

@@ -652,6 +652,18 @@ struct ModelConfig
             {
                 attr.filename_audio_encoder_axmodel_30s = j["filename_audio_encoder_axmodel_30s"].get<std::string>();
             }
+            if (j.contains("audio_tokens_per_second"))
+            {
+                attr.audio_tokens_per_second = j["audio_tokens_per_second"].get<float>();
+            }
+            if (j.contains("audio_time_marker_every_seconds"))
+            {
+                attr.audio_time_marker_every_seconds = j["audio_time_marker_every_seconds"].get<int>();
+            }
+            if (j.contains("audio_time_markers_enabled"))
+            {
+                attr.audio_time_markers_enabled = j["audio_time_markers_enabled"].get<bool>();
+            }
 
             if (j.contains("vision_cache_dir"))
             {
@@ -1881,24 +1893,54 @@ static bool run_audio_api_request(LLM &llm,
                                   std::string &final_text,
                                   std::string &err)
 {
+    const auto request_started = std::chrono::steady_clock::now();
     std::vector<Content> history;
-    if (!req.language.empty())
+    const bool moss_mode = llm.getAttr()->vlm_type == VLMType::MossTranscribeDiarizeVL;
+    ALOGI("ASR runtime: moss_mode=%d max_token_len=%d prefill_max_token_num=%d tokens_embed_num=%d",
+          moss_mode ? 1 : 0,
+          llm.getAttr()->max_token_len,
+          llm.getAttr()->prefill_max_token_num,
+          llm.getAttr()->tokens_embed_num);
+    if (moss_mode)
+    {
+        // Keep the `/v1/audio/transcriptions` path aligned with the Python
+        // reference runner: fixed system prompt and Chinese diarization
+        // instruction, one audio placeholder in the user turn.
+        history.push_back({SYSTEM, TEXT, "You are a helpful assistant."});
+        history.push_back({USER, AUDIO,
+                           "请将音频转写为文本，每一段需以起始时间戳和说话人编号"
+                           "（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，"
+                           "并在段末标注结束时间戳，以清晰标明该段语音范围。"});
+    }
+    else if (!req.language.empty())
     {
         history.push_back({SYSTEM, TEXT, "The target language for this audio task is: " + req.language + "."});
     }
 
-    const size_t user_index = history.size();
-    history.push_back({USER, AUDIO, build_audio_task_instruction(req)});
-
-    std::vector<MediaInputs> media_inputs;
     std::vector<std::string> temp_files;
     const std::string audio_path = save_upload_to_tempfile(req.filename, req.audio_data);
+    ALOGI("ASR request start: model=%s filename=%s bytes=%zu task=%s response_format=%s language=%s",
+          req.model.c_str(),
+          req.filename.c_str(),
+          req.audio_data.size(),
+          req.task.c_str(),
+          req.response_format.c_str(),
+          req.language.c_str());
     if (audio_path.empty())
     {
         err = "failed to persist uploaded audio payload";
         return false;
     }
     temp_files.push_back(audio_path);
+
+    const size_t user_index = moss_mode ? history.size() - 1 : history.size();
+    if (!moss_mode)
+    {
+        history.push_back({USER, AUDIO, build_audio_task_instruction(req)});
+    }
+
+    std::vector<MediaInputs> media_inputs;
+    media_inputs.reserve(1);
     media_inputs.push_back({user_index, {audio_path}});
 
     llm.getAttr()->runing_callback = nullptr;
@@ -1917,6 +1959,13 @@ static bool run_audio_api_request(LLM &llm,
     if (!out_history.empty() && out_history.back().role == ASSISTANT)
     {
         final_text = out_history.back().data;
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - request_started).count();
+        ALOGI("ASR request done: text_tokens=%d completion_tokens=%d total_tokens=%d elapsed_ms=%lld text_chars=%zu",
+              llm.GetLastPromptTokenNum(),
+              llm.GetLastCompletionTokenNum(),
+              llm.GetLastPromptTokenNum() + llm.GetLastCompletionTokenNum(),
+              (long long)elapsed_ms,
+              final_text.size());
         return true;
     }
 
@@ -2453,9 +2502,11 @@ int run_server_mode(const ModelConfig &config, int port)
         else
         {
             const bool has_audio_encoder =
-                config.attr.vlm_type == VLMType::Gemma4VL &&
-                (file_exist(config.attr.filename_audio_encoder_axmodel_5s) ||
-                 file_exist(config.attr.filename_audio_encoder_axmodel_30s));
+                ((config.attr.vlm_type == VLMType::Gemma4VL &&
+                  (file_exist(config.attr.filename_audio_encoder_axmodel_5s) ||
+                   file_exist(config.attr.filename_audio_encoder_axmodel_30s))) ||
+                 (config.attr.vlm_type == VLMType::MossTranscribeDiarizeVL &&
+                  file_exist(config.attr.filename_audio_encoder_axmodel_30s)));
 
             openai_api::ChatModelOptions options;
             options.supports_vision = config.attr.vlm_type != VLMType::None;

@@ -1,6 +1,6 @@
 [submodule "third_party/tokenizer.axera"]
 	path = third_party/tokenizer.axera
-	url = https://github.com/ZHEQIUSHUI/tokenizer.axera
+	url = https://github.com/ZHEQIUSHUI/tokenizer.git
 [submodule "third_party/openai-api.cpp"]
 	path = third_party/openai-api.cpp
 	url = https://github.com/ZHEQIUSHUI/openai-api.cpp

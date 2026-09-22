@@ -100,6 +100,13 @@ struct LLMAttrType {
     std::string filename_audio_encoder_axmodel_5s = "gemma4_audio_5s.axmodel";
     std::string filename_audio_encoder_axmodel_30s = "gemma4_audio_30s.axmodel";
 
+    // MOSS-Transcribe-Diarize audio wiring. These control how the single
+    // `<|audio_pad|>` placeholder is expanded into audio-pad tokens plus
+    // numeric time anchors after the Whisper-VQ frontend.
+    float audio_tokens_per_second = 12.5f;
+    int audio_time_marker_every_seconds = 5;
+    bool audio_time_markers_enabled = true;
+
     // Optional: vision embedding cache directory. If empty: memory-only cache for the process lifetime.
     // If set: read/write encoded embeddings for repeated images across runs.
     std::string vision_cache_dir;

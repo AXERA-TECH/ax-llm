@@ -835,4 +835,181 @@ bool LoadWhisperAudioInputFeatures(const std::string& audio_path,
     return true;
 }
 
+bool LoadMossAudioInputChunks(const std::string& audio_path,
+                              const WhisperAudioProfile& profile,
+                              std::vector<MossAudioChunk>& chunks,
+                              std::string& err)
+{
+    chunks.clear();
+
+    if (profile.feature_size <= 0 || profile.num_mel_frames <= 0 ||
+        profile.hop_length <= 0 || profile.sampling_rate <= 0) {
+        err = "invalid Whisper audio profile for MOSS chunking";
+        return false;
+    }
+
+    // Whisper's 2x temporal stride and the VQ adaptor's 4x merge.
+    constexpr int kWhisperEncoderStride = 2;
+    constexpr int kAudioMergeSize = 4;
+    const int samples_per_token =
+        profile.hop_length * kWhisperEncoderStride * kAudioMergeSize;
+    if (samples_per_token <= 0) {
+        err = "invalid MOSS audio token stride";
+        return false;
+    }
+
+    // The compiled audio model takes [1, feature_size, num_mel_frames] for a
+    // 30-second chunk (16000 Hz * 30 s = 480000 samples).
+    const int chunk_samples = profile.num_mel_frames * profile.hop_length;
+    if (chunk_samples <= 0) {
+        err = "invalid MOSS audio chunk length";
+        return false;
+    }
+
+    std::string working_audio_path = audio_path;
+    std::string decoded_audio_path;
+    std::string ffmpeg_err;
+    const bool decoded_with_ffmpeg =
+        maybe_decode_audio_via_ffmpeg(audio_path, profile.sampling_rate, decoded_audio_path, ffmpeg_err);
+    if (decoded_with_ffmpeg) {
+        working_audio_path = decoded_audio_path;
+    }
+
+    std::vector<float> waveform;
+    int source_sample_rate = 0;
+    if (!read_wav_mono_f32(working_audio_path, waveform, source_sample_rate, err)) {
+        if (decoded_with_ffmpeg) {
+            std::error_code ec;
+            std::filesystem::remove(decoded_audio_path, ec);
+        }
+        return false;
+    }
+    if (decoded_with_ffmpeg) {
+        std::error_code ec;
+        std::filesystem::remove(decoded_audio_path, ec);
+    }
+    if (waveform.empty()) {
+        err = "MOSS audio input contains no samples";
+        return false;
+    }
+
+    std::vector<float> mono = resample_via_libsamplerate(waveform, source_sample_rate, profile.sampling_rate);
+    if (mono.empty()) mono = resample_bandlimited(waveform, source_sample_rate, profile.sampling_rate);
+    if (mono.empty()) {
+        err = "MOSS audio resampling produced no samples";
+        return false;
+    }
+
+    WhisperAudioProfile fixed_profile = profile;
+    if (fixed_profile.duration_sec <= 0.0f) {
+        fixed_profile.duration_sec =
+            (float)fixed_profile.num_mel_frames * (float)fixed_profile.hop_length /
+            (float)fixed_profile.sampling_rate;
+    }
+    if (fixed_profile.num_audio_tokens <= 0) {
+        fixed_profile.num_audio_tokens = fixed_profile.num_mel_frames / 4;
+    }
+
+    const bool resample_compat_correction = source_sample_rate != profile.sampling_rate;
+    for (int start = 0; start < (int)mono.size(); start += chunk_samples) {
+        const int valid_samples = std::min<int>(chunk_samples, (int)mono.size() - start);
+        if (valid_samples <= 0) break;
+
+        const int num_tokens = (valid_samples - 1) / samples_per_token + 1;
+        if (num_tokens <= 0 || num_tokens > fixed_profile.num_audio_tokens) {
+            err = "MOSS audio chunk token count out of range: " + std::to_string(num_tokens);
+            return false;
+        }
+
+        std::vector<float> padded((size_t)chunk_samples, 0.0f);
+        std::copy(mono.begin() + start, mono.begin() + start + valid_samples, padded.begin());
+
+        std::vector<float> features;
+        if (!compute_whisper_log_mel_features(padded, fixed_profile, features, err)) {
+            return false;
+        }
+        if (resample_compat_correction) {
+            apply_whisper_resample_compat_correction(features, fixed_profile);
+        }
+
+        MossAudioChunk chunk;
+        chunk.input_features = std::move(features);
+        chunk.num_tokens = num_tokens;
+        chunks.push_back(std::move(chunk));
+    }
+
+    if (chunks.empty()) {
+        err = "MOSS audio produced no chunks";
+        return false;
+    }
+    return true;
+}
+
+bool BuildMossAudioSpan(int audio_pad_id,
+                        int audio_seq_len,
+                        const std::vector<int>& digit_ids,
+                        float audio_tokens_per_second,
+                        int time_marker_every_seconds,
+                        bool enable_time_markers,
+                        std::vector<int>& out_span,
+                        std::string& err)
+{
+    out_span.clear();
+    if (audio_pad_id < 0) {
+        err = "invalid MOSS audio pad token id";
+        return false;
+    }
+    if (audio_seq_len < 0) {
+        err = "negative MOSS audio token count";
+        return false;
+    }
+    if (digit_ids.size() != 10) {
+        err = "MOSS digit token map must contain exactly 10 entries";
+        return false;
+    }
+
+    if (!enable_time_markers || audio_seq_len <= 0 || time_marker_every_seconds <= 0) {
+        out_span.assign((size_t)audio_seq_len, audio_pad_id);
+        return true;
+    }
+    if (audio_tokens_per_second <= 0.0f) {
+        err = "invalid MOSS audio_tokens_per_second";
+        return false;
+    }
+
+    const int tokens_per_marker = (int)(audio_tokens_per_second * (float)time_marker_every_seconds);
+    if (tokens_per_marker <= 0) {
+        out_span.assign((size_t)audio_seq_len, audio_pad_id);
+        return true;
+    }
+
+    const double duration = (double)audio_seq_len / (double)audio_tokens_per_second;
+    int consumed = 0;
+    for (int second = time_marker_every_seconds;
+         second <= (int)duration;
+         second += time_marker_every_seconds) {
+        const int position = (second / time_marker_every_seconds) * tokens_per_marker;
+        const int segment_len = position - consumed;
+        if (segment_len > 0) {
+            out_span.insert(out_span.end(), (size_t)segment_len, audio_pad_id);
+            consumed += segment_len;
+        }
+        const std::string digits = std::to_string(second);
+        for (const char c : digits) {
+            const int digit = (int)(c - '0');
+            if (digit < 0 || digit > 9) {
+                err = "invalid MOSS time marker digit";
+                out_span.clear();
+                return false;
+            }
+            out_span.push_back(digit_ids[(size_t)digit]);
+        }
+    }
+    const int remainder = audio_seq_len - consumed;
+    if (remainder > 0) {
+        out_span.insert(out_span.end(), (size_t)remainder, audio_pad_id);
+    }
+    return true;
+}
+
 } // namespace vision::audio

@@ -62,6 +62,7 @@ enum class AudioKind {
     None,
     Gemma4Audio,     // dual 5s/30s profiles, select-by-duration
     Qwen3OmniAudio,  // single Whisper 30s profile
+    MossAudio,       // 30s Whisper-VQ chunks with dynamic valid-token spans
 };
 
 // Placeholder / special token ids used to locate vision positions in input_ids.

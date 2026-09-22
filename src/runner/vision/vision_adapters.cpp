@@ -633,6 +633,18 @@ public:
     }
 };
 
+class MossTranscribeDiarizeAdapter : public IVisionAdapter {
+public:
+    bool resolveTokenIds(const std::shared_ptr<BaseTokenizer>& tok,
+                         TokenIds& out,
+                         std::string& err) const override {
+        return get_single_token_id(tok, "<|audio_pad|>", out.audio_pad, err);
+    }
+
+    const char* displayName() const override { return "MossTranscribeDiarize"; }
+    AudioKind audioKind() const override { return AudioKind::MossAudio; }
+};
+
 } // namespace
 
 std::unique_ptr<IVisionAdapter> make_vision_adapter(VLMType type) {
@@ -647,6 +659,7 @@ std::unique_ptr<IVisionAdapter> make_vision_adapter(VLMType type) {
         case VLMType::Gemma4VL:        return std::make_unique<Gemma4VLAdapter>();
         case VLMType::MiniCPMV46VL:    return std::make_unique<MiniCPMV46VLAdapter>();
         case VLMType::LocateAnythingVL:return std::make_unique<LocateAnythingVLAdapter>();
+        case VLMType::MossTranscribeDiarizeVL:return std::make_unique<MossTranscribeDiarizeAdapter>();
         // VLMType::None + anything unrecognized: base (no-op) adapter.
         default:                       return std::make_unique<IVisionAdapter>();
     }
