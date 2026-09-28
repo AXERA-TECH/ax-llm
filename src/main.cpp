@@ -2342,6 +2342,10 @@ int run_server_mode(const ModelConfig &config, int port)
         if (config.is_embedding_model())
         {
             const bool use_jina_prompt_prefix = normalized_key(config.attr.tokenizer_type) == "qwen3omni";
+            g_server.setModelExtraFields(model_name, {
+                {"prefill_max_token_num", llm.getAttr()->prefill_max_token_num},
+                {"max_token_len", llm.getAttr()->max_token_len},
+            });
             g_server.registerEmbedding(model_name, [&llm, use_jina_prompt_prefix](const openai_api::EmbeddingRequest &req,
                                                                std::shared_ptr<openai_api::BaseDataProvider> provider)
                                        {
@@ -2685,7 +2689,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 }
 
                 cleanup_temp_files(temp_files);
-                provider->end(); });
+                provider->end(); }, options);
 
             if (has_audio_encoder)
             {
