@@ -4,6 +4,7 @@
 bool LLM::Impl::EmbedTokens(const std::vector<int> &token_ids, std::vector<float> &out_embedding)
 {
     b_stop.store(false, std::memory_order_relaxed);
+    clear_last_error();
 
     if (token_ids.empty())
     {
@@ -29,6 +30,21 @@ bool LLM::Impl::EmbedTokens(const std::vector<int> &token_ids, std::vector<float
     if (_attr.prefill_token_num <= 0 || _attr.tokens_embed_size <= 0 || _attr.kv_cache_size <= 0)
     {
         ALOGE("LLM embedding not initialized correctly (prefill_token_num/embed_size/kv_cache_size)");
+        set_last_error("embedding 模型未正确初始化。");
+        return false;
+    }
+
+    // Reject oversized inputs up front with a user-facing reason, instead of failing inside the
+    // prefill-group selection below (the server then had nothing to report and answered 504).
+    // largest prefill group's total capacity (history + current chunk), as in SetKVCache()
+    const int max_input = _attr.prefill_max_kv_cache_num_grp.empty()
+                              ? _attr.prefill_max_token_num
+                              : _attr.prefill_max_kv_cache_num_grp.back();
+    if (max_input > 0 && input_embed_num > max_input)
+    {
+        ALOGE("embedding input too long: %d tokens > %d", input_embed_num, max_input);
+        set_last_error("输入内容超过了 embedding 模型的长度上限（" + std::to_string(input_embed_num) + " > " +
+                       std::to_string(max_input) + " token），请缩短文本或减少图片数量。");
         return false;
     }
 
@@ -48,6 +64,8 @@ bool LLM::Impl::EmbedTokens(const std::vector<int> &token_ids, std::vector<float
         if (gid < 0)
         {
             ALOGE("failed to select prefill group for embedding: history_len=%d chunk_tokens=%d", history_len, chunk_tokens);
+            set_last_error("输入内容超过了 embedding 模型的长度上限（" + std::to_string(input_embed_num) +
+                           " token），请缩短文本或减少图片数量。");
             return false;
         }
         prefill_grp_list[p] = gid;

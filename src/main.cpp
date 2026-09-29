@@ -2136,6 +2136,16 @@ static bool normalize_single_image_ocr_request(const ModelConfig &config,
 }
 
 // Run server mode
+// Embedding failures must reach the client as an error: without a chunk the HTTP layer only
+// sees an ended provider and answers "504 Request timeout", which looks like a hung server.
+static void push_embedding_error(const std::shared_ptr<openai_api::BaseDataProvider> &provider, LLM &llm)
+{
+    std::string msg = llm.GetLastError();
+    if (msg.empty()) msg = "embedding 计算失败，请重新尝试。";
+    ALOGW("Returning user-facing embedding error: %s", msg.c_str());
+    provider->push(openai_api::OutputChunk::Error("model_error", msg));
+}
+
 int run_server_mode(const ModelConfig &config, int port)
 {
     g_exit_on_sigint.store(true, std::memory_order_relaxed);
@@ -2368,6 +2378,9 @@ int run_server_mode(const ModelConfig &config, int port)
                     {
                         ALOGE("handle_api_messages failed for embeddings messages");
                         cleanup_temp_files(temp_files);
+                        keepalive.stop();
+                        provider->push(openai_api::OutputChunk::Error("invalid_request_error",
+                                                                      "无法解析 messages（文本或图片内容无效）。"));
                         provider->end();
                         return;
                     }
@@ -2380,6 +2393,8 @@ int run_server_mode(const ModelConfig &config, int port)
                     {
                         ALOGE("Embed(messages) failed");
                         cleanup_temp_files(temp_files);
+                        keepalive.stop();
+                        push_embedding_error(provider, llm);
                         provider->end();
                         return;
                     }
@@ -2402,6 +2417,8 @@ int run_server_mode(const ModelConfig &config, int port)
                 std::vector<std::vector<float>> embeds;
                 if (!llm.EmbedBatch(inputs, embeds)) {
                     ALOGE("EmbedBatch failed");
+                    keepalive.stop();
+                    push_embedding_error(provider, llm);
                     provider->end();
                     return;
                 }
