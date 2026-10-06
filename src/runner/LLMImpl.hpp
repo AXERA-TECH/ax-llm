@@ -459,6 +459,14 @@ struct LLM::Impl : public IKvSlotHost {
     std::vector<DecodeIoBinding> decode_io_saved_;
     std::vector<unsigned char> decode_io_owns_indices_; // 1: layer uploads its own "indices"
     std::vector<unsigned char> decode_io_owns_mask_;    // 1: layer uploads its own "mask"
+    // K/V written straight into the cache: each token, a layer's K_cache_out/V_cache_out are
+    // re-pointed at slot kv_slot of its K_cache/V_cache inputs. That slot is masked for the
+    // current token (build_decode_mask opens only [0, kv_slot) plus the tail element), so the
+    // layer never reads what it writes there, and the two per-layer D2D copies disappear.
+    // Re-pointing an IO buffer is host-only (~0.1 us) while a copy is a ~0.15 ms round trip.
+    // AXLLM_DECODE_KV_DIRECT=0 turns just this part off.
+    bool decode_kv_direct_ = false;
+    std::vector<int> decode_kv_redirected_gid_; // per layer: decode group whose outputs are re-pointed, -1 = none
 
     bool decode_io_share_allowed() const
     {
@@ -495,7 +503,10 @@ struct LLM::Impl : public IKvSlotHost {
         const int n = _attr.axmodel_num;
         decode_io_owns_indices_.assign((size_t)std::max(0, n), 1);
         decode_io_owns_mask_.assign((size_t)std::max(0, n), 1);
+        decode_kv_redirected_gid_.assign((size_t)std::max(0, n), -1);
         if (!decode_io_share_allowed()) return;
+        const char *kv_env = std::getenv("AXLLM_DECODE_KV_DIRECT");
+        decode_kv_direct_ = !(kv_env && kv_env[0] == '0');
 
         for (int m = 1; m < n; ++m)
         {
@@ -541,8 +552,47 @@ struct LLM::Impl : public IKvSlotHost {
         ALOGI("decode io share: %zu input bindings redirected", decode_io_saved_.size());
     }
 
+    void decode_kv_restore_outputs(int layer_idx)
+    {
+        const int gid = decode_kv_redirected_gid_[(size_t)layer_idx];
+        if (gid < 0) return;
+        auto &runner = llama_layers[(size_t)layer_idx].layer;
+        // set_output() leaves the tensor table untouched, so it still holds the original buffers.
+        for (const char *name : {"K_cache_out", "V_cache_out"})
+        {
+            const ax_runner_tensor_t *t = try_get_group_output_tensor(runner, gid, name);
+            if (t) runner.set_output(gid, (int)t->nIdx, t->phyAddr, (unsigned long)t->nSize);
+        }
+        decode_kv_redirected_gid_[(size_t)layer_idx] = -1;
+    }
+
+    // Returns true when this layer's K/V outputs now land directly in cache slot kv_slot.
+    bool decode_kv_bind_slot(int layer_idx, int gid, const ax_runner_tensor_t &in_k, const ax_runner_tensor_t &in_v,
+                             unsigned int kv_slot)
+    {
+        if (!decode_kv_direct_ || layer_idx >= (int)decode_kv_redirected_gid_.size()) return false;
+        auto &runner = llama_layers[(size_t)layer_idx].layer;
+        const ax_runner_tensor_t *out_k = try_get_group_output_tensor(runner, gid, "K_cache_out");
+        const ax_runner_tensor_t *out_v = try_get_group_output_tensor(runner, gid, "V_cache_out");
+        const size_t slot_bytes = (size_t)kv_cache_size_for_layer(layer_idx) * sizeof(unsigned short);
+        const size_t off = (size_t)kv_slot * slot_bytes;
+        if (!out_k || !out_v || (size_t)out_k->nSize != slot_bytes || (size_t)out_v->nSize != slot_bytes ||
+            off + slot_bytes > (size_t)in_k.nSize || off + slot_bytes > (size_t)in_v.nSize)
+            return false;
+
+        decode_kv_redirected_gid_[(size_t)layer_idx] = gid;
+        if (runner.set_output(gid, (int)out_k->nIdx, in_k.phyAddr + off, (unsigned long)slot_bytes) == 0 &&
+            runner.set_output(gid, (int)out_v->nIdx, in_v.phyAddr + off, (unsigned long)slot_bytes) == 0)
+            return true;
+        decode_kv_restore_outputs(layer_idx); // half-applied: fall back to the copy path
+        return false;
+    }
+
     void decode_io_share_end()
     {
+        for (int m = 0; m < (int)decode_kv_redirected_gid_.size(); ++m) decode_kv_restore_outputs(m);
+        decode_kv_redirected_gid_.clear();
+        decode_kv_direct_ = false;
         for (auto it = decode_io_saved_.rbegin(); it != decode_io_saved_.rend(); ++it)
             llama_layers[(size_t)it->layer].layer.set_input(it->grpid, it->idx, it->phy, it->size);
         decode_io_saved_.clear();

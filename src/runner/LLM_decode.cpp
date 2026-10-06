@@ -868,6 +868,8 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                         devid);
             }
             if (!ensure_layer_loaded(m)) return final_out;
+            const bool kv_direct = !is_linear_layer(m) && shared_src < 0 &&
+                                   decode_kv_bind_slot(m, layer_decode_grpid, in_k, in_v, kv_slot);
             lyr.layer.inference(layer_decode_grpid);
             if (is_linear_layer(m))
             {
@@ -905,7 +907,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                                 devid);
                     }
                 }
-                else
+                else if (!kv_direct)
                 {
                     llm_d2d((unsigned short *)LLM_WADDR(in_k) + kv_slot * layer_kv, LLM_RADDR(out_k), std::min((size_t)out_k.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
                     llm_d2d((unsigned short *)LLM_WADDR(in_v) + kv_slot * layer_kv, LLM_RADDR(out_v), std::min((size_t)out_v.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
