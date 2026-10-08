@@ -172,14 +172,15 @@ static int get_remaining_ddr_size()
 static int get_pcie_remaining_cmm_size(int devid)
 {
     const std::string axcl_smi = get_axcl_smi_cmd();
-    char command[512];
+    // Built as a std::string: the axcl-smi path may come from $AXCL_SMI and has no length bound.
     // Redirect stderr to keep logs clean when axcl-smi isn't available.
+    std::string command = axcl_smi + " -d " + std::to_string(devid) + " sh cat /proc/ax_proc/mem_cmm_info";
 #ifdef _WIN32
-    sprintf(command, "%s -d %d sh cat /proc/ax_proc/mem_cmm_info 2>NUL", axcl_smi.c_str(), devid);
+    command += " 2>NUL";
 #else
-    sprintf(command, "%s -d %d sh cat /proc/ax_proc/mem_cmm_info 2>/dev/null", axcl_smi.c_str(), devid);
+    command += " 2>/dev/null";
 #endif
-    std::string result = exec_cmd(std::string(command));
+    std::string result = exec_cmd(command);
 
     std::regex pattern("remain=(\\d+)KB\\((\\d+)MB \\+ (\\d+)KB\\)");
     std::smatch match;

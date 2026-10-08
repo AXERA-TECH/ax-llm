@@ -1,5 +1,6 @@
 // Auto-split from LLM.cpp/LLMImpl.hpp: init + layer-topology method bodies (LLM::Impl::*).
 #include "LLMImpl.hpp"
+#include "utils/layer_template.hpp"
 
 void LLM::Impl::init_layer_groups()
 {
@@ -555,9 +556,12 @@ bool LLM::Impl::Init(LLMAttrType attr)
     // Prepare filenames first (thread-safe, no I/O).
     for (int i = 0; i < attr.axmodel_num; i++)
     {
-        char path[1024];
-        std::snprintf(path, sizeof(path), attr.template_filename_axmodel.c_str(), i);
-        llama_layers[i].filename = path;
+        std::string tmpl_err;
+        if (!expand_layer_template(attr.template_filename_axmodel, i, llama_layers[i].filename, &tmpl_err))
+        {
+            ALOGE("invalid template_filename_axmodel: %s", tmpl_err.c_str());
+            return false;
+        }
         const int dev_idx = (dev_assign.empty() ? 0 : dev_assign[i]);
         if (dev_idx >= 0 && (size_t)dev_idx < _attr.dev_ids.size())
             dynamic_layer_devids_[(size_t)i] = _attr.dev_ids[(size_t)dev_idx];
@@ -732,11 +736,15 @@ bool LLM::Impl::Init(LLMAttrType attr)
     }
 #else
     llama_layers.resize(attr.axmodel_num);
-    char axmodel_path[1024];
+    char progress_msg[256];  // progress-bar text only; layer file names live in std::string
     for (int i = 0; i < attr.axmodel_num; i++)
     {
-        sprintf(axmodel_path, attr.template_filename_axmodel.c_str(), i);
-        llama_layers[i].filename = axmodel_path;
+        std::string tmpl_err;
+        if (!expand_layer_template(attr.template_filename_axmodel, i, llama_layers[i].filename, &tmpl_err))
+        {
+            ALOGE("invalid template_filename_axmodel: %s", tmpl_err.c_str());
+            return false;
+        }
     }
     if (!mem_preflight({})) return false;
     running_guard_init();
@@ -751,8 +759,8 @@ bool LLM::Impl::Init(LLMAttrType attr)
             llama_layers[i].layer.set_auto_sync_after_inference(true);
             llama_layers[i].layer.unload_handle_keep_io();
             int remain_cmm = get_remaining_cmm_size();
-            sprintf(axmodel_path, "init %d axmodel io ok,remain_cmm(%d MB)", i, remain_cmm);
-            update_cqdm(&cqdm, i + 1, "count", axmodel_path);
+            snprintf(progress_msg, sizeof(progress_msg), "init %d axmodel io ok,remain_cmm(%d MB)", i, remain_cmm);
+            update_cqdm(&cqdm, i + 1, "count", progress_msg);
         }
 
         // Start with an empty residency pool (handles will be loaded on-demand).
@@ -764,8 +772,8 @@ bool LLM::Impl::Init(LLMAttrType attr)
         llama_post.set_auto_sync_before_inference(true);
         llama_post.set_auto_sync_after_inference(true);
         int remain_cmm = get_remaining_cmm_size();
-        sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
-        update_cqdm(&cqdm, attr.axmodel_num + 1, "count", axmodel_path);
+        snprintf(progress_msg, sizeof(progress_msg), "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
+        update_cqdm(&cqdm, attr.axmodel_num + 1, "count", progress_msg);
     }
     else
     {
@@ -777,8 +785,8 @@ bool LLM::Impl::Init(LLMAttrType attr)
             llama_layers[i].layer.set_auto_sync_before_inference(true);
             llama_layers[i].layer.set_auto_sync_after_inference(true);
             int remain_cmm = get_remaining_cmm_size();
-            sprintf(axmodel_path, "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
-            update_cqdm(&cqdm, i + 1, "count", axmodel_path);
+            snprintf(progress_msg, sizeof(progress_msg), "init %d axmodel ok,remain_cmm(%d MB)", i, remain_cmm);
+            update_cqdm(&cqdm, i + 1, "count", progress_msg);
         }
         {
             int ret = llama_post.init(attr.filename_post_axmodel.c_str(), -1);
@@ -786,8 +794,8 @@ bool LLM::Impl::Init(LLMAttrType attr)
             llama_post.set_auto_sync_before_inference(true);
             llama_post.set_auto_sync_after_inference(true);
             int remain_cmm = get_remaining_cmm_size();
-            sprintf(axmodel_path, "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
-            update_cqdm(&cqdm, attr.axmodel_num + 1, "count", axmodel_path);
+            snprintf(progress_msg, sizeof(progress_msg), "init post axmodel ok,remain_cmm(%d MB)", remain_cmm);
+            update_cqdm(&cqdm, attr.axmodel_num + 1, "count", progress_msg);
         }
     }
 
