@@ -751,6 +751,14 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     }
 
     t_cost.start();
+#ifdef USE_AXCL
+    decode_io_share_begin(decode_grpid);
+    struct DecodeIoShareGuard
+    {
+        Impl *self;
+        ~DecodeIoShareGuard() { self->decode_io_share_end(); }
+    } decode_io_share_guard{this};
+#endif
     for (unsigned int decode_pos = decode_start, kv_slot = dense_decode_start;
          !b_hit_eos && decode_pos < (unsigned int)_attr.max_token_len && kv_slot < (unsigned int)_attr.max_token_len;
          ++decode_pos, ++kv_slot)
@@ -769,6 +777,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     return final_out;
                 }
                 decode_grpid = want_gid;
+#ifdef USE_AXCL
+                decode_io_share_begin(decode_grpid);
+#endif
             }
             need_full_shared_sync = (decode_grpid != last_shared_sync_decode_grpid);
         }
@@ -831,9 +842,14 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                             sizeof(unsigned short) * (size_t)layer_kv, devid);
                 }
             }
-            auto &t_idx = lyr.layer.get_input(layer_decode_grpid, "indices"); llm_h2d(LLM_WADDR(t_idx), &decode_pos, sizeof(decode_pos), devid);
+            auto &t_idx = lyr.layer.get_input(layer_decode_grpid, "indices");
+            if (decode_io_owns(decode_io_owns_indices_, m)) llm_h2d(LLM_WADDR(t_idx), &decode_pos, sizeof(decode_pos), devid);
             auto &t_mask= lyr.layer.get_input(layer_decode_grpid, "mask");
-            if (is_linear_layer(m))
+            if (!decode_io_owns(decode_io_owns_mask_, m) && !use_sparse_full_cache_mask())
+            {
+                // shares the mask an earlier layer of the same kind already uploaded this token
+            }
+            else if (is_linear_layer(m))
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
                 std::vector<unsigned short> linear_decode_mask(elems, bf16_one.data);
@@ -867,6 +883,8 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                         devid);
             }
             if (!ensure_layer_loaded(m)) return final_out;
+            const bool kv_direct = !is_linear_layer(m) && shared_src < 0 &&
+                                   decode_kv_bind_slot(m, layer_decode_grpid, in_k, in_v, kv_slot);
             lyr.layer.inference(layer_decode_grpid);
             if (is_linear_layer(m))
             {
@@ -904,7 +922,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                                 devid);
                     }
                 }
-                else
+                else if (!kv_direct)
                 {
                     llm_d2d((unsigned short *)LLM_WADDR(in_k) + kv_slot * layer_kv, LLM_RADDR(out_k), std::min((size_t)out_k.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
                     llm_d2d((unsigned short *)LLM_WADDR(in_v) + kv_slot * layer_kv, LLM_RADDR(out_v), std::min((size_t)out_v.nSize, (size_t)layer_kv * sizeof(unsigned short)), devid);
@@ -921,7 +939,11 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             {
                 const int next_decode_grpid = decode_gid_for_layer(m + 1, decode_grpid);
                 auto &next_in = llama_layers[m + 1].layer.get_input(next_decode_grpid, "input"); int next_devid = llama_layers[m + 1].layer.get_devid();
-                if (next_devid == devid) { llm_d2d(LLM_WADDR(next_in), LLM_RADDR(cur_out), next_in.nSize, devid); }
+                if (next_devid == devid)
+                {
+                    // Skipped when decode IO sharing bound next_in to this very buffer.
+                    if (LLM_WADDR(next_in) != LLM_RADDR(cur_out)) llm_d2d(LLM_WADDR(next_in), LLM_RADDR(cur_out), next_in.nSize, devid);
+                }
                 else { llm_d2h(cur_out.pVirAddr, LLM_RADDR(cur_out), cur_out.nSize, devid); llm_h2d(LLM_WADDR(next_in), cur_out.pVirAddr, next_in.nSize, next_devid); }
             }
         }
