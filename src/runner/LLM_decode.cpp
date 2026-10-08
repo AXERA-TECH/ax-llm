@@ -77,6 +77,13 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
             const int layer_prefill_grpid = prefill_gid_for_layer(m, prefill_grpid);
             auto &t_idx = lyr.layer.get_input(layer_prefill_grpid, "indices");
             unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
+            if ((size_t)input_num_token > (size_t)t_idx.nSize / sizeof(unsigned int))
+            {
+                ALOGE("layer %d indices input holds %zu positions, chunk has %d tokens", m,
+                      (size_t)t_idx.nSize / sizeof(unsigned int), input_num_token);
+                set_last_error("模型的 indices 输入尺寸与 prefill 分块不匹配，请检查模型包。");
+                return -1;
+            }
             int idx_i = 0; for (int i = 0; i < input_num_token; ++i) idx_ptr[idx_i++] = (unsigned int)(p * _attr.prefill_token_num + i);
             llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
             auto &t_mask = lyr.layer.get_input(layer_prefill_grpid, "mask");
@@ -410,6 +417,14 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 const int idx_elems = (int)(t_idx.nSize / (int)sizeof(unsigned int));
                 int idx_rows = idx_elems / _attr.prefill_token_num;
                 if (idx_rows <= 0) idx_rows = 1;
+                // rows are prefill_token_num apart (3 rows for mRoPE): the last write must fit
+                if ((size_t)(idx_rows - 1) * (size_t)_attr.prefill_token_num + (size_t)input_num_token > (size_t)idx_elems)
+                {
+                    ALOGE("layer %d indices input holds %d positions (%d rows x %d), chunk has %d tokens",
+                          m, idx_elems, idx_rows, _attr.prefill_token_num, input_num_token);
+                    set_last_error("模型的 indices 输入尺寸与 prefill 分块不匹配，请检查模型包。");
+                    return final_out;
+                }
                 const bool use_pos_ids = has_vision_state &&
                                          idx_rows >= 3 &&
                                          vision_state.position_ids.size() >= 3 &&
@@ -430,7 +445,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                                     v = (unsigned int)row[token_start_pos + j];
                             }
                         }
-                        idx_ptr[r * _attr.prefill_token_num + j] = v;
+                        idx_ptr[(size_t)r * (size_t)_attr.prefill_token_num + (size_t)j] = v;
                     }
                 }
             }

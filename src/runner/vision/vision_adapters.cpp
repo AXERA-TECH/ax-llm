@@ -175,10 +175,11 @@ public:
     // Qwen2_5VL / Qwen3VL video: Qwen2VideoProcessor over ALL frames -> temporal blocks,
     // u8 encode + deepstack, video_grid_thw = {nBlocks, gridH, gridW}.
     bool preprocessVideo(std::vector<axcv::Mat>& frames, const VisionParams& vp, VideoPreproc& out,
-                         std::string& /*err*/) const override {
+                         std::string& err) const override {
         std::vector<std::vector<unsigned char>> pixel_values;
         Qwen2VideoProcessor(frames, pixel_values, vp.height, vp.width, vp.temporal_patch_size,
                             vp.spatial_merge_size, vp.patch_size);
+        if (pixel_values.empty()) { err = "Qwen2VideoProcessor(video) produced no blocks"; return false; }
         out.mode = ImagePreproc::PixelU8;
         out.collect_deepstack = true;
         out.num_media_for_tokenizer = (int)pixel_values.size();
@@ -516,9 +517,12 @@ public:
     }
 
     bool preprocessImage(axcv::Mat& img, const VisionParams& vp, ImagePreproc& out,
-                         std::string& /*err*/) const override {
+                         std::string& err) const override {
         std::vector<unsigned char> pv;
-        Gemma4ImageProcessor(img, pv, vp.height, vp.width, vp.patch_size);
+        if (Gemma4ImageProcessor(img, pv, vp.height, vp.width, vp.patch_size) != 0 || pv.empty()) {
+            err = "Gemma4ImageProcessor failed (invalid vision geometry in config?)";
+            return false;
+        }
         out.mode = ImagePreproc::PixelNormalizedFloat;
         out.norm_mean = 0.0f;
         out.norm_std = 1.0f;
@@ -527,11 +531,14 @@ public:
     }
 
     bool preprocessVideo(std::vector<axcv::Mat>& frames, const VisionParams& vp, VideoPreproc& out,
-                         std::string& /*err*/) const override {
+                         std::string& err) const override {
         out.pixel_blocks.reserve(frames.size());
         for (auto& frame : frames) {
             std::vector<unsigned char> pv;
-            Gemma4ImageProcessor(frame, pv, vp.height, vp.width, vp.patch_size);
+            if (Gemma4ImageProcessor(frame, pv, vp.height, vp.width, vp.patch_size) != 0 || pv.empty()) {
+                err = "Gemma4ImageProcessor failed (invalid vision geometry in config?)";
+                return false;
+            }
             out.pixel_blocks.push_back(std::move(pv));
         }
         out.mode = ImagePreproc::PixelNormalizedFloat;

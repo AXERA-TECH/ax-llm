@@ -140,6 +140,14 @@ bool LLM::Impl::EmbedTokens(const std::vector<int> &token_ids, std::vector<float
                 const int idx_elems = (int)(t_idx.nSize / (int)sizeof(unsigned int));
                 int idx_rows = _attr.prefill_token_num > 0 ? (idx_elems / _attr.prefill_token_num) : 1;
                 if (idx_rows <= 0) idx_rows = 1;
+                // rows are prefill_token_num apart (3 rows for mRoPE): the last write must fit
+                if ((size_t)(idx_rows - 1) * (size_t)_attr.prefill_token_num + (size_t)input_num_token > (size_t)idx_elems)
+                {
+                    ALOGE("layer %d indices input holds %d positions (%d rows x %d), chunk has %d tokens",
+                          m, idx_elems, idx_rows, _attr.prefill_token_num, input_num_token);
+                    set_last_error("embedding 模型的 indices 输入尺寸与 prefill 分块不匹配，请检查模型包。");
+                    return false;
+                }
 
                 const bool use_pos_ids = has_vision_state &&
                                          idx_rows >= 3 &&

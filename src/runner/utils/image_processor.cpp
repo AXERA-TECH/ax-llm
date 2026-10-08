@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -10,6 +11,15 @@
 #include "files.hpp"
 
 namespace {
+
+// Sanity limits for sizes that come from images or model config.json: keep every byte count
+// and index well inside 32-bit/size_t arithmetic and reject nonsense instead of allocating it.
+constexpr int kMaxImageSide = 32768;
+constexpr int kMaxPatchSize = 1024;
+constexpr int kMaxPatchGroup = 64;  // merge_size / temporal_patch_size
+
+inline bool image_dims_ok(int w, int h) { return w > 0 && h > 0 && w <= kMaxImageSide && h <= kMaxImageSide; }
+
 
 // A minimal Pillow-compatible bicubic resizer for uint8 RGB images.
 // Matches Pillow's `Image.resize(..., Image.Resampling.BICUBIC)` implementation (Pillow 12.x)
@@ -116,7 +126,7 @@ static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<un
     const int src_w = axcv::width(src_bgr);
     const int src_h = axcv::height(src_bgr);
     const int channels = axcv::channels(src_bgr);
-    if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 || channels <= 0 || axcv::empty(src_bgr)) {
+    if (!image_dims_ok(src_w, src_h) || !image_dims_ok(dst_w, dst_h) || channels <= 0 || axcv::empty(src_bgr)) {
         return false;
     }
 
@@ -140,7 +150,7 @@ static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<un
     }
 
     // Convert to Pillow-like RGBX (4 bytes per pixel, X=0) for bit-exact resampling.
-    const int src_step = src_w * 4;
+    const size_t src_step = (size_t)src_w * 4;
     std::vector<uint8_t> src_rgbx((size_t)src_h * (size_t)src_step);
     for (int y = 0; y < src_h; ++y)
     {
@@ -161,7 +171,7 @@ static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<un
     if (!pillow_precompute_axis_coeffs(src_h, dst_h, ycoeff)) return false;
 
     // Horizontal pass: [src_h, dst_w, 4]
-    const int tmp_step = dst_w * 4;
+    const size_t tmp_step = (size_t)dst_w * 4;
     std::vector<uint8_t> tmp_rgbx((size_t)src_h * (size_t)tmp_step, 0);
     for (int yy = 0; yy < src_h; ++yy)
     {
@@ -231,7 +241,7 @@ static bool pillow_resize_rgb_u8(const std::vector<unsigned char>& src_rgb,
                                  int dst_w,
                                  int dst_h)
 {
-    if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 ||
+    if (!image_dims_ok(src_w, src_h) || !image_dims_ok(dst_w, dst_h) ||
         src_rgb.size() < (size_t)src_w * (size_t)src_h * 3) {
         return false;
     }
@@ -242,7 +252,7 @@ static bool pillow_resize_rgb_u8(const std::vector<unsigned char>& src_rgb,
         return true;
     }
 
-    const int src_step = src_w * 4;
+    const size_t src_step = (size_t)src_w * 4;
     std::vector<uint8_t> src_rgbx((size_t)src_h * (size_t)src_step);
     for (int y = 0; y < src_h; ++y)
     {
@@ -261,7 +271,7 @@ static bool pillow_resize_rgb_u8(const std::vector<unsigned char>& src_rgb,
     if (!pillow_precompute_axis_coeffs(src_w, dst_w, xcoeff)) return false;
     if (!pillow_precompute_axis_coeffs(src_h, dst_h, ycoeff)) return false;
 
-    const int tmp_step = dst_w * 4;
+    const size_t tmp_step = (size_t)dst_w * 4;
     std::vector<uint8_t> tmp_rgbx((size_t)src_h * (size_t)tmp_step, 0);
     for (int yy = 0; yy < src_h; ++yy)
     {
@@ -360,6 +370,14 @@ int Qwen2VideoProcessor(std::vector<axcv::Mat>& src,
                         int merge_size,
                         int patch_size) {
     if (src.empty()) return 0;
+    if (!image_dims_ok(tgt_w, tgt_h) || patch_size <= 0 || patch_size > kMaxPatchSize ||
+        merge_size <= 0 || merge_size > kMaxPatchGroup ||
+        temporal_patch_size <= 0 || temporal_patch_size > kMaxPatchGroup) {
+        std::fprintf(stderr, "[image_processor] invalid vision geometry: %dx%d patch=%d merge=%d temporal=%d\n",
+                     tgt_w, tgt_h, patch_size, merge_size, temporal_patch_size);
+        output.clear();
+        return -1;
+    }
 
     std::vector<std::vector<unsigned char>> imgs_resized;
     imgs_resized.reserve(src.size());
@@ -521,6 +539,11 @@ int Gemma4ImageProcessor(axcv::Mat& src,
                          std::vector<unsigned char>& output,
                          int tgt_h, int tgt_w,
                          int patch_size) {
+    if (!image_dims_ok(tgt_w, tgt_h) || patch_size <= 0 || patch_size > kMaxPatchSize) {
+        std::fprintf(stderr, "[image_processor] invalid vision geometry: %dx%d patch=%d\n", tgt_w, tgt_h, patch_size);
+        output.clear();
+        return -1;
+    }
     axcv::Mat img_rs;
     if (axcv::width(src) != tgt_w || axcv::height(src) != tgt_h) {
         axcv::resize(src, img_rs, tgt_w, tgt_h);
@@ -533,8 +556,8 @@ int Gemma4ImageProcessor(axcv::Mat& src,
 
     const int grid_h = tgt_h / patch_size;
     const int grid_w = tgt_w / patch_size;
-    const int pixel_dim = patch_size * patch_size * 3;
-    output.resize((size_t)grid_h * (size_t)grid_w * (size_t)pixel_dim);
+    const size_t pixel_dim = (size_t)patch_size * (size_t)patch_size * 3;
+    output.resize((size_t)grid_h * (size_t)grid_w * pixel_dim);
 
     size_t idx = 0;
     for (int gh = 0; gh < grid_h; ++gh) {
