@@ -99,7 +99,8 @@ struct LLMAttrType {
     // ---- vision / VLM (optional, runtime switch by `vlm_type`) ----
     // If `vlm_type != VLMType::None`, vision encoder will be initialized and used.
     // See `VLMType` in `src/runner/VLMType.hpp`.
-    // Names/ids (via magic_enum): `None(0)`, `Qwen2_5VL(1)`, `Qwen3VL(2)`, `InternVL3(3)`, `FastVLM(4)`, `SmolVLM2(5)`, `PaddleOCRVL(6)`, `Gemma4VL(7)`.
+    // Names/ids (via magic_enum): `None(0)`, `Qwen2_5VL(1)`, `Qwen3VL(2)`, `InternVL3(3)`,
+    // `FastVLM(4)`, `SmolVLM2(5)`, `PaddleOCRVL(6)`, `Gemma4VL(7)`, ..., `Qwen3_5VL(11)`.
     VLMType vlm_type = VLMType::None;
 
     // Vision encoder axmodel (image/video encoder). Required if `vlm_type != VLMType::None`.

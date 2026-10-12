@@ -639,6 +639,7 @@ std::unique_ptr<IVisionAdapter> make_vision_adapter(VLMType type) {
     switch (type) {
         case VLMType::Qwen2_5VL:       return std::make_unique<Qwen2_5VLAdapter>();
         case VLMType::Qwen3VL:         return std::make_unique<Qwen3VLAdapter>();
+        case VLMType::Qwen3_5VL:       return std::make_unique<Qwen3VLAdapter>();
         case VLMType::Qwen3Omni:       return std::make_unique<Qwen3OmniAdapter>();
         case VLMType::PaddleOCRVL:     return std::make_unique<PaddleOCRVLAdapter>();
         case VLMType::InternVL3:       return std::make_unique<InternVL3Adapter>();

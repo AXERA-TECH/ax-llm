@@ -418,6 +418,11 @@ add_executable(group_dispatch_policy_test tools/group_dispatch_policy_test.cpp)
 target_include_directories(group_dispatch_policy_test PRIVATE src/runner)
 install(TARGETS group_dispatch_policy_test DESTINATION bin)
 
+# Pure VLMType parsing regression test; no NPU/model files.
+add_executable(vlm_type_test tools/vlm_type_test.cpp)
+target_include_directories(vlm_type_test PRIVATE src/runner)
+install(TARGETS vlm_type_test DESTINATION bin)
+
 # Pure multimodal history policy regression test; no NPU or model files.
 add_executable(media_history_test
     tools/media_history_test.cpp
