@@ -413,6 +413,11 @@ add_executable(qwen3_5_runtime_test
 target_include_directories(qwen3_5_runtime_test PRIVATE src/runner)
 install(TARGETS qwen3_5_runtime_test DESTINATION bin)
 
+# Pure graph-group dispatch/reuse policy regression test; no NPU/model files.
+add_executable(group_dispatch_policy_test tools/group_dispatch_policy_test.cpp)
+target_include_directories(group_dispatch_policy_test PRIVATE src/runner)
+install(TARGETS group_dispatch_policy_test DESTINATION bin)
+
 # Pure multimodal history policy regression test; no NPU or model files.
 add_executable(media_history_test
     tools/media_history_test.cpp

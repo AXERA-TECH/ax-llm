@@ -38,6 +38,13 @@ struct LLMAttrType {
     int num_kv_shared_layers = 0;
     int sliding_window = 0;
     std::vector<std::string> layer_types;
+    // Optional graph ABI classes emitted by the builder. Equal classes may
+    // share dispatch/group metadata, but each layer still owns its weights
+    // and AXModel handle.
+    std::vector<std::string> layer_graph_classes;
+    // Reuse validated group/dispatch metadata between layers with identical
+    // graph ABI.  Layer AXModels and their constant weights remain separate.
+    bool reuse_graph_metadata = true;
 
     int prefill_token_num = 96; // auto calc
     int prefill_max_token_num = 512;

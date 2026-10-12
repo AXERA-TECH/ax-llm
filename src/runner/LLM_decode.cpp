@@ -29,7 +29,6 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
 
     std::vector<int> prefill_grp_list;
     prefill_grp_list.resize(prefill_split_num, -1);
-    int max_prefill_gid = -1;
     for (int p = 0; p < prefill_split_num; ++p)
     {
         const int history_len = p * _attr.prefill_token_num;
@@ -41,7 +40,6 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
             return -1;
         }
         prefill_grp_list[p] = gid;
-        if (gid > max_prefill_gid) max_prefill_gid = gid;
     }
 
     const int prefill_decode_grpid = choose_decode_gid(std::max(1, input_embed_num));
@@ -113,10 +111,24 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
                 llm_d2d((unsigned short *)LLM_WADDR(dec_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                 llm_d2d((unsigned short *)LLM_WADDR(dec_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
 
-                const int ng = (int)lyr.layer.get_num_input_groups();
-                const int max_gid = std::min(max_prefill_gid, ng - 1);
-                for (int gid = layer_prefill_grpid + 1; gid <= max_gid; ++gid)
+                // Do not assume raw group ids are contiguous.  AXModel
+                // export may omit deduplicated prefill groups (GDN keeps one
+                // ABI-compatible group; full attention keeps the maximum
+                // capacity group), so iterating gid+1..max_gid can address a
+                // non-existent group.  Synchronize only the groups actually
+                // detected for this layer and skip the source group itself.
+                std::vector<int> layer_prefill_groups;
+                if (m >= 0 && m < (int)layer_prefill_grpids_.size())
+                    layer_prefill_groups = layer_prefill_grpids_[(size_t)m];
+                if (layer_prefill_groups.empty())
                 {
+                    const int ng = (int)lyr.layer.get_num_input_groups();
+                    for (int gid = 0; gid < ng; ++gid)
+                        layer_prefill_groups.push_back(gid);
+                }
+                for (const int gid : layer_prefill_groups)
+                {
+                    if (gid == layer_prefill_grpid) continue;
                     auto &gk = lyr.layer.get_input(gid, "K_cache");
                     auto &gv = lyr.layer.get_input(gid, "V_cache");
                     const int cap_tokens_k = (int)(gk.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));

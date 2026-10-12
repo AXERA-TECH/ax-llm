@@ -540,6 +540,32 @@ struct ModelConfig
             {
                 attr.layer_types = std::move(*v);
             }
+            attr.layer_graph_classes.clear();
+            if (auto v = json_string_list_value(j, "layer_graph_classes"); v.has_value())
+            {
+                attr.layer_graph_classes = std::move(*v);
+            }
+            else if (!attr.layer_types.empty())
+            {
+                attr.layer_graph_classes.reserve(attr.layer_types.size());
+                for (const auto &type : attr.layer_types)
+                {
+                    if (type == "linear_attention") attr.layer_graph_classes.emplace_back("linear_attention");
+                    else if (type == "sliding_attention") attr.layer_graph_classes.emplace_back("sliding_attention");
+                    else attr.layer_graph_classes.emplace_back("full_attention");
+                }
+            }
+            else if (attr.axmodel_num > 0)
+            {
+                // Legacy Qwen3/Qwen3-VL packages predate layer_types and do
+                // not carry an explicit graph-class list.  Their layer ABI is
+                // uniform full attention, so enable safe dispatch metadata
+                // reuse by default instead of silently falling back to
+                // layer-local maps.
+                attr.layer_graph_classes.assign((size_t)attr.axmodel_num, "full_attention");
+            }
+            attr.reuse_graph_metadata = true;
+            json_bool_value(j, "reuse_graph_metadata", attr.reuse_graph_metadata);
 
             check_key("tokens_embed_num");
             attr.tokens_embed_num = j["tokens_embed_num"].get<int>();

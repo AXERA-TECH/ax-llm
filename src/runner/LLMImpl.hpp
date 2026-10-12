@@ -16,6 +16,8 @@
 #include <mutex>
 #include <numeric>
 #include <queue>
+#include <memory>
+#include <unordered_map>
 #include <thread>
 #ifndef _WIN32
 #include <sys/sysinfo.h>
@@ -308,6 +310,7 @@ struct LLM::Impl : public IKvSlotHost {
     bool deinited_ = false; // guards Deinit() against double-invocation (explicit call + destructor path)
     // Optional per-layer attention type (for models like Qwen3.5 that mix linear/full attention).
     std::vector<bool> layer_is_linear_attn;
+    std::vector<std::string> layer_graph_classes_;
     std::vector<int> layer_kv_cache_sizes;
     std::vector<int> shared_kv_source_layers;
     // Backend-neutral Qwen3.5 mixed-attention policy. The existing layer/group
@@ -331,6 +334,30 @@ struct LLM::Impl : public IKvSlotHost {
     bool decode_only_prefill_mode_ = false;
     std::vector<std::vector<int>> layer_decode_grpids_;
     std::vector<std::vector<int>> layer_prefill_grpids_;
+
+    // Group dispatch metadata is identical for layers with the same graph
+    // class (for example, all Qwen3.5 GDN layers).  Keep one immutable slot
+    // map per validated ABI signature and let layers point at it.  The
+    // runners themselves are intentionally not shared: their AXModels carry
+    // layer-local constant weights.
+    struct GroupDispatchMap
+    {
+        // Indices in the layer-local sorted group vectors, never raw group
+        // ids (raw ids may differ when a backend emits groups in another order).
+        std::vector<int> decode_slots;
+        std::vector<int> prefill_slots;
+        std::string signature;
+    };
+    std::unordered_map<std::string, std::shared_ptr<const GroupDispatchMap>> graph_dispatch_cache_;
+    std::vector<std::shared_ptr<const GroupDispatchMap>> layer_dispatch_maps_;
+    size_t graph_dispatch_reuse_count_ = 0;
+
+    const std::string &layer_graph_class_for(int layer_idx) const
+    {
+        static const std::string empty;
+        if (layer_idx < 0 || layer_idx >= (int)layer_graph_classes_.size()) return empty;
+        return layer_graph_classes_[(size_t)layer_idx];
+    }
     std::vector<unsigned char> full_cache_valid_slots_;
     bool full_cache_has_sparse_slots_ = false;
     std::atomic<bool> b_stop{false};
@@ -1138,6 +1165,15 @@ struct LLM::Impl : public IKvSlotHost {
         if (gids.empty()) return requested_gid;
 
         const int requested_idx = group_index_by_gid(decode_grpids_, requested_gid);
+        if (requested_idx >= 0 && layer_idx < (int)layer_dispatch_maps_.size())
+        {
+            const auto &map = layer_dispatch_maps_[(size_t)layer_idx];
+            if (map && requested_idx < (int)map->decode_slots.size())
+            {
+                const int slot = map->decode_slots[(size_t)requested_idx];
+                if (slot >= 0 && slot < (int)gids.size()) return gids[(size_t)slot];
+            }
+        }
         if (requested_idx < 0)
         {
             if (std::find(gids.begin(), gids.end(), requested_gid) != gids.end()) return requested_gid;
@@ -1157,6 +1193,15 @@ struct LLM::Impl : public IKvSlotHost {
         if (gids.empty()) return requested_gid;
 
         const int requested_idx = group_index_by_gid(prefill_grpids_, requested_gid);
+        if (requested_idx >= 0 && layer_idx < (int)layer_dispatch_maps_.size())
+        {
+            const auto &map = layer_dispatch_maps_[(size_t)layer_idx];
+            if (map && requested_idx < (int)map->prefill_slots.size())
+            {
+                const int slot = map->prefill_slots[(size_t)requested_idx];
+                if (slot >= 0 && slot < (int)gids.size()) return gids[(size_t)slot];
+            }
+        }
         if (requested_idx < 0)
         {
             if (std::find(gids.begin(), gids.end(), requested_gid) != gids.end()) return requested_gid;

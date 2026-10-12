@@ -1,16 +1,180 @@
 // Auto-split from LLM.cpp/LLMImpl.hpp: init + layer-topology method bodies (LLM::Impl::*).
 #include "LLMImpl.hpp"
+#include "GroupDispatchPolicy.hpp"
+#include <sstream>
+
+namespace {
+
+static void append_tensor_signature(std::ostringstream &os, const ax_runner_tensor_t &tensor)
+{
+    // Tensor names are generated per layer/group by the AXModel exporter
+    // (for example input_17 vs input_21). They are not part of the graph
+    // ABI and including them makes otherwise identical layers miss the
+    // metadata cache. Keep only structural properties that affect binding.
+    os << tensor.nSize << ':' << tensor.eDataType << ':';
+    for (unsigned int dim : tensor.vShape) os << dim << ',';
+    os << ';';
+}
+
+static std::string group_signature(ax_runner_t &runner, int gid)
+{
+    std::ostringstream os;
+    os << "in=" << runner.get_num_inputs(gid) << "{";
+    for (int i = 0; i < runner.get_num_inputs(gid); ++i)
+        append_tensor_signature(os, runner.get_input(gid, i));
+    os << "}out=" << runner.get_num_outputs(gid) << "{";
+    for (int i = 0; i < runner.get_num_outputs(gid); ++i)
+        append_tensor_signature(os, runner.get_output(gid, i));
+    os << '}';
+    return os.str();
+}
+
+static std::string dispatch_signature(ax_runner_t &runner,
+                                      const std::vector<int> &decode_gids,
+                                      const std::vector<int> &prefill_gids)
+{
+    std::ostringstream os;
+    os << "decode=";
+    for (int gid : decode_gids) os << group_signature(runner, gid) << '|';
+    os << "prefill=";
+    for (int gid : prefill_gids) os << group_signature(runner, gid) << '|';
+    return os.str();
+}
+
+static int tensor_elements_bf16(const ax_runner_tensor_t &tensor)
+{
+    // Qwen3/Qwen3.5 masks and cache tensors are BF16.  nSize is the byte
+    // size, so this avoids depending on the backend-specific enum spelling.
+    return tensor.nSize >= 2 ? static_cast<int>(tensor.nSize / 2u) : 0;
+}
+
+static int group_query_tokens(ax_runner_t &runner, int gid)
+{
+    try
+    {
+        const auto &indices = runner.get_input(gid, "indices");
+        if (!indices.vShape.empty())
+            return std::max(1, static_cast<int>(indices.vShape.back()));
+        const int elems = static_cast<int>((size_t)indices.nSize / sizeof(unsigned int));
+        return std::max(1, elems);
+    }
+    catch (...)
+    {
+        return 1;
+    }
+}
+
+static int group_decode_capacity(ax_runner_t &runner, int gid)
+{
+    try
+    {
+        const auto &mask = runner.get_input(gid, "mask");
+        // Decode masks are [1, 1, history+1].  Keep the historical
+        // `mask_elems - 1` interpretation and clamp malformed metadata.
+        return std::max(1, tensor_elements_bf16(mask) - 1);
+    }
+    catch (...)
+    {
+        return 1;
+    }
+}
+
+static std::pair<int, int> group_prefill_capacity(ax_runner_t &runner, int gid)
+{
+    const int query = group_query_tokens(runner, gid);
+    try
+    {
+        const auto &mask = runner.get_input(gid, "mask");
+        const int elems = tensor_elements_bf16(mask);
+        if (query > 0 && elems > 0 && elems % query == 0)
+        {
+            const int columns = elems / query;
+            // Full-attention masks are [query, history+query].  GDN masks are
+            // [1, query] and intentionally carry no KV-history dimension.
+            if (columns == 1 && query > 1)
+                return {query, 0};
+            const int history = std::max(0, columns - query);
+            return {columns, history};
+        }
+    }
+    catch (...)
+    {
+    }
+    return {query, 0};
+}
+
+} // namespace
 
 void LLM::Impl::init_layer_groups()
 {
     layer_decode_grpids_.assign((size_t)_attr.axmodel_num, {});
     layer_prefill_grpids_.assign((size_t)_attr.axmodel_num, {});
+    layer_dispatch_maps_.assign((size_t)_attr.axmodel_num, nullptr);
+    graph_dispatch_cache_.clear();
+    graph_dispatch_reuse_count_ = 0;
     for (int i = 0; i < _attr.axmodel_num; ++i)
     {
         layer_decode_grpids_[(size_t)i] = detect_decode_grpids(llama_layers[(size_t)i].layer);
         layer_prefill_grpids_[(size_t)i] = detect_prefill_grpids(llama_layers[(size_t)i].layer);
+        // Canonicalize each layer-local list by capacity, not raw AXModel
+        // group id.  Export order is allowed to differ between layers (and a
+        // deduplicated model may leave gaps in raw IDs); sorting here makes
+        // ABI signatures and slot indices stable for graph-class reuse.
+        auto &layer_runner = llama_layers[(size_t)i].layer;
+        auto sort_decode = [&](std::vector<int> &gids) {
+            std::stable_sort(gids.begin(), gids.end(), [&](int lhs, int rhs) {
+                const int lc = group_decode_capacity(layer_runner, lhs);
+                const int rc = group_decode_capacity(layer_runner, rhs);
+                return lc == rc ? lhs < rhs : lc < rc;
+            });
+        };
+        auto sort_prefill = [&](std::vector<int> &gids) {
+            std::stable_sort(gids.begin(), gids.end(), [&](int lhs, int rhs) {
+                const int lc = group_prefill_capacity(layer_runner, lhs).first;
+                const int rc = group_prefill_capacity(layer_runner, rhs).first;
+                return lc == rc ? lhs < rhs : lc < rc;
+            });
+        };
+        sort_decode(layer_decode_grpids_[(size_t)i]);
+        sort_prefill(layer_prefill_grpids_[(size_t)i]);
         const auto &decode_gids = layer_decode_grpids_[(size_t)i];
         const auto &gids = layer_prefill_grpids_[(size_t)i];
+        const auto &graph_class = layer_graph_class_for(i);
+        std::vector<int> local_decode_caps;
+        local_decode_caps.reserve(decode_gids.size());
+        for (const int gid : decode_gids)
+            local_decode_caps.push_back(group_decode_capacity(llama_layers[(size_t)i].layer, gid));
+        std::vector<int> local_prefill_caps;
+        local_prefill_caps.reserve(gids.size());
+        for (const int gid : gids)
+            local_prefill_caps.push_back(group_prefill_capacity(llama_layers[(size_t)i].layer, gid).first);
+        const std::string signature = dispatch_signature(llama_layers[(size_t)i].layer, decode_gids, gids) +
+                                      ":decode_caps=" + axllm::capacity_signature(local_decode_caps) +
+                                      ":prefill_caps=" + axllm::capacity_signature(local_prefill_caps);
+        const std::string cache_key = axllm::dispatch_cache_key(
+            _attr.reuse_graph_metadata, i, graph_class, signature);
+        auto cache_it = graph_dispatch_cache_.find(cache_key);
+        if (cache_it != graph_dispatch_cache_.end())
+        {
+            layer_dispatch_maps_[(size_t)i] = cache_it->second;
+            ++graph_dispatch_reuse_count_;
+        }
+        else
+        {
+            auto map = std::make_shared<GroupDispatchMap>();
+            map->decode_slots = axllm::make_capacity_slot_map(decode_max_token_len_grp_, local_decode_caps);
+            map->prefill_slots = axllm::make_capacity_slot_map(_attr.prefill_max_kv_cache_num_grp, local_prefill_caps);
+            map->signature = signature;
+            std::shared_ptr<const GroupDispatchMap> immutable = map;
+            graph_dispatch_cache_.emplace(cache_key, immutable);
+            layer_dispatch_maps_[(size_t)i] = std::move(immutable);
+        }
+        if (!graph_class.empty())
+        {
+            ALOGI("layer %d graph class=%s decode_groups=%zu prefill_groups=%zu%s",
+                  i, graph_class.c_str(), decode_gids.size(), gids.size(),
+                  cache_it != graph_dispatch_cache_.end() ? " dispatch-reused" : "");
+        }
         if (decode_gids.empty())
         {
             ALOGW("layer %d has no decode groups detected", i);
@@ -37,6 +201,9 @@ void LLM::Impl::init_layer_groups()
                   gids.back());
         }
     }
+    if (graph_dispatch_reuse_count_ > 0)
+        ALOGI("reused graph dispatch metadata for %zu layers; AXModel weights remain layer-local",
+              graph_dispatch_reuse_count_);
 }
 
 void LLM::Impl::init_shared_kv_source_layers()
@@ -486,6 +653,14 @@ bool LLM::Impl::Init(LLMAttrType attr)
     dynamic_layer_lru_.clear();
     dynamic_layer_devids_.clear();
     embedding_profile_for_tokenizer(_attr.tokenizer_type, embedding_append_eos, embedding_eos_token_id);
+    layer_graph_classes_ = _attr.layer_graph_classes;
+    if (!layer_graph_classes_.empty() &&
+        (int)layer_graph_classes_.size() < _attr.axmodel_num)
+    {
+        ALOGW("layer_graph_classes has %zu entries for %d layers; missing entries use weight-local dispatch",
+              layer_graph_classes_.size(), _attr.axmodel_num);
+        layer_graph_classes_.resize((size_t)_attr.axmodel_num);
+    }
     init_layer_types();
     init_shared_kv_source_layers();
     cache_ref_full_layer_idx = first_full_layer_idx();
@@ -793,7 +968,35 @@ bool LLM::Impl::Init(LLMAttrType attr)
 #endif
     axllm::Logger::finish_inplace_line();
     {
-        auto &ref_layer = llama_layers[(size_t)cache_ref_full_layer_idx].layer;
+        // The first layer in Qwen3.5 is normally a GDN/linear-attention
+        // layer.  Its recurrent-state ABI intentionally has only the
+        // deduplicated prefill group and therefore cannot describe the
+        // global full-attention KV-cache capacities.  Use the first
+        // full-attention layer as the canonical group reference; fall back
+        // to the first layer only for legacy/all-linear models.
+        int reference_layer_idx = cache_ref_full_layer_idx;
+        if (reference_layer_idx < 0 || reference_layer_idx >= _attr.axmodel_num)
+            reference_layer_idx = 0;
+        if (!_attr.layer_types.empty() &&
+            (reference_layer_idx >= (int)_attr.layer_types.size() ||
+             _attr.layer_types[(size_t)reference_layer_idx] == "linear_attention"))
+        {
+            for (int i = 0; i < _attr.axmodel_num && i < (int)_attr.layer_types.size(); ++i)
+            {
+                if (_attr.layer_types[(size_t)i] != "linear_attention")
+                {
+                    reference_layer_idx = i;
+                    break;
+                }
+            }
+        }
+        if (reference_layer_idx != cache_ref_full_layer_idx)
+        {
+            ALOGI("group reference layer: %d -> %d (full-attention ABI)",
+                  cache_ref_full_layer_idx, reference_layer_idx);
+            cache_ref_full_layer_idx = reference_layer_idx;
+        }
+        auto &ref_layer = llama_layers[(size_t)reference_layer_idx].layer;
         _attr.max_token_len = ref_layer.get_input("mask").nSize / sizeof(unsigned short) - 1;
         ALOGI("max_token_len : %d", _attr.max_token_len);
         _attr.kv_cache_size = ref_layer.get_output("K_cache_out").nSize / sizeof(unsigned short);
