@@ -110,6 +110,8 @@ uninstall.bat
 ./build_axcl_aarch64.sh
 ```
 
+> **AX8860 BSP 提示**：如果你使用 `arm64_glibc` 这类按 glibc 2.34/2.38 构建的 SDK，请使用 Arm GNU 13.3 或更新的交叉工具链。Arm GCC 9.2 的 sysroot 只有 glibc 2.30，链接时会出现 `mtx_lock/thrd_create` 等 `GLIBC_2.34` 未定义符号。
+
 `build_ax650.sh` 默认禁用 OpenCV，使用内置 SimpleCV，避免交叉编译时误链接主机架构的 OpenCV。若已准备好可用于目标架构的 OpenCV，可覆盖该默认值：
 
 ```shell
