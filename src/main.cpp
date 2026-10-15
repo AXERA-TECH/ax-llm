@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <optional>
 #include <ctime>
@@ -83,6 +84,23 @@
 static LLM g_llm;
 static openai_api::Server g_server;
 static std::atomic<bool> g_running{true};
+
+static void configure_ax_engine_diagnostics()
+{
+    const char *diagnostics = std::getenv("AXLLM_AX_ENGINE_DIAG");
+    const bool enable = diagnostics && *diagnostics &&
+                        std::strcmp(diagnostics, "0") != 0 &&
+                        std::strcmp(diagnostics, "false") != 0 &&
+                        std::strcmp(diagnostics, "off") != 0 &&
+                        std::strcmp(diagnostics, "no") != 0;
+#ifndef _WIN32
+    if (setenv("AX_ENGINE_DIAG", enable ? "true" : "false", 1) != 0)
+    {
+        ALOGW("failed to set AX_ENGINE_DIAG=%s", enable ? "true" : "false");
+    }
+#endif
+}
+
 // In interactive mode: SIGINT/Ctrl+C stops current generation and returns to prompt.
 // In server mode: SIGINT/Ctrl+C exits the process (by stopping server loop).
 
@@ -464,6 +482,12 @@ struct ModelConfig
 
             check_key("axmodel_num");
             attr.axmodel_num = j["axmodel_num"].get<int>();
+
+            attr.runtime_max_context = 0;
+            if (auto v = json_int_value(j, "runtime_max_context"); v.has_value())
+            {
+                attr.runtime_max_context = std::max(0, *v);
+            }
 
             attr.dynamic_load_enable = false;
             json_bool_value(j, "dynamic_load_enable", attr.dynamic_load_enable);
@@ -1074,6 +1098,7 @@ int run_interactive_mode(ModelConfig &config)
     g_exit_on_sigint.store(false, std::memory_order_relaxed);
     config.attr.runing_callback = llm_running_callback;
     config.attr.reserve = nullptr;
+    configure_ax_engine_diagnostics();
 
     // Initialize engine
 #if USE_AXCL
@@ -2165,6 +2190,7 @@ static bool normalize_single_image_ocr_request(const ModelConfig &config,
 int run_server_mode(const ModelConfig &config, int port)
 {
     g_exit_on_sigint.store(true, std::memory_order_relaxed);
+    configure_ax_engine_diagnostics();
     ALOGI("server request/queue timeout: %d ms (config.server_timeout_ms, overridable via --server_timeout_ms)", config.server_timeout_ms);
 
     // Check whether port is available.

@@ -48,6 +48,10 @@ struct LLMAttrType {
 
     int prefill_token_num = 96; // auto calc
     int prefill_max_token_num = 512;
+    // Optional logical context cap for a statically compiled AXModel.  Zero
+    // keeps the compiled capacity; a positive value may reduce it at runtime
+    // without changing tensor shapes or reloading the model.
+    int runtime_max_context = 0;
 
     std::string filename_post_axmodel = "tinyllama-int8/tinyllama_post.axmodel";
 

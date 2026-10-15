@@ -56,6 +56,19 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
         int input_num_token = (p == prefill_split_num - 1) ? input_embed_num - p * _attr.prefill_token_num : _attr.prefill_token_num;
         const int history_len = p * _attr.prefill_token_num;
         const int prefill_grpid = prefill_grp_list[p];
+        if (history_len > 0 &&
+            !sync_active_prefill_group_from_decode(prefill_grpid, prefill_decode_grpid, history_len))
+        {
+            ALOGE("KV prefill cache sync failed: group=%d history_len=%d", prefill_grpid, history_len);
+            return -1;
+        }
+        int query_tokens = prefill_query_tokens_by_gid(prefill_grpid);
+        if (query_tokens <= 1) query_tokens = _attr.prefill_token_num;
+        if (input_num_token > query_tokens)
+        {
+            ALOGE("prefill group %d query=%d cannot hold chunk_tokens=%d", prefill_grpid, query_tokens, input_num_token);
+            return -1;
+        }
         int kv_cache_num = prefill_history_capacity_by_gid(prefill_grpid);
         const int kv_from_mask = prefill_history_capacity_by_mask(prefill_grpid);
         if (kv_from_mask >= 0) kv_cache_num = kv_from_mask;
@@ -64,7 +77,7 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
             ALOGE("invalid kv_cache_num=%d for prefill_grpid=%d", kv_cache_num, prefill_grpid);
             return -1;
         }
-        std::vector<unsigned short> mask_tmp(_attr.prefill_token_num * (kv_cache_num + _attr.prefill_token_num), bf16.data);
+        std::vector<unsigned short> mask_tmp((size_t)query_tokens * (size_t)(kv_cache_num + query_tokens), bf16.data);
         std::vector<unsigned short> embed_tmp(_attr.prefill_token_num * _attr.tokens_embed_size, 0);
         size_t copy_tokens = (p == prefill_split_num - 1) ? (size_t)(input_embed_num - p * _attr.prefill_token_num) : (size_t)_attr.prefill_token_num;
         memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, copy_tokens * _attr.tokens_embed_size * sizeof(unsigned short));
@@ -73,9 +86,23 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
         {
             auto &lyr = llama_layers[m]; int devid = LLM_DEVID(lyr);
             const int layer_prefill_grpid = prefill_gid_for_layer(m, prefill_grpid);
+            int layer_query_tokens = prefill_query_tokens_for_layer(m, layer_prefill_grpid);
+            if (layer_query_tokens <= 1) layer_query_tokens = _attr.prefill_token_num;
+            if (input_num_token > layer_query_tokens)
+            {
+                ALOGE("prefill layer %d group %d query=%d cannot hold chunk_tokens=%d",
+                      m, layer_prefill_grpid, layer_query_tokens, input_num_token);
+                return -1;
+            }
             auto &t_idx = lyr.layer.get_input(layer_prefill_grpid, "indices");
             unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
-            int idx_i = 0; for (int i = 0; i < input_num_token; ++i) idx_ptr[idx_i++] = (unsigned int)(p * _attr.prefill_token_num + i);
+            const int idx_elems = (int)(t_idx.nSize / (int)sizeof(unsigned int));
+            const int idx_query = std::max(1, layer_query_tokens);
+            const int idx_rows = std::max(1, idx_elems / idx_query);
+            const int live_last = std::max(0, input_num_token - 1);
+            for (int r = 0; r < idx_rows; ++r)
+                for (int i = 0; i < idx_query; ++i)
+                    idx_ptr[r * idx_query + i] = (unsigned int)(p * _attr.prefill_token_num + std::min(i, live_last));
             llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
             auto &t_mask = lyr.layer.get_input(layer_prefill_grpid, "mask");
             if (is_linear_layer(m))
@@ -86,12 +113,22 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
             }
             else
             {
-                build_layer_prefill_mask(mask_tmp, kv_cache_num, _attr.prefill_token_num, history_len, input_num_token, m);
+                mask_tmp.assign((size_t)layer_query_tokens * (size_t)(kv_cache_num + layer_query_tokens), bf16.data);
+                build_layer_prefill_mask(mask_tmp, kv_cache_num, layer_query_tokens, history_len, input_num_token, m);
                 llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
             }
             auto &t_in = lyr.layer.get_input(layer_prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
+            set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len, devid);
             if (!ensure_layer_loaded(m)) return -1;
-            lyr.layer.inference(layer_prefill_grpid);
+            const int kv_prefill_infer_ret = lyr.layer.inference(layer_prefill_grpid);
+            if (kv_prefill_infer_ret != 0)
+            {
+                ALOGW("KV prefill layer %d gid=%d inference failed: 0x%x", m, layer_prefill_grpid, kv_prefill_infer_ret);
+                set_last_error("KV prefill layer inference 失败: layer=" + std::to_string(m) +
+                               " group=" + std::to_string(layer_prefill_grpid) +
+                               " ret=" + std::to_string(kv_prefill_infer_ret));
+                return -1;
+            }
             const int layer_decode_grpid = decode_gid_for_layer(m, prefill_decode_grpid);
             auto &dec_k  = lyr.layer.get_input(layer_decode_grpid, "K_cache");
             auto &dec_v  = lyr.layer.get_input(layer_decode_grpid, "V_cache");
@@ -100,7 +137,10 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
             {
                 (void)dec_k;
                 (void)dec_v;
-                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true)) return -1;
+                // Keep only decode groups current.  The next prefill chunk
+                // copies the recurrent state into its selected shape bucket
+                // on demand.
+                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, false, false)) return -1;
             }
             else
             {
@@ -111,33 +151,6 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
                 llm_d2d((unsigned short *)LLM_WADDR(dec_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                 llm_d2d((unsigned short *)LLM_WADDR(dec_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
 
-                // Do not assume raw group ids are contiguous.  AXModel
-                // export may omit deduplicated prefill groups (GDN keeps one
-                // ABI-compatible group; full attention keeps the maximum
-                // capacity group), so iterating gid+1..max_gid can address a
-                // non-existent group.  Synchronize only the groups actually
-                // detected for this layer and skip the source group itself.
-                std::vector<int> layer_prefill_groups;
-                if (m >= 0 && m < (int)layer_prefill_grpids_.size())
-                    layer_prefill_groups = layer_prefill_grpids_[(size_t)m];
-                if (layer_prefill_groups.empty())
-                {
-                    const int ng = (int)lyr.layer.get_num_input_groups();
-                    for (int gid = 0; gid < ng; ++gid)
-                        layer_prefill_groups.push_back(gid);
-                }
-                for (const int gid : layer_prefill_groups)
-                {
-                    if (gid == layer_prefill_grpid) continue;
-                    auto &gk = lyr.layer.get_input(gid, "K_cache");
-                    auto &gv = lyr.layer.get_input(gid, "V_cache");
-                    const int cap_tokens_k = (int)(gk.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
-                    const int cap_tokens_v = (int)(gv.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
-                    if (history_len + input_num_token <= cap_tokens_k)
-                        llm_d2d((unsigned short *)LLM_WADDR(gk) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
-                    if (history_len + input_num_token <= cap_tokens_v)
-                        llm_d2d((unsigned short *)LLM_WADDR(gv) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
-                }
             }
             auto &t_out = lyr.layer.get_output(layer_prefill_grpid, "output"); llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), std::min((size_t)t_out.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
         }
@@ -286,6 +299,8 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         if (g < 0)
         {
             ALOGE("failed to select prefill group for history_len=%d chunk_tokens=%d", history_len, chunk_tokens);
+            set_last_error("prefill group 选择失败: history_len=" + std::to_string(history_len) +
+                           " chunk_tokens=" + std::to_string(chunk_tokens));
             return final_out;
         }
         prefill_grp_list[p] = g;
@@ -293,7 +308,16 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
 
     const bool use_per_layer_input = gemma4_per_layer_helper.enabled();
     const int per_layer_hidden = gemma4_per_layer_helper.hidden_size_per_layer_input();
-    const bool decode_profile_enabled = std::getenv("AXLLM_PROFILE_DECODE") != nullptr;
+    const auto env_flag_enabled = [](const char *name) {
+        const char *value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') return false;
+        return std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "no") != 0;
+    };
+    const bool decode_profile_enabled = env_flag_enabled("AXLLM_PROFILE_DECODE");
+    const bool prefill_chunk_profile_enabled = env_flag_enabled("AXLLM_PROFILE_PREFILL_CHUNKS");
     DecodeProfileStats decode_profile{};
     std::vector<unsigned short> prefill_per_layer_inputs;
     std::vector<unsigned short> decode_per_layer_input;
@@ -338,6 +362,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     for (int p = 0; p < prefill_split_num; p++)
     {
         if (b_stop.load(std::memory_order_relaxed)) break;
+        const auto prefill_chunk_t0 = prefill_chunk_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
+        uint64_t prefill_layer_inference_ns = 0;
+        int prefill_profiled_layers = 0;
         int input_num_token = (p == prefill_split_num - 1) ? input_embed_num - p * _attr.prefill_token_num : _attr.prefill_token_num;
         const int history_len = precompute_len + p * _attr.prefill_token_num;
         const int token_start_pos = (active_token_pos_start >= 0)
@@ -348,7 +375,51 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                                        : history_len;
 
         const int prefill_grpid = prefill_grp_list[p];
+        int query_tokens = prefill_query_tokens_by_gid(prefill_grpid);
+        if (query_tokens <= 1) query_tokens = _attr.prefill_token_num;
+        const auto log_prefill_chunk_profile = [&](const char *status, int failed_layer, const char *stage) {
+            if (!prefill_chunk_profile_enabled) return;
+            const double total_ms = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - prefill_chunk_t0).count() / 1e6;
+            const double inference_ms = (double)prefill_layer_inference_ns / 1e6;
+            ALOGN("prefill chunk profile: status=%s chunk=%d/%d history=%d tokens=%d gid=%d query=%d layers=%d total=%.3f ms layer_inference_sum=%.3f ms failed_layer=%d stage=%s\n",
+                  status,
+                  p + 1,
+                  prefill_split_num,
+                  history_len,
+                  input_num_token,
+                  prefill_grpid,
+                  query_tokens,
+                  prefill_profiled_layers,
+                  total_ms,
+                  inference_ms,
+                  failed_layer,
+                  stage);
+        };
         // ALOGI("prefill group for chunk %d: %d", p, prefill_grpid);
+        // Prefill groups are shape buckets and are synchronized lazily.  The
+        // canonical decode group contains the prefix produced by previous
+        // chunks (or SetKVCache/prefix reuse); copy only the bucket selected
+        // for this chunk before its graph reads K/V.  Without this call a
+        // bucket switch could consume stale/zero history even though the
+        // decode cache itself was correct.
+        if (history_len > 0 &&
+            !sync_active_prefill_group_from_decode(prefill_grpid, decode_grpid, history_len))
+        {
+            ALOGE("prefill cache sync failed: group=%d history_len=%d", prefill_grpid, history_len);
+            log_prefill_chunk_profile("failed", -1, "cache_sync");
+            set_last_error("模型运行失败，请重新尝试。");
+            ResetKVCache();
+            return final_out;
+        }
+        if (input_num_token > query_tokens)
+        {
+            ALOGE("prefill group %d query=%d cannot hold chunk_tokens=%d", prefill_grpid, query_tokens, input_num_token);
+            log_prefill_chunk_profile("failed", -1, "group_capacity");
+            set_last_error("prefill chunk 超出 group 容量: group=" + std::to_string(prefill_grpid) +
+                           " query=" + std::to_string(query_tokens) +
+                           " tokens=" + std::to_string(input_num_token));
+            return final_out;
+        }
         int kv_cache_num_p = prefill_history_capacity_for_layer_group(cache_ref_full_layer_idx, prefill_grpid);
         if (kv_cache_num_p < 0) kv_cache_num_p = prefill_history_capacity_by_gid(prefill_grpid);
         ALOGI("prefill chunk p=%d history_len=%d grpid=%d kv_cache_num=%d input_tokens=%d",
@@ -374,6 +445,19 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (b_stop.load(std::memory_order_relaxed)) break;
             auto &lyr   = llama_layers[m]; int devid = LLM_DEVID(lyr);
             const int layer_prefill_grpid = prefill_gid_for_layer(m, prefill_grpid);
+            int layer_query_tokens = prefill_query_tokens_for_layer(m, layer_prefill_grpid);
+            if (layer_query_tokens <= 1) layer_query_tokens = _attr.prefill_token_num;
+            if (input_num_token > layer_query_tokens)
+            {
+                ALOGE("prefill layer %d group %d query=%d cannot hold chunk_tokens=%d",
+                      m, layer_prefill_grpid, layer_query_tokens, input_num_token);
+                log_prefill_chunk_profile("failed", m, "layer_capacity");
+                set_last_error("prefill layer chunk 超出 group 容量: layer=" + std::to_string(m) +
+                               " group=" + std::to_string(layer_prefill_grpid) +
+                               " query=" + std::to_string(layer_query_tokens) +
+                               " tokens=" + std::to_string(input_num_token));
+                return final_out;
+            }
             int layer_kv_cache_num = prefill_history_capacity_for_layer_group(m, layer_prefill_grpid);
             if (layer_kv_cache_num < 0) layer_kv_cache_num = kv_cache_num_p;
             if (layer_kv_cache_num < history_len && !is_linear_layer(m))
@@ -398,7 +482,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             {
                 const int seq_start_pos = rope_start_pos;
                 const int idx_elems = (int)(t_idx.nSize / (int)sizeof(unsigned int));
-                int idx_rows = idx_elems / _attr.prefill_token_num;
+                int idx_rows = idx_elems / layer_query_tokens;
                 if (idx_rows <= 0) idx_rows = 1;
                 const bool use_pos_ids = has_vision_state &&
                                          idx_rows >= 3 &&
@@ -408,19 +492,26 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 for (int r = 0; r < idx_rows; ++r)
                 {
                     // ALOGI("r %d, idx_rows: %d", r, idx_rows);
-                    for (int j = 0; j < input_num_token; ++j)
+                    // Fixed-query graphs execute padded rows too.  Keep their
+                    // position indices in range by repeating the last live
+                    // token instead of leaving zero/uninitialized positions.
+                    // These rows are masked from all real query rows and are
+                    // not copied to the host KV/output.
+                    const int live_last = std::max(0, input_num_token - 1);
+                    for (int j = 0; j < layer_query_tokens; ++j)
                     {
-                        unsigned int v = (unsigned int)(seq_start_pos + j);
+                        const int live_j = std::min(j, live_last);
+                        unsigned int v = (unsigned int)(seq_start_pos + live_j);
                         if (use_pos_ids)
                         {
                             if ((size_t)r < vision_state.position_ids.size())
                             {
                                 const auto &row = vision_state.position_ids[r];
-                                if ((size_t)(token_start_pos + j) < row.size())
-                                    v = (unsigned int)row[token_start_pos + j];
+                                if ((size_t)(token_start_pos + live_j) < row.size())
+                                    v = (unsigned int)row[token_start_pos + live_j];
                             }
                         }
-                        idx_ptr[r * _attr.prefill_token_num + j] = v;
+                        idx_ptr[r * layer_query_tokens + j] = v;
                     }
                 }
             }
@@ -434,23 +525,24 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             }
             else
             {
-                mask_tmp.assign((size_t)_attr.prefill_token_num * (size_t)(layer_kv_cache_num + _attr.prefill_token_num), bf16.data);
+                mask_tmp.assign((size_t)layer_query_tokens * (size_t)(layer_kv_cache_num + layer_query_tokens), bf16.data);
                 if (use_sparse_full_cache_mask())
-                    build_sparse_layer_prefill_mask(mask_tmp, layer_kv_cache_num, _attr.prefill_token_num, history_len, input_num_token, m);
+                    build_sparse_layer_prefill_mask(mask_tmp, layer_kv_cache_num, layer_query_tokens, history_len, input_num_token, m);
                 else
-                    build_layer_prefill_mask(mask_tmp, layer_kv_cache_num, _attr.prefill_token_num, history_len, input_num_token, m);
+                    build_layer_prefill_mask(mask_tmp, layer_kv_cache_num, layer_query_tokens, history_len, input_num_token, m);
                 llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
             }
             auto &t_in = lyr.layer.get_input(layer_prefill_grpid, "input");
             if (std::getenv("AXLLM_ZERO_LAYER0_PREFILL_INPUT") && m == 0 && p == 0)
             {
                 std::vector<unsigned short> zero_embed(embed_tmp.size(), 0);
-                llm_h2d(LLM_WADDR(t_in), zero_embed.data(), zero_embed.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_in), zero_embed.data(), std::min((size_t)t_in.nSize, zero_embed.size() * sizeof(unsigned short)), devid);
             }
             else
             {
-                llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
+                llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
             }
+            set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len, devid);
             const int shared_src = shared_kv_source_for_layer(m);
             if (shared_src >= 0)
             {
@@ -515,10 +607,22 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 dump_selected_prefill_tensors(lyr.layer, layer_prefill_grpid, -1);
             const bool linear_prefill = is_linear_layer(m);
             const int layer_decode_grpid = decode_gid_for_layer(m, decode_grpid);
+            const auto layer_infer_t0 = prefill_chunk_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
             const int infer_ret = lyr.layer.inference(layer_prefill_grpid);
+            if (prefill_chunk_profile_enabled)
+            {
+                prefill_layer_inference_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - layer_infer_t0).count();
+                if (infer_ret == 0) ++prefill_profiled_layers;
+            }
             if (infer_ret != 0)
             {
                 ALOGW("prefill layer %d gid=%d inference failed: 0x%x", m, layer_prefill_grpid, infer_ret);
+                log_prefill_chunk_profile("failed", m, "inference");
+                set_last_error("prefill layer inference 失败: chunk=" + std::to_string(p + 1) + "/" +
+                               std::to_string(prefill_split_num) + " layer=" + std::to_string(m) +
+                               " group=" + std::to_string(layer_prefill_grpid) +
+                               " ret=" + std::to_string(infer_ret));
+                ResetKVCache();
                 return final_out;
             }
             if (debug_prefill) ALOGI("prefill layer %d inference done", m);
@@ -550,7 +654,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             {
                 (void)dec_k;
                 (void)dec_v;
-                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, true))
+                // Recurrent state is canonicalized in decode groups; avoid
+                // an O(number-of-prefill-buckets) copy after every chunk.
+                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, false, false))
                 {
                     set_last_error("模型运行失败，请重新尝试。");
                     ResetKVCache();
@@ -566,26 +672,6 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 size_t kv_sz = (size_t)input_num_token * (size_t)layer_kv * sizeof(unsigned short);
                 llm_d2d((unsigned short *)LLM_WADDR(dec_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                 llm_d2d((unsigned short *)LLM_WADDR(dec_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
-                std::vector<int> future_prefill_gids;
-                future_prefill_gids.reserve((size_t)std::max(0, prefill_split_num - p - 1));
-                for (int q = p + 1; q < prefill_split_num; ++q)
-                {
-                    const int future_gid = prefill_gid_for_layer(m, prefill_grp_list[(size_t)q]);
-                    if (std::find(future_prefill_gids.begin(), future_prefill_gids.end(), future_gid) == future_prefill_gids.end())
-                        future_prefill_gids.push_back(future_gid);
-                }
-                for (const int gid : future_prefill_gids) {
-                    auto &gk = lyr.layer.get_input(gid, "K_cache");
-                    auto &gv = lyr.layer.get_input(gid, "V_cache");
-                    const int cap_tokens_k = (int)(gk.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
-                    const int cap_tokens_v = (int)(gv.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
-                    if (kv_off / layer_kv + input_num_token <= cap_tokens_k) {
-                        llm_d2d((unsigned short *)LLM_WADDR(gk) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
-                    }
-                    if (kv_off / layer_kv + input_num_token <= cap_tokens_v) {
-                        llm_d2d((unsigned short *)LLM_WADDR(gv) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
-                    }
-                }
             }
 
             auto &t_out = lyr.layer.get_output(layer_prefill_grpid, "output");
@@ -637,6 +723,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         capture_linear_state_snapshot(history_len + input_num_token);
         if (p == prefill_split_num - 1)
             memcpy(embed.data(), embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
+        log_prefill_chunk_profile("ok", -1, "complete");
     }
 
     int next_token = -1; t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
@@ -661,7 +748,14 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         dump_hidden_trace("post_input_hidden", 0, embed.data(), _attr.tokens_embed_size);
         llm_h2d(LLM_WADDR(t_in), embed.data(), embed.size() * sizeof(unsigned short), LLM_DEVID(llama_layers.back()));
         if (debug_prefill) ALOGI("post stage h2d done");
-        llama_post.inference();
+        const int post_infer_ret = llama_post.inference();
+        if (post_infer_ret != 0)
+        {
+            ALOGW("post layer inference failed: ret=0x%x", post_infer_ret);
+            set_last_error("post layer inference 失败: ret=" + std::to_string(post_infer_ret));
+            ResetKVCache();
+            return final_out;
+        }
         if (debug_prefill) ALOGI("post stage inference done");
         auto &t_out = llama_post.get_output("output");
         llm_d2h(t_out.pVirAddr, LLM_RADDR(t_out), t_out.nSize, llama_post.get_devid());
@@ -726,8 +820,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     }
 
     t_cost.start();
+    const int logical_max_context = logical_context_limit();
     for (unsigned int decode_pos = decode_start, kv_slot = dense_decode_start;
-         !b_hit_eos && decode_pos < (unsigned int)_attr.max_token_len && kv_slot < (unsigned int)_attr.max_token_len;
+         !b_hit_eos && decode_pos < (unsigned int)logical_max_context && kv_slot < (unsigned int)logical_max_context;
          ++decode_pos, ++kv_slot)
     {
         if (b_stop.load(std::memory_order_relaxed)) break;
@@ -807,6 +902,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 }
             }
             auto &t_idx = lyr.layer.get_input(layer_decode_grpid, "indices"); llm_h2d(LLM_WADDR(t_idx), &decode_pos, sizeof(decode_pos), devid);
+            set_kv_block_count_if_present(lyr.layer, layer_decode_grpid, (int)kv_slot, devid);
             auto &t_mask= lyr.layer.get_input(layer_decode_grpid, "mask");
             if (is_linear_layer(m))
             {
@@ -842,7 +938,17 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                         devid);
             }
             if (!ensure_layer_loaded(m)) return final_out;
-            lyr.layer.inference(layer_decode_grpid);
+            const int decode_infer_ret = lyr.layer.inference(layer_decode_grpid);
+            if (decode_infer_ret != 0)
+            {
+                ALOGW("decode layer %d gid=%d inference failed: 0x%x", m, layer_decode_grpid, decode_infer_ret);
+                set_last_error("decode layer inference 失败: layer=" + std::to_string(m) +
+                               " group=" + std::to_string(layer_decode_grpid) +
+                               " kv_slot=" + std::to_string(kv_slot) +
+                               " ret=" + std::to_string(decode_infer_ret));
+                ResetKVCache();
+                return final_out;
+            }
             if (is_linear_layer(m))
             {
                 (void)in_k;
@@ -901,7 +1007,14 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             }
         }
         if (use_sparse_full_cache_mask()) mark_full_cache_slot((int)kv_slot);
-        llama_post.inference();
+        const int post_infer_ret = llama_post.inference();
+        if (post_infer_ret != 0)
+        {
+            ALOGW("post layer inference failed: ret=0x%x", post_infer_ret);
+            set_last_error("post layer inference 失败: ret=" + std::to_string(post_infer_ret));
+            ResetKVCache();
+            return final_out;
+        }
         {
             auto &t_out = llama_post.get_output("output"); llm_d2h(t_out.pVirAddr, LLM_RADDR(t_out), t_out.nSize, llama_post.get_devid());
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
@@ -909,7 +1022,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
 #else // AX650
         for (int m = 0; m < _attr.axmodel_num; m++)
         {
-            if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m];
+            if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m]; int devid = lyr.layer.get_devid();
             const int layer_decode_grpid = decode_gid_for_layer(m, decode_grpid);
             auto &in_k = lyr.layer.get_input(layer_decode_grpid, "K_cache"); auto *in_k_ptr = (unsigned short *)in_k.pVirAddr;
             auto &in_v = lyr.layer.get_input(layer_decode_grpid, "V_cache"); auto *in_v_ptr = (unsigned short *)in_v.pVirAddr;
@@ -947,6 +1060,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 decode_profile.shared_kv_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - shared_t0).count();
             const auto prep_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
             auto &t_idx = lyr.layer.get_input(layer_decode_grpid, "indices"); memcpy(t_idx.pVirAddr, &decode_pos, sizeof(decode_pos));
+            set_kv_block_count_if_present(lyr.layer, layer_decode_grpid, (int)kv_slot, devid);
             auto &t_mask= lyr.layer.get_input(layer_decode_grpid, "mask");
             if (is_linear_layer(m))
             {
@@ -984,7 +1098,17 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 decode_profile.prep_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - prep_t0).count();
             const auto infer_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
             if (!ensure_layer_loaded(m)) return final_out;
-            lyr.layer.inference(layer_decode_grpid);
+            const int decode_infer_ret = lyr.layer.inference(layer_decode_grpid);
+            if (decode_infer_ret != 0)
+            {
+                ALOGW("decode layer %d gid=%d inference failed: 0x%x", m, layer_decode_grpid, decode_infer_ret);
+                set_last_error("decode layer inference 失败: layer=" + std::to_string(m) +
+                               " group=" + std::to_string(layer_decode_grpid) +
+                               " kv_slot=" + std::to_string(kv_slot) +
+                               " ret=" + std::to_string(decode_infer_ret));
+                ResetKVCache();
+                return final_out;
+            }
             if (decode_profile_enabled)
                 decode_profile.inference_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - infer_t0).count();
             const auto out_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
@@ -1031,7 +1155,15 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         const auto post_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
         auto &t_in = llama_post.get_input("input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
         dump_hidden_trace("post_input_hidden", (int)token_ids.size(), embed.data(), _attr.tokens_embed_size);
-        llama_post.inference(); auto &t_out = llama_post.get_output("output");
+        const int post_infer_ret = llama_post.inference();
+        if (post_infer_ret != 0)
+        {
+            ALOGW("post layer inference failed: ret=0x%x", post_infer_ret);
+            set_last_error("post layer inference 失败: ret=" + std::to_string(post_infer_ret));
+            ResetKVCache();
+            return final_out;
+        }
+        auto &t_out = llama_post.get_output("output");
         unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
         dump_decode_trace((int)token_ids.size(), post_out, _attr.tokens_embed_num, next_token);
         if (decode_profile_enabled)
@@ -1283,18 +1415,15 @@ std::vector<Content> LLM::Impl::Run(std::vector<Content> history,
             budget.last_tokens = last_tokens_ids;
             budget.precompute_len = precompute_len;
             budget.prefill_token_num = _attr.prefill_token_num;
-            const int max_cap = !_attr.prefill_max_kv_cache_num_grp.empty()
-                                    ? _attr.prefill_max_kv_cache_num_grp.back()
-                                    : _attr.prefill_max_token_num;
+            const int max_cap = logical_context_limit();
             budget.max_total_tokens = max_cap;
             budget.max_history_tokens = (_attr.prefill_token_num > 0)
                                             ? std::max(0, max_cap - _attr.prefill_token_num)
                                             : std::max(0, max_cap);
+            // This is a logical context budget, not a count of full regular
+            // chunks. Adaptive query profiles handle a short final chunk, so
+            // retaining the complete remainder avoids rejecting valid prompts.
             int remaining = std::max(0, max_cap - precompute_len);
-            if (_attr.prefill_token_num > 0)
-            {
-                remaining = ALIGN_DOWN(remaining, _attr.prefill_token_num);
-            }
             budget.max_tail_tokens = remaining;
 
             std::vector<Content> prepared_history;

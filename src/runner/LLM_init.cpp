@@ -130,9 +130,13 @@ void LLM::Impl::init_layer_groups()
         };
         auto sort_prefill = [&](std::vector<int> &gids) {
             std::stable_sort(gids.begin(), gids.end(), [&](int lhs, int rhs) {
-                const int lc = group_prefill_capacity(layer_runner, lhs).first;
-                const int rc = group_prefill_capacity(layer_runner, rhs).first;
-                return lc == rc ? lhs < rhs : lc < rc;
+                const auto lc = group_prefill_capacity(layer_runner, lhs);
+                const auto rc = group_prefill_capacity(layer_runner, rhs);
+                if (lc.first != rc.first) return lc.first < rc.first;
+                const int lq = group_query_tokens(layer_runner, lhs);
+                const int rq = group_query_tokens(layer_runner, rhs);
+                if (lq != rq) return lq < rq;
+                return lhs < rhs;
             });
         };
         sort_decode(layer_decode_grpids_[(size_t)i]);
@@ -274,8 +278,11 @@ bool LLM::Impl::init_groups_from_model(ax_runner_t &ref_layer)
         ALOGW("no native prefill groups detected, fallback to decode-only prefill mode");
     }
 
-    // Detect prefill_token_num from the first prefill group.
-    // Prefer `indices` last-dim (most consistent across models/backends). Fall back to `mask` shape.
+    // `prefill_token_num` is the normal chunk size and therefore the largest
+    // compiled prefill query profile.  Smaller profiles are selected only for
+    // a final partial chunk.  The old first-group assumption is wrong for
+    // adaptive profiles because the first profile is intentionally the
+    // smallest query shape.
     int detected_prefill_token_num = 0;
     if (decode_only_prefill_mode_)
     {
@@ -283,28 +290,13 @@ bool LLM::Impl::init_groups_from_model(ax_runner_t &ref_layer)
     }
     else
     {
-        const int gid = prefill_gids.front();
-        try
-        {
-            const auto &t_idx = ref_layer.get_input(gid, "indices");
-            if (!t_idx.vShape.empty()) detected_prefill_token_num = (int)t_idx.vShape.back();
-        }
-        catch (const std::exception &)
-        {
-        }
-        // Guard against picking the batch dimension (often 1).
-        if (detected_prefill_token_num <= 1)
+        for (const int gid : prefill_gids)
         {
             try
             {
-                const auto &t_mask = ref_layer.get_input(gid, "mask");
-                if (!t_mask.vShape.empty())
-                {
-                    if (t_mask.vShape.size() >= 2 && t_mask.vShape[0] == 1)
-                        detected_prefill_token_num = (int)t_mask.vShape[1];
-                    else
-                        detected_prefill_token_num = (int)t_mask.vShape[0];
-                }
+                detected_prefill_token_num = std::max(
+                    detected_prefill_token_num,
+                    group_query_tokens(ref_layer, gid));
             }
             catch (const std::exception &)
             {
@@ -357,6 +349,22 @@ bool LLM::Impl::init_groups_from_model(ax_runner_t &ref_layer)
     };
     std::vector<PrefillGroupInfo> prefill_infos;
     const auto &prefill_scan_gids = decode_only_prefill_mode_ ? decode_gids : prefill_gids;
+    // Adaptive tail profiles have deliberately oversized physical masks. For
+    // example, q=8 is built with history capacity max_context-1 so it can run
+    // a one-token final chunk at the context limit; its mask width is therefore
+    // greater than max_context. Keep physical history capacity for safety, but
+    // derive the logical total-token ceiling from the decode ABI instead.
+    int profile_context_capacity = 0;
+    for (const auto &p : decode_pairs)
+        profile_context_capacity = std::max(profile_context_capacity, p.first + 1);
+    std::vector<int> distinct_prefill_queries;
+    for (const int gid : prefill_gids)
+    {
+        const int q = group_query_tokens(ref_layer, gid);
+        if (q > 1 && std::find(distinct_prefill_queries.begin(), distinct_prefill_queries.end(), q) == distinct_prefill_queries.end())
+            distinct_prefill_queries.push_back(q);
+    }
+    const bool adaptive_prefill_profiles = distinct_prefill_queries.size() > 1 && profile_context_capacity > 0;
     for (const int gid : prefill_scan_gids)
     {
         int total_cap = -1;
@@ -395,23 +403,9 @@ bool LLM::Impl::init_groups_from_model(ax_runner_t &ref_layer)
             }
             continue;
         }
-        try
-        {
-            const auto &t_mask = ref_layer.get_input(gid, "mask");
-            const int elems = (int)((size_t)t_mask.nSize / sizeof(unsigned short));
-            if (_attr.prefill_token_num > 0 && elems > 0 && (elems % _attr.prefill_token_num) == 0)
-            {
-                const int cols = elems / _attr.prefill_token_num;
-                if (cols >= _attr.prefill_token_num)
-                {
-                    total_cap = cols;
-                    history_cap = cols - _attr.prefill_token_num;
-                }
-            }
-        }
-        catch (const std::exception &)
-        {
-        }
+        const auto capacities = group_prefill_capacity(ref_layer, gid);
+        total_cap = capacities.first;
+        history_cap = capacities.second;
         try
         {
             const auto &t_k = ref_layer.get_input(gid, "K_cache");
@@ -427,6 +421,20 @@ bool LLM::Impl::init_groups_from_model(ax_runner_t &ref_layer)
         }
         catch (const std::exception &)
         {
+        }
+        if (adaptive_prefill_profiles)
+        {
+            // Tail-query graphs (q=8/16/...) are intentionally oversized so
+            // they can cover the final unaligned chunk at the context limit.
+            // Capacity-bucket graphs for the normal q=step profile are not
+            // oversized and must retain their real total capacity; otherwise
+            // deduplication collapses the ladder and the dispatcher always
+            // selects the first physical cache. Clamp only oversized graphs.
+            if (total_cap > profile_context_capacity)
+            {
+                total_cap = profile_context_capacity;
+                symbolic_cap = std::max(symbolic_cap, profile_context_capacity);
+            }
         }
         if (total_cap < 0 && symbolic_cap >= 0)
         {
@@ -452,13 +460,17 @@ bool LLM::Impl::init_groups_from_model(ax_runner_t &ref_layer)
                     pairs.end());
     };
     dedup_sorted(decode_pairs);
-    std::sort(prefill_infos.begin(), prefill_infos.end(), [](const PrefillGroupInfo &a, const PrefillGroupInfo &b) {
+    std::sort(prefill_infos.begin(), prefill_infos.end(), [&](const PrefillGroupInfo &a, const PrefillGroupInfo &b) {
         if (a.total_cap != b.total_cap) return a.total_cap < b.total_cap;
+        const int aq = group_query_tokens(ref_layer, a.gid);
+        const int bq = group_query_tokens(ref_layer, b.gid);
+        if (aq != bq) return aq < bq;
         return a.gid < b.gid;
     });
     prefill_infos.erase(std::unique(prefill_infos.begin(), prefill_infos.end(),
-                                    [](const PrefillGroupInfo &a, const PrefillGroupInfo &b) {
-                                        return a.total_cap == b.total_cap;
+                                    [&](const PrefillGroupInfo &a, const PrefillGroupInfo &b) {
+                                        return a.total_cap == b.total_cap &&
+                                               group_query_tokens(ref_layer, a.gid) == group_query_tokens(ref_layer, b.gid);
                                     }),
                         prefill_infos.end());
 
@@ -547,11 +559,16 @@ bool LLM::Impl::init_groups_from_model(ax_runner_t &ref_layer)
     _attr.prefill_grpid = prefill_grpids_.back();
     _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp.back();
 
-    // Canonical context capacity should follow the largest decode/prefill group.
+    // Canonical context capacity should follow the largest stored-KV capacity.
     // Some models provide multiple decode groups (2k/4k/8k/16k), and group 0 may
-    // not be the largest. Use discovered capacities to drive global limits.
+    // not be the largest.  A prefill group's total capacity includes its current
+    // query block, while its K/V tensor stores only the history prefix; using
+    // total capacity here would understate the per-token KV size and corrupt
+    // copies for full-tail prefill groups.
     const int max_decode = decode_max_token_len_grp_.back();
-    const int max_prefill = _attr.prefill_max_kv_cache_num_grp.back();
+    int max_prefill = 0;
+    for (const int capacity : prefill_history_kv_cache_num_grp)
+        max_prefill = std::max(max_prefill, capacity);
     const int canonical_cap = std::max(max_decode, max_prefill);
     if (canonical_cap > 0)
     {

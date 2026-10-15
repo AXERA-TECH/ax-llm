@@ -4,6 +4,11 @@
 
 > 路径类字段(`filename_*` / `template_filename_axmodel` / `post_config_path` 等)相对模型目录解析。
 
+## 运行日志
+
+- `AXLLM_LOG_LEVEL=error`：控制 ax-llm 自身日志级别。
+- ax-llm 默认在启动时设置 `AX_ENGINE_DIAG=false`，关闭 AX Engine 诊断输出。设置 `AXLLM_AX_ENGINE_DIAG=1` 可重新开启诊断。此项仅控制 AX Engine 诊断，不影响 ax-llm 自身日志级别。
+
 ## 必填
 
 | 字段 | 类型 | 说明 |

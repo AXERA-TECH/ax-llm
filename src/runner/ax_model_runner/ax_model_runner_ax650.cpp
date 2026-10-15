@@ -7,6 +7,7 @@
 #include <ax_sys_api.h>
 #include <ax_ivps_api.h>
 #include <ax_engine_api.h>
+#include <ax_engine_advanced_api.h>
 #include <fcntl.h>
 #include "memory_utils.hpp"
 #include "sample_log.h"
@@ -48,6 +49,24 @@ static int prepare_io_struct_only(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_
         io_data->pOutputs[i].nSize = info->pOutputs[i].nSize;
 
     return 0;
+}
+
+static bool axllm_env_flag_enabled(const char *name)
+{
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return false;
+    return std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "no") != 0;
+}
+
+static void mark_allow_inplace_io(AX_ENGINE_IO_T &io, int grpid)
+{
+    if (!axllm_env_flag_enabled("AXLLM_ALLOW_INPLACE_IO")) return;
+    io.u64Reserved[0] |= AX_ENGINE_IO_FLAG_ALLOW_INPLACE;
+    if (axllm_env_flag_enabled("AXLLM_DEBUG_LAYER0_IO"))
+        ALOGI("AXLLM_ALLOW_INPLACE_IO enabled for group %d", grpid);
 }
 
 // 辅助：分配 IO 结构体数组 + 物理内存
@@ -676,6 +695,7 @@ int ax_runner_ax650::inference()
         }
     }
 
+    mark_allow_inplace_io(m_handle->io_data[0], 0);
     int ret = 0;
     if (m_handle->io_data.size() == 1)
     {
@@ -777,6 +797,7 @@ int ax_runner_ax650::inference(int grpid)
         }
     }
 
+    mark_allow_inplace_io(m_handle->io_data[(size_t)grpid], grpid);
     int ret = 0;
     if (m_handle->io_data.size() == 1)
     {

@@ -13,6 +13,7 @@
 #include <deque>
 #include <exception>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <queue>
@@ -525,6 +526,25 @@ struct LLM::Impl : public IKvSlotHost {
     static inline void fill_indices(unsigned int *dst, int start, int count)
     { for (int i = 0; i < count; ++i) dst[i] = (unsigned int)(start + i); }
 
+    // New AX8860 DSL full-attention graphs expose a small runtime scalar that
+    // controls the number of live 256-token KV history tiles.  Keep this
+    // helper optional so older axmodels (and GDN/other layer types) continue
+    // to use their original ABI unchanged.
+    static inline void set_kv_block_count_if_present(ax_runner_t &runner,
+                                                     int grpid,
+                                                     int history_tokens,
+                                                     int devid)
+    {
+        const ax_runner_tensor_t *t = try_get_group_input_tensor(runner, grpid, "kv_block_count");
+        if (!t || t->nSize < sizeof(int32_t)) return;
+        int32_t blocks = (int32_t)((std::max(0, history_tokens) + 255) / 256);
+        if (blocks == 0 && std::getenv("AXLLM_MIN_KV_BLOCK_COUNT"))
+            blocks = 1;
+        if (std::getenv("AXLLM_DEBUG_LAYER0_IO"))
+            ALOGI("set kv_block_count: gid=%d history_tokens=%d blocks=%d", grpid, history_tokens, blocks);
+        llm_h2d(LLM_WADDR(*t), &blocks, sizeof(blocks), devid);
+    }
+
     static inline void build_prefill_mask(std::vector<unsigned short> &mask_tmp,
                                           int kv_cache_num,
                                           int token_rows,
@@ -548,6 +568,23 @@ struct LLM::Impl : public IKvSlotHost {
             }
             for (int j = history_start; j < history_len; ++j) row[j] = 0;
             int cur = kv_cache_num; for (int j = cur + current_start; j < cur + r + 1; ++j) row[j] = 0;
+        }
+
+        // Fixed-query prefill graphs execute all query rows even for a short
+        // tail chunk.  Keep padding rows numerically valid without changing
+        // the real-token rows consumed by the host.
+        if (rows < token_rows)
+        {
+            const int safe_col = (rows > 0)
+                                     ? (kv_cache_num + rows - 1)
+                                     : (history_len > 0 ? std::min(history_len - 1, kv_cache_num - 1)
+                                                         : kv_cache_num);
+            for (int r = rows; r < token_rows; ++r)
+            {
+                auto row = mask_tmp.data() + r * (kv_cache_num + token_rows);
+                if (safe_col >= 0 && safe_col < kv_cache_num + token_rows)
+                    row[safe_col] = 0;
+            }
         }
     }
 
@@ -694,6 +731,20 @@ struct LLM::Impl : public IKvSlotHost {
             const int cur = kv_cache_num;
             for (int j = cur + current_start; j < cur + r + 1; ++j)
                 row[j] = 0;
+        }
+
+        if (rows < token_rows)
+        {
+            const int safe_col = (rows > 0)
+                                     ? (kv_cache_num + rows - 1)
+                                     : (history_len > 0 ? std::min(history_len - 1, kv_cache_num - 1)
+                                                         : kv_cache_num);
+            for (int r = rows; r < token_rows; ++r)
+            {
+                auto row = mask_tmp.data() + r * (kv_cache_num + token_rows);
+                if (safe_col >= 0 && safe_col < kv_cache_num + token_rows)
+                    row[safe_col] = 0;
+            }
         }
     }
 
@@ -963,6 +1014,49 @@ struct LLM::Impl : public IKvSlotHost {
         return _attr.prefill_max_kv_cache_num_grp[(size_t)idx];
     }
 
+    int logical_context_limit() const
+    {
+        int physical = 0;
+        if (!_attr.prefill_max_kv_cache_num_grp.empty())
+            physical = _attr.prefill_max_kv_cache_num_grp.back();
+        if (physical <= 0) physical = _attr.max_token_len;
+        if (_attr.runtime_max_context > 0)
+            return std::min(physical, _attr.runtime_max_context);
+        return physical;
+    }
+
+    int prefill_query_tokens_by_gid(int gid)
+    {
+        if (cache_ref_full_layer_idx < 0 || cache_ref_full_layer_idx >= _attr.axmodel_num) return -1;
+        try
+        {
+            const auto &indices = llama_layers[(size_t)cache_ref_full_layer_idx].layer.get_input(gid, "indices");
+            if (!indices.vShape.empty()) return std::max(1, (int)indices.vShape.back());
+            const int elems = (int)((size_t)indices.nSize / sizeof(unsigned int));
+            return std::max(1, elems);
+        }
+        catch (...)
+        {
+        }
+        return -1;
+    }
+
+    int prefill_query_tokens_for_layer(int layer_idx, int gid)
+    {
+        if (layer_idx < 0 || layer_idx >= _attr.axmodel_num) return -1;
+        try
+        {
+            const auto &indices = llama_layers[(size_t)layer_idx].layer.get_input(gid, "indices");
+            if (!indices.vShape.empty()) return std::max(1, (int)indices.vShape.back());
+            const int elems = (int)((size_t)indices.nSize / sizeof(unsigned int));
+            return std::max(1, elems);
+        }
+        catch (...)
+        {
+        }
+        return -1;
+    }
+
     // Largest single-chunk prefill that needs no cached history (history_cap == 0).
     // A request within this size is cheaper to prefill fresh than to reuse via the
     // model's wider history-bearing prefill group, so multi-slot skips reuse below it.
@@ -990,6 +1084,13 @@ struct LLM::Impl : public IKvSlotHost {
         return prefill_history_kv_cache_num_grp[(size_t)idx];
     }
 
+    int prefill_total_capacity_by_gid(int gid) const
+    {
+        const int idx = group_index_by_gid(prefill_grpids_, gid);
+        if (idx < 0 || idx >= (int)_attr.prefill_max_kv_cache_num_grp.size()) return -1;
+        return _attr.prefill_max_kv_cache_num_grp[(size_t)idx];
+    }
+
     // Largest history (already-cached KV prefix) a single prefill can attend to. Prefill
     // shape-groups are sized for chunked prefill, so their max history cap is smaller than
     // the model's full context. A reused KV prefix longer than this cannot be set up in one
@@ -1010,16 +1111,20 @@ struct LLM::Impl : public IKvSlotHost {
 
     int prefill_history_capacity_by_mask(int prefill_grpid)
     {
-        if (_attr.prefill_token_num <= 0) return -1;
         if (cache_ref_full_layer_idx < 0 || cache_ref_full_layer_idx >= _attr.axmodel_num) return -1;
         try
         {
             const auto &mask_t = llama_layers[(size_t)cache_ref_full_layer_idx].layer.get_input(prefill_grpid, "mask");
             const int mask_elems = (int)((size_t)mask_t.nSize / sizeof(unsigned short));
             if (mask_elems <= 0) return -1;
-            if ((mask_elems % _attr.prefill_token_num) != 0) return -1;
-            const int cols = mask_elems / _attr.prefill_token_num;
-            const int kv_from_mask = cols - _attr.prefill_token_num;
+            // Adaptive profiles have different query dimensions (8/16/32/64/128).
+            // Parsing with the largest regular step would misread every smaller
+            // profile and force callers onto a physical-capacity fallback.
+            int query = prefill_query_tokens_by_gid(prefill_grpid);
+            if (query <= 1) query = _attr.prefill_token_num;
+            if (query <= 0 || (mask_elems % query) != 0) return -1;
+            const int cols = mask_elems / query;
+            const int kv_from_mask = cols - query;
             if (kv_from_mask < 0) return -1;
             return kv_from_mask;
         }
@@ -1031,16 +1136,17 @@ struct LLM::Impl : public IKvSlotHost {
 
     int prefill_history_capacity_for_layer_group(int layer_idx, int prefill_grpid)
     {
-        if (_attr.prefill_token_num <= 0) return -1;
         if (layer_idx < 0 || layer_idx >= _attr.axmodel_num) return -1;
         try
         {
             const auto &mask_t = llama_layers[(size_t)layer_idx].layer.get_input(prefill_grpid, "mask");
             const int mask_elems = (int)((size_t)mask_t.nSize / sizeof(unsigned short));
-            if (mask_elems > 0 && (mask_elems % _attr.prefill_token_num) == 0)
+            int query = prefill_query_tokens_for_layer(layer_idx, prefill_grpid);
+            if (query <= 1) query = _attr.prefill_token_num;
+            if (mask_elems > 0 && query > 0 && (mask_elems % query) == 0)
             {
-                const int cols = mask_elems / _attr.prefill_token_num;
-                const int kv_from_mask = cols - _attr.prefill_token_num;
+                const int cols = mask_elems / query;
+                const int kv_from_mask = cols - query;
                 if (kv_from_mask >= 0) return kv_from_mask;
             }
         }
@@ -1071,7 +1177,7 @@ struct LLM::Impl : public IKvSlotHost {
         return decode_grpids_.back();
     }
 
-    int select_prefill_group(int history_len, int chunk_tokens, bool prefer_symbolic_group = false) const
+    int select_prefill_group(int history_len, int chunk_tokens, bool prefer_symbolic_group = false)
     {
         if (prefill_grpids_.empty()) return -1;
 
@@ -1083,7 +1189,35 @@ struct LLM::Impl : public IKvSlotHost {
         {
             for (size_t i = 0; i < prefill_grpids_.size() && i < prefill_symbolic_kv_cache_num_grp.size(); ++i)
             {
-                if (total_tokens <= prefill_symbolic_kv_cache_num_grp[i])
+                const int query_tokens = prefill_query_tokens_by_gid(prefill_grpids_[i]);
+                if (query_tokens >= safe_chunk_tokens && total_tokens <= prefill_symbolic_kv_cache_num_grp[i])
+                    return prefill_grpids_[i];
+            }
+        }
+
+        // A partial final chunk should use the smallest query ABI that can
+        // represent it.  Otherwise the first capacity bucket (whose q is the
+        // normal 128-token chunk) would accept q=8/16 tails and erase the
+        // point of adaptive tail profiles.  Sort the candidate scan by query
+        // length without changing the canonical capacity arrays.
+        if (safe_chunk_tokens < _attr.prefill_token_num)
+        {
+            std::vector<size_t> tail_order;
+            tail_order.reserve(prefill_grpids_.size());
+            for (size_t i = 0; i < prefill_grpids_.size(); ++i) tail_order.push_back(i);
+            std::stable_sort(tail_order.begin(), tail_order.end(), [&](size_t lhs, size_t rhs) {
+                const int lq = prefill_query_tokens_by_gid(prefill_grpids_[lhs]);
+                const int rq = prefill_query_tokens_by_gid(prefill_grpids_[rhs]);
+                if (lq != rq) return lq < rq;
+                return prefill_history_kv_cache_num_grp[lhs] < prefill_history_kv_cache_num_grp[rhs];
+            });
+            for (const size_t i : tail_order)
+            {
+                if (i >= prefill_history_kv_cache_num_grp.size() || i >= _attr.prefill_max_kv_cache_num_grp.size()) continue;
+                const int history_cap = prefill_history_kv_cache_num_grp[i];
+                const int total_cap = std::min(_attr.prefill_max_kv_cache_num_grp[i], logical_context_limit());
+                const int query_tokens = prefill_query_tokens_by_gid(prefill_grpids_[i]);
+                if (query_tokens >= safe_chunk_tokens && safe_history_len <= history_cap && total_tokens <= total_cap)
                     return prefill_grpids_[i];
             }
         }
@@ -1094,8 +1228,10 @@ struct LLM::Impl : public IKvSlotHost {
              ++i)
         {
             const int history_cap = prefill_history_kv_cache_num_grp[i];
-            const int total_cap = _attr.prefill_max_kv_cache_num_grp[i];
-            if (safe_history_len <= history_cap && total_tokens <= total_cap)
+            const int total_cap = std::min(
+                _attr.prefill_max_kv_cache_num_grp[i], logical_context_limit());
+            const int query_tokens = prefill_query_tokens_by_gid(prefill_grpids_[i]);
+            if (query_tokens >= safe_chunk_tokens && safe_history_len <= history_cap && total_tokens <= total_cap)
                 return prefill_grpids_[i];
         }
         return -1;
@@ -1184,13 +1320,46 @@ struct LLM::Impl : public IKvSlotHost {
         return gids[mapped_idx];
     }
 
-    int prefill_gid_for_layer(int layer_idx, int requested_gid) const
+    int prefill_gid_for_layer(int layer_idx, int requested_gid)
     {
         if (requested_gid < 0) return requested_gid;
         if (layer_idx < 0 || layer_idx >= (int)layer_prefill_grpids_.size()) return requested_gid;
 
         const auto &gids = layer_prefill_grpids_[(size_t)layer_idx];
         if (gids.empty()) return requested_gid;
+
+        // Map adaptive profiles by query ABI and physical history capacity.
+        // A capacity ladder can contain multiple groups with the same query
+        // length; query-only mapping would alias every full chunk to the
+        // first (smallest) cache and lose the main performance benefit.
+        const int requested_query = prefill_query_tokens_by_gid(requested_gid);
+        const int requested_history = prefill_history_capacity_by_gid(requested_gid);
+        if (requested_query > 0)
+        {
+            int best_capacity_gid = -1;
+            int best_capacity = std::numeric_limits<int>::max();
+            int best_gid = -1;
+            int best_query = std::numeric_limits<int>::max();
+            for (const int gid : gids)
+            {
+                const int local_query = prefill_query_tokens_for_layer(layer_idx, gid);
+                const int local_history = prefill_history_capacity_for_layer_group(layer_idx, gid);
+                if (local_query == requested_query && local_history == requested_history)
+                    return gid;
+                if (local_query == requested_query && requested_history >= 0 && local_history >= requested_history && local_history < best_capacity)
+                {
+                    best_capacity = local_history;
+                    best_capacity_gid = gid;
+                }
+                if (local_query >= requested_query && local_query < best_query)
+                {
+                    best_query = local_query;
+                    best_gid = gid;
+                }
+            }
+            if (best_capacity_gid >= 0) return best_capacity_gid;
+            if (best_gid >= 0) return best_gid;
+        }
 
         const int requested_idx = group_index_by_gid(prefill_grpids_, requested_gid);
         if (requested_idx >= 0 && layer_idx < (int)layer_dispatch_maps_.size())
@@ -1286,7 +1455,8 @@ struct LLM::Impl : public IKvSlotHost {
                                             ax_runner_t &layer,
                                             int src_gid,
                                             int devid,
-                                            bool sync_prefill_groups) const
+                                            bool sync_prefill_groups,
+                                            bool sync_all_decode_groups = true) const
     {
         const ax_runner_tensor_t *src_out_k = try_get_group_output_tensor(layer, src_gid, "K_cache_out");
         const ax_runner_tensor_t *src_out_v = try_get_group_output_tensor(layer, src_gid, "V_cache_out");
@@ -1294,7 +1464,13 @@ struct LLM::Impl : public IKvSlotHost {
                                     LLM_RADDR(*src_out_k) != nullptr &&
                                     LLM_RADDR(*src_out_v) != nullptr;
 
-        if (layer_idx >= 0 && layer_idx < (int)layer_decode_grpids_.size())
+        if (!sync_all_decode_groups)
+        {
+            const int canonical_gid = decode_gid_for_layer(layer_idx, decode_grpid);
+            if (!copy_linear_input_state_to_group(layer, canonical_gid, src_gid, devid, src_out_k, src_out_v, prefer_outputs))
+                return false;
+        }
+        else if (layer_idx >= 0 && layer_idx < (int)layer_decode_grpids_.size())
         {
             for (const int gid : layer_decode_grpids_[(size_t)layer_idx])
                 if (!copy_linear_input_state_to_group(layer, gid, src_gid, devid, src_out_k, src_out_v, prefer_outputs)) return false;
@@ -1566,13 +1742,53 @@ struct LLM::Impl : public IKvSlotHost {
             }
 
             const int layer_kv = kv_cache_size_for_layer(m);
+            // Only the live prefix is consumed: the runtime attention mask
+            // hides every cache row >= valid_tokens, including the unused
+            // portion of the final 256-row loop tile. Avoid clearing a full
+            // maximum-capacity bucket on every cache-group switch.
             if (dst_layer_decode_gid != src_layer_decode_gid)
-                copy_full_cache_prefix_to_group(lyr.layer, dst_layer_decode_gid, src_layer_decode_gid, layer_kv, valid_tokens, devid, true);
+                copy_full_cache_prefix_to_group(lyr.layer, dst_layer_decode_gid, src_layer_decode_gid, layer_kv, valid_tokens, devid, false);
 
             if (sync_prefill_groups && m >= 0 && m < (int)layer_prefill_grpids_.size())
             {
                 for (const int gid : layer_prefill_grpids_[(size_t)m])
-                    copy_full_cache_prefix_to_group(lyr.layer, gid, src_layer_decode_gid, layer_kv, valid_tokens, devid, true);
+                    copy_full_cache_prefix_to_group(lyr.layer, gid, src_layer_decode_gid, layer_kv, valid_tokens, devid, false);
+            }
+        }
+        return true;
+    }
+
+    // Keep only the currently selected prefill group synchronized with the
+    // canonical decode cache.  Older code copied every produced KV tile to
+    // every future prefill group after each chunk.  That made the host do
+    // O(number-of-groups) D2D traffic even though only one group is consumed
+    // by the next inference.  Adaptive buckets deliberately make the next
+    // group depend on the actual history/query length, so lazy synchronization
+    // is both sufficient and substantially cheaper.
+    bool sync_active_prefill_group_from_decode(int requested_prefill_gid,
+                                               int src_decode_gid,
+                                               int valid_tokens)
+    {
+        if (valid_tokens <= 0 || requested_prefill_gid < 0) return true;
+        for (int m = 0; m < _attr.axmodel_num; ++m)
+        {
+            auto &lyr = llama_layers[(size_t)m];
+            const int devid = LLM_DEVID(lyr);
+            const int dst_gid = prefill_gid_for_layer(m, requested_prefill_gid);
+            const int src_gid = decode_gid_for_layer(m, src_decode_gid);
+            if (dst_gid < 0 || src_gid < 0) return false;
+            if (is_linear_layer(m))
+            {
+                if (!copy_linear_input_state_to_group(lyr.layer, dst_gid, src_gid, devid))
+                    return false;
+            }
+            else
+            {
+                // The same mask/block-count invariant applies to prefill
+                // buckets, so stale rows beyond the copied prefix are inert.
+                copy_full_cache_prefix_to_group(
+                    lyr.layer, dst_gid, src_gid, kv_cache_size_for_layer(m),
+                    valid_tokens, devid, false);
             }
         }
         return true;
@@ -1847,14 +2063,10 @@ struct LLM::Impl : public IKvSlotHost {
         if (close_tokens.empty()) return false;
 
         vision::PromptBudget budget;
-        const int max_cap = !_attr.prefill_max_kv_cache_num_grp.empty()
-                                ? _attr.prefill_max_kv_cache_num_grp.back()
-                                : _attr.prefill_max_token_num;
+        const int max_cap = logical_context_limit();
         int remaining = std::max(0, max_cap - precompute_len - (int)close_tokens.size());
-        if (_attr.prefill_token_num > 0)
-        {
-            remaining = ALIGN_DOWN(remaining, _attr.prefill_token_num);
-        }
+        // The tail may be dispatched to a smaller adaptive query profile;
+        // keep the logical budget unaligned to the regular chunk size.
         budget.prefill_token_num = _attr.prefill_token_num;
         budget.max_total_tokens = remaining;
         budget.max_tail_tokens = remaining;
@@ -2048,11 +2260,11 @@ struct LLM::Impl : public IKvSlotHost {
         kv_precompute_len = precompute_len > 0 ? precompute_len : inferred_precompute_len;
         ALOGI("precompute_len:%d, remaining:%d%s",
               kv_precompute_len,
-              _attr.prefill_max_kv_cache_num_grp.back() - kv_precompute_len,
+              logical_context_limit() - kv_precompute_len,
               precompute_len > 0 ? " (tracked)" : " (mask inferred)");
         (void)kv_k;
         (void)kv_v;
-        _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp.back();
+        _attr.prefill_max_token_num = logical_context_limit();
         return 0;
     }
 
@@ -2086,10 +2298,12 @@ struct LLM::Impl : public IKvSlotHost {
         }
         // Remaining prefill budget should be derived from the model capacity, not accumulated across calls.
         // Otherwise, a failed prefill (e.g. context overflow) can make it negative and break `/reset`.
-        const int max_cap = _attr.prefill_max_kv_cache_num_grp.empty() ? 0 : _attr.prefill_max_kv_cache_num_grp.back();
+        const int max_cap = logical_context_limit();
         int remaining = max_cap - _precompute_len;
         if (remaining < 0) remaining = 0;
-        remaining = ALIGN_DOWN(remaining, _attr.prefill_token_num);
+        // Keep the logical remainder unaligned.  A short final chunk can be
+        // dispatched to an adaptive query profile rather than the regular
+        // prefill step size.
         _attr.prefill_max_token_num = remaining;
         ALOGI("current prefill_max_token_num:%d", remaining);
         if (_precompute_len > history_cap) {
@@ -2113,7 +2327,10 @@ struct LLM::Impl : public IKvSlotHost {
         // slot's own device buffer). Just sync the cached prefix across shape groups.
         (void)kv_k;
         (void)kv_v;
-        if (!sync_device_kv_cache_from_decode(prev_decode_grpid, decode_grpid, _precompute_len, true))
+        // Prefill buckets are synchronized lazily immediately before their
+        // chunk runs.  Copying the prefix into every bucket here duplicates
+        // the same O(context) transfer and defeats adaptive dispatch.
+        if (!sync_device_kv_cache_from_decode(prev_decode_grpid, decode_grpid, _precompute_len, false))
         {
             set_last_error("模型运行失败，请重新尝试。");
             ResetKVCache();
@@ -2129,7 +2346,7 @@ struct LLM::Impl : public IKvSlotHost {
         _attr.prefill_grpid = prefill_grpids_.empty() ? 1 : prefill_grpids_.back();
         if (!_attr.prefill_max_kv_cache_num_grp.empty())
         {
-            _attr.prefill_max_token_num = _attr.prefill_max_kv_cache_num_grp.back();
+            _attr.prefill_max_token_num = logical_context_limit();
         }
         for (int i = 0; i < _attr.axmodel_num; i++)
         {
