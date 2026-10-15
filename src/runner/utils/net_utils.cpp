@@ -14,6 +14,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #endif
 
@@ -109,6 +111,34 @@ std::vector<std::string> get_local_ipv4_addresses()
     return ips;
 }
 
+#ifndef _WIN32
+// True when something accepts TCP connections on 127.0.0.1:port (a live listener).
+static bool local_listener_present(int port)
+{
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
+    const int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+    bool connected = ::connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
+    if (!connected && errno == EINPROGRESS)
+    {
+        pollfd pfd{sock, POLLOUT, 0};
+        if (::poll(&pfd, 1, 300) == 1)
+        {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            connected = getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0;
+        }
+    }
+    ::close(sock);
+    return connected;
+}
+#endif
+
 bool is_port_available(int port, const char **error)
 {
     if (port <= 0 || port > 65535)
@@ -144,8 +174,23 @@ bool is_port_available(int port, const char **error)
         return false;
     }
 
+    // A live server on the port must be reported even when it uses SO_REUSEPORT (as httplib
+    // does), because the bind probe below would then succeed and two servers would share it.
+    if (local_listener_present(port))
+    {
+        ::close(sock);
+        *error = "port is already in use";
+        return false;
+    }
+    // Probe with the same option httplib's listener uses: SO_REUSEPORT where available.
+    // TIME_WAIT sockets left by a previous axllm serve carry SO_REUSEPORT only, so a probe that
+    // sets just SO_REUSEADDR got EADDRINUSE for ~60 s after a restart on the same port.
     int opt = 1;
+#ifdef SO_REUSEPORT
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#else
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 #endif
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
