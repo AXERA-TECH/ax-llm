@@ -14,6 +14,7 @@
 #include <cmath>
 #include <optional>
 #include <mutex>
+#include <random>
 #include <ctime>
 
 // The AXera / AXCL SDK headers MUST be included before <windows.h>. The AX SDK
@@ -2202,6 +2203,110 @@ private:
     std::string buf_;
 };
 
+// ---------------- Native tool calling (Qwen3 <tool_call>{json}</tool_call> convention) ----------------
+
+static std::string random_tool_call_id()
+{
+    static const char kChars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static thread_local std::mt19937_64 gen(std::random_device{}());
+    std::uniform_int_distribution<int> pick(0, (int)sizeof(kChars) - 2);
+    std::string id = "call_";
+    for (int i = 0; i < 24; ++i) id.push_back(kChars[pick(gen)]);
+    return id;
+}
+
+// <tool_call>{...}</tool_call> blocks -> OpenAI tool_calls array (malformed blocks are skipped).
+static nlohmann::json parse_tool_calls_from_text(const std::string &text)
+{
+    nlohmann::json calls = nlohmann::json::array();
+    const std::string open = "<tool_call>", close = "</tool_call>";
+    size_t pos = 0;
+    while (true)
+    {
+        const size_t a = text.find(open, pos);
+        if (a == std::string::npos) break;
+        size_t b = text.find(close, a + open.size());
+        // a cut-off final block (max_tokens) may still hold a complete JSON object
+        const size_t end = (b == std::string::npos) ? text.size() : b;
+        std::string body = text.substr(a + open.size(), end - (a + open.size()));
+        pos = (b == std::string::npos) ? text.size() : b + close.size();
+        // Anchor on the outermost braces: small models sometimes add stray tag artifacts
+        // (e.g. "<tool_call>>") around the JSON.
+        const size_t j0 = body.find('{');
+        const size_t j1 = body.rfind('}');
+        if (j0 == std::string::npos || j1 == std::string::npos || j1 < j0) continue;
+        nlohmann::json obj;
+        try { obj = nlohmann::json::parse(body.substr(j0, j1 - j0 + 1)); }
+        catch (...) { continue; }
+        if (!obj.is_object()) continue;
+        std::string name = obj.value("name", std::string());
+        if (name.empty() && obj.contains("function") && obj["function"].is_object())
+            name = obj["function"].value("name", std::string());
+        if (name.empty()) continue;
+        const nlohmann::json args = obj.contains("arguments") ? obj["arguments"]
+                                    : (obj.contains("parameters") ? obj["parameters"] : nlohmann::json::object());
+        nlohmann::json call;
+        call["id"] = random_tool_call_id();
+        call["type"] = "function";
+        call["function"]["name"] = name;
+        call["function"]["arguments"] = args.is_string() ? args.get<std::string>() : args.dump(); // OpenAI: a JSON string
+        calls.push_back(std::move(call));
+        if (b == std::string::npos) break;
+    }
+    return calls;
+}
+
+// Streams content up to the first <tool_call> and captures everything from there on, so plain
+// text is still delivered token by token while the tool call is parsed once generation ends.
+class ToolCallFilter
+{
+public:
+    std::string push(const std::string &piece)
+    {
+        if (capturing_)
+        {
+            captured_ += piece;
+            return {};
+        }
+        buf_ += piece;
+        const size_t at = buf_.find(kOpen);
+        if (at != std::string::npos)
+        {
+            capturing_ = true;
+            captured_ = buf_.substr(at);
+            std::string out = buf_.substr(0, at);
+            buf_.clear();
+            return out;
+        }
+        size_t hold = 0;
+        for (size_t k = std::min(kOpen.size() - 1, buf_.size()); k > 0; --k)
+        {
+            if (buf_.compare(buf_.size() - k, k, kOpen, 0, k) == 0)
+            {
+                hold = k;
+                break;
+            }
+        }
+        std::string out = buf_.substr(0, buf_.size() - hold);
+        buf_.erase(0, buf_.size() - hold);
+        return out;
+    }
+    std::string flush()
+    {
+        std::string out;
+        out.swap(buf_);
+        return out;
+    }
+    bool capturing() const { return capturing_; }
+    const std::string &captured() const { return captured_; }
+
+private:
+    const std::string kOpen = "<tool_call>";
+    std::string buf_;
+    std::string captured_;
+    bool capturing_ = false;
+};
+
 static const char *media_type_name(ContentType t)
 {
     switch (t)
@@ -2242,6 +2347,7 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         return false;
     }
 
+    bool last_was_tool = false;
     for (size_t msg_idx = 0; msg_idx < messages.size(); ++msg_idx)
     {
         const auto &item = messages[msg_idx];
@@ -2256,6 +2362,26 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         content.type = TEXT;
 
         const std::string role = item.contains("role") && item["role"].is_string() ? item["role"].get<std::string>() : "";
+        if (role == "tool")
+        {
+            // Tool result -> Qwen3 convention: a user turn of <tool_response> blocks; consecutive
+            // tool messages share one turn (as the HF chat template renders them).
+            std::string result;
+            const auto &tc = item.contains("content") ? item["content"] : nlohmann::json();
+            if (tc.is_string()) result = tc.get<std::string>();
+            else if (tc.is_array())
+            {
+                for (const auto &part : tc)
+                    if (part.is_object() && part.value("type", "") == "text") result += part.value("text", "");
+            }
+            else if (!tc.is_null()) result = tc.dump();
+            const std::string block = "<tool_response>\n" + result + "\n</tool_response>";
+            if (last_was_tool && !history.empty()) history.back().data += "\n" + block;
+            else history.push_back({USER, TEXT, block});
+            last_was_tool = true;
+            continue;
+        }
+        last_was_tool = false;
         if (role == "system" || role == "developer") content.role = SYSTEM;
         else if (role == "user") content.role = USER;
         else if (role == "assistant") content.role = ASSISTANT;
@@ -2362,6 +2488,32 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         {
             error = where + ": 'content' must be a string, an array of content parts, or null";
             return false;
+        }
+
+        // An assistant turn that called tools: render the calls back in the model's <tool_call> form.
+        if (content.role == ASSISTANT && item.contains("tool_calls") && item["tool_calls"].is_array())
+        {
+            for (const auto &call : item["tool_calls"])
+            {
+                if (!call.is_object() || !call.contains("function") || !call["function"].is_object()) continue;
+                const auto &fn = call["function"];
+                nlohmann::json one;
+                one["name"] = fn.value("name", std::string());
+                nlohmann::json args = nlohmann::json::object();
+                if (fn.contains("arguments"))
+                {
+                    const auto &a = fn["arguments"];
+                    if (a.is_string())
+                    {
+                        try { args = nlohmann::json::parse(a.get<std::string>()); }
+                        catch (...) { args = a; }
+                    }
+                    else args = a;
+                }
+                one["arguments"] = args;
+                if (!content.data.empty()) content.data += "\n";
+                content.data += "<tool_call>\n" + one.dump() + "\n</tool_call>";
+            }
         }
 
         if (!media_uris.empty())
@@ -2905,6 +3057,41 @@ int run_server_mode(const ModelConfig &config, int port)
                 // serve mode does NOT inject config.system_prompt: the client controls the
                 // system message (OpenAI-compatible — no system message means no system block).
                 // config.system_prompt only applies to interactive `run` mode.
+                // Native tool calling: tools are rendered by the tokenizer (cleared again when the request
+                // ends so they never leak into the next one); tool_choice forcing is appended to the last
+                // user turn so history indices stay aligned with media_inputs.
+                const bool req_has_tools = req.raw.contains("tools") && req.raw["tools"].is_array() && !req.raw["tools"].empty();
+                std::string tool_choice_mode = "auto";
+                std::string forced_tool_name;
+                if (req.raw.contains("tool_choice")) {
+                    const auto &tc = req.raw["tool_choice"];
+                    if (tc.is_string()) tool_choice_mode = tc.get<std::string>();
+                    else if (tc.is_object() && tc.contains("function") && tc["function"].is_object()) {
+                        tool_choice_mode = "function";
+                        forced_tool_name = tc["function"].value("name", std::string());
+                    }
+                }
+                const bool tools_active = req_has_tools && tool_choice_mode != "none";
+                if (tools_active && !llm.TokenizerSupportsTools()) {
+                    cleanup_temp_files(temp_files);
+                    push_chat_error("invalid_request_error", "This model does not support tool calling");
+                    return;
+                }
+                struct ToolsGuard {
+                    LLM &llm;
+                    ~ToolsGuard() { llm.SetTools(std::string()); }
+                } tools_guard{llm};
+                llm.SetTools(tools_active ? req.raw["tools"].dump() : std::string());
+                if (tools_active) {
+                    std::string force;
+                    if (tool_choice_mode == "required")
+                        force = "\n\nYou MUST call one of the provided functions to answer. Do not answer in plain text.";
+                    else if (tool_choice_mode == "function" && !forced_tool_name.empty())
+                        force = "\n\nYou MUST call the function \"" + forced_tool_name + "\" to answer. Do not answer in plain text.";
+                    for (auto it = history.rbegin(); !force.empty() && it != history.rend(); ++it) {
+                        if (it->role == USER) { it->data += force; break; }
+                    }
+                }
                 int output_max_tokens = resolve_chat_output_max_tokens(config, req, llm.getAttr()->max_token_len);
                 if (hymt_translation_mode) {
                     std::string hymt_err;
@@ -2978,12 +3165,16 @@ int run_server_mode(const ModelConfig &config, int port)
                         fprintf(stdout, "%s", text.c_str());
                         fflush(stdout);
                     };
+                    ToolCallFilter tool_filter;
+                    auto push_content = [&](const std::string &text) {
+                        push_delta(tools_active ? tool_filter.push(text) : text, false);
+                    };
                     auto emit = [&](const std::string &str) {
                         if (split_reasoning)
                         {
                             auto parts = splitter.push(str);
                             push_delta(parts.reasoning, true);
-                            push_delta(parts.content, false);
+                            push_content(parts.content);
                             return;
                         }
                         std::string out = str;
@@ -2999,7 +3190,7 @@ int run_server_mode(const ModelConfig &config, int port)
                                 thinking_open_emitted = true;
                             }
                         }
-                        push_delta(out, false);
+                        push_content(out);
                     };
                     auto callback = [&llm, provider, &stop_filter, &emit](std::string str, float token_per_sec, void *reserve) {
                         if (!provider->is_writable()) {
@@ -3016,13 +3207,27 @@ int run_server_mode(const ModelConfig &config, int port)
                     if (!media_inputs.empty()) llm.Run(history, media_inputs, output_max_tokens);
                     else llm.Run(history, output_max_tokens);
                     llm.getAttr()->runing_callback = nullptr;
+                    nlohmann::json stream_tool_calls = nlohmann::json::array();
                     if (provider->is_writable()) {
                         emit(stop_filter.flush());
                         if (split_reasoning) {
                             auto parts = splitter.flush();
                             push_delta(parts.reasoning, true);
-                            push_delta(parts.content, false);
+                            push_content(parts.content);
                         }
+                        if (tools_active) {
+                            push_delta(tool_filter.flush(), false);
+                            if (tool_filter.capturing()) {
+                                stream_tool_calls = parse_tool_calls_from_text(tool_filter.captured());
+                                if (stream_tool_calls.empty()) push_delta(tool_filter.captured(), false); // not a valid call: plain text
+                            }
+                        }
+                    }
+                    if (!stream_tool_calls.empty()) {
+                        auto d = openai_api::OutputChunk::TextDelta("", req.model);
+                        d.obj["tool_calls"] = stream_tool_calls;
+                        provider->push(d);
+                        streamed_any = true;
                     }
                     const std::string llm_error = llm.GetLastError();
                     if (!llm_error.empty()) {
@@ -3041,6 +3246,7 @@ int run_server_mode(const ModelConfig &config, int port)
                         }
                         auto final_chunk = openai_api::OutputChunk::FinalText("", req.model);
                         fill_usage(final_chunk);
+                        if (!stream_tool_calls.empty()) final_chunk.obj["finish_reason"] = "tool_calls";
                         provider->push(final_chunk);
                     }
                 } else {
@@ -3090,9 +3296,21 @@ int run_server_mode(const ModelConfig &config, int port)
                     {
                         final_text = wrap_thinking_text_for_client(final_text);
                     }
+                    nlohmann::json tool_calls = nlohmann::json::array();
+                    if (tools_active) {
+                        const size_t at = final_text.find("<tool_call>");
+                        if (at != std::string::npos) {
+                            tool_calls = parse_tool_calls_from_text(final_text.substr(at));
+                            if (!tool_calls.empty()) final_text = trim_copy(final_text.substr(0, at));
+                        }
+                    }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
                     if (!reasoning_text.empty()) chunk.obj["reasoning_content"] = reasoning_text;
                     fill_usage(chunk);
+                    if (!tool_calls.empty()) {
+                        chunk.obj["tool_calls"] = tool_calls;
+                        chunk.obj["finish_reason"] = "tool_calls";
+                    }
                     fprintf(stdout, "%s", final_text.c_str());
                     fflush(stdout);
                     provider->push(chunk);

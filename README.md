@@ -426,6 +426,19 @@ curl http://127.0.0.1:8000/v1/audio/translations \
 >
 > 当指定 `--image` 或 `--audio` 时，脚本会将媒体读取并以 `data:...;base64,...` 格式嵌入请求，服务端会自动解码为临时文件供对应编码器使用。
 
+### OpenAI 接口兼容性
+
+`/v1/chat/completions` 按 OpenAI 协议实现，并兼容 vLLM / SGLang 的常用扩展，官方 OpenAI SDK 可直接使用：
+
+| 能力 | 说明 |
+|---|---|
+| 采样 | `temperature`、`top_p`、`top_k`、`min_p`、`repetition_penalty`、`presence_penalty`、`frequency_penalty`、`seed`；都不传时为 greedy |
+| 长度 / 停止 | `max_completion_tokens`（或 `max_tokens`）、`stop`；`finish_reason` 区分 `stop` / `length` / `tool_calls` |
+| 思考 | `<think>` 内容放在 `reasoning_content`（流式为 `delta.reasoning_content`）；`chat_template_kwargs.enable_thinking` 控制开关；config 里 `server_reasoning_content: false` 可恢复旧的 `<think>` 内嵌输出 |
+| 工具调用 | `tools`、`tool_choice`、`role: "tool"`，见 [docs/tool_calling.md](docs/tool_calling.md) |
+| 流式 | `stream_options.include_usage`；同一个流的 chunk 共用一个 id |
+| 其他 | 角色 `system` / `developer` / `user` / `assistant` / `tool`；客户端断开会立即停止生成；并发请求排队等待（最长 `server_timeout_ms`）；仅支持 `n=1` |
+
 ### 多模态输入格式（与 OpenAI / vLLM / SGLang 对齐）
 
 `/v1/chat/completions` 的 `content` 数组里每种媒体一项，可以和 `text` 混排：

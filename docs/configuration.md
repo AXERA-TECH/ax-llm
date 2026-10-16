@@ -135,6 +135,7 @@
 | `media_allow_remote` | true | 是否允许请求里的 `http(s)://` 媒体地址(服务端去下载);设为 false 时只接受 base64 / 本地路径 |
 | `media_fetch_timeout_s` | 60 | 下载单个媒体文件的超时(秒) |
 | `media_max_mb` | 256 | 下载单个媒体文件的大小上限(MB) |
+| `server_reasoning_content` | true | 把 `<think>...</think>` 拆到 `reasoning_content`(vLLM reasoning parser 行为);false 时保留在 content 里 |
 
 ## 采样 / 后处理（post_config.json）
 

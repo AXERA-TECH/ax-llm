@@ -18,6 +18,8 @@ void LLM::SetRequestSamplingOverride(const SamplingRequest &req) { impl_->postpr
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
 void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
 void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }
+void LLM::SetTools(const std::string &tools_json) { if (impl_->tokenizer) impl_->tokenizer->set_tools(tools_json); }
+bool LLM::TokenizerSupportsTools() const { return impl_->tokenizer ? impl_->tokenizer->supports_tools() : false; }
 bool LLM::TokenizerSupportsThinkingToggle() const { return impl_->tokenizer ? impl_->tokenizer->supports_thinking_toggle() : false; }
 std::vector<std::string> LLM::SupportedInputModalities() const
 {

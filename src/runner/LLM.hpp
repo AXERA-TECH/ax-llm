@@ -147,6 +147,9 @@ public:
     // True if the active tokenizer actually honors think/no_think in its prompt
     // (so callers can warn when a mode is requested but would be ignored).
     bool TokenizerSupportsThinkingToggle() const;
+    // OpenAI tools for the next prompt (JSON array text; "" clears) and whether the tokenizer renders them.
+    void SetTools(const std::string &tools_json);
+    bool TokenizerSupportsTools() const;
     // Input modalities this model accepts in chat: "text" plus any of "image", "video", "audio".
     std::vector<std::string> SupportedInputModalities() const;
     void MarkRequestStart();
