@@ -7,6 +7,7 @@
 
 #include "BaseTokenizer.hpp"  // for Content/RoleType definitions
 #include "VLMType.hpp"
+#include "SamplingRequest.hpp"
 
 class LLMPostprocess;
 class LLaMaEmbedSelector;
@@ -139,13 +140,18 @@ public:
     LLMAttrType *getAttr();
     LLMPostprocess *getPostprocess();
     LLaMaEmbedSelector *getEmbedSelector();
-    void SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p, bool has_frequency_penalty, float frequency_penalty, bool has_presence_penalty, float presence_penalty);
+    void SetRequestSamplingOverride(const SamplingRequest &req);
     void ClearRequestSamplingOverride();
     void SetRequestThinkingMode(ThinkingMode mode);
     void ClearRequestThinkingMode();
     // True if the active tokenizer actually honors think/no_think in its prompt
     // (so callers can warn when a mode is requested but would be ignored).
     bool TokenizerSupportsThinkingToggle() const;
+    // OpenAI tools for the next prompt (JSON array text; "" clears) and whether the tokenizer renders them.
+    void SetTools(const std::string &tools_json);
+    bool TokenizerSupportsTools() const;
+    // Input modalities this model accepts in chat: "text" plus any of "image", "video", "audio".
+    std::vector<std::string> SupportedInputModalities() const;
     void MarkRequestStart();
     void ClearRequestStart();
     std::string GetLastError() const;
@@ -153,6 +159,8 @@ public:
     int GetLastCompletionTokenNum() const;
     // Performance metrics from the most recent Run (negative/zero = not measured).
     float GetLastTtftMs() const;
+    // "stop", "length" or "abort" for the last Run() (see LLM::Impl::last_finish_reason_).
+    std::string GetLastFinishReason() const;
     float GetLastDecodeTps() const;
     float GetLastPrefillTps() const;
     int GetLastPrefillTokens() const;
@@ -190,6 +198,12 @@ public:
     std::vector<Content> Run(std::vector<Content> history, std::vector<MediaInputs> &media_inputs, int output_max_token = -1);
     std::vector<Content> Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token = -1);
     std::string Run(std::vector<unsigned short> &embed, int output_max_token = -1);
+    // Continue raw text without a chat template (OpenAI /v1/completions).
+    std::string RunPrompt(const std::string &prompt, int output_max_token = -1);
+    // Tokenizer access for /tokenize and /detokenize.
+    std::vector<int> Tokenize(const std::string &text);
+    std::vector<int> TokenizeHistory(const std::vector<Content> &history, bool add_generation_prompt);
+    std::string Detokenize(const std::vector<int> &ids);
 
 private:
     struct Impl;

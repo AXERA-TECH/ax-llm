@@ -426,6 +426,37 @@ curl http://127.0.0.1:8000/v1/audio/translations \
 >
 > 当指定 `--image` 或 `--audio` 时，脚本会将媒体读取并以 `data:...;base64,...` 格式嵌入请求，服务端会自动解码为临时文件供对应编码器使用。
 
+### OpenAI 接口兼容性
+
+`/v1/chat/completions` 按 OpenAI 协议实现，并兼容 vLLM / SGLang 的常用扩展，官方 OpenAI SDK 可直接使用：
+
+| 能力 | 说明 |
+|---|---|
+| 采样 | `temperature`、`top_p`、`top_k`、`min_p`、`repetition_penalty`、`presence_penalty`、`frequency_penalty`、`seed`；都不传时为 greedy |
+| 长度 / 停止 | `max_completion_tokens`（或 `max_tokens`）、`stop`；`finish_reason` 区分 `stop` / `length` / `tool_calls` |
+| 思考 | `<think>` 内容放在 `reasoning_content`（流式为 `delta.reasoning_content`）；`chat_template_kwargs.enable_thinking` 控制开关；config 里 `server_reasoning_content: false` 可恢复旧的 `<think>` 内嵌输出 |
+| 工具调用 | `tools`、`tool_choice`、`role: "tool"`，见 [docs/tool_calling.md](docs/tool_calling.md) |
+| 流式 | `stream_options.include_usage`；同一个流的 chunk 共用一个 id |
+| 其他 | 角色 `system` / `developer` / `user` / `assistant` / `tool`；客户端断开会立即停止生成；并发请求排队等待（最长 `server_timeout_ms`）；仅支持 `n=1` |
+| 其他接口 | `/v1/completions`（原始文本续写，`max_tokens` 默认 16，支持 `echo` / `stop` / 流式）、`/tokenize`、`/detokenize`（vLLM 格式，`/tokenize` 可带 `messages` 和 `tools`）、`/version`、`/metrics`（Prometheus，沿用 vLLM 指标名） |
+
+### 多模态输入格式（与 OpenAI / vLLM / SGLang 对齐）
+
+`/v1/chat/completions` 的 `content` 数组里每种媒体一项，可以和 `text` 混排：
+
+| 类型 | 写法 |
+|---|---|
+| 图片 | `{"type": "image_url", "image_url": {"url": "..."}}` |
+| 视频 | `{"type": "video_url", "video_url": {"url": "..."}}` |
+| 音频 | `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}` 或 `{"type": "audio_url", "audio_url": {"url": "..."}}` |
+
+`url` 支持：
+- `data:<mime>;base64,<数据>`：内容直接放在请求里；
+- `http://` / `https://`：服务端下载（https 依赖系统 `curl`；超时和大小上限见 `media_*` 配置）；
+- `file:///绝对路径` 或服务器本地路径；视频还可以传一个帧图片目录。
+
+视频由服务端用 `ffmpeg` 解码抽帧，默认 2 fps，可按请求用 `"mm_processor_kwargs": {"fps": 1}` 修改。模型支持哪些输入看 `/v1/models` 里的 `input_modalities`；发送模型不支持的类型会返回 400。当前限制：同一条消息里只能有一种媒体类型（图片、视频、音频分开放到不同的 user 消息里）。
+
 ## 技术讨论
 
 - Github issues

@@ -11,7 +11,10 @@
 #include <string>
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 #include <optional>
+#include <mutex>
+#include <random>
 #include <ctime>
 
 // The AXera / AXCL SDK headers MUST be included before <windows.h>. The AX SDK
@@ -40,6 +43,7 @@
 #include "openai_api/server.hpp"
 #include "runner/utils/memory_utils.hpp"
 #include "runner/utils/net_utils.hpp"
+#include "runner/utils/media_fetch.hpp"
 #include "runner/utils/sample_log.h"
 
 #ifndef AXLLM_GIT_COMMIT
@@ -271,6 +275,13 @@ struct ModelConfig
     int server_default_max_tokens = 0;
     int server_max_output_tokens = 0;
     std::string server_forced_prompt_text;
+    // Remote media (http/https URLs in image_url / video_url / audio_url parts).
+    bool media_allow_remote = true;
+    int media_fetch_timeout_s = 60;
+    int media_max_mb = 256;
+    // Split <think>...</think> into message.reasoning_content (vLLM reasoning parser); false keeps
+    // the think block inside content.
+    bool server_reasoning_content = true;
     bool is_embedding = false;
     bool is_image_generation = false;
     std::string image_model_dir = ".";
@@ -740,6 +751,10 @@ struct ModelConfig
             {
                 server_forced_prompt_text = j["server_forced_prompt_text"].get<std::string>();
             }
+            if (j.contains("media_allow_remote")) media_allow_remote = j["media_allow_remote"].get<bool>();
+            if (j.contains("media_fetch_timeout_s")) media_fetch_timeout_s = j["media_fetch_timeout_s"].get<int>();
+            if (j.contains("media_max_mb")) media_max_mb = j["media_max_mb"].get<int>();
+            if (j.contains("server_reasoning_content")) server_reasoning_content = j["server_reasoning_content"].get<bool>();
 
             return true;
         }
@@ -1525,23 +1540,74 @@ static std::string save_upload_to_tempfile(const std::string &filename, const st
     return write_bytes_to_tempfile(ext, bytes);
 }
 
-// Resolve a media URI: if it's a base64 data-URI, decode to a temp file.
-// Otherwise return as-is (file path / directory).
-static std::string resolve_media_uri(const std::string &uri, std::vector<std::string> &temp_files)
+static std::string lower_copy(std::string value);
+
+// Resolve a media URI from an OpenAI/vLLM content part to a local path:
+// - data:<mime>;base64,<payload>  decoded to a temp file
+// - http(s)://...                 downloaded to a temp file
+// - file:///abs/path              the local path
+// - anything else                 used as a local path / frame directory as-is
+// Temp files are appended to `temp_files`; returns "" and sets `err` on failure.
+static std::string resolve_media_uri(const std::string &uri, std::vector<std::string> &temp_files, std::string &err)
 {
     std::string ext, payload;
     if (parse_base64_data_uri(uri, ext, payload))
     {
         payload = percent_decode_copy(payload);
+        const size_t semi = uri.find(';');
+        const std::string mime_ext = axllm::media::ext_for_mime(uri.substr(5, semi - 5));
+        if (!mime_ext.empty()) ext = mime_ext;
         std::string path = save_base64_to_tempfile(ext, payload);
-        if (!path.empty()) temp_files.push_back(path);
-        else
+        if (path.empty())
         {
             ALOGE("failed to decode base64 media: mime_ext=%s payload_chars=%zu", ext.c_str(), payload.size());
+            err = "invalid base64 media data";
+            return {};
         }
+        temp_files.push_back(path);
         return path;
     }
-    return uri; // plain file path
+    if (lower_copy(uri.substr(0, 5)) == "data:")
+    {
+        err = "unsupported data URI: only base64 data URIs (data:<mime>;base64,...) are accepted";
+        return {};
+    }
+    if (axllm::media::is_remote_url(uri))
+    {
+        std::vector<uint8_t> bytes;
+        if (!axllm::media::fetch_url(uri, bytes, ext, err))
+        {
+            ALOGE("%s: %s", err.c_str(), uri.c_str());
+            return {};
+        }
+        std::string path = write_bytes_to_tempfile(ext, bytes);
+        if (path.empty())
+        {
+            err = "failed to store downloaded media";
+            return {};
+        }
+        ALOGI("downloaded media: %s -> %s (%zu bytes)", uri.c_str(), path.c_str(), bytes.size());
+        temp_files.push_back(path);
+        return path;
+    }
+    std::string path = uri;
+    if (lower_copy(uri.substr(0, 7)) == "file://")
+    {
+        path = percent_decode_copy(uri.substr(7));
+        if (lower_copy(path.substr(0, 10)) == "localhost/") path = path.substr(9);
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec))
+    {
+        // Video paths may carry an axllm ":<fps>" suffix; let the vision module validate those.
+        const size_t colon = path.rfind(':');
+        if (colon == std::string::npos || colon == 0 || !std::filesystem::exists(path.substr(0, colon), ec))
+        {
+            err = "media file not found on server: " + path;
+            return {};
+        }
+    }
+    return path;
 }
 
 // Clean up temporary files created from base64 decoding.
@@ -1616,7 +1682,7 @@ static int resolve_chat_output_max_tokens(const ModelConfig &config,
                                           const openai_api::ChatRequest &req,
                                           int runtime_max_token_len)
 {
-    const bool has_request_max_tokens = req.raw.is_object() && req.raw.contains("max_tokens");
+    const bool has_request_max_tokens = req.has_max_tokens;
     const int server_default_max_tokens = effective_server_default_max_tokens(config);
 
     int output_max_tokens = req.max_tokens;
@@ -1966,113 +2032,491 @@ static void infer_media_type_from_uri_prefix(std::string &raw_url, ContentType &
     }
 }
 
-// Handle HTTP API messages
+// Serializes every use of the single LLM instance across HTTP handler threads (a request
+// whose client disconnected may still be winding down when the next one is admitted).
+static std::mutex g_llm_mutex;
+
+// OpenAI `stop` sequences over streamed text: push() returns the text that is safe to emit,
+// holding back any tail that could still begin a stop sequence; once a sequence appears,
+// hit() turns true and the sequence and everything after it are dropped.
+class StopSequenceFilter
+{
+public:
+    explicit StopSequenceFilter(const std::vector<std::string> &stops)
+    {
+        for (const auto &s : stops)
+            if (!s.empty()) stops_.push_back(s);
+    }
+    bool active() const { return !stops_.empty(); }
+    bool hit() const { return hit_; }
+
+    std::string push(const std::string &piece)
+    {
+        if (hit_) return {};
+        buf_ += piece;
+        size_t first = std::string::npos;
+        for (const auto &s : stops_) first = std::min(first, buf_.find(s));
+        if (first != std::string::npos)
+        {
+            hit_ = true;
+            std::string out = buf_.substr(0, first);
+            buf_.clear();
+            return out;
+        }
+        size_t hold = 0;
+        for (const auto &s : stops_)
+        {
+            for (size_t k = std::min(s.size() - 1, buf_.size()); k > hold; --k)
+            {
+                if (buf_.compare(buf_.size() - k, k, s, 0, k) == 0)
+                {
+                    hold = k;
+                    break;
+                }
+            }
+        }
+        std::string out = buf_.substr(0, buf_.size() - hold);
+        buf_.erase(0, buf_.size() - hold);
+        return out;
+    }
+
+    std::string flush()
+    {
+        if (hit_) return {};
+        std::string out;
+        out.swap(buf_);
+        return out;
+    }
+
+private:
+    std::vector<std::string> stops_;
+    std::string buf_;
+    bool hit_ = false;
+};
+
+// vLLM-style reasoning parser for <think>...</think> output (Qwen3 family and similar): the think
+// block goes to `reasoning_content`, the rest to `content`. Streaming text is fed with push(); a
+// tail that could still be part of a tag is held back until it is decided.
+class ReasoningSplitter
+{
+public:
+    struct Parts
+    {
+        std::string reasoning;
+        std::string content;
+    };
+
+    // starts_in_reasoning: output that does not open with <think> is still reasoning (thinking was
+    // requested, so a missing open tag means the template already emitted it).
+    explicit ReasoningSplitter(bool starts_in_reasoning) : default_reasoning_(starts_in_reasoning) {}
+
+    Parts push(const std::string &piece)
+    {
+        Parts out;
+        buf_ += piece;
+        while (true)
+        {
+            if (state_ == Start)
+            {
+                const size_t first = buf_.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) return out;
+                const std::string rest = buf_.substr(first);
+                if (rest.compare(0, kOpen.size(), kOpen) == 0)
+                {
+                    buf_ = rest.substr(kOpen.size());
+                    state_ = Reasoning;
+                    continue;
+                }
+                if (kOpen.compare(0, rest.size(), rest) == 0) return out; // could still become <think>
+                state_ = default_reasoning_ ? Reasoning : Content;
+                continue;
+            }
+            if (state_ == Reasoning)
+            {
+                const size_t close = buf_.find(kClose);
+                if (close != std::string::npos)
+                {
+                    out.reasoning += buf_.substr(0, close);
+                    buf_ = buf_.substr(close + kClose.size());
+                    state_ = AfterThink;
+                    continue;
+                }
+                const size_t hold = partial_tag_suffix(buf_, kClose);
+                out.reasoning += buf_.substr(0, buf_.size() - hold);
+                buf_.erase(0, buf_.size() - hold);
+                return out;
+            }
+            if (state_ == AfterThink)
+            {
+                const size_t first = buf_.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos)
+                {
+                    buf_.clear();
+                    return out;
+                }
+                buf_ = buf_.substr(first);
+                state_ = Content;
+                continue;
+            }
+            out.content += buf_;
+            buf_.clear();
+            return out;
+        }
+    }
+
+    Parts flush()
+    {
+        Parts out;
+        if (state_ == Reasoning || (state_ == Start && default_reasoning_)) out.reasoning = buf_;
+        else if (state_ != AfterThink) out.content = buf_;
+        buf_.clear();
+        return out;
+    }
+
+    // Whole-text split (non-streaming).
+    static Parts split(const std::string &text, bool starts_in_reasoning)
+    {
+        ReasoningSplitter sp(starts_in_reasoning);
+        Parts a = sp.push(text);
+        Parts b = sp.flush();
+        return {a.reasoning + b.reasoning, a.content + b.content};
+    }
+
+private:
+    enum State
+    {
+        Start,
+        Reasoning,
+        AfterThink,
+        Content
+    };
+    static size_t partial_tag_suffix(const std::string &s, const std::string &tag)
+    {
+        for (size_t k = std::min(tag.size() - 1, s.size()); k > 0; --k)
+            if (s.compare(s.size() - k, k, tag, 0, k) == 0) return k;
+        return 0;
+    }
+    const std::string kOpen = "<think>";
+    const std::string kClose = "</think>";
+    bool default_reasoning_ = false;
+    State state_ = Start;
+    std::string buf_;
+};
+
+// ---------------- Native tool calling (Qwen3 <tool_call>{json}</tool_call> convention) ----------------
+
+static std::string random_tool_call_id()
+{
+    static const char kChars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static thread_local std::mt19937_64 gen(std::random_device{}());
+    std::uniform_int_distribution<int> pick(0, (int)sizeof(kChars) - 2);
+    std::string id = "call_";
+    for (int i = 0; i < 24; ++i) id.push_back(kChars[pick(gen)]);
+    return id;
+}
+
+// <tool_call>{...}</tool_call> blocks -> OpenAI tool_calls array (malformed blocks are skipped).
+static nlohmann::json parse_tool_calls_from_text(const std::string &text)
+{
+    nlohmann::json calls = nlohmann::json::array();
+    const std::string open = "<tool_call>", close = "</tool_call>";
+    size_t pos = 0;
+    while (true)
+    {
+        const size_t a = text.find(open, pos);
+        if (a == std::string::npos) break;
+        size_t b = text.find(close, a + open.size());
+        // a cut-off final block (max_tokens) may still hold a complete JSON object
+        const size_t end = (b == std::string::npos) ? text.size() : b;
+        std::string body = text.substr(a + open.size(), end - (a + open.size()));
+        pos = (b == std::string::npos) ? text.size() : b + close.size();
+        // Anchor on the outermost braces: small models sometimes add stray tag artifacts
+        // (e.g. "<tool_call>>") around the JSON.
+        const size_t j0 = body.find('{');
+        const size_t j1 = body.rfind('}');
+        if (j0 == std::string::npos || j1 == std::string::npos || j1 < j0) continue;
+        nlohmann::json obj;
+        try { obj = nlohmann::json::parse(body.substr(j0, j1 - j0 + 1)); }
+        catch (...) { continue; }
+        if (!obj.is_object()) continue;
+        std::string name = obj.value("name", std::string());
+        if (name.empty() && obj.contains("function") && obj["function"].is_object())
+            name = obj["function"].value("name", std::string());
+        if (name.empty()) continue;
+        const nlohmann::json args = obj.contains("arguments") ? obj["arguments"]
+                                    : (obj.contains("parameters") ? obj["parameters"] : nlohmann::json::object());
+        nlohmann::json call;
+        call["id"] = random_tool_call_id();
+        call["type"] = "function";
+        call["function"]["name"] = name;
+        call["function"]["arguments"] = args.is_string() ? args.get<std::string>() : args.dump(); // OpenAI: a JSON string
+        calls.push_back(std::move(call));
+        if (b == std::string::npos) break;
+    }
+    return calls;
+}
+
+// Streams content up to the first <tool_call> and captures everything from there on, so plain
+// text is still delivered token by token while the tool call is parsed once generation ends.
+class ToolCallFilter
+{
+public:
+    std::string push(const std::string &piece)
+    {
+        if (capturing_)
+        {
+            captured_ += piece;
+            return {};
+        }
+        buf_ += piece;
+        const size_t at = buf_.find(kOpen);
+        if (at != std::string::npos)
+        {
+            capturing_ = true;
+            captured_ = buf_.substr(at);
+            std::string out = buf_.substr(0, at);
+            buf_.clear();
+            return out;
+        }
+        size_t hold = 0;
+        for (size_t k = std::min(kOpen.size() - 1, buf_.size()); k > 0; --k)
+        {
+            if (buf_.compare(buf_.size() - k, k, kOpen, 0, k) == 0)
+            {
+                hold = k;
+                break;
+            }
+        }
+        std::string out = buf_.substr(0, buf_.size() - hold);
+        buf_.erase(0, buf_.size() - hold);
+        return out;
+    }
+    std::string flush()
+    {
+        std::string out;
+        out.swap(buf_);
+        return out;
+    }
+    bool capturing() const { return capturing_; }
+    const std::string &captured() const { return captured_; }
+
+private:
+    const std::string kOpen = "<tool_call>";
+    std::string buf_;
+    std::string captured_;
+    bool capturing_ = false;
+};
+
+static const char *media_type_name(ContentType t)
+{
+    switch (t)
+    {
+    case IMAGE: return "image";
+    case VIDEO: return "video";
+    case AUDIO: return "audio";
+    default: return "text";
+    }
+}
+
+static std::string format_fps(double fps)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.6g", fps);
+    return buf;
+}
+
+// Convert OpenAI chat messages into engine contents. Accepts the OpenAI content parts
+// (text, image_url, input_audio) plus the vLLM/SGLang ones (video_url, audio_url) and the
+// short aliases image/video/audio. Media URLs may be data: URIs, http(s) URLs, file:// URLs
+// or server-local paths. `video_fps` > 0 sets the frame sampling rate for raw video files
+// (vLLM's mm_processor_kwargs.fps). On failure returns false with a client-facing `err`.
 bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history,
                          std::vector<MediaInputs> *media_inputs = nullptr,
-                         std::vector<std::string> *temp_files = nullptr)
+                         std::vector<std::string> *temp_files = nullptr,
+                         std::string *err = nullptr,
+                         double video_fps = 0.0)
 {
-    for (auto &item : messages)
+    std::string local_err;
+    std::string &error = err ? *err : local_err;
+    std::vector<std::string> untracked_temp_files;
+    std::vector<std::string> &temps = temp_files ? *temp_files : untracked_temp_files;
+
+    if (!messages.is_array())
     {
+        error = "'messages' must be an array";
+        return false;
+    }
+
+    bool last_was_tool = false;
+    for (size_t msg_idx = 0; msg_idx < messages.size(); ++msg_idx)
+    {
+        const auto &item = messages[msg_idx];
+        const std::string where = "messages[" + std::to_string(msg_idx) + "]";
+        if (!item.is_object())
+        {
+            error = where + " must be an object";
+            return false;
+        }
+
         Content content;
         content.type = TEXT;
 
-        if (item.contains("role") && item["role"] == "system")
+        const std::string role = item.contains("role") && item["role"].is_string() ? item["role"].get<std::string>() : "";
+        if (role == "tool")
         {
-            content.role = SYSTEM;
+            // Tool result -> Qwen3 convention: a user turn of <tool_response> blocks; consecutive
+            // tool messages share one turn (as the HF chat template renders them).
+            std::string result;
+            const auto &tc = item.contains("content") ? item["content"] : nlohmann::json();
+            if (tc.is_string()) result = tc.get<std::string>();
+            else if (tc.is_array())
+            {
+                for (const auto &part : tc)
+                    if (part.is_object() && part.value("type", "") == "text") result += part.value("text", "");
+            }
+            else if (!tc.is_null()) result = tc.dump();
+            const std::string block = "<tool_response>\n" + result + "\n</tool_response>";
+            if (last_was_tool && !history.empty()) history.back().data += "\n" + block;
+            else history.push_back({USER, TEXT, block});
+            last_was_tool = true;
+            continue;
         }
-        else if (item.contains("role") && item["role"] == "user")
-        {
-            content.role = USER;
-        }
-        else if (item.contains("role") && item["role"] == "assistant")
-        {
-            content.role = ASSISTANT;
-        }
+        last_was_tool = false;
+        if (role == "system" || role == "developer") content.role = SYSTEM;
+        else if (role == "user") content.role = USER;
+        else if (role == "assistant") content.role = ASSISTANT;
         else
         {
-            ALOGE("content type not support");
+            error = where + ": unsupported role '" + role + "'";
             return false;
         }
 
         std::vector<std::string> media_uris;
         ContentType media_type = TEXT;
 
-        if (item.contains("content") && item["content"].is_string())
+        const nlohmann::json empty_content;
+        const auto &body = item.contains("content") ? item["content"] : empty_content;
+        if (body.is_string())
         {
-            content.data = item["content"];
+            content.data = body.get<std::string>();
         }
-        else if (item.contains("content") && item["content"].is_array())
+        else if (body.is_array())
         {
-            for (auto &c : item["content"])
+            bool first_text = true;
+            for (size_t part_idx = 0; part_idx < body.size(); ++part_idx)
             {
-                if (c.contains("type") && c["type"] == "text")
+                const auto &c = body[part_idx];
+                const std::string part_where = where + ".content[" + std::to_string(part_idx) + "]";
+                const std::string type = c.is_object() && c.contains("type") && c["type"].is_string() ? c["type"].get<std::string>() : "";
+                if (type == "text")
                 {
-                    content.data += c["text"];
+                    if (!first_text) content.data += "\n";
+                    content.data += c.value("text", "");
+                    first_text = false;
+                    continue;
                 }
-                else if (c.contains("type") &&
-                         (c["type"] == "image_url" || c["type"] == "image" ||
-                          c["type"] == "video_url" || c["type"] == "video" ||
-                          c["type"] == "audio_url" || c["type"] == "audio"))
-                {
-                    std::string raw_url;
-                    ContentType part_type = TEXT;
-                    if (c["type"] == "image_url" || c["type"] == "image")
-                    {
-                        part_type = IMAGE;
-                        raw_url = extract_media_url(c, "image_url", "image");
-                    }
-                    else if (c["type"] == "video_url" || c["type"] == "video")
-                    {
-                        part_type = VIDEO;
-                        raw_url = extract_media_url(c, "video_url", "video");
-                    }
-                    else if (c["type"] == "audio_url" || c["type"] == "audio")
-                    {
-                        part_type = AUDIO;
-                        raw_url = extract_media_url(c, "audio_url", "audio");
-                    }
-                    if (!raw_url.empty())
-                    {
-                        infer_media_type_from_uri_prefix(raw_url, part_type);
-                        if (media_type != TEXT && media_type != part_type)
-                        {
-                            ALOGE("mixed media types in a single message are not supported yet");
-                            return false;
-                        }
-                        media_type = part_type;
 
-                        if (temp_files)
-                        {
-                            std::string resolved = resolve_media_uri(raw_url, *temp_files);
-                            if (resolved.empty())
-                            {
-                                ALOGE("failed to resolve media uri for message");
-                                return false;
-                            }
-                            media_uris.push_back(std::move(resolved));
-                        }
-                        else
-                        {
-                            std::vector<std::string> dummy;
-                            std::string resolved = resolve_media_uri(raw_url, dummy);
-                            if (resolved.empty())
-                            {
-                                ALOGE("failed to resolve media uri for message");
-                                return false;
-                            }
-                            media_uris.push_back(std::move(resolved));
-                        }
+                std::string raw_url;
+                ContentType part_type = TEXT;
+                if (type == "image_url" || type == "image")
+                {
+                    part_type = IMAGE;
+                    raw_url = extract_media_url(c, "image_url", "image");
+                }
+                else if (type == "video_url" || type == "video")
+                {
+                    part_type = VIDEO;
+                    raw_url = extract_media_url(c, "video_url", "video");
+                }
+                else if (type == "audio_url" || type == "audio")
+                {
+                    part_type = AUDIO;
+                    raw_url = extract_media_url(c, "audio_url", "audio");
+                }
+                else if (type == "input_audio")
+                {
+                    // OpenAI: {"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}
+                    part_type = AUDIO;
+                    const auto &ia = c.contains("input_audio") ? c["input_audio"] : empty_content;
+                    if (ia.is_object() && ia.contains("data") && ia["data"].is_string())
+                    {
+                        const std::string format = normalize_extension(ia.value("format", "wav"), "wav");
+                        raw_url = "data:audio/" + format + ";base64," + ia["data"].get<std::string>();
                     }
                 }
+                else
+                {
+                    error = part_where + ": unsupported content part type '" + type + "'";
+                    return false;
+                }
+                if (raw_url.empty())
+                {
+                    error = part_where + ": missing media data for '" + type + "'";
+                    return false;
+                }
+
+                infer_media_type_from_uri_prefix(raw_url, part_type);
+                if (content.role != USER)
+                {
+                    error = part_where + ": media inputs are only supported in user messages";
+                    return false;
+                }
+                if (media_type != TEXT && media_type != part_type)
+                {
+                    error = where + ": mixing " + media_type_name(media_type) + " and " + media_type_name(part_type) +
+                            " in one message is not supported; send them as separate user messages";
+                    return false;
+                }
+                media_type = part_type;
+
+                std::string resolve_err;
+                std::string resolved = resolve_media_uri(raw_url, temps, resolve_err);
+                if (resolved.empty())
+                {
+                    error = part_where + ": " + resolve_err;
+                    return false;
+                }
+                std::error_code fs_ec;
+                if (part_type == VIDEO && video_fps > 0.0 && std::filesystem::is_regular_file(resolved, fs_ec))
+                {
+                    resolved += ":" + format_fps(video_fps);
+                }
+                media_uris.push_back(std::move(resolved));
             }
         }
-        else
+        else if (!body.is_null())
         {
-            ALOGE("content type not support");
+            error = where + ": 'content' must be a string, an array of content parts, or null";
             return false;
         }
 
-        if (!media_uris.empty() && content.role == USER)
+        // An assistant turn that called tools: render the calls back in the model's <tool_call> form.
+        if (content.role == ASSISTANT && item.contains("tool_calls") && item["tool_calls"].is_array())
+        {
+            for (const auto &call : item["tool_calls"])
+            {
+                if (!call.is_object() || !call.contains("function") || !call["function"].is_object()) continue;
+                const auto &fn = call["function"];
+                nlohmann::ordered_json one; // {"name", "arguments"} in the model's own key order
+                one["name"] = fn.value("name", std::string());
+                nlohmann::json args = nlohmann::json::object();
+                if (fn.contains("arguments"))
+                {
+                    const auto &a = fn["arguments"];
+                    if (a.is_string())
+                    {
+                        try { args = nlohmann::json::parse(a.get<std::string>()); }
+                        catch (...) { args = a; }
+                    }
+                    else args = a;
+                }
+                one["arguments"] = args;
+                if (!content.data.empty()) content.data += "\n";
+                content.data += "<tool_call>\n" + one.dump() + "\n</tool_call>";
+            }
+        }
+
+        if (!media_uris.empty())
         {
             content.type = media_type;
             if (media_inputs)
@@ -2084,6 +2528,16 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     }
 
     return true;
+}
+
+// vLLM-style per-request video sampling rate: mm_processor_kwargs.fps (0 when absent/invalid).
+static double request_video_fps(const nlohmann::json &raw)
+{
+    if (!raw.is_object() || !raw.contains("mm_processor_kwargs")) return 0.0;
+    const auto &kw = raw["mm_processor_kwargs"];
+    if (!kw.is_object() || !kw.contains("fps") || !kw["fps"].is_number()) return 0.0;
+    const double fps = kw["fps"].get<double>();
+    return (fps > 0.0 && std::isfinite(fps)) ? fps : 0.0;
 }
 
 static bool normalize_single_image_ocr_request(const ModelConfig &config,
@@ -2150,6 +2604,13 @@ int run_server_mode(const ModelConfig &config, int port)
 {
     g_exit_on_sigint.store(true, std::memory_order_relaxed);
     ALOGI("server request/queue timeout: %d ms (config.server_timeout_ms, overridable via --server_timeout_ms)", config.server_timeout_ms);
+    {
+        axllm::media::FetchOptions fetch;
+        fetch.allow_remote = config.media_allow_remote;
+        fetch.timeout_s = std::max(1, config.media_fetch_timeout_s);
+        fetch.max_bytes = (size_t)std::max(1, config.media_max_mb) * 1024u * 1024u;
+        axllm::media::set_fetch_options(fetch);
+    }
 
     // Check whether port is available.
     const char *port_error = "unknown";
@@ -2181,6 +2642,13 @@ int run_server_mode(const ModelConfig &config, int port)
 #endif
 
     g_server.setMaxConcurrency(1);
+    g_server.addJsonRoute("GET", "/version", [](const nlohmann::json &, nlohmann::json &out) -> int {
+        const std::string commit = AXLLM_GIT_COMMIT;
+        out["version"] = commit.empty() ? std::string("axllm") : "axllm-" + commit;
+        out["commit"] = AXLLM_GIT_COMMIT;
+        out["backend"] = AXLLM_BUILD_BACKEND;
+        return 200;
+    });
 
     std::string model_name = config.model_name;
 
@@ -2322,6 +2790,8 @@ int run_server_mode(const ModelConfig &config, int port)
             timeout_ms = 300000;
         }
         g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        // requests queue for the single inference slot as long as they may run
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
         g_server.run(port);
     }
     else
@@ -2364,6 +2834,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     return;
                 }
                 ProviderKeepAlive keepalive(provider);
+                std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
 
                 if (!req.encoding_format.empty() && req.encoding_format != "float") {
                     ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
@@ -2374,13 +2845,14 @@ int run_server_mode(const ModelConfig &config, int port)
                     std::vector<Content> history;
                     std::vector<MediaInputs> media_inputs;
                     std::vector<std::string> temp_files;
-                    if (!handle_api_messages(req.raw["messages"], history, &media_inputs, &temp_files))
+                    std::string parse_err;
+                    if (!handle_api_messages(req.raw["messages"], history, &media_inputs, &temp_files, &parse_err,
+                                             request_video_fps(req.raw)))
                     {
-                        ALOGE("handle_api_messages failed for embeddings messages");
+                        ALOGE("handle_api_messages failed for embeddings messages: %s", parse_err.c_str());
                         cleanup_temp_files(temp_files);
                         keepalive.stop();
-                        provider->push(openai_api::OutputChunk::Error("invalid_request_error",
-                                                                      "无法解析 messages（文本或图片内容无效）。"));
+                        provider->push(openai_api::OutputChunk::Error("invalid_request_error", parse_err));
                         provider->end();
                         return;
                     }
@@ -2469,6 +2941,8 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+            // requests queue for the single inference slot as long as they may run
+            g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
             g_server.run(port);
         }
         else
@@ -2479,9 +2953,10 @@ int run_server_mode(const ModelConfig &config, int port)
                  file_exist(config.attr.filename_audio_encoder_axmodel_30s));
 
             openai_api::ChatModelOptions options;
-            options.supports_vision = config.attr.vlm_type != VLMType::None;
+            options.input_modalities = llm.SupportedInputModalities();
             options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+            options.extra_fields["max_model_len"] = llm.getAttr()->max_token_len; // vLLM field name
             options.extra_fields["thinking_mode"] = thinking_mode_name(llm.getAttr()->generation_thinking_mode);
             if (config.server_max_output_tokens > 0) options.extra_fields["server_max_output_tokens"] = config.server_max_output_tokens;
 
@@ -2494,6 +2969,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     ALOGE("provider not writable");
                     return;
                 }
+                std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
 
                 const ThinkingMode request_thinking_mode = resolve_chat_thinking_mode(config, req);
                 if (request_thinking_mode != ThinkingMode::Unspecified && !llm.TokenizerSupportsThinkingToggle())
@@ -2531,7 +3007,24 @@ int run_server_mode(const ModelConfig &config, int port)
                     {
                         if (enabled)
                         {
-                            llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p, req.has_frequency_penalty, req.frequency_penalty, req.has_presence_penalty, req.presence_penalty);
+                            SamplingRequest sr;
+                            sr.has_temperature = req.has_temperature;
+                            sr.temperature = req.temperature;
+                            sr.has_top_p = req.has_top_p;
+                            sr.top_p = req.top_p;
+                            sr.has_top_k = req.has_top_k;
+                            sr.top_k = req.top_k;
+                            sr.has_min_p = req.has_min_p;
+                            sr.min_p = req.min_p;
+                            sr.has_frequency_penalty = req.has_frequency_penalty;
+                            sr.frequency_penalty = req.frequency_penalty;
+                            sr.has_presence_penalty = req.has_presence_penalty;
+                            sr.presence_penalty = req.presence_penalty;
+                            sr.has_repetition_penalty = req.has_repetition_penalty;
+                            sr.repetition_penalty = req.repetition_penalty;
+                            sr.has_seed = req.has_seed;
+                            sr.seed = (uint64_t)req.seed;
+                            llm.SetRequestSamplingOverride(sr);
                         }
                     }
                     ~SamplingOverrideGuard()
@@ -2557,18 +3050,98 @@ int run_server_mode(const ModelConfig &config, int port)
                     provider->end();
                 };
 
+                if (req.is_completion) {
+                    // Legacy /v1/completions: continue the raw prompt (no chat template, reasoning split or tools).
+                    const int max_out = resolve_chat_output_max_tokens(config, req, llm.getAttr()->max_token_len);
+                    StopSequenceFilter stop_filter(req.stop);
+                    std::string text = req.echo ? req.prompt : std::string();
+                    if (req.stream && !text.empty()) provider->push(openai_api::OutputChunk::TextDelta(text, req.model));
+                    llm.getAttr()->runing_callback = [&](std::string str, float, void *) {
+                        if (!provider->is_writable()) { llm.Stop(); return; }
+                        if (stop_filter.hit()) return;
+                        const std::string out = stop_filter.push(str);
+                        if (stop_filter.hit()) llm.Stop();
+                        if (out.empty()) return;
+                        if (req.stream) provider->push(openai_api::OutputChunk::TextDelta(out, req.model));
+                        else text += out;
+                    };
+                    llm.RunPrompt(req.prompt, max_out);
+                    llm.getAttr()->runing_callback = nullptr;
+                    const std::string tail = stop_filter.flush();
+                    if (!tail.empty()) {
+                        if (req.stream) provider->push(openai_api::OutputChunk::TextDelta(tail, req.model));
+                        else text += tail;
+                    }
+                    const std::string llm_error = llm.GetLastError();
+                    if (!llm_error.empty()) {
+                        llm.ResetKVCache();
+                        push_chat_error("model_error", llm_error);
+                        return;
+                    }
+                    auto fin = openai_api::OutputChunk::FinalText(req.stream ? std::string() : text, req.model);
+                    fin.usage.prompt_tokens = llm.GetLastPromptTokenNum();
+                    fin.usage.completion_tokens = llm.GetLastCompletionTokenNum();
+                    fin.usage.total_tokens = fin.usage.prompt_tokens + fin.usage.completion_tokens;
+                    fin.usage.ttft_ms = llm.GetLastTtftMs();
+                    fin.usage.decode_tps = llm.GetLastDecodeTps();
+                    fin.usage.prefill_tps = llm.GetLastPrefillTps();
+                    fin.usage.prefill_tokens = llm.GetLastPrefillTokens();
+                    fin.obj["finish_reason"] = stop_filter.hit() ? "stop"
+                                               : (llm.GetLastFinishReason() == "length" ? "length" : "stop");
+                    provider->push(fin);
+                    provider->end();
+                    return;
+                }
+
                 std::vector<Content> history;
                 std::vector<MediaInputs> media_inputs;
                 std::vector<std::string> temp_files;
-                if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files)) {
-                    ALOGE("handle_body failed");
+                std::string parse_err;
+                if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files, &parse_err,
+                                         request_video_fps(req.raw))) {
+                    ALOGW("Reject chat request: %s", parse_err.c_str());
                     cleanup_temp_files(temp_files);
-                    push_chat_error("invalid_request_error", "Failed to parse chat messages.");
+                    push_chat_error("invalid_request_error", parse_err);
                     return;
                 }
                 // serve mode does NOT inject config.system_prompt: the client controls the
                 // system message (OpenAI-compatible — no system message means no system block).
                 // config.system_prompt only applies to interactive `run` mode.
+                // Native tool calling: tools are rendered by the tokenizer (cleared again when the request
+                // ends so they never leak into the next one); tool_choice forcing is appended to the last
+                // user turn so history indices stay aligned with media_inputs.
+                const bool req_has_tools = req.raw.contains("tools") && req.raw["tools"].is_array() && !req.raw["tools"].empty();
+                std::string tool_choice_mode = "auto";
+                std::string forced_tool_name;
+                if (req.raw.contains("tool_choice")) {
+                    const auto &tc = req.raw["tool_choice"];
+                    if (tc.is_string()) tool_choice_mode = tc.get<std::string>();
+                    else if (tc.is_object() && tc.contains("function") && tc["function"].is_object()) {
+                        tool_choice_mode = "function";
+                        forced_tool_name = tc["function"].value("name", std::string());
+                    }
+                }
+                const bool tools_active = req_has_tools && tool_choice_mode != "none";
+                if (tools_active && !llm.TokenizerSupportsTools()) {
+                    cleanup_temp_files(temp_files);
+                    push_chat_error("invalid_request_error", "This model does not support tool calling");
+                    return;
+                }
+                struct ToolsGuard {
+                    LLM &llm;
+                    ~ToolsGuard() { llm.SetTools(std::string()); }
+                } tools_guard{llm};
+                llm.SetTools(tools_active ? req.raw["tools"].dump() : std::string());
+                if (tools_active) {
+                    std::string force;
+                    if (tool_choice_mode == "required")
+                        force = "\n\nYou MUST call one of the provided functions to answer. Do not answer in plain text.";
+                    else if (tool_choice_mode == "function" && !forced_tool_name.empty())
+                        force = "\n\nYou MUST call the function \"" + forced_tool_name + "\" to answer. Do not answer in plain text.";
+                    for (auto it = history.rbegin(); !force.empty() && it != history.rend(); ++it) {
+                        if (it->role == USER) { it->data += force; break; }
+                    }
+                }
                 int output_max_tokens = resolve_chat_output_max_tokens(config, req, llm.getAttr()->max_token_len);
                 if (hymt_translation_mode) {
                     std::string hymt_err;
@@ -2603,19 +3176,55 @@ int run_server_mode(const ModelConfig &config, int port)
                     llm.ResetKVCache();
                 }
 
+                StopSequenceFilter stop_filter(req.stop);
+                // Finish reason reported to the client: a matched stop sequence wins, otherwise the engine's
+                // reason ("abort" only happens when the client is gone, so nobody sees it).
+                auto finish_reason = [&]() -> std::string {
+                    if (stop_filter.hit()) return "stop";
+                    const std::string r = llm.GetLastFinishReason();
+                    return r == "length" ? "length" : "stop";
+                };
+                auto fill_usage = [&](openai_api::OutputChunk &chunk) {
+                    chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
+                    chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
+                    chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
+                    chunk.usage.ttft_ms = llm.GetLastTtftMs();
+                    chunk.usage.decode_tps = llm.GetLastDecodeTps();
+                    chunk.usage.prefill_tps = llm.GetLastPrefillTps();
+                    chunk.usage.prefill_tokens = llm.GetLastPrefillTokens();
+                    chunk.obj["finish_reason"] = finish_reason();
+                };
+
+                // reasoning_content split (vLLM reasoning parser) or, when disabled, the legacy
+                // <think> markup kept inside content.
+                const bool split_reasoning = config.server_reasoning_content;
+                const bool prompt_opens_think = request_thinking_mode == ThinkingMode::Think;
+
                 if (req.stream) {
                     bool streamed_any = false;
-                    const bool emit_thinking_markup = should_emit_thinking_markup(request_thinking_mode);
+                    const bool emit_thinking_markup = !split_reasoning && should_emit_thinking_markup(request_thinking_mode);
                     bool thinking_open_emitted = false;
                     std::string streamed_text;
-                    auto callback = [provider,
-                                     model_id = req.model,
-                                     emit_thinking_markup,
-                                     &streamed_any,
-                                     &thinking_open_emitted,
-                                     &streamed_text](std::string str, float token_per_sec, void *reserve) {
-                        if (!provider->is_writable()) {
-                            ALOGE("provider not writable");
+                    ReasoningSplitter splitter(prompt_opens_think);
+                    auto push_delta = [provider, model_id = req.model, &streamed_any](const std::string &text, bool reasoning) {
+                        if (text.empty()) return;
+                        streamed_any = true;
+                        auto chunk = openai_api::OutputChunk::TextDelta(reasoning ? std::string() : text, model_id);
+                        if (reasoning) chunk.obj["reasoning_content"] = text;
+                        provider->push(chunk);
+                        fprintf(stdout, "%s", text.c_str());
+                        fflush(stdout);
+                    };
+                    ToolCallFilter tool_filter;
+                    auto push_content = [&](const std::string &text) {
+                        push_delta(tools_active ? tool_filter.push(text) : text, false);
+                    };
+                    auto emit = [&](const std::string &str) {
+                        if (split_reasoning)
+                        {
+                            auto parts = splitter.push(str);
+                            push_delta(parts.reasoning, true);
+                            push_content(parts.content);
                             return;
                         }
                         std::string out = str;
@@ -2631,16 +3240,45 @@ int run_server_mode(const ModelConfig &config, int port)
                                 thinking_open_emitted = true;
                             }
                         }
-                        if (!out.empty()) streamed_any = true;
-                        auto chunk = openai_api::OutputChunk::TextDelta(out, model_id);
-                        provider->push(chunk);
-                        fprintf(stdout, "%s", out.c_str());
-                        fflush(stdout);
+                        push_content(out);
+                    };
+                    auto callback = [&llm, provider, &stop_filter, &emit](std::string str, float token_per_sec, void *reserve) {
+                        if (!provider->is_writable()) {
+                            // client disconnected (or the request timed out): stop decoding early
+                            llm.Stop();
+                            return;
+                        }
+                        if (stop_filter.hit()) return;
+                        emit(stop_filter.push(str));
+                        if (stop_filter.hit()) llm.Stop();
                     };
 
                     llm.getAttr()->runing_callback = callback;
                     if (!media_inputs.empty()) llm.Run(history, media_inputs, output_max_tokens);
                     else llm.Run(history, output_max_tokens);
+                    llm.getAttr()->runing_callback = nullptr;
+                    nlohmann::json stream_tool_calls = nlohmann::json::array();
+                    if (provider->is_writable()) {
+                        emit(stop_filter.flush());
+                        if (split_reasoning) {
+                            auto parts = splitter.flush();
+                            push_delta(parts.reasoning, true);
+                            push_content(parts.content);
+                        }
+                        if (tools_active) {
+                            push_delta(tool_filter.flush(), false);
+                            if (tool_filter.capturing()) {
+                                stream_tool_calls = parse_tool_calls_from_text(tool_filter.captured());
+                                if (stream_tool_calls.empty()) push_delta(tool_filter.captured(), false); // not a valid call: plain text
+                            }
+                        }
+                    }
+                    if (!stream_tool_calls.empty()) {
+                        auto d = openai_api::OutputChunk::TextDelta("", req.model);
+                        d.obj["tool_calls"] = stream_tool_calls;
+                        provider->push(d);
+                        streamed_any = true;
+                    }
                     const std::string llm_error = llm.GetLastError();
                     if (!llm_error.empty()) {
                         ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
@@ -2649,7 +3287,7 @@ int run_server_mode(const ModelConfig &config, int port)
                             provider->push(openai_api::OutputChunk::Error("model_error", llm_error));
                         }
                     }
-                    if (streamed_any) {
+                    if (streamed_any || llm_error.empty()) {
                         if (emit_thinking_markup && thinking_open_emitted && !has_thinking_close_tag(streamed_text))
                         {
                             provider->push(openai_api::OutputChunk::TextDelta("\n</think>", req.model));
@@ -2657,21 +3295,30 @@ int run_server_mode(const ModelConfig &config, int port)
                             fflush(stdout);
                         }
                         auto final_chunk = openai_api::OutputChunk::FinalText("", req.model);
-                        final_chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
-                        final_chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
-                        final_chunk.usage.total_tokens = final_chunk.usage.prompt_tokens + final_chunk.usage.completion_tokens;
-                        final_chunk.usage.ttft_ms = llm.GetLastTtftMs();
-                        final_chunk.usage.decode_tps = llm.GetLastDecodeTps();
-                        final_chunk.usage.prefill_tps = llm.GetLastPrefillTps();
-                        final_chunk.usage.prefill_tokens = llm.GetLastPrefillTokens();
+                        fill_usage(final_chunk);
+                        if (!stream_tool_calls.empty()) final_chunk.obj["finish_reason"] = "tool_calls";
                         provider->push(final_chunk);
                     }
                 } else {
-                    llm.getAttr()->runing_callback = nullptr;
+                    // No streaming, but a callback still watches for stop sequences and a closed connection
+                    // so decoding ends as early as it would when streaming.
+                    llm.getAttr()->runing_callback = [&llm, provider, &stop_filter](std::string str, float, void *) {
+                        if (!provider->is_writable()) { llm.Stop(); return; }
+                        if (!stop_filter.active() || stop_filter.hit()) return;
+                        stop_filter.push(str);
+                        if (stop_filter.hit()) llm.Stop();
+                    };
                     auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, output_max_tokens) : llm.Run(history, output_max_tokens);
+                    llm.getAttr()->runing_callback = nullptr;
                     std::string final_text;
                     if (!out_history.empty() && out_history.back().role == ASSISTANT) {
                         final_text = out_history.back().data;
+                    }
+                    if (stop_filter.active()) {
+                        // Cut the decoded text at the first stop sequence (same rule as the streaming filter).
+                        StopSequenceFilter cut(req.stop);
+                        std::string kept = cut.push(final_text);
+                        final_text = cut.hit() ? kept : kept + cut.flush();
                     }
                     const std::string llm_error = llm.GetLastError();
                     if (!llm_error.empty()) {
@@ -2681,25 +3328,39 @@ int run_server_mode(const ModelConfig &config, int port)
                         push_chat_error("model_error", llm_error);
                         return;
                     }
-                    if (final_text.empty()) {
+                    if (final_text.empty() && !stop_filter.hit()) {
                         ALOGW("Returning user-facing chat error: empty model response");
                         if (single_image_ocr_mode) llm.ResetKVCache();
                         cleanup_temp_files(temp_files);
                         push_chat_error("model_error", "模型运行失败，请重新尝试。");
                         return;
                     }
-                    if (should_emit_thinking_markup(request_thinking_mode))
+                    std::string reasoning_text;
+                    if (split_reasoning)
+                    {
+                        auto parts = ReasoningSplitter::split(final_text, prompt_opens_think);
+                        reasoning_text = std::move(parts.reasoning);
+                        final_text = std::move(parts.content);
+                    }
+                    else if (should_emit_thinking_markup(request_thinking_mode))
                     {
                         final_text = wrap_thinking_text_for_client(final_text);
                     }
+                    nlohmann::json tool_calls = nlohmann::json::array();
+                    if (tools_active) {
+                        const size_t at = final_text.find("<tool_call>");
+                        if (at != std::string::npos) {
+                            tool_calls = parse_tool_calls_from_text(final_text.substr(at));
+                            if (!tool_calls.empty()) final_text = trim_copy(final_text.substr(0, at));
+                        }
+                    }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
-                    chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
-                    chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
-                    chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
-                    chunk.usage.ttft_ms = llm.GetLastTtftMs();
-                    chunk.usage.decode_tps = llm.GetLastDecodeTps();
-                    chunk.usage.prefill_tps = llm.GetLastPrefillTps();
-                    chunk.usage.prefill_tokens = llm.GetLastPrefillTokens();
+                    if (!reasoning_text.empty()) chunk.obj["reasoning_content"] = reasoning_text;
+                    fill_usage(chunk);
+                    if (!tool_calls.empty()) {
+                        chunk.obj["tool_calls"] = tool_calls;
+                        chunk.obj["finish_reason"] = "tool_calls";
+                    }
                     fprintf(stdout, "%s", final_text.c_str());
                     fflush(stdout);
                     provider->push(chunk);
@@ -2707,6 +3368,60 @@ int run_server_mode(const ModelConfig &config, int port)
 
                 cleanup_temp_files(temp_files);
                 provider->end(); }, options);
+
+            // vLLM-compatible utility endpoints.
+            auto tokenize_handler = [&llm](const nlohmann::json &body, nlohmann::json &out) -> int {
+                std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
+                std::vector<int> ids;
+                if (body.contains("messages")) {
+                    std::vector<Content> history;
+                    std::string err;
+                    if (!handle_api_messages(body["messages"], history, nullptr, nullptr, &err)) {
+                        out = {{"error", {{"message", err}, {"type", "invalid_request_error"}}}};
+                        return 400;
+                    }
+                    for (const auto &c : history) {
+                        if (c.type != TEXT) {
+                            out = {{"error", {{"message", "/tokenize accepts text messages only"}, {"type", "invalid_request_error"}}}};
+                            return 400;
+                        }
+                    }
+                    const bool with_tools = body.contains("tools") && body["tools"].is_array() && !body["tools"].empty();
+                    llm.SetTools(with_tools ? body["tools"].dump() : std::string()); // render tools like a chat request
+                    ids = llm.TokenizeHistory(history, body.value("add_generation_prompt", true));
+                    llm.SetTools(std::string());
+                } else if (body.contains("prompt") && body["prompt"].is_string()) {
+                    ids = llm.Tokenize(body["prompt"].get<std::string>());
+                } else {
+                    out = {{"error", {{"message", "'prompt' (string) or 'messages' is required"}, {"type", "invalid_request_error"}}}};
+                    return 400;
+                }
+                out["count"] = ids.size();
+                out["max_model_len"] = llm.getAttr()->max_token_len;
+                out["tokens"] = ids;
+                return 200;
+            };
+            auto detokenize_handler = [&llm](const nlohmann::json &body, nlohmann::json &out) -> int {
+                if (!body.contains("tokens") || !body["tokens"].is_array()) {
+                    out = {{"error", {{"message", "'tokens' (array of ints) is required"}, {"type", "invalid_request_error"}}}};
+                    return 400;
+                }
+                std::vector<int> ids;
+                for (const auto &t : body["tokens"]) {
+                    if (!t.is_number_integer()) {
+                        out = {{"error", {{"message", "'tokens' must contain integers"}, {"type", "invalid_request_error"}}}};
+                        return 400;
+                    }
+                    ids.push_back(t.get<int>());
+                }
+                std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
+                out["prompt"] = llm.Detokenize(ids);
+                return 200;
+            };
+            g_server.addJsonRoute("POST", "/tokenize", tokenize_handler);
+            g_server.addJsonRoute("POST", "/v1/tokenize", tokenize_handler);
+            g_server.addJsonRoute("POST", "/detokenize", detokenize_handler);
+            g_server.addJsonRoute("POST", "/v1/detokenize", detokenize_handler);
 
             if (has_audio_encoder)
             {
@@ -2717,6 +3432,7 @@ int run_server_mode(const ModelConfig &config, int port)
                         ALOGE("provider not writable");
                         return;
                     }
+                    std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
 
                     std::string final_text;
                     std::string err;
@@ -2779,6 +3495,8 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+            // requests queue for the single inference slot as long as they may run
+            g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
             g_server.run(port);
         }
         llm.Deinit();
@@ -2902,9 +3620,9 @@ int main(int argc, char *argv[])
 
     if (!config.load_from_json(config_path))
     {
+        // Never fall back to defaults: they point at another model and at NPU card 0.
         ALOGE("Failed to load config from: %s", config_path.c_str());
-        // Try to use default config and resolve paths
-        ALOGE("Using default configuration");
+        return -1;
     }
 
     // Resolve relative paths to absolute paths based on model_path

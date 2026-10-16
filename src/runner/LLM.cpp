@@ -14,16 +14,28 @@ void LLM::Stop() { impl_->Stop(); }
 LLMAttrType *LLM::getAttr() { return &impl_->_attr; }
 LLMPostprocess *LLM::getPostprocess() { return &impl_->postprocess; }
 LLaMaEmbedSelector *LLM::getEmbedSelector() { return &impl_->embed_selector; }
-void LLM::SetRequestSamplingOverride(bool has_temperature, float temperature, bool has_top_p, float top_p, bool has_frequency_penalty, float frequency_penalty, bool has_presence_penalty, float presence_penalty) { impl_->postprocess.set_request_sampling_override(has_temperature, temperature, has_top_p, top_p, has_frequency_penalty, frequency_penalty, has_presence_penalty, presence_penalty); }
+void LLM::SetRequestSamplingOverride(const SamplingRequest &req) { impl_->postprocess.set_request_sampling_override(req); }
 void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_sampling_override(); }
 void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
 void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }
+void LLM::SetTools(const std::string &tools_json) { if (impl_->tokenizer) impl_->tokenizer->set_tools(tools_json); }
+bool LLM::TokenizerSupportsTools() const { return impl_->tokenizer ? impl_->tokenizer->supports_tools() : false; }
 bool LLM::TokenizerSupportsThinkingToggle() const { return impl_->tokenizer ? impl_->tokenizer->supports_thinking_toggle() : false; }
+std::vector<std::string> LLM::SupportedInputModalities() const
+{
+    std::vector<std::string> out{"text"};
+    if (!impl_->vision) return out;
+    if (impl_->vision->SupportsInput(IMAGE)) out.push_back("image");
+    if (impl_->vision->SupportsInput(VIDEO)) out.push_back("video");
+    if (impl_->vision->SupportsInput(AUDIO)) out.push_back("audio");
+    return out;
+}
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
 void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
 int LLM::GetLastPromptTokenNum() const { return impl_->get_last_prompt_token_num(); }
 int LLM::GetLastCompletionTokenNum() const { return impl_->get_last_completion_token_num(); }
+std::string LLM::GetLastFinishReason() const { return impl_->get_last_finish_reason(); }
 float LLM::GetLastTtftMs() const { return impl_->get_last_ttft_ms(); }
 float LLM::GetLastDecodeTps() const { return impl_->get_last_decode_tps(); }
 float LLM::GetLastPrefillTps() const { return impl_->get_last_prefill_tps(); }
@@ -44,3 +56,7 @@ std::vector<Content> LLM::Run(std::vector<Content> history, int output_max_token
 std::vector<Content> LLM::Run(std::vector<Content> history, std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token, &media_inputs); }
 std::vector<Content> LLM::Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token); }
 std::string LLM::Run(std::vector<unsigned short> &embed, int output_max_token) { return impl_->Run(embed, output_max_token); }
+std::string LLM::RunPrompt(const std::string &prompt, int output_max_token) { return impl_->RunPrompt(prompt, output_max_token); }
+std::vector<int> LLM::Tokenize(const std::string &text) { return impl_->tokenizer ? impl_->tokenizer->encode(text) : std::vector<int>{}; }
+std::vector<int> LLM::TokenizeHistory(const std::vector<Content> &history, bool add_generation_prompt) { return impl_->tokenizer ? impl_->tokenizer->encode(history, add_generation_prompt) : std::vector<int>{}; }
+std::string LLM::Detokenize(const std::vector<int> &ids) { return impl_->tokenizer ? impl_->tokenizer->decode(ids) : std::string(); }

@@ -178,6 +178,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     };
 
     b_stop.store(false, std::memory_order_relaxed); std::string final_out;
+    last_finish_reason_ = "stop";
     utf8_filter = UTF8Filter();
     ChannelSectionFilter channel_filter;
     channel_filter.reset();
@@ -746,6 +747,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (output_max_token > 0 && (int)token_ids.size() >= output_max_token)
             {
                 b_hit_eos = true;
+                last_finish_reason_ = "length";
             }
         }
     }
@@ -763,7 +765,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
          !b_hit_eos && decode_pos < (unsigned int)_attr.max_token_len && kv_slot < (unsigned int)_attr.max_token_len;
          ++decode_pos, ++kv_slot)
     {
-        if (b_stop.load(std::memory_order_relaxed)) break;
+        if (b_stop.load(std::memory_order_relaxed)) { last_finish_reason_ = "abort"; break; }
         bool need_full_shared_sync = false;
         {
             const int want_gid = choose_decode_gid((int)kv_slot + 1);
@@ -1137,9 +1139,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (hide_channel_markup) str = channel_filter.filter(str);
             emit_stream_chunk(str, tps);
         }
-        if (output_max_token > 0 && (int)token_ids.size() >= output_max_token) { b_hit_eos = true; break; }
+        if (output_max_token > 0 && (int)token_ids.size() >= output_max_token) { b_hit_eos = true; last_finish_reason_ = "length"; break; }
         if (_attr.runing_callback == nullptr) update_cqdm(&cqdm, kv_slot, "token", "");
     }
+    if (!b_hit_eos && last_finish_reason_ == "stop") last_finish_reason_ = "length"; // ran out of context
 
     const int generated_token_count = (int)token_ids.size();
     last_run_generated_token_ids = token_ids;
@@ -1207,6 +1210,40 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     active_prefill_pos_start = -1;
     active_token_pos_start = -1;
     return final_out;
+}
+
+std::string LLM::Impl::RunPrompt(const std::string &prompt, int output_max_token)
+{
+    clear_last_error();
+    has_vision_state = false;
+    const std::vector<int> ids = tokenizer->encode(prompt);
+    if (ids.empty())
+    {
+        set_last_error("prompt is empty after tokenization");
+        return {};
+    }
+    if (kv_mgr_.multi_slot_enabled() && !kv_mgr_.select_kv_slot(ids)) return {};
+    ResetKVCache();
+    last_run_prompt_token_num_ = (int)ids.size();
+    if (SetKVCache(k_caches, v_caches, 0, (int)ids.size()) != 0)
+    {
+        if (get_last_error().empty()) set_last_error("prompt does not fit the model context");
+        ResetKVCache();
+        return {};
+    }
+    active_token_pos_start = 0;
+    active_prefill_pos_start = -1;
+    std::vector<unsigned short> embed(ids.size() * _attr.tokens_embed_size);
+    for (size_t i = 0; i < ids.size(); ++i)
+        embed_selector.getByIndex(ids[i], embed.data() + i * _attr.tokens_embed_size);
+    last_run_generated_token_ids.clear();
+    run_input_token_ids = ids;
+    std::string reply = Run(embed, output_max_token);
+    run_input_token_ids.clear();
+    std::vector<int> generated = std::move(last_run_generated_token_ids);
+    ResetKVCache(); // the next chat request must not mistake this KV for its history
+    last_run_generated_token_ids = std::move(generated); // keeps usage.completion_tokens
+    return reply;
 }
 
 std::vector<Content> LLM::Impl::Run(std::vector<Content> history, int output_max_token)
