@@ -953,6 +953,14 @@ VisionModule::~VisionModule() { Deinit(); }
 VisionModule::VisionModule(VisionModule&&) noexcept = default;
 VisionModule& VisionModule::operator=(VisionModule&&) noexcept = default;
 
+bool VisionModule::SupportsInput(ContentType type) const
+{
+    if (!enabled_ || !impl_ || !impl_->encoder_inited || !tokenizer_) return false;
+    if (!tokenizer_->support(type)) return false;
+    if (type == AUDIO) return audio_encoder_ && audio_encoder_->enabled();
+    return type == IMAGE || type == VIDEO;
+}
+
 void VisionModule::Deinit()
 {
     if (impl_) {

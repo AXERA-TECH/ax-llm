@@ -11,6 +11,7 @@
 #include <string>
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 #include <optional>
 #include <ctime>
 
@@ -40,6 +41,7 @@
 #include "openai_api/server.hpp"
 #include "runner/utils/memory_utils.hpp"
 #include "runner/utils/net_utils.hpp"
+#include "runner/utils/media_fetch.hpp"
 #include "runner/utils/sample_log.h"
 
 #ifndef AXLLM_GIT_COMMIT
@@ -271,6 +273,10 @@ struct ModelConfig
     int server_default_max_tokens = 0;
     int server_max_output_tokens = 0;
     std::string server_forced_prompt_text;
+    // Remote media (http/https URLs in image_url / video_url / audio_url parts).
+    bool media_allow_remote = true;
+    int media_fetch_timeout_s = 60;
+    int media_max_mb = 256;
     bool is_embedding = false;
     bool is_image_generation = false;
     std::string image_model_dir = ".";
@@ -740,6 +746,9 @@ struct ModelConfig
             {
                 server_forced_prompt_text = j["server_forced_prompt_text"].get<std::string>();
             }
+            if (j.contains("media_allow_remote")) media_allow_remote = j["media_allow_remote"].get<bool>();
+            if (j.contains("media_fetch_timeout_s")) media_fetch_timeout_s = j["media_fetch_timeout_s"].get<int>();
+            if (j.contains("media_max_mb")) media_max_mb = j["media_max_mb"].get<int>();
 
             return true;
         }
@@ -1525,23 +1534,74 @@ static std::string save_upload_to_tempfile(const std::string &filename, const st
     return write_bytes_to_tempfile(ext, bytes);
 }
 
-// Resolve a media URI: if it's a base64 data-URI, decode to a temp file.
-// Otherwise return as-is (file path / directory).
-static std::string resolve_media_uri(const std::string &uri, std::vector<std::string> &temp_files)
+static std::string lower_copy(std::string value);
+
+// Resolve a media URI from an OpenAI/vLLM content part to a local path:
+// - data:<mime>;base64,<payload>  decoded to a temp file
+// - http(s)://...                 downloaded to a temp file
+// - file:///abs/path              the local path
+// - anything else                 used as a local path / frame directory as-is
+// Temp files are appended to `temp_files`; returns "" and sets `err` on failure.
+static std::string resolve_media_uri(const std::string &uri, std::vector<std::string> &temp_files, std::string &err)
 {
     std::string ext, payload;
     if (parse_base64_data_uri(uri, ext, payload))
     {
         payload = percent_decode_copy(payload);
+        const size_t semi = uri.find(';');
+        const std::string mime_ext = axllm::media::ext_for_mime(uri.substr(5, semi - 5));
+        if (!mime_ext.empty()) ext = mime_ext;
         std::string path = save_base64_to_tempfile(ext, payload);
-        if (!path.empty()) temp_files.push_back(path);
-        else
+        if (path.empty())
         {
             ALOGE("failed to decode base64 media: mime_ext=%s payload_chars=%zu", ext.c_str(), payload.size());
+            err = "invalid base64 media data";
+            return {};
         }
+        temp_files.push_back(path);
         return path;
     }
-    return uri; // plain file path
+    if (lower_copy(uri.substr(0, 5)) == "data:")
+    {
+        err = "unsupported data URI: only base64 data URIs (data:<mime>;base64,...) are accepted";
+        return {};
+    }
+    if (axllm::media::is_remote_url(uri))
+    {
+        std::vector<uint8_t> bytes;
+        if (!axllm::media::fetch_url(uri, bytes, ext, err))
+        {
+            ALOGE("%s: %s", err.c_str(), uri.c_str());
+            return {};
+        }
+        std::string path = write_bytes_to_tempfile(ext, bytes);
+        if (path.empty())
+        {
+            err = "failed to store downloaded media";
+            return {};
+        }
+        ALOGI("downloaded media: %s -> %s (%zu bytes)", uri.c_str(), path.c_str(), bytes.size());
+        temp_files.push_back(path);
+        return path;
+    }
+    std::string path = uri;
+    if (lower_copy(uri.substr(0, 7)) == "file://")
+    {
+        path = percent_decode_copy(uri.substr(7));
+        if (lower_copy(path.substr(0, 10)) == "localhost/") path = path.substr(9);
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec))
+    {
+        // Video paths may carry an axllm ":<fps>" suffix; let the vision module validate those.
+        const size_t colon = path.rfind(':');
+        if (colon == std::string::npos || colon == 0 || !std::filesystem::exists(path.substr(0, colon), ec))
+        {
+            err = "media file not found on server: " + path;
+            return {};
+        }
+    }
+    return path;
 }
 
 // Clean up temporary files created from base64 decoding.
@@ -1966,113 +2026,169 @@ static void infer_media_type_from_uri_prefix(std::string &raw_url, ContentType &
     }
 }
 
-// Handle HTTP API messages
+static const char *media_type_name(ContentType t)
+{
+    switch (t)
+    {
+    case IMAGE: return "image";
+    case VIDEO: return "video";
+    case AUDIO: return "audio";
+    default: return "text";
+    }
+}
+
+static std::string format_fps(double fps)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.6g", fps);
+    return buf;
+}
+
+// Convert OpenAI chat messages into engine contents. Accepts the OpenAI content parts
+// (text, image_url, input_audio) plus the vLLM/SGLang ones (video_url, audio_url) and the
+// short aliases image/video/audio. Media URLs may be data: URIs, http(s) URLs, file:// URLs
+// or server-local paths. `video_fps` > 0 sets the frame sampling rate for raw video files
+// (vLLM's mm_processor_kwargs.fps). On failure returns false with a client-facing `err`.
 bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &history,
                          std::vector<MediaInputs> *media_inputs = nullptr,
-                         std::vector<std::string> *temp_files = nullptr)
+                         std::vector<std::string> *temp_files = nullptr,
+                         std::string *err = nullptr,
+                         double video_fps = 0.0)
 {
-    for (auto &item : messages)
+    std::string local_err;
+    std::string &error = err ? *err : local_err;
+    std::vector<std::string> untracked_temp_files;
+    std::vector<std::string> &temps = temp_files ? *temp_files : untracked_temp_files;
+
+    if (!messages.is_array())
     {
+        error = "'messages' must be an array";
+        return false;
+    }
+
+    for (size_t msg_idx = 0; msg_idx < messages.size(); ++msg_idx)
+    {
+        const auto &item = messages[msg_idx];
+        const std::string where = "messages[" + std::to_string(msg_idx) + "]";
+        if (!item.is_object())
+        {
+            error = where + " must be an object";
+            return false;
+        }
+
         Content content;
         content.type = TEXT;
 
-        if (item.contains("role") && item["role"] == "system")
-        {
-            content.role = SYSTEM;
-        }
-        else if (item.contains("role") && item["role"] == "user")
-        {
-            content.role = USER;
-        }
-        else if (item.contains("role") && item["role"] == "assistant")
-        {
-            content.role = ASSISTANT;
-        }
+        const std::string role = item.contains("role") && item["role"].is_string() ? item["role"].get<std::string>() : "";
+        if (role == "system" || role == "developer") content.role = SYSTEM;
+        else if (role == "user") content.role = USER;
+        else if (role == "assistant") content.role = ASSISTANT;
         else
         {
-            ALOGE("content type not support");
+            error = where + ": unsupported role '" + role + "'";
             return false;
         }
 
         std::vector<std::string> media_uris;
         ContentType media_type = TEXT;
 
-        if (item.contains("content") && item["content"].is_string())
+        const nlohmann::json empty_content;
+        const auto &body = item.contains("content") ? item["content"] : empty_content;
+        if (body.is_string())
         {
-            content.data = item["content"];
+            content.data = body.get<std::string>();
         }
-        else if (item.contains("content") && item["content"].is_array())
+        else if (body.is_array())
         {
-            for (auto &c : item["content"])
+            bool first_text = true;
+            for (size_t part_idx = 0; part_idx < body.size(); ++part_idx)
             {
-                if (c.contains("type") && c["type"] == "text")
+                const auto &c = body[part_idx];
+                const std::string part_where = where + ".content[" + std::to_string(part_idx) + "]";
+                const std::string type = c.is_object() && c.contains("type") && c["type"].is_string() ? c["type"].get<std::string>() : "";
+                if (type == "text")
                 {
-                    content.data += c["text"];
+                    if (!first_text) content.data += "\n";
+                    content.data += c.value("text", "");
+                    first_text = false;
+                    continue;
                 }
-                else if (c.contains("type") &&
-                         (c["type"] == "image_url" || c["type"] == "image" ||
-                          c["type"] == "video_url" || c["type"] == "video" ||
-                          c["type"] == "audio_url" || c["type"] == "audio"))
-                {
-                    std::string raw_url;
-                    ContentType part_type = TEXT;
-                    if (c["type"] == "image_url" || c["type"] == "image")
-                    {
-                        part_type = IMAGE;
-                        raw_url = extract_media_url(c, "image_url", "image");
-                    }
-                    else if (c["type"] == "video_url" || c["type"] == "video")
-                    {
-                        part_type = VIDEO;
-                        raw_url = extract_media_url(c, "video_url", "video");
-                    }
-                    else if (c["type"] == "audio_url" || c["type"] == "audio")
-                    {
-                        part_type = AUDIO;
-                        raw_url = extract_media_url(c, "audio_url", "audio");
-                    }
-                    if (!raw_url.empty())
-                    {
-                        infer_media_type_from_uri_prefix(raw_url, part_type);
-                        if (media_type != TEXT && media_type != part_type)
-                        {
-                            ALOGE("mixed media types in a single message are not supported yet");
-                            return false;
-                        }
-                        media_type = part_type;
 
-                        if (temp_files)
-                        {
-                            std::string resolved = resolve_media_uri(raw_url, *temp_files);
-                            if (resolved.empty())
-                            {
-                                ALOGE("failed to resolve media uri for message");
-                                return false;
-                            }
-                            media_uris.push_back(std::move(resolved));
-                        }
-                        else
-                        {
-                            std::vector<std::string> dummy;
-                            std::string resolved = resolve_media_uri(raw_url, dummy);
-                            if (resolved.empty())
-                            {
-                                ALOGE("failed to resolve media uri for message");
-                                return false;
-                            }
-                            media_uris.push_back(std::move(resolved));
-                        }
+                std::string raw_url;
+                ContentType part_type = TEXT;
+                if (type == "image_url" || type == "image")
+                {
+                    part_type = IMAGE;
+                    raw_url = extract_media_url(c, "image_url", "image");
+                }
+                else if (type == "video_url" || type == "video")
+                {
+                    part_type = VIDEO;
+                    raw_url = extract_media_url(c, "video_url", "video");
+                }
+                else if (type == "audio_url" || type == "audio")
+                {
+                    part_type = AUDIO;
+                    raw_url = extract_media_url(c, "audio_url", "audio");
+                }
+                else if (type == "input_audio")
+                {
+                    // OpenAI: {"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}
+                    part_type = AUDIO;
+                    const auto &ia = c.contains("input_audio") ? c["input_audio"] : empty_content;
+                    if (ia.is_object() && ia.contains("data") && ia["data"].is_string())
+                    {
+                        const std::string format = normalize_extension(ia.value("format", "wav"), "wav");
+                        raw_url = "data:audio/" + format + ";base64," + ia["data"].get<std::string>();
                     }
                 }
+                else
+                {
+                    error = part_where + ": unsupported content part type '" + type + "'";
+                    return false;
+                }
+                if (raw_url.empty())
+                {
+                    error = part_where + ": missing media data for '" + type + "'";
+                    return false;
+                }
+
+                infer_media_type_from_uri_prefix(raw_url, part_type);
+                if (content.role != USER)
+                {
+                    error = part_where + ": media inputs are only supported in user messages";
+                    return false;
+                }
+                if (media_type != TEXT && media_type != part_type)
+                {
+                    error = where + ": mixing " + media_type_name(media_type) + " and " + media_type_name(part_type) +
+                            " in one message is not supported; send them as separate user messages";
+                    return false;
+                }
+                media_type = part_type;
+
+                std::string resolve_err;
+                std::string resolved = resolve_media_uri(raw_url, temps, resolve_err);
+                if (resolved.empty())
+                {
+                    error = part_where + ": " + resolve_err;
+                    return false;
+                }
+                std::error_code fs_ec;
+                if (part_type == VIDEO && video_fps > 0.0 && std::filesystem::is_regular_file(resolved, fs_ec))
+                {
+                    resolved += ":" + format_fps(video_fps);
+                }
+                media_uris.push_back(std::move(resolved));
             }
         }
-        else
+        else if (!body.is_null())
         {
-            ALOGE("content type not support");
+            error = where + ": 'content' must be a string, an array of content parts, or null";
             return false;
         }
 
-        if (!media_uris.empty() && content.role == USER)
+        if (!media_uris.empty())
         {
             content.type = media_type;
             if (media_inputs)
@@ -2084,6 +2200,16 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     }
 
     return true;
+}
+
+// vLLM-style per-request video sampling rate: mm_processor_kwargs.fps (0 when absent/invalid).
+static double request_video_fps(const nlohmann::json &raw)
+{
+    if (!raw.is_object() || !raw.contains("mm_processor_kwargs")) return 0.0;
+    const auto &kw = raw["mm_processor_kwargs"];
+    if (!kw.is_object() || !kw.contains("fps") || !kw["fps"].is_number()) return 0.0;
+    const double fps = kw["fps"].get<double>();
+    return (fps > 0.0 && std::isfinite(fps)) ? fps : 0.0;
 }
 
 static bool normalize_single_image_ocr_request(const ModelConfig &config,
@@ -2150,6 +2276,13 @@ int run_server_mode(const ModelConfig &config, int port)
 {
     g_exit_on_sigint.store(true, std::memory_order_relaxed);
     ALOGI("server request/queue timeout: %d ms (config.server_timeout_ms, overridable via --server_timeout_ms)", config.server_timeout_ms);
+    {
+        axllm::media::FetchOptions fetch;
+        fetch.allow_remote = config.media_allow_remote;
+        fetch.timeout_s = std::max(1, config.media_fetch_timeout_s);
+        fetch.max_bytes = (size_t)std::max(1, config.media_max_mb) * 1024u * 1024u;
+        axllm::media::set_fetch_options(fetch);
+    }
 
     // Check whether port is available.
     const char *port_error = "unknown";
@@ -2374,13 +2507,14 @@ int run_server_mode(const ModelConfig &config, int port)
                     std::vector<Content> history;
                     std::vector<MediaInputs> media_inputs;
                     std::vector<std::string> temp_files;
-                    if (!handle_api_messages(req.raw["messages"], history, &media_inputs, &temp_files))
+                    std::string parse_err;
+                    if (!handle_api_messages(req.raw["messages"], history, &media_inputs, &temp_files, &parse_err,
+                                             request_video_fps(req.raw)))
                     {
-                        ALOGE("handle_api_messages failed for embeddings messages");
+                        ALOGE("handle_api_messages failed for embeddings messages: %s", parse_err.c_str());
                         cleanup_temp_files(temp_files);
                         keepalive.stop();
-                        provider->push(openai_api::OutputChunk::Error("invalid_request_error",
-                                                                      "无法解析 messages（文本或图片内容无效）。"));
+                        provider->push(openai_api::OutputChunk::Error("invalid_request_error", parse_err));
                         provider->end();
                         return;
                     }
@@ -2479,7 +2613,7 @@ int run_server_mode(const ModelConfig &config, int port)
                  file_exist(config.attr.filename_audio_encoder_axmodel_30s));
 
             openai_api::ChatModelOptions options;
-            options.supports_vision = config.attr.vlm_type != VLMType::None;
+            options.input_modalities = llm.SupportedInputModalities();
             options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
             options.extra_fields["thinking_mode"] = thinking_mode_name(llm.getAttr()->generation_thinking_mode);
@@ -2560,10 +2694,12 @@ int run_server_mode(const ModelConfig &config, int port)
                 std::vector<Content> history;
                 std::vector<MediaInputs> media_inputs;
                 std::vector<std::string> temp_files;
-                if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files)) {
-                    ALOGE("handle_body failed");
+                std::string parse_err;
+                if (!handle_api_messages(req.messages, history, &media_inputs, &temp_files, &parse_err,
+                                         request_video_fps(req.raw))) {
+                    ALOGW("Reject chat request: %s", parse_err.c_str());
                     cleanup_temp_files(temp_files);
-                    push_chat_error("invalid_request_error", "Failed to parse chat messages.");
+                    push_chat_error("invalid_request_error", parse_err);
                     return;
                 }
                 // serve mode does NOT inject config.system_prompt: the client controls the

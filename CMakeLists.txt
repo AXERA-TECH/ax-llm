@@ -234,6 +234,7 @@ set(COMMON_SOURCES
     src/runner/utils/cqdm.cpp
     src/runner/utils/logger.cpp
     src/runner/utils/net_utils.cpp
+    src/runner/utils/media_fetch.cpp
     src/runner/LLM.cpp
     src/runner/MediaHistory.cpp
     src/runner/Qwen3_5Runtime.cpp

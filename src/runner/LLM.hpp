@@ -146,6 +146,8 @@ public:
     // True if the active tokenizer actually honors think/no_think in its prompt
     // (so callers can warn when a mode is requested but would be ignored).
     bool TokenizerSupportsThinkingToggle() const;
+    // Input modalities this model accepts in chat: "text" plus any of "image", "video", "audio".
+    std::vector<std::string> SupportedInputModalities() const;
     void MarkRequestStart();
     void ClearRequestStart();
     std::string GetLastError() const;

@@ -132,6 +132,9 @@
 | `server_default_max_tokens` | 0 | 请求未带 max_tokens 时的默认值(0=用内置默认) |
 | `server_max_output_tokens` | 0 | 输出 token 硬上限(0=不额外限制) |
 | `server_forced_prompt_text` | — | 强制提示词(如 OCR 规整) |
+| `media_allow_remote` | true | 是否允许请求里的 `http(s)://` 媒体地址(服务端去下载);设为 false 时只接受 base64 / 本地路径 |
+| `media_fetch_timeout_s` | 60 | 下载单个媒体文件的超时(秒) |
+| `media_max_mb` | 256 | 下载单个媒体文件的大小上限(MB) |
 
 ## 采样 / 后处理（post_config.json）
 

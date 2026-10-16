@@ -19,6 +19,15 @@ void LLM::ClearRequestSamplingOverride() { impl_->postprocess.clear_request_samp
 void LLM::SetRequestThinkingMode(ThinkingMode mode) { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(mode); }
 void LLM::ClearRequestThinkingMode() { if (impl_->tokenizer) impl_->tokenizer->set_generation_thinking_mode(impl_->_attr.generation_thinking_mode); }
 bool LLM::TokenizerSupportsThinkingToggle() const { return impl_->tokenizer ? impl_->tokenizer->supports_thinking_toggle() : false; }
+std::vector<std::string> LLM::SupportedInputModalities() const
+{
+    std::vector<std::string> out{"text"};
+    if (!impl_->vision) return out;
+    if (impl_->vision->SupportsInput(IMAGE)) out.push_back("image");
+    if (impl_->vision->SupportsInput(VIDEO)) out.push_back("video");
+    if (impl_->vision->SupportsInput(AUDIO)) out.push_back("audio");
+    return out;
+}
 void LLM::MarkRequestStart() { impl_->MarkRequestStart(); }
 void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
