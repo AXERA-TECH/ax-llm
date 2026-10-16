@@ -155,6 +155,8 @@ public:
     int GetLastCompletionTokenNum() const;
     // Performance metrics from the most recent Run (negative/zero = not measured).
     float GetLastTtftMs() const;
+    // "stop", "length" or "abort" for the last Run() (see LLM::Impl::last_finish_reason_).
+    std::string GetLastFinishReason() const;
     float GetLastDecodeTps() const;
     float GetLastPrefillTps() const;
     int GetLastPrefillTokens() const;

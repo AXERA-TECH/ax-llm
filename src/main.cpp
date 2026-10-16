@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <optional>
+#include <mutex>
 #include <ctime>
 
 // The AXera / AXCL SDK headers MUST be included before <windows.h>. The AX SDK
@@ -1676,7 +1677,7 @@ static int resolve_chat_output_max_tokens(const ModelConfig &config,
                                           const openai_api::ChatRequest &req,
                                           int runtime_max_token_len)
 {
-    const bool has_request_max_tokens = req.raw.is_object() && req.raw.contains("max_tokens");
+    const bool has_request_max_tokens = req.has_max_tokens;
     const int server_default_max_tokens = effective_server_default_max_tokens(config);
 
     int output_max_tokens = req.max_tokens;
@@ -2025,6 +2026,68 @@ static void infer_media_type_from_uri_prefix(std::string &raw_url, ContentType &
         raw_url = trim_copy(raw_url.substr(6));
     }
 }
+
+// Serializes every use of the single LLM instance across HTTP handler threads (a request
+// whose client disconnected may still be winding down when the next one is admitted).
+static std::mutex g_llm_mutex;
+
+// OpenAI `stop` sequences over streamed text: push() returns the text that is safe to emit,
+// holding back any tail that could still begin a stop sequence; once a sequence appears,
+// hit() turns true and the sequence and everything after it are dropped.
+class StopSequenceFilter
+{
+public:
+    explicit StopSequenceFilter(const std::vector<std::string> &stops)
+    {
+        for (const auto &s : stops)
+            if (!s.empty()) stops_.push_back(s);
+    }
+    bool active() const { return !stops_.empty(); }
+    bool hit() const { return hit_; }
+
+    std::string push(const std::string &piece)
+    {
+        if (hit_) return {};
+        buf_ += piece;
+        size_t first = std::string::npos;
+        for (const auto &s : stops_) first = std::min(first, buf_.find(s));
+        if (first != std::string::npos)
+        {
+            hit_ = true;
+            std::string out = buf_.substr(0, first);
+            buf_.clear();
+            return out;
+        }
+        size_t hold = 0;
+        for (const auto &s : stops_)
+        {
+            for (size_t k = std::min(s.size() - 1, buf_.size()); k > hold; --k)
+            {
+                if (buf_.compare(buf_.size() - k, k, s, 0, k) == 0)
+                {
+                    hold = k;
+                    break;
+                }
+            }
+        }
+        std::string out = buf_.substr(0, buf_.size() - hold);
+        buf_.erase(0, buf_.size() - hold);
+        return out;
+    }
+
+    std::string flush()
+    {
+        if (hit_) return {};
+        std::string out;
+        out.swap(buf_);
+        return out;
+    }
+
+private:
+    std::vector<std::string> stops_;
+    std::string buf_;
+    bool hit_ = false;
+};
 
 static const char *media_type_name(ContentType t)
 {
@@ -2497,6 +2560,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     return;
                 }
                 ProviderKeepAlive keepalive(provider);
+                std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
 
                 if (!req.encoding_format.empty() && req.encoding_format != "float") {
                     ALOGW("embedding encoding_format='%s' is not supported, using float", req.encoding_format.c_str());
@@ -2616,6 +2680,7 @@ int run_server_mode(const ModelConfig &config, int port)
             options.input_modalities = llm.SupportedInputModalities();
             options.extra_fields["prefill_max_token_num"] = llm.getAttr()->prefill_max_token_num;
             options.extra_fields["max_token_len"] = llm.getAttr()->max_token_len;
+            options.extra_fields["max_model_len"] = llm.getAttr()->max_token_len; // vLLM field name
             options.extra_fields["thinking_mode"] = thinking_mode_name(llm.getAttr()->generation_thinking_mode);
             if (config.server_max_output_tokens > 0) options.extra_fields["server_max_output_tokens"] = config.server_max_output_tokens;
 
@@ -2628,6 +2693,7 @@ int run_server_mode(const ModelConfig &config, int port)
                     ALOGE("provider not writable");
                     return;
                 }
+                std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
 
                 const ThinkingMode request_thinking_mode = resolve_chat_thinking_mode(config, req);
                 if (request_thinking_mode != ThinkingMode::Unspecified && !llm.TokenizerSupportsThinkingToggle())
@@ -2739,21 +2805,36 @@ int run_server_mode(const ModelConfig &config, int port)
                     llm.ResetKVCache();
                 }
 
+                StopSequenceFilter stop_filter(req.stop);
+                // Finish reason reported to the client: a matched stop sequence wins, otherwise the engine's
+                // reason ("abort" only happens when the client is gone, so nobody sees it).
+                auto finish_reason = [&]() -> std::string {
+                    if (stop_filter.hit()) return "stop";
+                    const std::string r = llm.GetLastFinishReason();
+                    return r == "length" ? "length" : "stop";
+                };
+                auto fill_usage = [&](openai_api::OutputChunk &chunk) {
+                    chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
+                    chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
+                    chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
+                    chunk.usage.ttft_ms = llm.GetLastTtftMs();
+                    chunk.usage.decode_tps = llm.GetLastDecodeTps();
+                    chunk.usage.prefill_tps = llm.GetLastPrefillTps();
+                    chunk.usage.prefill_tokens = llm.GetLastPrefillTokens();
+                    chunk.obj["finish_reason"] = finish_reason();
+                };
+
                 if (req.stream) {
                     bool streamed_any = false;
                     const bool emit_thinking_markup = should_emit_thinking_markup(request_thinking_mode);
                     bool thinking_open_emitted = false;
                     std::string streamed_text;
-                    auto callback = [provider,
-                                     model_id = req.model,
-                                     emit_thinking_markup,
-                                     &streamed_any,
-                                     &thinking_open_emitted,
-                                     &streamed_text](std::string str, float token_per_sec, void *reserve) {
-                        if (!provider->is_writable()) {
-                            ALOGE("provider not writable");
-                            return;
-                        }
+                    auto emit = [provider,
+                                 model_id = req.model,
+                                 emit_thinking_markup,
+                                 &streamed_any,
+                                 &thinking_open_emitted,
+                                 &streamed_text](const std::string &str) {
                         std::string out = str;
                         if (emit_thinking_markup)
                         {
@@ -2767,16 +2848,28 @@ int run_server_mode(const ModelConfig &config, int port)
                                 thinking_open_emitted = true;
                             }
                         }
-                        if (!out.empty()) streamed_any = true;
-                        auto chunk = openai_api::OutputChunk::TextDelta(out, model_id);
-                        provider->push(chunk);
+                        if (out.empty()) return;
+                        streamed_any = true;
+                        provider->push(openai_api::OutputChunk::TextDelta(out, model_id));
                         fprintf(stdout, "%s", out.c_str());
                         fflush(stdout);
+                    };
+                    auto callback = [&llm, provider, &stop_filter, &emit](std::string str, float token_per_sec, void *reserve) {
+                        if (!provider->is_writable()) {
+                            // client disconnected (or the request timed out): stop decoding early
+                            llm.Stop();
+                            return;
+                        }
+                        if (stop_filter.hit()) return;
+                        emit(stop_filter.push(str));
+                        if (stop_filter.hit()) llm.Stop();
                     };
 
                     llm.getAttr()->runing_callback = callback;
                     if (!media_inputs.empty()) llm.Run(history, media_inputs, output_max_tokens);
                     else llm.Run(history, output_max_tokens);
+                    llm.getAttr()->runing_callback = nullptr;
+                    if (provider->is_writable()) emit(stop_filter.flush());
                     const std::string llm_error = llm.GetLastError();
                     if (!llm_error.empty()) {
                         ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
@@ -2785,7 +2878,7 @@ int run_server_mode(const ModelConfig &config, int port)
                             provider->push(openai_api::OutputChunk::Error("model_error", llm_error));
                         }
                     }
-                    if (streamed_any) {
+                    if (streamed_any || llm_error.empty()) {
                         if (emit_thinking_markup && thinking_open_emitted && !has_thinking_close_tag(streamed_text))
                         {
                             provider->push(openai_api::OutputChunk::TextDelta("\n</think>", req.model));
@@ -2793,21 +2886,29 @@ int run_server_mode(const ModelConfig &config, int port)
                             fflush(stdout);
                         }
                         auto final_chunk = openai_api::OutputChunk::FinalText("", req.model);
-                        final_chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
-                        final_chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
-                        final_chunk.usage.total_tokens = final_chunk.usage.prompt_tokens + final_chunk.usage.completion_tokens;
-                        final_chunk.usage.ttft_ms = llm.GetLastTtftMs();
-                        final_chunk.usage.decode_tps = llm.GetLastDecodeTps();
-                        final_chunk.usage.prefill_tps = llm.GetLastPrefillTps();
-                        final_chunk.usage.prefill_tokens = llm.GetLastPrefillTokens();
+                        fill_usage(final_chunk);
                         provider->push(final_chunk);
                     }
                 } else {
-                    llm.getAttr()->runing_callback = nullptr;
+                    // No streaming, but a callback still watches for stop sequences and a closed connection
+                    // so decoding ends as early as it would when streaming.
+                    llm.getAttr()->runing_callback = [&llm, provider, &stop_filter](std::string str, float, void *) {
+                        if (!provider->is_writable()) { llm.Stop(); return; }
+                        if (!stop_filter.active() || stop_filter.hit()) return;
+                        stop_filter.push(str);
+                        if (stop_filter.hit()) llm.Stop();
+                    };
                     auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, output_max_tokens) : llm.Run(history, output_max_tokens);
+                    llm.getAttr()->runing_callback = nullptr;
                     std::string final_text;
                     if (!out_history.empty() && out_history.back().role == ASSISTANT) {
                         final_text = out_history.back().data;
+                    }
+                    if (stop_filter.active()) {
+                        // Cut the decoded text at the first stop sequence (same rule as the streaming filter).
+                        StopSequenceFilter cut(req.stop);
+                        std::string kept = cut.push(final_text);
+                        final_text = cut.hit() ? kept : kept + cut.flush();
                     }
                     const std::string llm_error = llm.GetLastError();
                     if (!llm_error.empty()) {
@@ -2817,7 +2918,7 @@ int run_server_mode(const ModelConfig &config, int port)
                         push_chat_error("model_error", llm_error);
                         return;
                     }
-                    if (final_text.empty()) {
+                    if (final_text.empty() && !stop_filter.hit()) {
                         ALOGW("Returning user-facing chat error: empty model response");
                         if (single_image_ocr_mode) llm.ResetKVCache();
                         cleanup_temp_files(temp_files);
@@ -2829,13 +2930,7 @@ int run_server_mode(const ModelConfig &config, int port)
                         final_text = wrap_thinking_text_for_client(final_text);
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
-                    chunk.usage.prompt_tokens = llm.GetLastPromptTokenNum();
-                    chunk.usage.completion_tokens = llm.GetLastCompletionTokenNum();
-                    chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
-                    chunk.usage.ttft_ms = llm.GetLastTtftMs();
-                    chunk.usage.decode_tps = llm.GetLastDecodeTps();
-                    chunk.usage.prefill_tps = llm.GetLastPrefillTps();
-                    chunk.usage.prefill_tokens = llm.GetLastPrefillTokens();
+                    fill_usage(chunk);
                     fprintf(stdout, "%s", final_text.c_str());
                     fflush(stdout);
                     provider->push(chunk);
@@ -2853,6 +2948,7 @@ int run_server_mode(const ModelConfig &config, int port)
                         ALOGE("provider not writable");
                         return;
                     }
+                    std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
 
                     std::string final_text;
                     std::string err;
@@ -3038,9 +3134,9 @@ int main(int argc, char *argv[])
 
     if (!config.load_from_json(config_path))
     {
+        // Never fall back to defaults: they point at another model and at NPU card 0.
         ALOGE("Failed to load config from: %s", config_path.c_str());
-        // Try to use default config and resolve paths
-        ALOGE("Using default configuration");
+        return -1;
     }
 
     // Resolve relative paths to absolute paths based on model_path

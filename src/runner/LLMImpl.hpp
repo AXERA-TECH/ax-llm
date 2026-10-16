@@ -244,6 +244,10 @@ struct LLM::Impl : public IKvSlotHost {
     float last_run_decode_tps_ = -1.0f;
     float last_run_prefill_tps_ = -1.0f;
     int last_run_prefill_tokens_ = -1;
+    // Why the last Run() stopped generating: "stop" (end-of-sequence token), "length"
+    // (output_max_token or context limit reached) or "abort" (Stop() was called).
+    std::string last_finish_reason_ = "stop";
+    const std::string &get_last_finish_reason() const { return last_finish_reason_; }
     float get_last_ttft_ms() const { return last_run_ttft_ms_; }
     float get_last_decode_tps() const { return last_run_decode_tps_; }
     float get_last_prefill_tps() const { return last_run_prefill_tps_; }

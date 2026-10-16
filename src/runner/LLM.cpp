@@ -33,6 +33,7 @@ void LLM::ClearRequestStart() { impl_->ClearRequestStart(); }
 std::string LLM::GetLastError() const { return impl_->get_last_error(); }
 int LLM::GetLastPromptTokenNum() const { return impl_->get_last_prompt_token_num(); }
 int LLM::GetLastCompletionTokenNum() const { return impl_->get_last_completion_token_num(); }
+std::string LLM::GetLastFinishReason() const { return impl_->get_last_finish_reason(); }
 float LLM::GetLastTtftMs() const { return impl_->get_last_ttft_ms(); }
 float LLM::GetLastDecodeTps() const { return impl_->get_last_decode_tps(); }
 float LLM::GetLastPrefillTps() const { return impl_->get_last_prefill_tps(); }

@@ -178,6 +178,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     };
 
     b_stop.store(false, std::memory_order_relaxed); std::string final_out;
+    last_finish_reason_ = "stop";
     utf8_filter = UTF8Filter();
     ChannelSectionFilter channel_filter;
     channel_filter.reset();
@@ -746,6 +747,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (output_max_token > 0 && (int)token_ids.size() >= output_max_token)
             {
                 b_hit_eos = true;
+                last_finish_reason_ = "length";
             }
         }
     }
@@ -763,7 +765,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
          !b_hit_eos && decode_pos < (unsigned int)_attr.max_token_len && kv_slot < (unsigned int)_attr.max_token_len;
          ++decode_pos, ++kv_slot)
     {
-        if (b_stop.load(std::memory_order_relaxed)) break;
+        if (b_stop.load(std::memory_order_relaxed)) { last_finish_reason_ = "abort"; break; }
         bool need_full_shared_sync = false;
         {
             const int want_gid = choose_decode_gid((int)kv_slot + 1);
@@ -1137,9 +1139,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (hide_channel_markup) str = channel_filter.filter(str);
             emit_stream_chunk(str, tps);
         }
-        if (output_max_token > 0 && (int)token_ids.size() >= output_max_token) { b_hit_eos = true; break; }
+        if (output_max_token > 0 && (int)token_ids.size() >= output_max_token) { b_hit_eos = true; last_finish_reason_ = "length"; break; }
         if (_attr.runing_callback == nullptr) update_cqdm(&cqdm, kv_slot, "token", "");
     }
+    if (!b_hit_eos && last_finish_reason_ == "stop") last_finish_reason_ = "length"; // ran out of context
 
     const int generated_token_count = (int)token_ids.size();
     last_run_generated_token_ids = token_ids;
