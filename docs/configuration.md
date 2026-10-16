@@ -86,6 +86,15 @@
 
 > 这几项也可不在 `config.json` 顶层写:`full_attention_interval` / `num_kv_shared_layers` 会回退读 `text_config.*`;`sliding_window` / `layer_types` 未配置时会自动从模型目录下分词器的 sidecar config 读取。
 
+## AX8860 片上后端性能开关
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `AXLLM_PREFILL_IO_ALIAS` | `0` | 实验开关。同一个 prefill chunk 内，graph ABI/shape 完全相同的层复用同一份 `mask`/`indices` 输入。当前 AX8860 engine 在部分模型上跨 AXModel handle 复用输入指针会在 prefill 中途返回 `0x80060084`，因此默认关闭。 |
+| `AXLLM_AX650_AUTO_SYNC` | `0` | AX8860 片上后端默认跳过确认非 cached 的最大容量 `K_cache`/`V_cache` full-range flush，保留 `mask`/`indices`/`input` 等小输入 flush，并选择性 invalidate cached 输出。设为 `1` 恢复旧的 blanket input/output cache sync。 |
+
+`AXLLM_PREFILL_IO_ALIAS` 按 graph class、attention 类型、query/history 容量、sliding window 和 tensor 尺寸生成复用签名；任一条件不匹配都会自动回到逐层构建路径。所有输入 alias 都会在 chunk 结束或提前返回时恢复原始绑定。
+
 ## 多槽前缀 KV 缓存（serve 多用户/多提示词加速）
 
 | 字段 | 默认 | 说明 |

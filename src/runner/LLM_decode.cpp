@@ -316,6 +316,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                std::strcmp(value, "off") != 0 &&
                std::strcmp(value, "no") != 0;
     };
+    const bool prefill_io_alias_enabled = env_flag_enabled("AXLLM_PREFILL_IO_ALIAS");
     const bool decode_profile_enabled = env_flag_enabled("AXLLM_PROFILE_DECODE");
     const bool prefill_chunk_profile_enabled = env_flag_enabled("AXLLM_PROFILE_PREFILL_CHUNKS");
     DecodeProfileStats decode_profile{};
@@ -430,6 +431,15 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         std::vector<unsigned short> linear_mask_tmp;
         if (use_per_layer_input) per_layer_tmp.assign((size_t)_attr.prefill_token_num * (size_t)per_layer_hidden, 0);
 
+        std::map<std::string, std::pair<int, int>> prefill_io_anchors;
+        std::vector<std::pair<int, int>> prefill_aliased_layers;
+        auto restore_prefill_input_aliases = [&prefill_aliased_layers, &layers = llama_layers](void *) {
+            for (auto it = prefill_aliased_layers.rbegin(); it != prefill_aliased_layers.rend(); ++it)
+                (void)layers[(size_t)it->first].layer.restore_group_input_aliases(it->second);
+        };
+        std::unique_ptr<void, decltype(restore_prefill_input_aliases)> prefill_alias_guard(
+            reinterpret_cast<void *>(1), restore_prefill_input_aliases);
+
         size_t copy_tokens = (p == prefill_split_num - 1) ? (size_t)(input_embed_num - p * _attr.prefill_token_num) : (size_t)_attr.prefill_token_num;
         memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, copy_tokens * _attr.tokens_embed_size * sizeof(unsigned short));
         scale_prefill_text_embeds_inplace(embed_tmp.data(), input_num_token, token_start_pos);
@@ -478,59 +488,104 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                       layer_kv_cache_num);
             }
             auto &t_idx = lyr.layer.get_input(layer_prefill_grpid, "indices");
-            unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
-            {
-                const int seq_start_pos = rope_start_pos;
-                const int idx_elems = (int)(t_idx.nSize / (int)sizeof(unsigned int));
-                int idx_rows = idx_elems / layer_query_tokens;
-                if (idx_rows <= 0) idx_rows = 1;
-                const bool use_pos_ids = has_vision_state &&
-                                         idx_rows >= 3 &&
-                                         vision_state.position_ids.size() >= 3 &&
-                                         !vision_state.position_ids.empty();
+            auto &t_mask = lyr.layer.get_input(layer_prefill_grpid, "mask");
+            const std::string prefill_io_signature =
+                layer_graph_class_for(m) + "|" +
+                (is_linear_layer(m) ? "linear" : "attention") + "|" +
+                (is_sliding_attention_layer(m) ? "sliding" : "regular") + "|" +
+                std::to_string(layer_query_tokens) + "|" +
+                std::to_string(layer_kv_cache_num) + "|" +
+                std::to_string(_attr.sliding_window) + "|" +
+                std::to_string(t_idx.nSize) + "|" +
+                std::to_string(t_mask.nSize);
 
-                for (int r = 0; r < idx_rows; ++r)
+            bool prefill_inputs_aliased = false;
+            if (prefill_io_alias_enabled)
+            {
+                const auto anchor_it = prefill_io_anchors.find(prefill_io_signature);
+                if (anchor_it != prefill_io_anchors.end())
                 {
-                    // ALOGI("r %d, idx_rows: %d", r, idx_rows);
-                    // Fixed-query graphs execute padded rows too.  Keep their
-                    // position indices in range by repeating the last live
-                    // token instead of leaving zero/uninitialized positions.
-                    // These rows are masked from all real query rows and are
-                    // not copied to the host KV/output.
-                    const int live_last = std::max(0, input_num_token - 1);
-                    for (int j = 0; j < layer_query_tokens; ++j)
+                    auto &anchor_layer = llama_layers[(size_t)anchor_it->second.first];
+                    const int anchor_gid = anchor_it->second.second;
+                    auto &anchor_idx = anchor_layer.layer.get_input(anchor_gid, "indices");
+                    auto &anchor_mask = anchor_layer.layer.get_input(anchor_gid, "mask");
+                    if (anchor_layer.layer.get_devid() == lyr.layer.get_devid() &&
+                        anchor_idx.nSize == t_idx.nSize && anchor_mask.nSize == t_mask.nSize &&
+                        anchor_idx.phyAddr != 0 && anchor_mask.phyAddr != 0)
                     {
-                        const int live_j = std::min(j, live_last);
-                        unsigned int v = (unsigned int)(seq_start_pos + live_j);
-                        if (use_pos_ids)
+                        const int idx_alias_ret = lyr.layer.alias_group_input(
+                            layer_prefill_grpid, "indices", anchor_idx.pVirAddr, anchor_idx.phyAddr);
+                        const int mask_alias_ret = lyr.layer.alias_group_input(
+                            layer_prefill_grpid, "mask", anchor_mask.pVirAddr, anchor_mask.phyAddr);
+                        prefill_inputs_aliased = idx_alias_ret == 0 && mask_alias_ret == 0;
+                        if (!prefill_inputs_aliased)
                         {
-                            if ((size_t)r < vision_state.position_ids.size())
-                            {
-                                const auto &row = vision_state.position_ids[r];
-                                if ((size_t)(token_start_pos + live_j) < row.size())
-                                    v = (unsigned int)row[token_start_pos + live_j];
-                            }
+                            (void)lyr.layer.restore_group_input_aliases(layer_prefill_grpid);
                         }
-                        idx_ptr[r * layer_query_tokens + j] = v;
+                        else
+                        {
+                            prefill_aliased_layers.emplace_back(m, layer_prefill_grpid);
+                        }
                     }
                 }
             }
-            llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
-            auto &t_mask = lyr.layer.get_input(layer_prefill_grpid, "mask");
-            if (is_linear_layer(m))
+
+            if (!prefill_inputs_aliased)
             {
-                const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
-                fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
-                llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), linear_mask_tmp.size() * sizeof(unsigned short), devid);
-            }
-            else
-            {
-                mask_tmp.assign((size_t)layer_query_tokens * (size_t)(layer_kv_cache_num + layer_query_tokens), bf16.data);
-                if (use_sparse_full_cache_mask())
-                    build_sparse_layer_prefill_mask(mask_tmp, layer_kv_cache_num, layer_query_tokens, history_len, input_num_token, m);
+                prefill_io_anchors.emplace(prefill_io_signature, std::make_pair(m, layer_prefill_grpid));
+                unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
+                {
+                    const int seq_start_pos = rope_start_pos;
+                    const int idx_elems = (int)(t_idx.nSize / (int)sizeof(unsigned int));
+                    int idx_rows = idx_elems / layer_query_tokens;
+                    if (idx_rows <= 0) idx_rows = 1;
+                    const bool use_pos_ids = has_vision_state &&
+                                             idx_rows >= 3 &&
+                                             vision_state.position_ids.size() >= 3 &&
+                                             !vision_state.position_ids.empty();
+
+                    for (int r = 0; r < idx_rows; ++r)
+                    {
+                        // ALOGI("r %d, idx_rows: %d", r, idx_rows);
+                        // Fixed-query graphs execute padded rows too.  Keep their
+                        // position indices in range by repeating the last live
+                        // token instead of leaving zero/uninitialized positions.
+                        // These rows are masked from all real query rows and are
+                        // not copied to the host KV/output.
+                        const int live_last = std::max(0, input_num_token - 1);
+                        for (int j = 0; j < layer_query_tokens; ++j)
+                        {
+                            const int live_j = std::min(j, live_last);
+                            unsigned int v = (unsigned int)(seq_start_pos + live_j);
+                            if (use_pos_ids)
+                            {
+                                if ((size_t)r < vision_state.position_ids.size())
+                                {
+                                    const auto &row = vision_state.position_ids[r];
+                                    if ((size_t)(token_start_pos + live_j) < row.size())
+                                        v = (unsigned int)row[token_start_pos + live_j];
+                                }
+                            }
+                            idx_ptr[r * layer_query_tokens + j] = v;
+                        }
+                    }
+                }
+                llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
+                if (is_linear_layer(m))
+                {
+                    const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
+                    fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
+                    llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), linear_mask_tmp.size() * sizeof(unsigned short), devid);
+                }
                 else
-                    build_layer_prefill_mask(mask_tmp, layer_kv_cache_num, layer_query_tokens, history_len, input_num_token, m);
-                llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
+                {
+                    mask_tmp.assign((size_t)layer_query_tokens * (size_t)(layer_kv_cache_num + layer_query_tokens), bf16.data);
+                    if (use_sparse_full_cache_mask())
+                        build_sparse_layer_prefill_mask(mask_tmp, layer_kv_cache_num, layer_query_tokens, history_len, input_num_token, m);
+                    else
+                        build_layer_prefill_mask(mask_tmp, layer_kv_cache_num, layer_query_tokens, history_len, input_num_token, m);
+                    llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
+                }
             }
             auto &t_in = lyr.layer.get_input(layer_prefill_grpid, "input");
             if (std::getenv("AXLLM_ZERO_LAYER0_PREFILL_INPUT") && m == 0 && p == 0)
@@ -717,6 +772,14 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     }
                 }
             }
+        }
+
+        if (debug_prefill && !prefill_aliased_layers.empty())
+        {
+            ALOGI("prefill IO alias: chunk=%d reused_layers=%zu/%d",
+                  p,
+                  prefill_aliased_layers.size(),
+                  _attr.axmodel_num);
         }
 
         mark_full_cache_slots(history_len, input_num_token);

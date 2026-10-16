@@ -69,9 +69,16 @@ static void mark_allow_inplace_io(AX_ENGINE_IO_T &io, int grpid)
         ALOGI("AXLLM_ALLOW_INPLACE_IO enabled for group %d", grpid);
 }
 
+static bool axllm_ax650_blanket_auto_sync()
+{
+    return axllm_env_flag_enabled("AXLLM_AX650_AUTO_SYNC");
+}
+
 // 辅助：分配 IO 结构体数组 + 物理内存
 static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data,
-                                 std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRATEGY_T> strategy, std::vector<std::string> skip_alloc_names = {})
+                                 std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRATEGY_T> strategy,
+                                 std::vector<std::string> skip_alloc_names = {},
+                                 std::unordered_set<unsigned long long> *cached_phy_addrs = nullptr)
 {
     const bool force_uncached = std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr;
     if (force_uncached)
@@ -104,6 +111,8 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
             ALOGE("Alloc input[%d] failed", i);
             return ret; // 注意：此处在实际工程中应跳转到 cleanup，为简化展示直接返回
         }
+        if (strategy.first == AX_ENGINE_ABST_CACHED && buffer.phyAddr && cached_phy_addrs)
+            cached_phy_addrs->insert(buffer.phyAddr);
         memset(buffer.pVirAddr, 0, buffer.nSize);
     }
 
@@ -128,6 +137,8 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
             ALOGE("Alloc output[%d] failed", i);
             return ret;
         }
+        if (strategy.second == AX_ENGINE_ABST_CACHED && buffer.phyAddr && cached_phy_addrs)
+            cached_phy_addrs->insert(buffer.phyAddr);
         memset(buffer.pVirAddr, 0, buffer.nSize);
     }
     return 0;
@@ -200,18 +211,26 @@ int ax_runner_ax650::sub_init()
         {
             ret = prepare_io_with_alloc(io_info,
                                         &m_handle->io_data[grpid],
-                                        {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED});
+                                        {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED},
+                                        {},
+                                        &mcached_phy_addrs_);
         }
         // Keep the original AX650 multi-group behavior for KV-cache sharing.
         else if (grpid == 0)
         {
             ret = prepare_io_with_alloc(io_info,
                                         &m_handle->io_data[grpid],
-                                        {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED});
+                                        {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED},
+                                        {},
+                                        &mcached_phy_addrs_);
         }
         else if (grpid == io_count - 1)
         {
-            ret = prepare_io_with_alloc(io_info, &m_handle->io_data[grpid], {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED}, skip_alloc_names);
+            ret = prepare_io_with_alloc(io_info,
+                                        &m_handle->io_data[grpid],
+                                        {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED},
+                                        skip_alloc_names,
+                                        &mcached_phy_addrs_);
         }
         else
         {
@@ -255,6 +274,7 @@ int ax_runner_ax650::sub_init()
                 if ((size_t)buf.nSize >= want_bytes) return 0;
                 const AX_U32 old_size = buf.nSize;
 
+                mcached_phy_addrs_.erase(buf.phyAddr);
                 if (buf.phyAddr != 0) AX_SYS_MemFree(buf.phyAddr, buf.pVirAddr);
 
                 int ret = force_uncached
@@ -280,6 +300,8 @@ int ax_runner_ax650::sub_init()
                     return ret;
                 }
                 buf.nSize = (AX_U32)want_bytes;
+                if (!force_uncached && buf.phyAddr)
+                    mcached_phy_addrs_.insert(buf.phyAddr);
                 memset(buf.pVirAddr, 0, want_bytes);
                 ALOGD("realloc %s buffer: group0_size=%u -> max_group_size=%zu", name, old_size, want_bytes);
                 return 0;
@@ -673,6 +695,51 @@ void ax_runner_ax650::deinit()
     mgroup_input_tensors.clear();
     map_group_input_tensors.clear();
     map_group_output_tensors.clear();
+    input_alias_orig_.clear();
+    mcached_phy_addrs_.clear();
+}
+
+int ax_runner_ax650::flush_cached_inputs(const std::vector<ax_runner_tensor_t> &tensors)
+{
+    for (const auto &tensor : tensors)
+    {
+        if (tensor.phyAddr == 0)
+            continue;
+        const bool cached = mcached_phy_addrs_.find(tensor.phyAddr) != mcached_phy_addrs_.end();
+
+        // Single-group dynamic-KV AXModels declare maximum-capacity K/V inputs
+        // but only consume ceil(live_history / 256) blocks.  The default K/V
+        // allocation is non-cached, so flushing the complete maximum-capacity
+        // tensor is expensive and unnecessary.  Keep the legacy flush for all
+        // other inputs: the smaller mask/indices/scalar flushes are also part
+        // of the timing contract observed by the AX8860 engine.
+        if (!cached && (tensor.sName == "K_cache" || tensor.sName == "V_cache"))
+            continue;
+
+        const int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+        if (sync_ret != 0)
+        {
+            ALOGE("AX_SYS_MflushCache(%s) failed: 0x%x", tensor.sName.c_str(), sync_ret);
+            return sync_ret;
+        }
+    }
+    return 0;
+}
+
+int ax_runner_ax650::invalidate_cached_outputs(const std::vector<ax_runner_tensor_t> &tensors)
+{
+    for (const auto &tensor : tensors)
+    {
+        if (tensor.phyAddr == 0 || mcached_phy_addrs_.find(tensor.phyAddr) == mcached_phy_addrs_.end())
+            continue;
+        const int sync_ret = AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+        if (sync_ret != 0)
+        {
+            ALOGE("AX_SYS_MinvalidateCache(%s) failed: 0x%x", tensor.sName.c_str(), sync_ret);
+            return sync_ret;
+        }
+    }
+    return 0;
 }
 
 int ax_runner_ax650::inference()
@@ -683,15 +750,23 @@ int ax_runner_ax650::inference()
     const bool force_runsync = std::getenv("AXLLM_AX650_FORCE_RUNSYNC") != nullptr;
     if (_auto_sync_before_inference)
     {
-        for (size_t i = 0; i < get_num_inputs(); i++)
+        if (axllm_ax650_blanket_auto_sync())
         {
-            auto &tensor = get_input(i);
-            int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
-            if (sync_ret != 0)
+            for (size_t i = 0; i < get_num_inputs(); i++)
             {
-                ALOGE("AX_SYS_MflushCache(input[%zu]) failed: 0x%x", i, sync_ret);
-                return sync_ret;
+                auto &tensor = get_input(i);
+                int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+                if (sync_ret != 0)
+                {
+                    ALOGE("AX_SYS_MflushCache(input[%zu]) failed: 0x%x", i, sync_ret);
+                    return sync_ret;
+                }
             }
+        }
+        else
+        {
+            const int sync_ret = flush_cached_inputs(minput_tensors);
+            if (sync_ret != 0) return sync_ret;
         }
     }
 
@@ -729,15 +804,23 @@ int ax_runner_ax650::inference()
 
     if (_auto_sync_after_inference)
     {
-        for (size_t i = 0; i < get_num_outputs(); i++)
+        if (axllm_ax650_blanket_auto_sync())
         {
-            auto &tensor = get_output(i);
-            int sync_ret = AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
-            if (sync_ret != 0)
+            for (size_t i = 0; i < get_num_outputs(); i++)
             {
-                ALOGE("AX_SYS_MinvalidateCache(output[%zu]) failed: 0x%x", i, sync_ret);
-                return sync_ret;
+                auto &tensor = get_output(i);
+                int sync_ret = AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+                if (sync_ret != 0)
+                {
+                    ALOGE("AX_SYS_MinvalidateCache(output[%zu]) failed: 0x%x", i, sync_ret);
+                    return sync_ret;
+                }
             }
+        }
+        else
+        {
+            const int sync_ret = invalidate_cached_outputs(moutput_tensors);
+            if (sync_ret != 0) return sync_ret;
         }
     }
     return 0;
@@ -785,15 +868,23 @@ int ax_runner_ax650::inference(int grpid)
 
     if (_auto_sync_before_inference)
     {
-        for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
+        if (axllm_ax650_blanket_auto_sync())
         {
-            auto &tensor = mgroup_input_tensors[grpid][i];
-            int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
-            if (sync_ret != 0)
+            for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
             {
-                ALOGE("AX_SYS_MflushCache(group=%d input[%zu]) failed: 0x%x", grpid, i, sync_ret);
-                return sync_ret;
+                auto &tensor = mgroup_input_tensors[grpid][i];
+                int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+                if (sync_ret != 0)
+                {
+                    ALOGE("AX_SYS_MflushCache(group=%d input[%zu]) failed: 0x%x", grpid, i, sync_ret);
+                    return sync_ret;
+                }
             }
+        }
+        else
+        {
+            const int sync_ret = flush_cached_inputs(mgroup_input_tensors[(size_t)grpid]);
+            if (sync_ret != 0) return sync_ret;
         }
     }
 
@@ -833,17 +924,108 @@ int ax_runner_ax650::inference(int grpid)
 
     if (_auto_sync_after_inference)
     {
-        for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
+        if (axllm_ax650_blanket_auto_sync())
         {
-            auto &tensor = mgroup_output_tensors[grpid][i];
-            int sync_ret = AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
-            if (sync_ret != 0)
+            for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
             {
-                ALOGE("AX_SYS_MinvalidateCache(group=%d output[%zu]) failed: 0x%x", grpid, i, sync_ret);
-                return sync_ret;
+                auto &tensor = mgroup_output_tensors[grpid][i];
+                int sync_ret = AX_SYS_MinvalidateCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+                if (sync_ret != 0)
+                {
+                    ALOGE("AX_SYS_MinvalidateCache(group=%d output[%zu]) failed: 0x%x", grpid, i, sync_ret);
+                    return sync_ret;
+                }
+            }
+        }
+        else
+        {
+            const int sync_ret = invalidate_cached_outputs(mgroup_output_tensors[(size_t)grpid]);
+            if (sync_ret != 0) return sync_ret;
+        }
+    }
+    return 0;
+}
+
+int ax_runner_ax650::alias_group_input(int grpid, const char *name, void *vir, uint64_t phy)
+{
+    if (!m_handle || grpid < 0 || grpid >= (int)m_handle->io_data.size())
+        return 1;
+    if (!m_handle->io_info[(size_t)grpid] || !m_handle->io_data[(size_t)grpid].pInputs || !vir || phy == 0)
+        return 1;
+
+    const std::string tensor_name = name ? name : "";
+    AX_ENGINE_IO_BUFFER_T *buffer = find_input_buffer_by_name(
+        m_handle->io_info[(size_t)grpid], &m_handle->io_data[(size_t)grpid], tensor_name);
+    if (!buffer || !buffer->pVirAddr || buffer->phyAddr == 0)
+        return 1;
+
+    auto &originals = input_alias_orig_[grpid];
+    bool already_recorded = false;
+    for (const auto &entry : originals)
+    {
+        if (entry.name == tensor_name)
+        {
+            already_recorded = true;
+            break;
+        }
+    }
+    if (!already_recorded)
+        originals.push_back({tensor_name, buffer->phyAddr, buffer->pVirAddr, buffer->nSize});
+
+    buffer->phyAddr = phy;
+    buffer->pVirAddr = vir;
+
+    // Keep the public tensor view consistent with the engine IO descriptor.
+    // The destination descriptor keeps its own nSize; callers must only alias
+    // tensors with an identical ABI size.
+    auto &tensors = mgroup_input_tensors[(size_t)grpid];
+    for (auto &tensor : tensors)
+    {
+        if (tensor.sName == tensor_name)
+        {
+            tensor.phyAddr = phy;
+            tensor.pVirAddr = vir;
+            break;
+        }
+    }
+    return 0;
+}
+
+int ax_runner_ax650::restore_group_input_aliases(int grpid)
+{
+    const auto original_it = input_alias_orig_.find(grpid);
+    if (original_it == input_alias_orig_.end())
+        return 0;
+
+    if (!m_handle || grpid < 0 || grpid >= (int)m_handle->io_data.size())
+        return -1;
+
+    auto &io = m_handle->io_data[(size_t)grpid];
+    auto *info = m_handle->io_info[(size_t)grpid];
+    auto &tensors = mgroup_input_tensors[(size_t)grpid];
+    for (const auto &entry : original_it->second)
+    {
+        if (info && io.pInputs)
+        {
+            AX_ENGINE_IO_BUFFER_T *buffer = find_input_buffer_by_name(info, &io, entry.name);
+            if (buffer)
+            {
+                buffer->phyAddr = entry.phy;
+                buffer->pVirAddr = entry.vir;
+                buffer->nSize = entry.nsize;
+            }
+        }
+        for (auto &tensor : tensors)
+        {
+            if (tensor.sName == entry.name)
+            {
+                tensor.phyAddr = entry.phy;
+                tensor.pVirAddr = entry.vir;
+                break;
             }
         }
     }
+    input_alias_orig_.erase(original_it);
     return 0;
 }
 
@@ -932,11 +1114,19 @@ int ax_runner_ax650::kv_cache_slots_alloc(int num_slots)
             memset(vir, 0, st.bytes);
             st.slot_phy[s] = phy;
             st.slot_vir[s] = vir;
+            if (!force_uncached && phy)
+                mcached_phy_addrs_.insert(phy);
         }
         if (!ok)
         {
             for (auto &st : kv_slot_tensors_)
-                if (st.slot_phy[s]) { AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]); st.slot_phy[s] = 0; st.slot_vir[s] = nullptr; }
+                if (st.slot_phy[s])
+                {
+                    mcached_phy_addrs_.erase(st.slot_phy[s]);
+                    AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]);
+                    st.slot_phy[s] = 0;
+                    st.slot_vir[s] = nullptr;
+                }
             break;
         }
         achieved = s + 1;
@@ -955,7 +1145,13 @@ int ax_runner_ax650::kv_cache_slots_set_count(int n)
     for (auto &st : kv_slot_tensors_)
     {
         for (int s = n; s < (int)st.slot_phy.size(); ++s)
-            if (st.slot_phy[s]) { AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]); st.slot_phy[s] = 0; st.slot_vir[s] = nullptr; }
+            if (st.slot_phy[s])
+            {
+                mcached_phy_addrs_.erase(st.slot_phy[s]);
+                AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]);
+                st.slot_phy[s] = 0;
+                st.slot_vir[s] = nullptr;
+            }
         if ((int)st.slot_phy.size() > n) { st.slot_phy.resize(n); st.slot_vir.resize(n); }
     }
     kv_num_slots_ = n;
@@ -1014,7 +1210,10 @@ void ax_runner_ax650::kv_cache_slots_release()
         for (int s = 1; s < (int)st.slot_phy.size(); ++s)
         {
             if (st.slot_phy[s])
+            {
+                mcached_phy_addrs_.erase(st.slot_phy[s]);
                 AX_SYS_MemFree(st.slot_phy[s], st.slot_vir[s]);
+            }
             st.slot_phy[s] = 0;
             st.slot_vir[s] = nullptr;
         }
