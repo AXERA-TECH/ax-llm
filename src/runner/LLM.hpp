@@ -198,6 +198,12 @@ public:
     std::vector<Content> Run(std::vector<Content> history, std::vector<MediaInputs> &media_inputs, int output_max_token = -1);
     std::vector<Content> Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token = -1);
     std::string Run(std::vector<unsigned short> &embed, int output_max_token = -1);
+    // Continue raw text without a chat template (OpenAI /v1/completions).
+    std::string RunPrompt(const std::string &prompt, int output_max_token = -1);
+    // Tokenizer access for /tokenize and /detokenize.
+    std::vector<int> Tokenize(const std::string &text);
+    std::vector<int> TokenizeHistory(const std::vector<Content> &history, bool add_generation_prompt);
+    std::string Detokenize(const std::vector<int> &ids);
 
 private:
     struct Impl;

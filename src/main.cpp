@@ -2497,7 +2497,7 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
             {
                 if (!call.is_object() || !call.contains("function") || !call["function"].is_object()) continue;
                 const auto &fn = call["function"];
-                nlohmann::json one;
+                nlohmann::ordered_json one; // {"name", "arguments"} in the model's own key order
                 one["name"] = fn.value("name", std::string());
                 nlohmann::json args = nlohmann::json::object();
                 if (fn.contains("arguments"))
@@ -2642,6 +2642,13 @@ int run_server_mode(const ModelConfig &config, int port)
 #endif
 
     g_server.setMaxConcurrency(1);
+    g_server.addJsonRoute("GET", "/version", [](const nlohmann::json &, nlohmann::json &out) -> int {
+        const std::string commit = AXLLM_GIT_COMMIT;
+        out["version"] = commit.empty() ? std::string("axllm") : "axllm-" + commit;
+        out["commit"] = AXLLM_GIT_COMMIT;
+        out["backend"] = AXLLM_BUILD_BACKEND;
+        return 200;
+    });
 
     std::string model_name = config.model_name;
 
@@ -3043,6 +3050,49 @@ int run_server_mode(const ModelConfig &config, int port)
                     provider->end();
                 };
 
+                if (req.is_completion) {
+                    // Legacy /v1/completions: continue the raw prompt (no chat template, reasoning split or tools).
+                    const int max_out = resolve_chat_output_max_tokens(config, req, llm.getAttr()->max_token_len);
+                    StopSequenceFilter stop_filter(req.stop);
+                    std::string text = req.echo ? req.prompt : std::string();
+                    if (req.stream && !text.empty()) provider->push(openai_api::OutputChunk::TextDelta(text, req.model));
+                    llm.getAttr()->runing_callback = [&](std::string str, float, void *) {
+                        if (!provider->is_writable()) { llm.Stop(); return; }
+                        if (stop_filter.hit()) return;
+                        const std::string out = stop_filter.push(str);
+                        if (stop_filter.hit()) llm.Stop();
+                        if (out.empty()) return;
+                        if (req.stream) provider->push(openai_api::OutputChunk::TextDelta(out, req.model));
+                        else text += out;
+                    };
+                    llm.RunPrompt(req.prompt, max_out);
+                    llm.getAttr()->runing_callback = nullptr;
+                    const std::string tail = stop_filter.flush();
+                    if (!tail.empty()) {
+                        if (req.stream) provider->push(openai_api::OutputChunk::TextDelta(tail, req.model));
+                        else text += tail;
+                    }
+                    const std::string llm_error = llm.GetLastError();
+                    if (!llm_error.empty()) {
+                        llm.ResetKVCache();
+                        push_chat_error("model_error", llm_error);
+                        return;
+                    }
+                    auto fin = openai_api::OutputChunk::FinalText(req.stream ? std::string() : text, req.model);
+                    fin.usage.prompt_tokens = llm.GetLastPromptTokenNum();
+                    fin.usage.completion_tokens = llm.GetLastCompletionTokenNum();
+                    fin.usage.total_tokens = fin.usage.prompt_tokens + fin.usage.completion_tokens;
+                    fin.usage.ttft_ms = llm.GetLastTtftMs();
+                    fin.usage.decode_tps = llm.GetLastDecodeTps();
+                    fin.usage.prefill_tps = llm.GetLastPrefillTps();
+                    fin.usage.prefill_tokens = llm.GetLastPrefillTokens();
+                    fin.obj["finish_reason"] = stop_filter.hit() ? "stop"
+                                               : (llm.GetLastFinishReason() == "length" ? "length" : "stop");
+                    provider->push(fin);
+                    provider->end();
+                    return;
+                }
+
                 std::vector<Content> history;
                 std::vector<MediaInputs> media_inputs;
                 std::vector<std::string> temp_files;
@@ -3318,6 +3368,60 @@ int run_server_mode(const ModelConfig &config, int port)
 
                 cleanup_temp_files(temp_files);
                 provider->end(); }, options);
+
+            // vLLM-compatible utility endpoints.
+            auto tokenize_handler = [&llm](const nlohmann::json &body, nlohmann::json &out) -> int {
+                std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
+                std::vector<int> ids;
+                if (body.contains("messages")) {
+                    std::vector<Content> history;
+                    std::string err;
+                    if (!handle_api_messages(body["messages"], history, nullptr, nullptr, &err)) {
+                        out = {{"error", {{"message", err}, {"type", "invalid_request_error"}}}};
+                        return 400;
+                    }
+                    for (const auto &c : history) {
+                        if (c.type != TEXT) {
+                            out = {{"error", {{"message", "/tokenize accepts text messages only"}, {"type", "invalid_request_error"}}}};
+                            return 400;
+                        }
+                    }
+                    const bool with_tools = body.contains("tools") && body["tools"].is_array() && !body["tools"].empty();
+                    llm.SetTools(with_tools ? body["tools"].dump() : std::string()); // render tools like a chat request
+                    ids = llm.TokenizeHistory(history, body.value("add_generation_prompt", true));
+                    llm.SetTools(std::string());
+                } else if (body.contains("prompt") && body["prompt"].is_string()) {
+                    ids = llm.Tokenize(body["prompt"].get<std::string>());
+                } else {
+                    out = {{"error", {{"message", "'prompt' (string) or 'messages' is required"}, {"type", "invalid_request_error"}}}};
+                    return 400;
+                }
+                out["count"] = ids.size();
+                out["max_model_len"] = llm.getAttr()->max_token_len;
+                out["tokens"] = ids;
+                return 200;
+            };
+            auto detokenize_handler = [&llm](const nlohmann::json &body, nlohmann::json &out) -> int {
+                if (!body.contains("tokens") || !body["tokens"].is_array()) {
+                    out = {{"error", {{"message", "'tokens' (array of ints) is required"}, {"type", "invalid_request_error"}}}};
+                    return 400;
+                }
+                std::vector<int> ids;
+                for (const auto &t : body["tokens"]) {
+                    if (!t.is_number_integer()) {
+                        out = {{"error", {{"message", "'tokens' must contain integers"}, {"type", "invalid_request_error"}}}};
+                        return 400;
+                    }
+                    ids.push_back(t.get<int>());
+                }
+                std::lock_guard<std::mutex> llm_lock(g_llm_mutex);
+                out["prompt"] = llm.Detokenize(ids);
+                return 200;
+            };
+            g_server.addJsonRoute("POST", "/tokenize", tokenize_handler);
+            g_server.addJsonRoute("POST", "/v1/tokenize", tokenize_handler);
+            g_server.addJsonRoute("POST", "/detokenize", detokenize_handler);
+            g_server.addJsonRoute("POST", "/v1/detokenize", detokenize_handler);
 
             if (has_audio_encoder)
             {

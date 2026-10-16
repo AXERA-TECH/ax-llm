@@ -438,6 +438,7 @@ curl http://127.0.0.1:8000/v1/audio/translations \
 | 工具调用 | `tools`、`tool_choice`、`role: "tool"`，见 [docs/tool_calling.md](docs/tool_calling.md) |
 | 流式 | `stream_options.include_usage`；同一个流的 chunk 共用一个 id |
 | 其他 | 角色 `system` / `developer` / `user` / `assistant` / `tool`；客户端断开会立即停止生成；并发请求排队等待（最长 `server_timeout_ms`）；仅支持 `n=1` |
+| 其他接口 | `/v1/completions`（原始文本续写，`max_tokens` 默认 16，支持 `echo` / `stop` / 流式）、`/tokenize`、`/detokenize`（vLLM 格式，`/tokenize` 可带 `messages` 和 `tools`）、`/version`、`/metrics`（Prometheus，沿用 vLLM 指标名） |
 
 ### 多模态输入格式（与 OpenAI / vLLM / SGLang 对齐）
 

@@ -56,3 +56,7 @@ std::vector<Content> LLM::Run(std::vector<Content> history, int output_max_token
 std::vector<Content> LLM::Run(std::vector<Content> history, std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token, &media_inputs); }
 std::vector<Content> LLM::Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token); }
 std::string LLM::Run(std::vector<unsigned short> &embed, int output_max_token) { return impl_->Run(embed, output_max_token); }
+std::string LLM::RunPrompt(const std::string &prompt, int output_max_token) { return impl_->RunPrompt(prompt, output_max_token); }
+std::vector<int> LLM::Tokenize(const std::string &text) { return impl_->tokenizer ? impl_->tokenizer->encode(text) : std::vector<int>{}; }
+std::vector<int> LLM::TokenizeHistory(const std::vector<Content> &history, bool add_generation_prompt) { return impl_->tokenizer ? impl_->tokenizer->encode(history, add_generation_prompt) : std::vector<int>{}; }
+std::string LLM::Detokenize(const std::vector<int> &ids) { return impl_->tokenizer ? impl_->tokenizer->decode(ids) : std::string(); }

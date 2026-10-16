@@ -2354,6 +2354,8 @@ struct LLM::Impl : public IKvSlotHost {
 
 
     std::string Run(std::vector<unsigned short> &test_embed, int output_max_token = -1);
+    // Raw-text continuation (no chat template) for /v1/completions; never reuses or keeps chat KV state.
+    std::string RunPrompt(const std::string &prompt, int output_max_token = -1);
 
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1);
 
