@@ -17,7 +17,23 @@ git submodule update --init --recursive
 git submodule status
 ```
 
-**子模块获取限制：** 本分支固定的 `third_party/tokenizer.axera` 提交为 `404c00951dfa938a4e74c7b1452d0928e35b392a`。截至本次文档核查，该提交无法从 `.gitmodules` 配置的远程仓库获取，递归初始化可能报 `not our ref`。完整复现编译前，需要由维护者提供该精确版本的公开获取方式或配套源码。不要直接将其替换为最新 tokenizer 并假设 API、模板和多模态 token 行为一致。`third_party/openai-api.cpp` 和 `third_party/SimpleCV` 的当前固定提交可从各自配置的远程获取。
+`third_party/tokenizer.axera` 使用 `.gitmodules` 中指定的依赖仓库，其配套分支为 `feat/chat-lora-task-runtime`。访问私有依赖仓库需要预先获得授权，并为 Git 配置相应的 HTTPS 凭据；主仓库的访问权限不代表同时拥有私有子模块权限。没有依赖仓库权限时，需要先由交付方提供访问权限或匹配版本的源码包。
+
+本分支固定的子模块版本如下。普通 `git submodule update --init --recursive` 按主仓库记录的精确提交检出，`.gitmodules` 的分支名称不替代该固定版本；复现时不要使用 `--remote` 升级依赖，也不要直接替换为最新 tokenizer 并假设 API、模板和多模态 token 行为一致。
+
+| 子模块 | 固定提交 |
+| --- | --- |
+| `third_party/tokenizer.axera` | `404c00951dfa938a4e74c7b1452d0928e35b392a` |
+| `third_party/openai-api.cpp` | `14db1ad0cdd6d3af4d031d7376ff182336c28fbb` |
+| `third_party/SimpleCV` | `7729953c7c75ffaea441f70e0a9eb62790f3eb2b` |
+
+已有克隆在更新本分支后，应同步子模块地址，再初始化：
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+git submodule status
+```
 
 依赖齐备后，在支持的 Linux 交叉编译环境中使用仓库脚本：
 
@@ -272,7 +288,7 @@ LoRA 改变各层隐状态，旧 adapter 下产生的 K/V 无法作为新 adapte
 
 | 现象 | 优先检查 |
 | --- | --- |
-| 子模块初始化 `not our ref` | 是否能获取本分支固定的 tokenizer 提交 |
+| 私有子模块无法访问，或出现 `not our ref` | 仓库访问权限、Git 凭据、是否同步了 `.gitmodules` 地址，以及固定提交是否可获取 |
 | 缺失 `lora_*` 输入 | 是否误用了普通 AXModel，或编译图删掉了 LoRA 分支 |
 | adapter 文件长度不匹配 | rank、投影维度、层号、dtype、padding 和打包顺序 |
 | 加载成功但答案异常 | 基座版本、B 是否重复缩放、文件内容与参考输出 |
