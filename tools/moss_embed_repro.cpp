@@ -120,7 +120,7 @@ int main(int argc, char **argv)
         return seg;
     };
 
-    llm.SetRequestSamplingOverride(true, 0.0f, false, 0.0f, false, 0.0f, false, 0.0f); // greedy
+    { SamplingRequest greedy; greedy.has_temperature = true; greedy.temperature = 0.0f; llm.SetRequestSamplingOverride(greedy); }
 
     auto pre_len = [&]() {
         std::vector<std::vector<unsigned short>> k, v;

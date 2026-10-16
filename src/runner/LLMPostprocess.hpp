@@ -12,20 +12,13 @@
 #include "utils/bfloat16.hpp"
 #include "utils/json.hpp"
 #include "utils/sample_log.h"
+#include "SamplingRequest.hpp"
 
 class LLMPostprocess
 {
 private:
-    struct RequestSamplingOverride
+    struct RequestSamplingOverride : SamplingRequest
     {
-        bool has_temperature = false;
-        float temperature = 1.0f;
-        bool has_top_p = false;
-        float top_p = 1.0f;
-        bool has_frequency_penalty = false;
-        float frequency_penalty = 0.0f;
-        bool has_presence_penalty = false;
-        float presence_penalty = 0.0f;
         bool force_greedy = false;
     };
 
@@ -36,6 +29,7 @@ private:
         bool enable_repetition_penalty = false;
         float repetition_penalty = 1.0f;
         int penalty_window = 20;
+        bool repetition_penalty_hf = false; // request-level: HF rule over all generated tokens
         bool enable_frequency_penalty = false;
         float frequency_penalty = 0.0f;
         bool enable_presence_penalty = false;
@@ -47,8 +41,17 @@ private:
         float top_p = 1.0f;
         bool enable_top_k_sampling = false;
         int top_k = 1;
+        float min_p = 0.0f;
         bool greedy = false;
     };
+
+    // Sampling RNG for the decoding thread; set_request_sampling_override() seeds it from a
+    // request seed so sampled outputs are reproducible.
+    static std::mt19937_64 &rng()
+    {
+        static thread_local std::mt19937_64 gen(std::random_device{}());
+        return gen;
+    }
 
     static thread_local RequestSamplingOverride &request_override()
     {
@@ -66,14 +69,16 @@ private:
     }
 
     // 防止重复
+    // HF / vLLM repetition penalty: every token seen so far has its logit divided by `penalty`
+    // when positive and multiplied by it when negative (once per distinct token).
     void apply_repetition_penalty(std::vector<float> &logits, const std::vector<int> &history, float penalty)
     {
-        for (int token : history)
+        if (penalty == 1.0f || penalty <= 0.0f) return;
+        std::unordered_set<int> seen(history.begin(), history.end());
+        for (int token : seen)
         {
-            if (token < logits.size())
-            {
-                logits[token] = logits[token] < 0 ? logits[token] * penalty : logits[token] / penalty;
-            }
+            if (token < 0 || token >= (int)logits.size()) continue;
+            logits[token] = logits[token] < 0 ? logits[token] * penalty : logits[token] / penalty;
         }
     }
 
@@ -198,135 +203,6 @@ private:
         return probs;
     }
 
-    // 	动态裁剪低概率 token
-    int faster_top_p_sampling(const std::vector<float> &logits, float top_p)
-    {
-        // 计算softmax
-        std::vector<float> probs = softmax(logits);
-
-        // 构建最大堆（概率和索引的配对）
-        std::vector<std::pair<float, size_t>> prob_index;
-        prob_index.reserve(logits.size());
-        for (size_t i = 0; i < logits.size(); ++i)
-        {
-            prob_index.emplace_back(probs[i], i);
-        }
-        auto cmp = [](const auto &a, const auto &b)
-        { return a.first < b.first; };
-        std::make_heap(prob_index.begin(), prob_index.end(), cmp);
-
-        // 提取top-p元素
-        std::vector<size_t> filtered_indices;
-        std::vector<float> filtered_probs;
-        float cumulative_prob = 0.0f;
-
-        while (!prob_index.empty() && cumulative_prob < top_p)
-        {
-            std::pop_heap(prob_index.begin(), prob_index.end(), cmp);
-            auto [prob, index] = prob_index.back();
-            prob_index.pop_back();
-
-            cumulative_prob += prob;
-            filtered_indices.push_back(index);
-            filtered_probs.push_back(prob);
-
-            if (cumulative_prob >= top_p)
-                break;
-        }
-
-        // 处理边缘情况（概率全零时返回第一个元素）
-        if (filtered_indices.empty())
-            return 0;
-
-        // 使用thread_local随机数生成器（线程安全）
-        static thread_local std::mt19937 gen(std::random_device{}());
-        std::discrete_distribution<int> dist(filtered_probs.begin(), filtered_probs.end());
-        return filtered_indices[dist(gen)];
-    }
-    int top_p_sampling(const std::vector<float> &logits, float top_p)
-    {
-        std::vector<float> probs = softmax(logits);
-
-        // Sort indices by probability in descending order
-        std::vector<size_t> indices(logits.size());
-        std::iota(indices.begin(), indices.end(), 0);
-        std::sort(indices.begin(), indices.end(), [&](size_t i, size_t j)
-                  { return probs[i] > probs[j]; });
-
-        // Compute cumulative probabilities
-        float cumulative_prob = 0.0f;
-        size_t cut_off = 0;
-        for (; cut_off < indices.size(); ++cut_off)
-        {
-            cumulative_prob += probs[indices[cut_off]];
-            if (cumulative_prob >= top_p)
-                break;
-        }
-
-        // Keep only the top-p probabilities
-        std::vector<size_t> filtered_indices(indices.begin(), indices.begin() + cut_off + 1);
-        std::vector<float> filtered_probs(filtered_indices.size());
-        for (size_t i = 0; i < filtered_indices.size(); ++i)
-        {
-            filtered_probs[i] = probs[filtered_indices[i]];
-        }
-
-        // Normalize the probabilities
-        float filtered_sum = std::accumulate(filtered_probs.begin(), filtered_probs.end(), 0.0f);
-        for (float &p : filtered_probs)
-        {
-            p /= filtered_sum;
-        }
-
-        // Sample from the filtered distribution
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::discrete_distribution<int> dist(filtered_probs.begin(), filtered_probs.end());
-        return filtered_indices[dist(gen)];
-    }
-
-    // 限制候选 token 数
-    int top_k_sampling(const std::vector<float> &logits, int k)
-    {
-        if (logits.empty())
-            return 0;
-        // Clamp k to vocab size; k > logits.size() reads past the end in
-        // partial_sort / the copy below (out-of-bounds crash).
-        if (k > (int)logits.size())
-            k = (int)logits.size();
-        if (k < 1)
-            return argmax_index(logits);
-        // std::vector<float> probs = softmax(logits);
-
-        // 获取 top-k 索引
-        std::vector<size_t> indices(logits.size());
-        std::iota(indices.begin(), indices.end(), 0);
-        std::partial_sort(indices.begin(), indices.begin() + k, indices.end(), [&](size_t i, size_t j)
-                          { return logits[i] > logits[j]; });
-
-        // 仅保留 top-k 概率
-        std::vector<size_t> filtered_indices(indices.begin(), indices.begin() + k);
-        std::vector<float> filtered_probs(k);
-        for (size_t i = 0; i < k; ++i)
-        {
-            filtered_probs[i] = logits[filtered_indices[i]];
-        }
-        filtered_probs = softmax(filtered_probs);
-
-        // 归一化
-        float sum = std::accumulate(filtered_probs.begin(), filtered_probs.end(), 0.0f);
-        for (float &p : filtered_probs)
-        {
-            p /= sum;
-        }
-
-        // 采样
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::discrete_distribution<int> dist(filtered_probs.begin(), filtered_probs.end());
-        return filtered_indices[dist(gen)];
-    }
-
     bool enable_temperature = false;
     float temperature = 1.0f;
 
@@ -395,6 +271,18 @@ private:
 
         eff.enable_top_k_sampling = enable_top_k_sampling;
         eff.top_k = top_k;
+        if (ov.has_top_k)
+        {
+            eff.enable_top_k_sampling = ov.top_k > 0;
+            eff.top_k = ov.top_k;
+        }
+        if (ov.has_min_p) eff.min_p = ov.min_p;
+        if (ov.has_repetition_penalty)
+        {
+            eff.enable_repetition_penalty = ov.repetition_penalty != 1.0f;
+            eff.repetition_penalty = ov.repetition_penalty;
+            eff.repetition_penalty_hf = true;
+        }
 
         if (ov.force_greedy)
         {
@@ -416,11 +304,7 @@ private:
         {
             if (eff.top_p >= 1.0f) eff.enable_top_p_sampling = false;
             if (eff.top_k < 1) eff.enable_top_k_sampling = false;
-            if (eff.enable_top_p_sampling && eff.enable_top_k_sampling)
-            {
-                ALOGW("Both top_p and top_k enabled; prefer top_p and disable top_k");
-                eff.enable_top_k_sampling = false;
-            }
+            if (!(eff.min_p > 0.0f && eff.min_p < 1.0f)) eff.min_p = 0.0f;
         }
 
         return eff;
@@ -429,14 +313,52 @@ private:
     // Multinomial sample over the full softmax distribution (logits already
     // temperature-scaled). Prevents "temperature enabled but no top_p/top_k"
     // from silently collapsing to greedy argmax.
-    int sample_from_distribution(const std::vector<float> &logits)
+    // Sample from softmax(logits) restricted by top_k (<= 0: off), then top_p (>= 1: off), then
+    // min_p (<= 0: off), in that order (as vLLM / HF do when several are set).
+    int sample_filtered(const std::vector<float> &logits, int top_k, float top_p, float min_p)
     {
         if (logits.empty())
             return 0;
-        std::vector<float> probs = softmax(logits);
-        static thread_local std::mt19937 gen(std::random_device{}());
-        std::discrete_distribution<int> dist(probs.begin(), probs.end());
-        return dist(gen);
+        std::vector<int> idx(logits.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        const auto by_logit = [&](int a, int b) { return logits[(size_t)a] > logits[(size_t)b]; };
+        if (top_k > 0 && top_k < (int)idx.size())
+        {
+            std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(), by_logit);
+            idx.resize((size_t)top_k);
+        }
+        else if (top_p < 1.0f || min_p > 0.0f)
+        {
+            std::sort(idx.begin(), idx.end(), by_logit);
+        }
+        const float max_logit = logits[(size_t)*std::max_element(idx.begin(), idx.end(), [&](int a, int b) { return logits[(size_t)a] < logits[(size_t)b]; })];
+        std::vector<double> probs(idx.size());
+        double sum = 0.0;
+        for (size_t i = 0; i < idx.size(); ++i)
+        {
+            probs[i] = std::exp((double)logits[(size_t)idx[i]] - (double)max_logit);
+            sum += probs[i];
+        }
+        size_t keep = idx.size();
+        if (top_p < 1.0f && sum > 0.0)
+        {
+            double cum = 0.0;
+            for (size_t i = 0; i < idx.size(); ++i)
+            {
+                cum += probs[i] / sum;
+                if (cum >= top_p) { keep = i + 1; break; }
+            }
+        }
+        if (min_p > 0.0f && !probs.empty())
+        {
+            // idx is sorted (top_p/min_p imply sorting), so probs[0] is the max.
+            const double floor_p = (double)min_p * probs[0];
+            size_t k = 1;
+            while (k < keep && probs[k] >= floor_p) ++k;
+            keep = k;
+        }
+        std::discrete_distribution<size_t> dist(probs.begin(), probs.begin() + (std::ptrdiff_t)keep);
+        return idx[dist(rng())];
     }
 
     int apply_logits(std::vector<float> &logits, const std::vector<int> &history, const EffectiveSampling &eff)
@@ -444,7 +366,12 @@ private:
         if (eff.enable_temperature)
             apply_temperature(logits, eff.temperature);
         if (eff.enable_repetition_penalty)
-            apply_repetition_penalty(logits, history, eff.repetition_penalty, eff.penalty_window);
+        {
+            if (eff.repetition_penalty_hf)
+                apply_repetition_penalty(logits, history, eff.repetition_penalty);
+            else
+                apply_repetition_penalty(logits, history, eff.repetition_penalty, eff.penalty_window);
+        }
         if (eff.enable_frequency_penalty || eff.enable_presence_penalty)
             apply_frequency_presence_penalty(logits, history,
                                              eff.enable_frequency_penalty ? eff.frequency_penalty : 0.0f,
@@ -455,40 +382,30 @@ private:
         if (pad_token_id >= 0 && pad_token_id < (int)logits.size())
             logits[(size_t)pad_token_id] = -std::numeric_limits<float>::infinity();
 
-        if (eff.enable_top_p_sampling)
-            return faster_top_p_sampling(logits, eff.top_p);
-        else if (eff.enable_top_k_sampling)
-            return top_k_sampling(logits, eff.top_k);
-        else if (eff.enable_temperature)
-            return sample_from_distribution(logits); // temperature set, no top_p/top_k -> sample (not greedy)
+        if (eff.enable_top_p_sampling || eff.enable_top_k_sampling || eff.min_p > 0.0f || eff.enable_temperature)
+            return sample_filtered(logits,
+                                   eff.enable_top_k_sampling ? eff.top_k : 0,
+                                   eff.enable_top_p_sampling ? eff.top_p : 1.0f,
+                                   eff.min_p);
         return argmax_index(logits);
     }
 
 public:
     LLMPostprocess() {}
 
-    void set_request_sampling_override(bool has_temperature, float temperature,
-                                       bool has_top_p, float top_p,
-                                       bool has_frequency_penalty, float frequency_penalty,
-                                       bool has_presence_penalty, float presence_penalty)
+    void set_request_sampling_override(const SamplingRequest &req)
     {
         auto &ov = request_override();
-        ov.has_temperature = has_temperature;
-        ov.temperature = temperature;
-        ov.has_top_p = has_top_p;
-        ov.top_p = top_p;
-        ov.has_frequency_penalty = has_frequency_penalty;
-        ov.frequency_penalty = frequency_penalty;
-        ov.has_presence_penalty = has_presence_penalty;
-        ov.presence_penalty = presence_penalty;
-        // Penalties are not samplers: a request carrying only freq/presence still
-        // runs greedy (penalties are applied to the argmax) unless it also asks
-        // for temperature/top_p.
-        ov.force_greedy = !has_temperature && !has_top_p;
+        static_cast<SamplingRequest &>(ov) = req;
+        // Penalties are not samplers: a request carrying only penalties still runs greedy
+        // (penalties are applied to the argmax) unless it also asks for a sampler.
+        ov.force_greedy = !req.has_temperature && !req.has_top_p && !req.has_top_k && !req.has_min_p;
+        if (req.has_seed) rng().seed(req.seed);
     }
 
     void clear_request_sampling_override()
     {
+        if (request_override().has_seed) rng().seed(std::random_device{}());
         request_override() = {};
     }
 

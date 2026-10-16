@@ -278,6 +278,9 @@ struct ModelConfig
     bool media_allow_remote = true;
     int media_fetch_timeout_s = 60;
     int media_max_mb = 256;
+    // Split <think>...</think> into message.reasoning_content (vLLM reasoning parser); false keeps
+    // the think block inside content.
+    bool server_reasoning_content = true;
     bool is_embedding = false;
     bool is_image_generation = false;
     std::string image_model_dir = ".";
@@ -750,6 +753,7 @@ struct ModelConfig
             if (j.contains("media_allow_remote")) media_allow_remote = j["media_allow_remote"].get<bool>();
             if (j.contains("media_fetch_timeout_s")) media_fetch_timeout_s = j["media_fetch_timeout_s"].get<int>();
             if (j.contains("media_max_mb")) media_max_mb = j["media_max_mb"].get<int>();
+            if (j.contains("server_reasoning_content")) server_reasoning_content = j["server_reasoning_content"].get<bool>();
 
             return true;
         }
@@ -2089,6 +2093,115 @@ private:
     bool hit_ = false;
 };
 
+// vLLM-style reasoning parser for <think>...</think> output (Qwen3 family and similar): the think
+// block goes to `reasoning_content`, the rest to `content`. Streaming text is fed with push(); a
+// tail that could still be part of a tag is held back until it is decided.
+class ReasoningSplitter
+{
+public:
+    struct Parts
+    {
+        std::string reasoning;
+        std::string content;
+    };
+
+    // starts_in_reasoning: output that does not open with <think> is still reasoning (thinking was
+    // requested, so a missing open tag means the template already emitted it).
+    explicit ReasoningSplitter(bool starts_in_reasoning) : default_reasoning_(starts_in_reasoning) {}
+
+    Parts push(const std::string &piece)
+    {
+        Parts out;
+        buf_ += piece;
+        while (true)
+        {
+            if (state_ == Start)
+            {
+                const size_t first = buf_.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) return out;
+                const std::string rest = buf_.substr(first);
+                if (rest.compare(0, kOpen.size(), kOpen) == 0)
+                {
+                    buf_ = rest.substr(kOpen.size());
+                    state_ = Reasoning;
+                    continue;
+                }
+                if (kOpen.compare(0, rest.size(), rest) == 0) return out; // could still become <think>
+                state_ = default_reasoning_ ? Reasoning : Content;
+                continue;
+            }
+            if (state_ == Reasoning)
+            {
+                const size_t close = buf_.find(kClose);
+                if (close != std::string::npos)
+                {
+                    out.reasoning += buf_.substr(0, close);
+                    buf_ = buf_.substr(close + kClose.size());
+                    state_ = AfterThink;
+                    continue;
+                }
+                const size_t hold = partial_tag_suffix(buf_, kClose);
+                out.reasoning += buf_.substr(0, buf_.size() - hold);
+                buf_.erase(0, buf_.size() - hold);
+                return out;
+            }
+            if (state_ == AfterThink)
+            {
+                const size_t first = buf_.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos)
+                {
+                    buf_.clear();
+                    return out;
+                }
+                buf_ = buf_.substr(first);
+                state_ = Content;
+                continue;
+            }
+            out.content += buf_;
+            buf_.clear();
+            return out;
+        }
+    }
+
+    Parts flush()
+    {
+        Parts out;
+        if (state_ == Reasoning || (state_ == Start && default_reasoning_)) out.reasoning = buf_;
+        else if (state_ != AfterThink) out.content = buf_;
+        buf_.clear();
+        return out;
+    }
+
+    // Whole-text split (non-streaming).
+    static Parts split(const std::string &text, bool starts_in_reasoning)
+    {
+        ReasoningSplitter sp(starts_in_reasoning);
+        Parts a = sp.push(text);
+        Parts b = sp.flush();
+        return {a.reasoning + b.reasoning, a.content + b.content};
+    }
+
+private:
+    enum State
+    {
+        Start,
+        Reasoning,
+        AfterThink,
+        Content
+    };
+    static size_t partial_tag_suffix(const std::string &s, const std::string &tag)
+    {
+        for (size_t k = std::min(tag.size() - 1, s.size()); k > 0; --k)
+            if (s.compare(s.size() - k, k, tag, 0, k) == 0) return k;
+        return 0;
+    }
+    const std::string kOpen = "<think>";
+    const std::string kClose = "</think>";
+    bool default_reasoning_ = false;
+    State state_ = Start;
+    std::string buf_;
+};
+
 static const char *media_type_name(ContentType t)
 {
     switch (t)
@@ -2518,6 +2631,8 @@ int run_server_mode(const ModelConfig &config, int port)
             timeout_ms = 300000;
         }
         g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+        // requests queue for the single inference slot as long as they may run
+        g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
         g_server.run(port);
     }
     else
@@ -2667,6 +2782,8 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+            // requests queue for the single inference slot as long as they may run
+            g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
             g_server.run(port);
         }
         else
@@ -2731,7 +2848,24 @@ int run_server_mode(const ModelConfig &config, int port)
                     {
                         if (enabled)
                         {
-                            llm.SetRequestSamplingOverride(req.has_temperature, req.temperature, req.has_top_p, req.top_p, req.has_frequency_penalty, req.frequency_penalty, req.has_presence_penalty, req.presence_penalty);
+                            SamplingRequest sr;
+                            sr.has_temperature = req.has_temperature;
+                            sr.temperature = req.temperature;
+                            sr.has_top_p = req.has_top_p;
+                            sr.top_p = req.top_p;
+                            sr.has_top_k = req.has_top_k;
+                            sr.top_k = req.top_k;
+                            sr.has_min_p = req.has_min_p;
+                            sr.min_p = req.min_p;
+                            sr.has_frequency_penalty = req.has_frequency_penalty;
+                            sr.frequency_penalty = req.frequency_penalty;
+                            sr.has_presence_penalty = req.has_presence_penalty;
+                            sr.presence_penalty = req.presence_penalty;
+                            sr.has_repetition_penalty = req.has_repetition_penalty;
+                            sr.repetition_penalty = req.repetition_penalty;
+                            sr.has_seed = req.has_seed;
+                            sr.seed = (uint64_t)req.seed;
+                            llm.SetRequestSamplingOverride(sr);
                         }
                     }
                     ~SamplingOverrideGuard()
@@ -2824,17 +2958,34 @@ int run_server_mode(const ModelConfig &config, int port)
                     chunk.obj["finish_reason"] = finish_reason();
                 };
 
+                // reasoning_content split (vLLM reasoning parser) or, when disabled, the legacy
+                // <think> markup kept inside content.
+                const bool split_reasoning = config.server_reasoning_content;
+                const bool prompt_opens_think = request_thinking_mode == ThinkingMode::Think;
+
                 if (req.stream) {
                     bool streamed_any = false;
-                    const bool emit_thinking_markup = should_emit_thinking_markup(request_thinking_mode);
+                    const bool emit_thinking_markup = !split_reasoning && should_emit_thinking_markup(request_thinking_mode);
                     bool thinking_open_emitted = false;
                     std::string streamed_text;
-                    auto emit = [provider,
-                                 model_id = req.model,
-                                 emit_thinking_markup,
-                                 &streamed_any,
-                                 &thinking_open_emitted,
-                                 &streamed_text](const std::string &str) {
+                    ReasoningSplitter splitter(prompt_opens_think);
+                    auto push_delta = [provider, model_id = req.model, &streamed_any](const std::string &text, bool reasoning) {
+                        if (text.empty()) return;
+                        streamed_any = true;
+                        auto chunk = openai_api::OutputChunk::TextDelta(reasoning ? std::string() : text, model_id);
+                        if (reasoning) chunk.obj["reasoning_content"] = text;
+                        provider->push(chunk);
+                        fprintf(stdout, "%s", text.c_str());
+                        fflush(stdout);
+                    };
+                    auto emit = [&](const std::string &str) {
+                        if (split_reasoning)
+                        {
+                            auto parts = splitter.push(str);
+                            push_delta(parts.reasoning, true);
+                            push_delta(parts.content, false);
+                            return;
+                        }
                         std::string out = str;
                         if (emit_thinking_markup)
                         {
@@ -2848,11 +2999,7 @@ int run_server_mode(const ModelConfig &config, int port)
                                 thinking_open_emitted = true;
                             }
                         }
-                        if (out.empty()) return;
-                        streamed_any = true;
-                        provider->push(openai_api::OutputChunk::TextDelta(out, model_id));
-                        fprintf(stdout, "%s", out.c_str());
-                        fflush(stdout);
+                        push_delta(out, false);
                     };
                     auto callback = [&llm, provider, &stop_filter, &emit](std::string str, float token_per_sec, void *reserve) {
                         if (!provider->is_writable()) {
@@ -2869,7 +3016,14 @@ int run_server_mode(const ModelConfig &config, int port)
                     if (!media_inputs.empty()) llm.Run(history, media_inputs, output_max_tokens);
                     else llm.Run(history, output_max_tokens);
                     llm.getAttr()->runing_callback = nullptr;
-                    if (provider->is_writable()) emit(stop_filter.flush());
+                    if (provider->is_writable()) {
+                        emit(stop_filter.flush());
+                        if (split_reasoning) {
+                            auto parts = splitter.flush();
+                            push_delta(parts.reasoning, true);
+                            push_delta(parts.content, false);
+                        }
+                    }
                     const std::string llm_error = llm.GetLastError();
                     if (!llm_error.empty()) {
                         ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
@@ -2925,11 +3079,19 @@ int run_server_mode(const ModelConfig &config, int port)
                         push_chat_error("model_error", "模型运行失败，请重新尝试。");
                         return;
                     }
-                    if (should_emit_thinking_markup(request_thinking_mode))
+                    std::string reasoning_text;
+                    if (split_reasoning)
+                    {
+                        auto parts = ReasoningSplitter::split(final_text, prompt_opens_think);
+                        reasoning_text = std::move(parts.reasoning);
+                        final_text = std::move(parts.content);
+                    }
+                    else if (should_emit_thinking_markup(request_thinking_mode))
                     {
                         final_text = wrap_thinking_text_for_client(final_text);
                     }
                     auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
+                    if (!reasoning_text.empty()) chunk.obj["reasoning_content"] = reasoning_text;
                     fill_usage(chunk);
                     fprintf(stdout, "%s", final_text.c_str());
                     fflush(stdout);
@@ -3011,6 +3173,8 @@ int run_server_mode(const ModelConfig &config, int port)
                 timeout_ms = 300000;
             }
             g_server.setTimeout(std::chrono::milliseconds(timeout_ms));
+            // requests queue for the single inference slot as long as they may run
+            g_server.setWaitTimeout(std::chrono::milliseconds(timeout_ms));
             g_server.run(port);
         }
         llm.Deinit();

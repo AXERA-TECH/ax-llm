@@ -206,7 +206,7 @@ int main(int argc, char **argv) {
         else hist.push_back({USER, media_type, user});
         turn_out.clear();
         llm.MarkRequestStart();
-        llm.SetRequestSamplingOverride(true, 0.0f, false, 0.0f, false, 0.0f, false, 0.0f); // greedy
+        { SamplingRequest greedy; greedy.has_temperature = true; greedy.temperature = 0.0f; llm.SetRequestSamplingOverride(greedy); }
         if (image.empty()) {
             hist = llm.Run(hist, max_tokens);
         } else {
