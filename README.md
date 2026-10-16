@@ -39,9 +39,11 @@
 
 我们的 ModelZoo 已迁移到 [Huggingface](https://huggingface.co/AXERA-TECH)
 
-## 当前分支（axllm）
+## 当前分支（feat/chat-lora-task-runtime）
 
 本分支统一输出可执行文件名为 `axllm`，根据运行环境自动选择 AX650 片上后端或 AXCL PCIe 后端。
+
+本分支增加 AX650 LoRA 矩阵输入加载与请求级 adapter 选择。完整的设计、适配步骤、权重格式、配置示例、切换行为和限制见 [LoRA 适配与运行时切换指南](docs/lora_matrix_input.md)。阅读该分支源码时应先阅读指南中的依赖完整性说明；通用安装脚本默认选择 `axllm` 分支，学习或编译本分支应使用指南中的显式分支命令。
 
 ### 安装方式（推荐）
 
