@@ -952,6 +952,7 @@ void LLM::Impl::Deinit()
     deinited_ = true;
 #ifdef USE_AXCL
     decode_io_share_end(); // never let deinit() see a buffer shared across layers
+    prefill_io_share_end();
 #endif
     for (size_t i = 0; i < llama_layers.size(); i++) llama_layers[i].layer.deinit();
     llama_post.deinit();

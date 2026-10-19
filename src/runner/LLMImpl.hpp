@@ -603,6 +603,135 @@ struct LLM::Impl : public IKvSlotHost {
         decode_io_owns_indices_.clear();
         decode_io_owns_mask_.clear();
     }
+
+    // ---- Prefill IO sharing (AXCL) ----
+    // The prefill loop has the round trips decode had: for every layer of every 128-token chunk it
+    // uploaded "indices" and "mask" (identical for all full-attention layers of a chunk), uploaded the
+    // hidden-state input and downloaded the output (512 KB each way for a 2048-wide model). For the
+    // chunk shape groups of a run, layers after the first on a device are bound to that first layer's
+    // "indices"/"mask" buffers and layer m to layer m-1's "output" as its "input", so a chunk uploads
+    // those once and the hidden state stays on the card. Whether a layer skips a copy is decided from
+    // the bound addresses, so any binding that could not be made keeps its copy. Bindings are restored
+    // when prefill ends (deinit() frees tensors by address). AXLLM_PREFILL_IO_SHARE=0 turns this off.
+    bool prefill_io_active_ = false;
+    std::vector<int> prefill_io_ref_; // per layer: the first layer on its device, which uploads indices/mask
+    std::vector<DecodeIoBinding> prefill_io_saved_;
+
+    bool prefill_io_share_allowed(bool keep_host_hidden) const
+    {
+        const char *env = std::getenv("AXLLM_PREFILL_IO_SHARE");
+        if (env && env[0] == '0') return false;
+        if (keep_host_hidden) return false;
+        if (dynamic_layer_load_enabled()) return false; // a reload re-applies the layer's own IO buffers
+        if (has_linear_attention_layers()) return false;
+        if (gemma4_per_layer_helper.enabled()) return false;
+        if (use_sparse_full_cache_mask()) return false;
+        for (int src : shared_kv_source_layers)
+            if (src >= 0) return false;
+        for (int m = 0; m < _attr.axmodel_num; ++m)
+            if (is_sliding_attention_layer(m)) return false; // its mask differs from the full-attention one
+        return _attr.axmodel_num > 1;
+    }
+
+    bool prefill_io_rebind_input(int layer_idx, int grpid, const char *name, unsigned long long phy, unsigned long size)
+    {
+        auto &runner = llama_layers[(size_t)layer_idx].layer;
+        const ax_runner_tensor_t *t = try_get_group_input_tensor(runner, grpid, name);
+        if (!t || (unsigned long)t->nSize != size) return false;
+        if (t->phyAddr == phy) return true;
+        const DecodeIoBinding saved{layer_idx, grpid, (int)t->nIdx, t->phyAddr, (unsigned long)t->nSize};
+        if (runner.set_input(grpid, (int)t->nIdx, phy, size) != 0) return false;
+        prefill_io_saved_.push_back(saved);
+        return true;
+    }
+
+    void prefill_io_share_begin(const std::vector<int> &grp_list, bool keep_host_hidden)
+    {
+        prefill_io_share_end();
+        if (!prefill_io_share_allowed(keep_host_hidden)) return;
+        const int n = _attr.axmodel_num;
+        std::vector<int> gids;
+        for (int g : grp_list)
+            if (std::find(gids.begin(), gids.end(), g) == gids.end()) gids.push_back(g);
+        prefill_io_ref_.assign((size_t)n, -1);
+        for (int m = 0; m < n; ++m)
+        {
+            const int devid = llama_layers[(size_t)m].layer.get_devid();
+            for (int r = 0; r <= m; ++r)
+                if (llama_layers[(size_t)r].layer.get_devid() == devid) { prefill_io_ref_[(size_t)m] = r; break; }
+        }
+        for (int m = 1; m < n; ++m)
+        {
+            auto &lyr = llama_layers[(size_t)m].layer;
+            const int ref = prefill_io_ref_[(size_t)m];
+            for (int g : gids)
+            {
+                if (prefill_gid_for_layer(m, g) != g) continue;
+                if (ref != m && prefill_gid_for_layer(ref, g) == g &&
+                    prefill_history_capacity_for_layer_group(m, g) == prefill_history_capacity_for_layer_group(ref, g))
+                {
+                    for (const char *name : {"indices", "mask"})
+                    {
+                        const ax_runner_tensor_t *r = try_get_group_input_tensor(llama_layers[(size_t)ref].layer, g, name);
+                        if (r) prefill_io_rebind_input(m, g, name, r->phyAddr, (unsigned long)r->nSize);
+                    }
+                }
+                auto &prev = llama_layers[(size_t)(m - 1)].layer;
+                if (prev.get_devid() == lyr.get_devid() && prefill_gid_for_layer(m - 1, g) == g)
+                {
+                    const ax_runner_tensor_t *out = try_get_group_output_tensor(prev, g, "output");
+                    if (out) prefill_io_rebind_input(m, g, "input", out->phyAddr, (unsigned long)out->nSize);
+                }
+            }
+        }
+        prefill_io_active_ = true;
+        ALOGI("prefill io share: %zu input bindings redirected", prefill_io_saved_.size());
+    }
+
+    // Layer m's `name` input is bound to the buffer its device's first layer uploads for the chunk.
+    bool prefill_io_uses_shared(int m, int gid, const char *name)
+    {
+        if (!prefill_io_active_ || m <= 0 || m >= (int)prefill_io_ref_.size()) return false;
+        const int ref = prefill_io_ref_[(size_t)m];
+        if (ref < 0 || ref == m) return false;
+        const ax_runner_tensor_t *t = try_get_group_input_tensor(llama_layers[(size_t)m].layer, gid, name);
+        const ax_runner_tensor_t *r = try_get_group_input_tensor(llama_layers[(size_t)ref].layer, gid, name);
+        return t && r && t->phyAddr == r->phyAddr;
+    }
+
+    // Layer m reads layer m-1's output buffer directly.
+    bool prefill_io_input_chained(int m, int gid)
+    {
+        if (!prefill_io_active_ || m <= 0) return false;
+        const ax_runner_tensor_t *in = try_get_group_input_tensor(llama_layers[(size_t)m].layer, gid, "input");
+        const ax_runner_tensor_t *out = try_get_group_output_tensor(llama_layers[(size_t)(m - 1)].layer, gid, "output");
+        return in && out && in->phyAddr == out->phyAddr;
+    }
+
+    // Nothing on the host needs layer m's whole output: the next layer reads it on the card, or m is the
+    // last layer (its last row is fetched separately for the post model).
+    bool prefill_io_output_chained(int m, int gid, int global_gid)
+    {
+        if (!prefill_io_active_) return false;
+        if (m == _attr.axmodel_num - 1) return true;
+        const int next_gid = prefill_gid_for_layer(m + 1, global_gid);
+        const ax_runner_tensor_t *in = try_get_group_input_tensor(llama_layers[(size_t)(m + 1)].layer, next_gid, "input");
+        const ax_runner_tensor_t *out = try_get_group_output_tensor(llama_layers[(size_t)m].layer, gid, "output");
+        return in && out && in->phyAddr == out->phyAddr;
+    }
+
+    void prefill_io_share_end()
+    {
+        for (auto it = prefill_io_saved_.rbegin(); it != prefill_io_saved_.rend(); ++it)
+            llama_layers[(size_t)it->layer].layer.set_input(it->grpid, it->idx, it->phy, it->size);
+        prefill_io_saved_.clear();
+        prefill_io_ref_.clear();
+        prefill_io_active_ = false;
+    }
+#else
+    bool prefill_io_uses_shared(int, int, const char *) { return false; }
+    bool prefill_io_input_chained(int, int) { return false; }
+    bool prefill_io_output_chained(int, int, int) { return false; }
 #endif
 
     static std::string context_limit_user_message()

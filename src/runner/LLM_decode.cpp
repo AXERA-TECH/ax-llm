@@ -368,6 +368,18 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         }
     }
 
+#ifdef USE_AXCL
+    // The host copy of each layer's output is only read by the vision deepstack merge, the per-layer
+    // inputs and the debug traces; those keep the per-layer upload/download path.
+    const bool prefill_keep_host_hidden = debug_prefill || use_per_layer_input ||
+                                          (has_vision_state && !vision_state.deepstack_features.empty());
+    prefill_io_share_begin(prefill_grp_list, prefill_keep_host_hidden);
+    struct PrefillIoShareGuard
+    {
+        Impl *self;
+        ~PrefillIoShareGuard() { self->prefill_io_share_end(); }
+    } prefill_io_share_guard{this};
+#endif
     for (int p = 0; p < prefill_split_num; p++)
     {
         if (b_stop.load(std::memory_order_relaxed)) break;
@@ -466,7 +478,8 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     }
                 }
             }
-            llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
+            if (!prefill_io_uses_shared(m, layer_prefill_grpid, "indices"))
+                llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
             if (prefill_profile_enabled) { prefill_profile.idx_ns += prefill_ns_since(prof_t); prof_t = prefill_now(); }
             auto &t_mask = lyr.layer.get_input(layer_prefill_grpid, "mask");
             if (is_linear_layer(m))
@@ -475,7 +488,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
                 llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), std::min((size_t)t_mask.nSize, linear_mask_tmp.size() * sizeof(unsigned short)), devid);
             }
-            else
+            else if (!prefill_io_uses_shared(m, layer_prefill_grpid, "mask"))
             {
                 mask_tmp.assign((size_t)_attr.prefill_token_num * (size_t)(layer_kv_cache_num + _attr.prefill_token_num), bf16.data);
                 if (use_sparse_full_cache_mask())
@@ -491,7 +504,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 std::vector<unsigned short> zero_embed(embed_tmp.size(), 0);
                 llm_h2d(LLM_WADDR(t_in), zero_embed.data(), zero_embed.size() * sizeof(unsigned short), devid);
             }
-            else
+            else if (!prefill_io_input_chained(m, layer_prefill_grpid))
             {
                 llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
             }
@@ -646,7 +659,17 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
 
             if (prefill_profile_enabled) { prefill_profile.kv_future_ns += prefill_ns_since(prof_t); prof_t = prefill_now(); }
             auto &t_out = lyr.layer.get_output(layer_prefill_grpid, "output");
-            llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
+            if (!prefill_io_output_chained(m, layer_prefill_grpid, prefill_grpid))
+            {
+                llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
+            }
+            else if (m == _attr.axmodel_num - 1 && p == prefill_split_num - 1)
+            {
+                // Only the chunk's last row feeds the post model.
+                const size_t row = (size_t)(input_num_token - 1) * (size_t)_attr.tokens_embed_size;
+                llm_d2h(embed_tmp.data() + row, (const unsigned short *)LLM_RADDR(t_out) + row,
+                        (size_t)_attr.tokens_embed_size * sizeof(unsigned short), devid);
+            }
             if (prefill_profile_enabled) prefill_profile.out_ns += prefill_ns_since(prof_t);
             if (debug_prefill) ALOGI("prefill layer %d output d2h done", m);
             if (std::getenv("AXLLM_DEBUG_DECODE_TRACE") &&
@@ -697,6 +720,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             memcpy(embed.data(), embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
     }
 
+#ifdef USE_AXCL
+    prefill_io_share_end();
+#endif
     int next_token = -1; t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
     bool b_hit_eos = false;
     if (use_per_layer_input)
