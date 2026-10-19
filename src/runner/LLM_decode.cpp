@@ -854,8 +854,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             else if (is_linear_layer(m))
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
-                std::vector<unsigned short> linear_decode_mask(elems, bf16_one.data);
-                if (linear_decode_mask.empty()) linear_decode_mask.push_back(bf16_one.data);
+                // at least one element; sized up front (GCC 15 flags the push_back growth path with
+                // -Werror=free-nonheap-object once Run() inlines differently)
+                std::vector<unsigned short> linear_decode_mask(std::max<size_t>(elems, 1), bf16_one.data);
                 llm_h2d(LLM_WADDR(t_mask), linear_decode_mask.data(), linear_decode_mask.size() * sizeof(unsigned short), devid);
             }
             else
@@ -1018,8 +1019,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (is_linear_layer(m))
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
-                std::vector<unsigned short> linear_decode_mask(elems, bf16_one.data);
-                if (linear_decode_mask.empty()) linear_decode_mask.push_back(bf16_one.data);
+                // at least one element; sized up front (GCC 15 flags the push_back growth path with
+                // -Werror=free-nonheap-object once Run() inlines differently)
+                std::vector<unsigned short> linear_decode_mask(std::max<size_t>(elems, 1), bf16_one.data);
                 memcpy(t_mask.pVirAddr, linear_decode_mask.data(), std::min((size_t)t_mask.nSize, linear_decode_mask.size() * sizeof(unsigned short)));
             }
             else
