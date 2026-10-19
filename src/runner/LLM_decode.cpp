@@ -128,9 +128,11 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
                     auto &gv = lyr.layer.get_input(gid, "V_cache");
                     const int cap_tokens_k = (int)(gk.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
                     const int cap_tokens_v = (int)(gv.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
-                    if (history_len + input_num_token <= cap_tokens_k)
+                    // Groups that share the decode buffer (the AXCL runner aliases them) already
+                    // hold this chunk: the copy above wrote the same bytes to the same address.
+                    if (history_len + input_num_token <= cap_tokens_k && LLM_WADDR(gk) != LLM_WADDR(dec_k))
                         llm_d2d((unsigned short *)LLM_WADDR(gk) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
-                    if (history_len + input_num_token <= cap_tokens_v)
+                    if (history_len + input_num_token <= cap_tokens_v && LLM_WADDR(gv) != LLM_WADDR(dec_v))
                         llm_d2d((unsigned short *)LLM_WADDR(gv) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
                 }
             }
@@ -631,10 +633,12 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                         if (LLM_WADDR(gk) == LLM_WADDR(dec_k)) ++prefill_profile.kv_future_same_buffer;
                         if (LLM_WADDR(gv) == LLM_WADDR(dec_v)) ++prefill_profile.kv_future_same_buffer;
                     }
-                    if (kv_off / layer_kv + input_num_token <= cap_tokens_k) {
+                    // Groups that share the decode buffer (the AXCL runner aliases them) already
+                    // hold this chunk: the copy above wrote the same bytes to the same address.
+                    if (kv_off / layer_kv + input_num_token <= cap_tokens_k && LLM_WADDR(gk) != LLM_WADDR(dec_k)) {
                         llm_d2d((unsigned short *)LLM_WADDR(gk) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
                     }
-                    if (kv_off / layer_kv + input_num_token <= cap_tokens_v) {
+                    if (kv_off / layer_kv + input_num_token <= cap_tokens_v && LLM_WADDR(gv) != LLM_WADDR(dec_v)) {
                         llm_d2d((unsigned short *)LLM_WADDR(gv) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
                     }
                 }
