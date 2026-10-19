@@ -476,7 +476,6 @@ bool LLM::Impl::Init(LLMAttrType attr)
     ALOGI("LLM init start");
     this->_attr = attr;
     deinited_ = false;
-    mem_guard_.capture_sentry_baseline();
     dynamic_layer_load_enabled_ = _attr.dynamic_load_enable;
     dynamic_layer_pool_size_ = _attr.dynamic_load_pool_size;
     if (dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ <= 0)
@@ -535,6 +534,8 @@ bool LLM::Impl::Init(LLMAttrType attr)
         }
     }
 #endif
+    // After axcl_Init, so the devices' AXCL workers answer the CMM query (see axcl_GetCMMRemain).
+    mem_guard_.capture_sentry_baseline();
 
     t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
     tokenizer = create_tokenizer(this->_attr.tokenizer_type);
