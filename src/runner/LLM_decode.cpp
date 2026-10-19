@@ -1,5 +1,7 @@
 // Auto-split from LLM.cpp/LLMImpl.hpp: generation/decode engine (LLM::Impl::Run + prefill).
 #include "LLMImpl.hpp"
+#include <filesystem>
+#include <fstream>
 
 int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
                            std::vector<std::vector<unsigned short>> &k_caches,
@@ -204,6 +206,14 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         std::getenv("AXLLM_DEBUG_PREFILL") ||
         std::getenv("AXLLM_DEBUG_LAYER0_IO") ||
         std::getenv("AXLLM_DEBUG_DECODE_TRACE");
+    // AX650 group outputs are not safely consumable through a plain host
+    // memcpy on every board/firmware combination.  An explicit D2H/D2D
+    // transaction creates the required output barrier and made repeated
+    // full-attention decode runs bit-stable.  Keep the old path available for
+    // binary search and performance regression testing.
+    const bool decode_explicit_output_d2h =
+        std::getenv("AXLLM_DISABLE_DECODE_EXPLICIT_D2H") == nullptr ||
+        std::string(std::getenv("AXLLM_DISABLE_DECODE_EXPLICIT_D2H")) != "1";
     std::string streamed_visible_text;
     std::string streamed_raw_visible_text;
     auto emit_stream_chunk = [&](const std::string &chunk, float tps)
@@ -267,6 +277,47 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
               step,
               chosen_token,
               safe_decode_token(tokenizer, chosen_token).c_str());
+    };
+    const char *prefill_dump_dir_text = std::getenv("AXLLM_DEBUG_PREFILL_DUMP");
+    const std::filesystem::path prefill_dump_dir(
+        prefill_dump_dir_text ? prefill_dump_dir_text : "/tmp/axllm_prefill_dump"
+    );
+    auto dump_prefill_bf16 = [&](const std::string &name, const ax_runner_tensor_t &tensor) {
+        if (!prefill_dump_dir_text || !tensor.pVirAddr || tensor.nSize == 0) return;
+        std::error_code ec;
+        std::filesystem::create_directories(prefill_dump_dir, ec);
+        if (ec) return;
+        std::ofstream out(prefill_dump_dir / (name + ".bf16"), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char *>(tensor.pVirAddr), tensor.nSize);
+    };
+    const char *decode_dump_dir_text = std::getenv("AXLLM_DEBUG_DECODE_DUMP");
+    const std::filesystem::path decode_dump_dir(
+        decode_dump_dir_text ? decode_dump_dir_text : "/tmp/axllm_decode_dump"
+    );
+    const int decode_dump_start_token = decode_dump_dir_text
+        ? std::max(0, atoi(std::getenv("AXLLM_DEBUG_DECODE_DUMP_START_TOKEN") ? std::getenv("AXLLM_DEBUG_DECODE_DUMP_START_TOKEN") : "0"))
+        : 0;
+    auto dump_debug_tensor = [&](const std::string &name, const ax_runner_tensor_t &tensor) {
+        size_t token_pos = name.find("token_");
+        int dump_token = token_pos == std::string::npos ? 0 : std::atoi(name.c_str() + token_pos + 6);
+        if (!decode_dump_dir_text || dump_token < decode_dump_start_token || !tensor.pVirAddr || tensor.nSize == 0) return;
+        std::error_code ec;
+        std::filesystem::create_directories(decode_dump_dir, ec);
+        if (ec) return;
+        std::ofstream out(decode_dump_dir / (name + ".bin"), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char *>(tensor.pVirAddr), tensor.nSize);
+    };
+    auto dump_debug_device_tensor = [&](const std::string &name, const ax_runner_tensor_t &tensor, int devid) {
+        size_t token_pos = name.find("token_");
+        int dump_token = token_pos == std::string::npos ? 0 : std::atoi(name.c_str() + token_pos + 6);
+        if (!decode_dump_dir_text || dump_token < decode_dump_start_token || tensor.nSize == 0) return;
+        std::vector<char> host(tensor.nSize);
+        llm_d2h(host.data(), LLM_RADDR(tensor), tensor.nSize, devid);
+        std::error_code ec;
+        std::filesystem::create_directories(decode_dump_dir, ec);
+        if (ec) return;
+        std::ofstream out(decode_dump_dir / (name + ".bin"), std::ios::binary | std::ios::trunc);
+        out.write(host.data(), host.size());
     };
     bfloat16 bf16 = -65536.f;
     bfloat16 bf16_one = 1.0f;
@@ -730,6 +781,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             }
 
             auto &t_out = lyr.layer.get_output(layer_prefill_grpid, "output");
+            dump_prefill_bf16(
+                "chunk" + std::to_string(p) + "_layer" + std::to_string(m) + "_output",
+                t_out
+            );
             llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
             if (debug_prefill) ALOGI("prefill layer %d output d2h done", m);
             if (std::getenv("AXLLM_DEBUG_DECODE_TRACE") &&
@@ -1157,6 +1212,28 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                        std::min((size_t)t_per_layer->nSize, (size_t)per_layer_hidden * sizeof(unsigned short)));
             }
             auto &t_in  = lyr.layer.get_input(layer_decode_grpid, "input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
+            dump_debug_device_tensor(
+                "token_" + std::to_string(token_ids.size()) +
+                "_layer_" + std::to_string(m) + "_pre_K_state",
+                in_k,
+                devid
+            );
+            dump_debug_device_tensor(
+                "token_" + std::to_string(token_ids.size()) +
+                "_layer_" + std::to_string(m) + "_pre_V_state",
+                in_v,
+                devid
+            );
+            dump_debug_tensor(
+                "token_" + std::to_string(token_ids.size()) +
+                "_layer_" + std::to_string(m) + "_mask",
+                t_mask
+            );
+            dump_debug_tensor(
+                "token_" + std::to_string(token_ids.size()) +
+                "_layer_" + std::to_string(m) + "_indices",
+                t_idx
+            );
             if (decode_profile_enabled)
                 decode_profile.prep_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - prep_t0).count();
             const auto infer_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
@@ -1200,17 +1277,60 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                         const size_t tail_off = (dst_tokens - 1) * (size_t)layer_kv;
                         // See the AXCL branch above: shared layers must retain the
                         // source layer KV in their visible past cache.
-                        memcpy(in_k_ptr + cur_off, in_k_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
-                        memcpy(in_v_ptr + cur_off, in_v_ptr + tail_off, sizeof(unsigned short) * (size_t)layer_kv);
+                        const size_t copy_bytes = sizeof(unsigned short) * (size_t)layer_kv;
+                        if (decode_explicit_output_d2h)
+                        {
+                            llm_d2d(in_k_ptr + cur_off, in_k_ptr + tail_off, copy_bytes, devid);
+                            llm_d2d(in_v_ptr + cur_off, in_v_ptr + tail_off, copy_bytes, devid);
+                        }
+                        else
+                        {
+                            memcpy(in_k_ptr + cur_off, in_k_ptr + tail_off, copy_bytes);
+                            memcpy(in_v_ptr + cur_off, in_v_ptr + tail_off, copy_bytes);
+                        }
                     }
                 }
                 else
                 {
-                    memcpy(in_k_ptr + kv_slot * layer_kv, out_k.pVirAddr, sizeof(unsigned short) * layer_kv);
-                    memcpy(in_v_ptr + kv_slot * layer_kv, out_v.pVirAddr, sizeof(unsigned short) * layer_kv);
+                    const size_t copy_bytes = sizeof(unsigned short) * (size_t)layer_kv;
+                    if (decode_explicit_output_d2h)
+                    {
+                        llm_d2d(in_k_ptr + kv_slot * layer_kv, LLM_RADDR(out_k), copy_bytes, devid);
+                        llm_d2d(in_v_ptr + kv_slot * layer_kv, LLM_RADDR(out_v), copy_bytes, devid);
+                    }
+                    else
+                    {
+                        memcpy(in_k_ptr + kv_slot * layer_kv, out_k.pVirAddr, copy_bytes);
+                        memcpy(in_v_ptr + kv_slot * layer_kv, out_v.pVirAddr, copy_bytes);
+                    }
                 }
             }
-            auto &t_out= lyr.layer.get_output(layer_decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
+            auto &debug_decode_out = lyr.layer.get_output(layer_decode_grpid, "output");
+            dump_debug_device_tensor(
+                "token_" + std::to_string(token_ids.size()) +
+                "_layer_" + std::to_string(m) + "_output",
+                debug_decode_out,
+                devid
+            );
+            dump_debug_tensor(
+                "token_" + std::to_string(token_ids.size()) +
+                "_layer_" + std::to_string(m) + "_K_state",
+                in_k
+            );
+            dump_debug_tensor(
+                "token_" + std::to_string(token_ids.size()) +
+                "_layer_" + std::to_string(m) + "_V_state",
+                in_v
+            );
+            auto &t_out= lyr.layer.get_output(layer_decode_grpid, "output");
+            if (decode_explicit_output_d2h)
+            {
+                llm_d2h(embed.data(), LLM_RADDR(t_out), embed.size() * sizeof(unsigned short), devid);
+            }
+            else
+            {
+                memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
+            }
             if (decode_profile_enabled)
                 decode_profile.outcopy_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - out_t0).count();
         }
@@ -1228,6 +1348,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         }
         auto &t_out = llama_post.get_output("output");
         unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
+        dump_debug_tensor("token_" + std::to_string(token_ids.size()) + "_post_logits", t_out);
         dump_decode_trace((int)token_ids.size(), post_out, _attr.tokens_embed_num, next_token);
         if (decode_profile_enabled)
             decode_profile.post_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - post_t0).count();

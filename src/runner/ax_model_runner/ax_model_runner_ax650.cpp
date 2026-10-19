@@ -78,10 +78,24 @@ static bool axllm_ax650_blanket_auto_sync()
 static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data,
                                  std::pair<AX_ENGINE_ALLOC_BUFFER_STRATEGY_T, AX_ENGINE_ALLOC_BUFFER_STRATEGY_T> strategy,
                                  std::vector<std::string> skip_alloc_names = {},
-                                 std::unordered_set<unsigned long long> *cached_phy_addrs = nullptr)
+                                 std::unordered_set<unsigned long long> *cached_phy_addrs = nullptr,
+                                 int grpid = -1)
 {
     const bool force_uncached = std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr;
-    if (force_uncached)
+    bool uncached_full_attention_group = false;
+    if (axllm_env_flag_enabled("AXLLM_AX650_UNCACHED_FULL_ATTN_IO"))
+    {
+        for (uint i = 0; i < info->nInputSize; ++i)
+        {
+            const char *name = info->pInputs[i].pName ? info->pInputs[i].pName : "";
+            if (std::strcmp(name, "kv_block_count") == 0)
+            {
+                uncached_full_attention_group = true;
+                break;
+            }
+        }
+    }
+    if (force_uncached || uncached_full_attention_group)
     {
         strategy.first = AX_ENGINE_ABST_DEFAULT;
         strategy.second = AX_ENGINE_ABST_DEFAULT;
@@ -98,7 +112,12 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
         {
             continue;
         }
-        if (strategy.first == AX_ENGINE_ABST_CACHED)
+        const char *input_name = info->pInputs[i].pName ? info->pInputs[i].pName : "";
+        const bool selective_uncached_input =
+            axllm_env_flag_enabled("AXLLM_AX650_UNCACHED_SMALL_INPUTS") &&
+            std::strcmp(input_name, "K_cache") != 0 &&
+            std::strcmp(input_name, "V_cache") != 0;
+        if (strategy.first == AX_ENGINE_ABST_CACHED && !selective_uncached_input)
         {
             ret = AX_SYS_MemAllocCached((AX_U64 *)(&buffer.phyAddr), &buffer.pVirAddr, buffer.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
         }
@@ -124,7 +143,24 @@ static int prepare_io_with_alloc(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_d
         {
             continue;
         }
-        if (strategy.second == AX_ENGINE_ABST_CACHED)
+        const char *output_name = info->pOutputs[i].pName ? info->pOutputs[i].pName : "";
+        bool full_attention_group = false;
+        if (axllm_env_flag_enabled("AXLLM_AX650_UNCACHED_FULL_ATTN_OUTPUTS"))
+        {
+            for (uint j = 0; j < info->nInputSize; ++j)
+            {
+                const char *input_name = info->pInputs[j].pName ? info->pInputs[j].pName : "";
+                if (std::strcmp(input_name, "kv_block_count") == 0)
+                {
+                    full_attention_group = true;
+                    break;
+                }
+            }
+        }
+        const bool selective_uncached_output =
+            axllm_env_flag_enabled("AXLLM_AX650_UNCACHED_DECODE_OUTPUT") &&
+            grpid == 0 && std::strcmp(output_name, "output") == 0;
+        if (strategy.second == AX_ENGINE_ABST_CACHED && !selective_uncached_output && !full_attention_group)
         {
             ret = AX_SYS_MemAllocCached((AX_U64 *)(&buffer.phyAddr), &buffer.pVirAddr, buffer.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
         }
@@ -213,7 +249,8 @@ int ax_runner_ax650::sub_init()
                                         &m_handle->io_data[grpid],
                                         {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED},
                                         {},
-                                        &mcached_phy_addrs_);
+                                        &mcached_phy_addrs_,
+                                        (int)grpid);
         }
         // Keep the original AX650 multi-group behavior for KV-cache sharing.
         else if (grpid == 0)
@@ -222,7 +259,8 @@ int ax_runner_ax650::sub_init()
                                         &m_handle->io_data[grpid],
                                         {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED},
                                         {},
-                                        &mcached_phy_addrs_);
+                                        &mcached_phy_addrs_,
+                                        (int)grpid);
         }
         else if (grpid == io_count - 1)
         {
@@ -230,7 +268,8 @@ int ax_runner_ax650::sub_init()
                                         &m_handle->io_data[grpid],
                                         {AX_ENGINE_ABST_DEFAULT, AX_ENGINE_ABST_CACHED},
                                         skip_alloc_names,
-                                        &mcached_phy_addrs_);
+                                        &mcached_phy_addrs_,
+                                        (int)grpid);
         }
         else
         {
@@ -264,7 +303,9 @@ int ax_runner_ax650::sub_init()
             auto *first_info = m_handle->io_info[0];
             auto &first_data = m_handle->io_data[0];
             if (!first_info || !first_data.pInputs) return 0;
-            const bool force_uncached = std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr;
+            const bool force_uncached =
+                std::getenv("AXLLM_AX650_UNCACHED_IO") != nullptr ||
+                axllm_env_flag_enabled("AXLLM_AX650_UNCACHED_KV");
 
             for (size_t i = 0; i < first_info->nInputSize && i < first_data.nInputSize; ++i)
             {
@@ -748,6 +789,7 @@ int ax_runner_ax650::inference()
         return -1;
 
     const bool force_runsync = std::getenv("AXLLM_AX650_FORCE_RUNSYNC") != nullptr;
+    const int cache_sync_passes = axllm_env_flag_enabled("AXLLM_AX650_DOUBLE_CACHE_SYNC") ? 2 : 1;
     if (_auto_sync_before_inference)
     {
         if (axllm_ax650_blanket_auto_sync())
@@ -833,6 +875,7 @@ int ax_runner_ax650::inference(int grpid)
     if (grpid < 0 || grpid >= (int)m_handle->io_data.size())
         return -1;
     const bool force_runsync = std::getenv("AXLLM_AX650_FORCE_RUNSYNC") != nullptr;
+    const int cache_sync_passes = axllm_env_flag_enabled("AXLLM_AX650_DOUBLE_CACHE_SYNC") ? 2 : 1;
 
     if (std::getenv("AXLLM_DEBUG_LAYER0_IO"))
     {
@@ -868,23 +911,26 @@ int ax_runner_ax650::inference(int grpid)
 
     if (_auto_sync_before_inference)
     {
-        if (axllm_ax650_blanket_auto_sync())
+        for (int pass = 0; pass < cache_sync_passes; ++pass)
         {
-            for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
+            if (axllm_ax650_blanket_auto_sync())
             {
-                auto &tensor = mgroup_input_tensors[grpid][i];
-                int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
-                if (sync_ret != 0)
+                for (size_t i = 0; i < mgroup_input_tensors[grpid].size(); i++)
                 {
-                    ALOGE("AX_SYS_MflushCache(group=%d input[%zu]) failed: 0x%x", grpid, i, sync_ret);
-                    return sync_ret;
+                    auto &tensor = mgroup_input_tensors[grpid][i];
+                    int sync_ret = AX_SYS_MflushCache(tensor.phyAddr, tensor.pVirAddr, tensor.nSize);
+                    if (sync_ret != 0)
+                    {
+                        ALOGE("AX_SYS_MflushCache(group=%d input[%zu]) failed: 0x%x", grpid, i, sync_ret);
+                        return sync_ret;
+                    }
                 }
             }
-        }
-        else
-        {
-            const int sync_ret = flush_cached_inputs(mgroup_input_tensors[(size_t)grpid]);
-            if (sync_ret != 0) return sync_ret;
+            else
+            {
+                const int sync_ret = flush_cached_inputs(mgroup_input_tensors[(size_t)grpid]);
+                if (sync_ret != 0) return sync_ret;
+            }
         }
     }
 
@@ -924,8 +970,10 @@ int ax_runner_ax650::inference(int grpid)
 
     if (_auto_sync_after_inference)
     {
-        if (axllm_ax650_blanket_auto_sync())
+        for (int pass = 0; pass < cache_sync_passes; ++pass)
         {
+            if (axllm_ax650_blanket_auto_sync())
+            {
             for (size_t i = 0; i < mgroup_output_tensors[grpid].size(); i++)
             {
                 auto &tensor = mgroup_output_tensors[grpid][i];
@@ -942,6 +990,7 @@ int ax_runner_ax650::inference(int grpid)
             const int sync_ret = invalidate_cached_outputs(mgroup_output_tensors[(size_t)grpid]);
             if (sync_ret != 0) return sync_ret;
         }
+    }
     }
     return 0;
 }
