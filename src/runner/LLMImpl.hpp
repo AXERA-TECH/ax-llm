@@ -603,6 +603,200 @@ struct LLM::Impl : public IKvSlotHost {
         decode_io_owns_indices_.clear();
         decode_io_owns_mask_.clear();
     }
+
+    // ---- Prefill IO sharing (AXCL) ----
+    // The prefill loop has the round trips decode had: for every layer of every 128-token chunk it
+    // uploaded "indices" and "mask" (identical for all full-attention layers of a chunk), uploaded the
+    // hidden-state input and downloaded the output (512 KB each way for a 2048-wide model). For the
+    // chunk shape groups of a run, layers after the first on a device are bound to that first layer's
+    // "indices"/"mask" buffers and layer m to layer m-1's "output" as its "input", so a chunk uploads
+    // those once and the hidden state stays on the card. Whether a layer skips a copy is decided from
+    // the bound addresses, so any binding that could not be made keeps its copy. Bindings are restored
+    // when prefill ends (deinit() frees tensors by address). AXLLM_PREFILL_IO_SHARE=0 turns this off.
+    bool prefill_io_active_ = false;
+    std::vector<int> prefill_io_ref_; // per layer: the first layer on its device, which uploads indices/mask
+    std::vector<DecodeIoBinding> prefill_io_saved_;
+    // K/V written straight into the cache, as decode_kv_bind_slot does per token: before a chunk runs, a
+    // layer's K_cache_out/V_cache_out are re-pointed at rows [history_len, history_len + prefill_token_num)
+    // of its decode K_cache/V_cache. The chunk's past-cache mask opens only [0, history_len), so the layer
+    // never reads what it writes there. Rows after the chunk's last token receive the padding rows' K/V;
+    // they stay masked until decode or a later prefill overwrites them, as stale cache rows always were.
+    // This drops the two per-layer D2D copies of each chunk. It does not depend on the host keeping the
+    // hidden state, so it also runs where the IO share is off for that reason (vision deepstack, debug).
+    // AXLLM_PREFILL_KV_DIRECT=0 turns it off; it is independent of AXLLM_PREFILL_IO_SHARE.
+    bool prefill_kv_direct_ = false;
+    std::vector<std::pair<int, int>> prefill_kv_redirected_; // (layer, group) whose K/V outputs are re-pointed
+
+    bool prefill_io_share_allowed(bool keep_host_hidden) const
+    {
+        const char *env = std::getenv("AXLLM_PREFILL_IO_SHARE");
+        if (env && env[0] == '0') return false;
+        if (keep_host_hidden) return false;
+        return prefill_io_rebind_allowed();
+    }
+
+    // Model features that keep both the IO share and the direct K/V write off.
+    bool prefill_io_rebind_allowed() const
+    {
+        if (dynamic_layer_load_enabled()) return false; // a reload re-applies the layer's own IO buffers
+        if (has_linear_attention_layers()) return false;
+        if (gemma4_per_layer_helper.enabled()) return false;
+        if (use_sparse_full_cache_mask()) return false;
+        for (int src : shared_kv_source_layers)
+            if (src >= 0) return false;
+        for (int m = 0; m < _attr.axmodel_num; ++m)
+            if (is_sliding_attention_layer(m)) return false; // its mask differs from the full-attention one
+        return _attr.axmodel_num > 1;
+    }
+
+    bool prefill_io_rebind_input(int layer_idx, int grpid, const char *name, unsigned long long phy, unsigned long size)
+    {
+        auto &runner = llama_layers[(size_t)layer_idx].layer;
+        const ax_runner_tensor_t *t = try_get_group_input_tensor(runner, grpid, name);
+        if (!t || (unsigned long)t->nSize != size) return false;
+        if (t->phyAddr == phy) return true;
+        const DecodeIoBinding saved{layer_idx, grpid, (int)t->nIdx, t->phyAddr, (unsigned long)t->nSize};
+        if (runner.set_input(grpid, (int)t->nIdx, phy, size) != 0) return false;
+        prefill_io_saved_.push_back(saved);
+        return true;
+    }
+
+    void prefill_io_share_begin(const std::vector<int> &grp_list, bool keep_host_hidden)
+    {
+        prefill_io_share_end();
+        const char *kv_env = std::getenv("AXLLM_PREFILL_KV_DIRECT");
+        prefill_kv_direct_ = prefill_io_rebind_allowed() && !(kv_env && kv_env[0] == '0');
+        if (!prefill_io_share_allowed(keep_host_hidden)) return;
+        const int n = _attr.axmodel_num;
+        std::vector<int> gids;
+        for (int g : grp_list)
+            if (std::find(gids.begin(), gids.end(), g) == gids.end()) gids.push_back(g);
+        prefill_io_ref_.assign((size_t)n, -1);
+        for (int m = 0; m < n; ++m)
+        {
+            const int devid = llama_layers[(size_t)m].layer.get_devid();
+            for (int r = 0; r <= m; ++r)
+                if (llama_layers[(size_t)r].layer.get_devid() == devid) { prefill_io_ref_[(size_t)m] = r; break; }
+        }
+        for (int m = 1; m < n; ++m)
+        {
+            auto &lyr = llama_layers[(size_t)m].layer;
+            const int ref = prefill_io_ref_[(size_t)m];
+            for (int g : gids)
+            {
+                if (prefill_gid_for_layer(m, g) != g) continue;
+                if (ref != m && prefill_gid_for_layer(ref, g) == g &&
+                    prefill_history_capacity_for_layer_group(m, g) == prefill_history_capacity_for_layer_group(ref, g))
+                {
+                    for (const char *name : {"indices", "mask"})
+                    {
+                        const ax_runner_tensor_t *r = try_get_group_input_tensor(llama_layers[(size_t)ref].layer, g, name);
+                        if (r) prefill_io_rebind_input(m, g, name, r->phyAddr, (unsigned long)r->nSize);
+                    }
+                }
+                auto &prev = llama_layers[(size_t)(m - 1)].layer;
+                if (prev.get_devid() == lyr.get_devid() && prefill_gid_for_layer(m - 1, g) == g)
+                {
+                    const ax_runner_tensor_t *out = try_get_group_output_tensor(prev, g, "output");
+                    if (out) prefill_io_rebind_input(m, g, "input", out->phyAddr, (unsigned long)out->nSize);
+                }
+            }
+        }
+        prefill_io_active_ = true;
+        ALOGI("prefill io share: %zu input bindings redirected", prefill_io_saved_.size());
+    }
+
+    // Layer m's `name` input is bound to the buffer its device's first layer uploads for the chunk.
+    bool prefill_io_uses_shared(int m, int gid, const char *name)
+    {
+        if (!prefill_io_active_ || m <= 0 || m >= (int)prefill_io_ref_.size()) return false;
+        const int ref = prefill_io_ref_[(size_t)m];
+        if (ref < 0 || ref == m) return false;
+        const ax_runner_tensor_t *t = try_get_group_input_tensor(llama_layers[(size_t)m].layer, gid, name);
+        const ax_runner_tensor_t *r = try_get_group_input_tensor(llama_layers[(size_t)ref].layer, gid, name);
+        return t && r && t->phyAddr == r->phyAddr;
+    }
+
+    // Layer m reads layer m-1's output buffer directly.
+    bool prefill_io_input_chained(int m, int gid)
+    {
+        if (!prefill_io_active_ || m <= 0) return false;
+        const ax_runner_tensor_t *in = try_get_group_input_tensor(llama_layers[(size_t)m].layer, gid, "input");
+        const ax_runner_tensor_t *out = try_get_group_output_tensor(llama_layers[(size_t)(m - 1)].layer, gid, "output");
+        return in && out && in->phyAddr == out->phyAddr;
+    }
+
+    // Nothing on the host needs layer m's whole output: the next layer reads it on the card, or m is the
+    // last layer (its last row is fetched separately for the post model).
+    bool prefill_io_output_chained(int m, int gid, int global_gid)
+    {
+        if (!prefill_io_active_) return false;
+        if (m == _attr.axmodel_num - 1) return true;
+        const int next_gid = prefill_gid_for_layer(m + 1, global_gid);
+        const ax_runner_tensor_t *in = try_get_group_input_tensor(llama_layers[(size_t)(m + 1)].layer, next_gid, "input");
+        const ax_runner_tensor_t *out = try_get_group_output_tensor(llama_layers[(size_t)m].layer, gid, "output");
+        return in && out && in->phyAddr == out->phyAddr;
+    }
+
+    void prefill_kv_restore_outputs(int layer_idx, int gid)
+    {
+        const auto it = std::find(prefill_kv_redirected_.begin(), prefill_kv_redirected_.end(), std::make_pair(layer_idx, gid));
+        if (it == prefill_kv_redirected_.end()) return;
+        prefill_kv_redirected_.erase(it);
+        auto &runner = llama_layers[(size_t)layer_idx].layer;
+        // set_output() leaves the tensor table untouched, so it still holds the original buffers.
+        for (const char *name : {"K_cache_out", "V_cache_out"})
+        {
+            const ax_runner_tensor_t *t = try_get_group_output_tensor(runner, gid, name);
+            if (t) runner.set_output(gid, (int)t->nIdx, t->phyAddr, (unsigned long)t->nSize);
+        }
+    }
+
+    // Returns true when this chunk's K/V outputs of layer_idx now land directly in rows
+    // [history_len, history_len + prefill_token_num) of dec_k/dec_v. Otherwise the outputs are on their
+    // own buffers again and the caller copies.
+    bool prefill_kv_bind_rows(int layer_idx, int gid, const ax_runner_tensor_t &dec_k, const ax_runner_tensor_t &dec_v,
+                              int history_len)
+    {
+        if (!prefill_kv_direct_) return false;
+        auto &runner = llama_layers[(size_t)layer_idx].layer;
+        const ax_runner_tensor_t *out_k = try_get_group_output_tensor(runner, gid, "K_cache_out");
+        const ax_runner_tensor_t *out_v = try_get_group_output_tensor(runner, gid, "V_cache_out");
+        const size_t row_bytes = (size_t)kv_cache_size_for_layer(layer_idx) * sizeof(unsigned short);
+        const size_t chunk_bytes = (size_t)_attr.prefill_token_num * row_bytes;
+        const size_t off = (size_t)std::max(0, history_len) * row_bytes;
+        if (!out_k || !out_v || (size_t)out_k->nSize != chunk_bytes || (size_t)out_v->nSize != chunk_bytes ||
+            off + chunk_bytes > (size_t)dec_k.nSize || off + chunk_bytes > (size_t)dec_v.nSize)
+        {
+            prefill_kv_restore_outputs(layer_idx, gid); // an earlier chunk may have re-pointed this group
+            return false;
+        }
+        if (std::find(prefill_kv_redirected_.begin(), prefill_kv_redirected_.end(), std::make_pair(layer_idx, gid)) ==
+            prefill_kv_redirected_.end())
+            prefill_kv_redirected_.emplace_back(layer_idx, gid);
+        if (runner.set_output(gid, (int)out_k->nIdx, dec_k.phyAddr + off, (unsigned long)chunk_bytes) == 0 &&
+            runner.set_output(gid, (int)out_v->nIdx, dec_v.phyAddr + off, (unsigned long)chunk_bytes) == 0)
+            return true;
+        prefill_kv_restore_outputs(layer_idx, gid); // half-applied: fall back to the copy path
+        return false;
+    }
+
+    void prefill_io_share_end()
+    {
+        while (!prefill_kv_redirected_.empty())
+            prefill_kv_restore_outputs(prefill_kv_redirected_.back().first, prefill_kv_redirected_.back().second);
+        prefill_kv_direct_ = false;
+        for (auto it = prefill_io_saved_.rbegin(); it != prefill_io_saved_.rend(); ++it)
+            llama_layers[(size_t)it->layer].layer.set_input(it->grpid, it->idx, it->phy, it->size);
+        prefill_io_saved_.clear();
+        prefill_io_ref_.clear();
+        prefill_io_active_ = false;
+    }
+#else
+    bool prefill_io_uses_shared(int, int, const char *) { return false; }
+    bool prefill_io_input_chained(int, int) { return false; }
+    bool prefill_io_output_chained(int, int, int) { return false; }
+    bool prefill_kv_bind_rows(int, int, const ax_runner_tensor_t &, const ax_runner_tensor_t &, int) { return false; }
 #endif
 
     static std::string context_limit_user_message()
@@ -880,6 +1074,17 @@ struct LLM::Impl : public IKvSlotHost {
                 devid);
     }
 
+    // Shape groups can share one K/V buffer (the AXCL runner points every group at the same memory
+    // when a model has more than two groups), so clearing per group zeroed the same bytes once per
+    // group. Each start address is collected once, with the largest size seen for it.
+    static void add_kv_clear_range(std::vector<std::pair<void *, size_t>> &ranges, void *addr, size_t size)
+    {
+        if (!addr || !size) return;
+        for (auto &r : ranges)
+            if (r.first == addr) { r.second = std::max(r.second, size); return; }
+        ranges.emplace_back(addr, size);
+    }
+
     void clear_all_group_kv_cache_tensors()
     {
         for (int i = 0; i < _attr.axmodel_num; ++i)
@@ -887,6 +1092,7 @@ struct LLM::Impl : public IKvSlotHost {
             auto &lyr = llama_layers[i];
             const int devid = LLM_DEVID(lyr);
             const int ng = lyr.layer.get_num_input_groups();
+            std::vector<std::pair<void *, size_t>> ranges;
             for (int gid = 0; gid < ng; ++gid)
             {
                 // Some models/backends may not map KV cache buffers into CPU virtual address
@@ -894,17 +1100,10 @@ struct LLM::Impl : public IKvSlotHost {
                 // is best-effort: skip tensors that are missing or not writable from host.
                 const auto *k = try_get_group_input_tensor(lyr.layer, gid, "K_cache");
                 const auto *v = try_get_group_input_tensor(lyr.layer, gid, "V_cache");
-                if (k)
-                {
-                    void *kaddr = LLM_WADDR(*k);
-                    if (kaddr && k->nSize) llm_memset(kaddr, 0, k->nSize, devid);
-                }
-                if (v)
-                {
-                    void *vaddr = LLM_WADDR(*v);
-                    if (vaddr && v->nSize) llm_memset(vaddr, 0, v->nSize, devid);
-                }
+                if (k) add_kv_clear_range(ranges, LLM_WADDR(*k), k->nSize);
+                if (v) add_kv_clear_range(ranges, LLM_WADDR(*v), v->nSize);
             }
+            for (const auto &r : ranges) llm_memset(r.first, 0, r.second, devid);
         }
     }
 
@@ -2257,13 +2456,15 @@ struct LLM::Impl : public IKvSlotHost {
         {
             auto &lyr  = llama_layers[i]; int devid = LLM_DEVID(lyr);
             const int ng = lyr.layer.get_num_input_groups();
+            std::vector<std::pair<void *, size_t>> ranges; // see add_kv_clear_range
             for (int gid = 0; gid < ng; ++gid)
             {
                 auto &k = lyr.layer.get_input(gid, "K_cache");
                 auto &v = lyr.layer.get_input(gid, "V_cache");
-                llm_memset(LLM_WADDR(k), 0, k.nSize, devid);
-                llm_memset(LLM_WADDR(v), 0, v.nSize, devid);
+                add_kv_clear_range(ranges, LLM_WADDR(k), k.nSize);
+                add_kv_clear_range(ranges, LLM_WADDR(v), v.nSize);
             }
+            for (const auto &r : ranges) llm_memset(r.first, 0, r.second, devid);
         }
     }
 

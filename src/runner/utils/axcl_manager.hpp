@@ -13,6 +13,12 @@
 #include "ax_cmm_utils.hpp"
 #include "sample_log.h"
 
+// Free CMM in MB of the device bound to the calling thread, from AXCL_SYS_MemQueryStatus (looked up in
+// libaxcl_sys at run time), or -1 when that library or call is unavailable. Sets *sys_inited when it had
+// to initialise the SYS module; the caller deinitialises it (axcl_sys_deinit) on the same thread.
+int axcl_sys_cmm_remain_mb(bool *sys_inited);
+void axcl_sys_deinit();
+
 class AXCLWorker
 {
 private:
@@ -24,6 +30,7 @@ private:
     std::atomic<bool> stop_flag;
 
     std::promise<bool> initPromise;
+    bool sys_inited = false; // AXCL_SYS_Init was called on the worker thread (for the CMM query)
 
     void run(int devid)
     {
@@ -77,6 +84,7 @@ private:
             }
             task();
         }
+        if (sys_inited) axcl_sys_deinit();
         ALOGI("AXCLWorker exit with devid %d", devid);
     }
 
@@ -137,6 +145,10 @@ private:
     axclError axclrtMemset_func(void *devPtr, uint8_t value, size_t count)
     {
         return axclrtMemset(devPtr, value, count);
+    }
+    int cmmRemainMB_func()
+    {
+        return axcl_sys_cmm_remain_mb(&sys_inited);
     }
     axclError axclrtMemcpy_func(void *dstPtr, const void *srcPtr, size_t count, axclrtMemcpyKind kind)
     {
@@ -421,6 +433,11 @@ public:
     axclError axclFreeHost(void *hostPtr)
     {
         auto future_result = addTaskWithResult(&AXCLWorker::axclrtFreeHost_func, this, hostPtr);
+        return future_result.get();
+    }
+    int cmmRemainMB()
+    {
+        auto future_result = addTaskWithResult(&AXCLWorker::cmmRemainMB_func, this);
         return future_result.get();
     }
     axclError axclMemset(void *devPtr, uint8_t value, size_t count)
