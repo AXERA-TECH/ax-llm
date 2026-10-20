@@ -616,12 +616,28 @@ struct LLM::Impl : public IKvSlotHost {
     bool prefill_io_active_ = false;
     std::vector<int> prefill_io_ref_; // per layer: the first layer on its device, which uploads indices/mask
     std::vector<DecodeIoBinding> prefill_io_saved_;
+    // K/V written straight into the cache, as decode_kv_bind_slot does per token: before a chunk runs, a
+    // layer's K_cache_out/V_cache_out are re-pointed at rows [history_len, history_len + prefill_token_num)
+    // of its decode K_cache/V_cache. The chunk's past-cache mask opens only [0, history_len), so the layer
+    // never reads what it writes there. Rows after the chunk's last token receive the padding rows' K/V;
+    // they stay masked until decode or a later prefill overwrites them, as stale cache rows always were.
+    // This drops the two per-layer D2D copies of each chunk. It does not depend on the host keeping the
+    // hidden state, so it also runs where the IO share is off for that reason (vision deepstack, debug).
+    // AXLLM_PREFILL_KV_DIRECT=0 turns it off; it is independent of AXLLM_PREFILL_IO_SHARE.
+    bool prefill_kv_direct_ = false;
+    std::vector<std::pair<int, int>> prefill_kv_redirected_; // (layer, group) whose K/V outputs are re-pointed
 
     bool prefill_io_share_allowed(bool keep_host_hidden) const
     {
         const char *env = std::getenv("AXLLM_PREFILL_IO_SHARE");
         if (env && env[0] == '0') return false;
         if (keep_host_hidden) return false;
+        return prefill_io_rebind_allowed();
+    }
+
+    // Model features that keep both the IO share and the direct K/V write off.
+    bool prefill_io_rebind_allowed() const
+    {
         if (dynamic_layer_load_enabled()) return false; // a reload re-applies the layer's own IO buffers
         if (has_linear_attention_layers()) return false;
         if (gemma4_per_layer_helper.enabled()) return false;
@@ -648,6 +664,8 @@ struct LLM::Impl : public IKvSlotHost {
     void prefill_io_share_begin(const std::vector<int> &grp_list, bool keep_host_hidden)
     {
         prefill_io_share_end();
+        const char *kv_env = std::getenv("AXLLM_PREFILL_KV_DIRECT");
+        prefill_kv_direct_ = prefill_io_rebind_allowed() && !(kv_env && kv_env[0] == '0');
         if (!prefill_io_share_allowed(keep_host_hidden)) return;
         const int n = _attr.axmodel_num;
         std::vector<int> gids;
@@ -720,8 +738,54 @@ struct LLM::Impl : public IKvSlotHost {
         return in && out && in->phyAddr == out->phyAddr;
     }
 
+    void prefill_kv_restore_outputs(int layer_idx, int gid)
+    {
+        const auto it = std::find(prefill_kv_redirected_.begin(), prefill_kv_redirected_.end(), std::make_pair(layer_idx, gid));
+        if (it == prefill_kv_redirected_.end()) return;
+        prefill_kv_redirected_.erase(it);
+        auto &runner = llama_layers[(size_t)layer_idx].layer;
+        // set_output() leaves the tensor table untouched, so it still holds the original buffers.
+        for (const char *name : {"K_cache_out", "V_cache_out"})
+        {
+            const ax_runner_tensor_t *t = try_get_group_output_tensor(runner, gid, name);
+            if (t) runner.set_output(gid, (int)t->nIdx, t->phyAddr, (unsigned long)t->nSize);
+        }
+    }
+
+    // Returns true when this chunk's K/V outputs of layer_idx now land directly in rows
+    // [history_len, history_len + prefill_token_num) of dec_k/dec_v. Otherwise the outputs are on their
+    // own buffers again and the caller copies.
+    bool prefill_kv_bind_rows(int layer_idx, int gid, const ax_runner_tensor_t &dec_k, const ax_runner_tensor_t &dec_v,
+                              int history_len)
+    {
+        if (!prefill_kv_direct_) return false;
+        auto &runner = llama_layers[(size_t)layer_idx].layer;
+        const ax_runner_tensor_t *out_k = try_get_group_output_tensor(runner, gid, "K_cache_out");
+        const ax_runner_tensor_t *out_v = try_get_group_output_tensor(runner, gid, "V_cache_out");
+        const size_t row_bytes = (size_t)kv_cache_size_for_layer(layer_idx) * sizeof(unsigned short);
+        const size_t chunk_bytes = (size_t)_attr.prefill_token_num * row_bytes;
+        const size_t off = (size_t)std::max(0, history_len) * row_bytes;
+        if (!out_k || !out_v || (size_t)out_k->nSize != chunk_bytes || (size_t)out_v->nSize != chunk_bytes ||
+            off + chunk_bytes > (size_t)dec_k.nSize || off + chunk_bytes > (size_t)dec_v.nSize)
+        {
+            prefill_kv_restore_outputs(layer_idx, gid); // an earlier chunk may have re-pointed this group
+            return false;
+        }
+        if (std::find(prefill_kv_redirected_.begin(), prefill_kv_redirected_.end(), std::make_pair(layer_idx, gid)) ==
+            prefill_kv_redirected_.end())
+            prefill_kv_redirected_.emplace_back(layer_idx, gid);
+        if (runner.set_output(gid, (int)out_k->nIdx, dec_k.phyAddr + off, (unsigned long)chunk_bytes) == 0 &&
+            runner.set_output(gid, (int)out_v->nIdx, dec_v.phyAddr + off, (unsigned long)chunk_bytes) == 0)
+            return true;
+        prefill_kv_restore_outputs(layer_idx, gid); // half-applied: fall back to the copy path
+        return false;
+    }
+
     void prefill_io_share_end()
     {
+        while (!prefill_kv_redirected_.empty())
+            prefill_kv_restore_outputs(prefill_kv_redirected_.back().first, prefill_kv_redirected_.back().second);
+        prefill_kv_direct_ = false;
         for (auto it = prefill_io_saved_.rbegin(); it != prefill_io_saved_.rend(); ++it)
             llama_layers[(size_t)it->layer].layer.set_input(it->grpid, it->idx, it->phy, it->size);
         prefill_io_saved_.clear();
@@ -732,6 +796,7 @@ struct LLM::Impl : public IKvSlotHost {
     bool prefill_io_uses_shared(int, int, const char *) { return false; }
     bool prefill_io_input_chained(int, int) { return false; }
     bool prefill_io_output_chained(int, int, int) { return false; }
+    bool prefill_kv_bind_rows(int, int, const ax_runner_tensor_t &, const ax_runner_tensor_t &, int) { return false; }
 #endif
 
     static std::string context_limit_user_message()
