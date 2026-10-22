@@ -435,6 +435,14 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         !has_vision_state && !use_per_layer_input && !debug_prefill &&
         std::getenv("AXLLM_DEBUG_DECODE_TRACE") == nullptr &&
         std::getenv("AXLLM_DEBUG_PREFILL_DUMP") == nullptr;
+    // Fixed query-profile graphs mask padding rows, but still expose a full
+    // q128 input tensor.  For a short final chunk, copying only live rows
+    // reduces cross-layer hidden-state D2D traffic.  Board validation on
+    // Qwen3.5-9B matched both first-turn and append-turn final hidden hashes;
+    // keep a fallback for other packages or firmware regression tests.
+    const bool prefill_copy_valid_rows_only =
+        !env_flag_enabled("AXLLM_DISABLE_PREFILL_COPY_VALID_ROWS_ONLY") &&
+        !has_vision_state && !use_per_layer_input;
     const bool decode_profile_enabled = env_flag_enabled("AXLLM_PROFILE_DECODE");
     const bool prefill_chunk_profile_enabled = env_flag_enabled("AXLLM_PROFILE_PREFILL_CHUNKS");
     // Keep the GDN state shape and dtype unchanged, but make the graph's
@@ -450,12 +458,43 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     std::vector<unsigned char> decode_linear_state_output_ready;
     if (decode_linear_state_inplace_enabled)
         decode_linear_state_output_ready.assign((size_t)_attr.axmodel_num, 0);
+    // The final prefill group already contains the authoritative recurrent
+    // state.  Keep its output tensors as the first decode token's seed and
+    // alias the decode inputs directly, instead of copying the full state
+    // before TTFT.  Earlier chunks still canonicalize state for the next
+    // prefill bucket.
+    const bool defer_prefill_linear_state_seed =
+        decode_linear_state_inplace_enabled &&
+        !env_flag_enabled("AXLLM_DISABLE_DEFERRED_PREFILL_STATE_SEED");
+    std::vector<const ax_runner_tensor_t *> deferred_prefill_linear_k((size_t)_attr.axmodel_num, nullptr);
+    std::vector<const ax_runner_tensor_t *> deferred_prefill_linear_v((size_t)_attr.axmodel_num, nullptr);
+    std::vector<int> deferred_prefill_linear_gid((size_t)_attr.axmodel_num, -1);
     const auto sync_deferred_linear_states = [&]() {
         if (!decode_linear_state_inplace_enabled) return true;
         for (int m = 0; m < _attr.axmodel_num; ++m)
         {
             if (!is_linear_layer(m) || !decode_linear_state_output_ready[(size_t)m])
+            {
+                // If prefill's first token is EOS or the request stops before
+                // decode, no graph output exists yet.  Canonicalize the saved
+                // prefill seed so append-only multi-turn state remains valid.
+                const int seed_gid = deferred_prefill_linear_gid[(size_t)m];
+                if (seed_gid >= 0)
+                {
+                    auto &lyr = llama_layers[(size_t)m];
+                    const int canonical_gid = decode_gid_for_layer(m, decode_grpid);
+                    if (!copy_linear_input_state_to_group(
+                            lyr.layer,
+                            canonical_gid,
+                            seed_gid,
+                            LLM_DEVID(lyr),
+                            deferred_prefill_linear_k[(size_t)m],
+                            deferred_prefill_linear_v[(size_t)m],
+                            true))
+                        return false;
+                }
                 continue;
+            }
             auto &lyr = llama_layers[(size_t)m];
             const int src_gid = decode_gid_for_layer(m, decode_grpid);
             if (!sync_linear_input_state_from_group(m, lyr.layer, src_gid, 0, false))
@@ -596,6 +635,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
 #endif
 
         size_t copy_tokens = (p == prefill_split_num - 1) ? (size_t)(input_embed_num - p * _attr.prefill_token_num) : (size_t)_attr.prefill_token_num;
+        const size_t live_prefill_input_bytes =
+            std::min(embed_tmp.size() * sizeof(unsigned short),
+                     copy_tokens * (size_t)_attr.tokens_embed_size * sizeof(unsigned short));
         memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, copy_tokens * _attr.tokens_embed_size * sizeof(unsigned short));
         scale_prefill_text_embeds_inplace(embed_tmp.data(), input_num_token, token_start_pos);
         if (std::getenv("AXLLM_DEBUG_DECODE_TRACE") && p == 0 && input_num_token > 0)
@@ -778,23 +820,40 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     previous_prefill_output->nSize >= t_in.nSize &&
                     previous_prefill_output->phyAddr != 0 && t_in.phyAddr != 0)
                 {
-                    llm_d2d(LLM_WADDR(t_in), LLM_RADDR(*previous_prefill_output), t_in.nSize, devid);
+                    llm_d2d(LLM_WADDR(t_in),
+                            LLM_RADDR(*previous_prefill_output),
+                            prefill_copy_valid_rows_only
+                                ? std::min((size_t)t_in.nSize, live_prefill_input_bytes)
+                                : t_in.nSize,
+                            devid);
                 }
                 else
                 {
                     if (!previous_prefill_output_host_ready)
                         llm_d2h(embed_tmp.data(),
                                 LLM_RADDR(*previous_prefill_output),
-                                std::min((size_t)previous_prefill_output->nSize,
-                                         embed_tmp.size() * sizeof(unsigned short)),
+                                prefill_copy_valid_rows_only
+                                    ? std::min({(size_t)previous_prefill_output->nSize,
+                                                live_prefill_input_bytes,
+                                                embed_tmp.size() * sizeof(unsigned short)})
+                                    : std::min((size_t)previous_prefill_output->nSize,
+                                               embed_tmp.size() * sizeof(unsigned short)),
                                 previous_prefill_output_devid);
                     llm_h2d(LLM_WADDR(t_in), embed_tmp.data(),
-                            std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
+                            prefill_copy_valid_rows_only
+                                ? std::min((size_t)t_in.nSize, live_prefill_input_bytes)
+                                : std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)),
+                            devid);
                 }
             }
             else
             {
-                llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
+                llm_h2d(LLM_WADDR(t_in),
+                        embed_tmp.data(),
+                        prefill_copy_valid_rows_only
+                            ? std::min((size_t)t_in.nSize, live_prefill_input_bytes)
+                            : std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)),
+                        devid);
             }
             set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len, devid);
             const int shared_src = shared_kv_source_for_layer(m);
@@ -927,11 +986,29 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             const auto state_sync_t0 = prefill_chunk_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
             if (linear_prefill)
             {
-                (void)dec_k;
-                (void)dec_v;
-                // Recurrent state is canonicalized in decode groups; avoid
-                // an O(number-of-prefill-buckets) copy after every chunk.
-                if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, false, false))
+                const ax_runner_tensor_t *out_k =
+                    try_get_group_output_tensor(lyr.layer, layer_prefill_grpid, "K_cache_out");
+                const ax_runner_tensor_t *out_v =
+                    try_get_group_output_tensor(lyr.layer, layer_prefill_grpid, "V_cache_out");
+                const bool single_decode_group =
+                    m < (int)layer_decode_grpids_.size() &&
+                    layer_decode_grpids_[(size_t)m].size() == 1;
+                const bool can_defer_seed =
+                    defer_prefill_linear_state_seed &&
+                    p + 1 == prefill_split_num &&
+                    single_decode_group &&
+                    out_k && out_v &&
+                    LLM_RADDR(*out_k) != nullptr && LLM_RADDR(*out_v) != nullptr &&
+                    out_k->nSize == dec_k.nSize && out_v->nSize == dec_v.nSize &&
+                    axllm::qwen3_5::Runtime::compatible_cache_dtype(out_k->eDataType, dec_k.eDataType) &&
+                    axllm::qwen3_5::Runtime::compatible_cache_dtype(out_v->eDataType, dec_v.eDataType);
+                if (can_defer_seed)
+                {
+                    deferred_prefill_linear_k[(size_t)m] = out_k;
+                    deferred_prefill_linear_v[(size_t)m] = out_v;
+                    deferred_prefill_linear_gid[(size_t)m] = layer_prefill_grpid;
+                }
+                else if (!sync_linear_input_state_from_group(m, lyr.layer, layer_prefill_grpid, devid, false, false))
                 {
                     set_last_error("模型运行失败，请重新尝试。");
                     ResetKVCache();
@@ -962,7 +1039,12 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                                               !next_layer_same_device;
             if (stage_output_to_host)
                 llm_d2h(embed_tmp.data(), LLM_RADDR(t_out),
-                        std::min((size_t)t_out.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
+                        prefill_copy_valid_rows_only
+                            ? std::min({(size_t)t_out.nSize,
+                                        live_prefill_input_bytes,
+                                        embed_tmp.size() * sizeof(unsigned short)})
+                            : std::min((size_t)t_out.nSize, embed_tmp.size() * sizeof(unsigned short)),
+                        devid);
             dump_prefill_bf16(
                 "chunk" + std::to_string(p) + "_layer" + std::to_string(m) + "_output",
                 t_out
@@ -1433,6 +1515,39 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     linear_state_aliased = k_alias_ret == 0 && v_alias_ret == 0;
                     if (!linear_state_aliased && (k_alias_ret == 0 || v_alias_ret == 0))
                         (void)lyr.layer.restore_group_input_aliases(layer_decode_grpid);
+                }
+                else if (defer_prefill_linear_state_seed)
+                {
+                    const int seed_gid = deferred_prefill_linear_gid[(size_t)m];
+                    const ax_runner_tensor_t *seed_k = deferred_prefill_linear_k[(size_t)m];
+                    const ax_runner_tensor_t *seed_v = deferred_prefill_linear_v[(size_t)m];
+                    const bool seed_compatible =
+                        seed_gid >= 0 && seed_k && seed_v &&
+                        seed_k->nSize == in_k.nSize && seed_v->nSize == in_v.nSize &&
+                        axllm::qwen3_5::Runtime::compatible_cache_dtype(seed_k->eDataType, in_k.eDataType) &&
+                        axllm::qwen3_5::Runtime::compatible_cache_dtype(seed_v->eDataType, in_v.eDataType);
+                    if (seed_compatible)
+                    {
+                        const int k_alias_ret = seed_k->pVirAddr && seed_k->phyAddr
+                            ? lyr.layer.alias_group_input(layer_decode_grpid, "K_cache", seed_k->pVirAddr, seed_k->phyAddr)
+                            : -1;
+                        const int v_alias_ret = seed_v->pVirAddr && seed_v->phyAddr
+                            ? lyr.layer.alias_group_input(layer_decode_grpid, "V_cache", seed_v->pVirAddr, seed_v->phyAddr)
+                            : -1;
+                        linear_state_aliased = k_alias_ret == 0 && v_alias_ret == 0;
+                        if (!linear_state_aliased)
+                        {
+                            if (k_alias_ret == 0 || v_alias_ret == 0)
+                                (void)lyr.layer.restore_group_input_aliases(layer_decode_grpid);
+                            if (!copy_linear_input_state_to_group(
+                                    lyr.layer, layer_decode_grpid, seed_gid, devid, seed_k, seed_v, true))
+                            {
+                                set_last_error("模型运行失败，请重新尝试。");
+                                ResetKVCache();
+                                return final_out;
+                            }
+                        }
+                    }
                 }
                 if (decode_profile_enabled)
                     decode_profile.linear_state_alias_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - state_alias_t0).count();

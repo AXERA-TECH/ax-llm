@@ -91,6 +91,8 @@
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `AXLLM_PREFILL_IO_ALIAS` | `0` | 实验开关。同一个 prefill chunk 内，graph ABI/shape 完全相同的层复用同一份 `mask`/`indices` 输入。当前 AX8860 engine 在部分模型上跨 AXModel handle 复用输入指针会在 prefill 中途返回 `0x80060084`，因此默认关闭。 |
+| `AXLLM_DISABLE_PREFILL_COPY_VALID_ROWS_ONLY` | `0` | 默认关闭表示启用：只拷贝固定 query 形状中的有效 token 行，减少短 prompt 的逐层 hidden-state D2D/H2D。mask 仍覆盖 padding 行；Qwen3.5-9B 板端已验证首轮和 append 轮 final hidden hash 一致。 |
+| `AXLLM_DISABLE_DEFERRED_PREFILL_STATE_SEED` | `0` | 默认关闭表示启用：最后一个 prefill chunk 的 GDN state 先保留在 prefill output，第一个 decode token 直接 alias 该 seed；alias 失败自动回退 D2D。设为 `1` 恢复 prefill 后立即拷贝到 decode input。 |
 | `AXLLM_AX650_AUTO_SYNC` | `0` | AX8860 片上后端默认跳过确认非 cached 的最大容量 `K_cache`/`V_cache` full-range flush，保留 `mask`/`indices`/`input` 等小输入 flush，并选择性 invalidate cached 输出。设为 `1` 恢复旧的 blanket input/output cache sync。 |
 
 `AXLLM_PREFILL_IO_ALIAS` 按 graph class、attention 类型、query/history 容量、sliding window 和 tensor 尺寸生成复用签名；任一条件不匹配都会自动回到逐层构建路径。所有输入 alias 都会在 chunk 结束或提前返回时恢复原始绑定。
