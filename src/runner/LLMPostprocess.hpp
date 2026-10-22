@@ -601,6 +601,26 @@ public:
         return apply_logits(logits, history, resolve_effective_sampling());
     }
 
+    // The post AXModel may return an unmodified greedy argmax alongside its
+    // logits. Use it only when host-side sampling would not alter the ranking;
+    // all sampling and logit-penalty configurations retain the CPU fallback.
+    bool can_use_device_argmax() const
+    {
+        const auto eff = resolve_effective_sampling();
+        return !eff.enable_temperature &&
+               !eff.enable_repetition_penalty &&
+               !eff.enable_frequency_penalty &&
+               !eff.enable_presence_penalty &&
+               !eff.enable_diversity_penalty &&
+               !eff.enable_top_p_sampling &&
+               !eff.enable_top_k_sampling;
+    }
+
+    bool accepts_device_argmax(int token_id, int vocab_size) const
+    {
+        return token_id >= 0 && token_id < vocab_size && token_id != pad_token_id;
+    }
+
     int apply_bf16(const unsigned short *logits, int n, const std::vector<int> &history)
     {
         const auto eff = resolve_effective_sampling();

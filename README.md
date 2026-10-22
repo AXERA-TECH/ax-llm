@@ -112,6 +112,49 @@ uninstall.bat
 
 > **AX8860 BSP 提示**：如果你使用 `arm64_glibc` 这类按 glibc 2.34/2.38 构建的 SDK，请使用 Arm GNU 13.3 或更新的交叉工具链。Arm GCC 9.2 的 sysroot 只有 glibc 2.30，链接时会出现 `mtx_lock/thrd_create` 等 `GLIBC_2.34` 未定义符号。
 
+#### AX8860 aarch64 交叉编译
+
+使用本地 `arm64_glibc` SDK 和 Arm GNU 13.3 工具链完整编译：
+
+```shell
+AXLLM_BSP_MSP_DIR=/path/to/arm64_glibc \
+AXLLM_TOOLCHAIN_ROOT=/path/to/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu \
+AXLLM_BUILD_DIR=build_ax8860 \
+./build_ax650.sh
+```
+
+参数说明：
+
+- `AXLLM_BSP_MSP_DIR`：AX8860 SDK 根目录，需包含 `lib/libax_engine.so`、`lib/libax_interpreter.so`、`lib/libax_sys.so`
+- `AXLLM_TOOLCHAIN_ROOT`：Arm GNU 13.3 或更新的 aarch64 交叉工具链根目录
+- `AXLLM_BUILD_DIR`：CMake build 目录，可按需修改
+
+脚本会执行 configure、build 和 install。编译完成后：
+
+```text
+build_ax8860/axllm
+build_ax8860/install/bin/axllm
+```
+
+已配置过的 build 目录可只增量编译 `axllm` 目标：
+
+```shell
+cmake --build build_ax8860 --target axllm -j8
+```
+
+在 AX8860 板端运行时，需要让动态链接器找到 SDK 中的运行库：
+
+```shell
+export LD_LIBRARY_PATH=/path/to/arm64_glibc/lib:$LD_LIBRARY_PATH
+```
+
+AX8860 Qwen3.5 GDN decode 默认使用 deferred in-place recurrent state：第一个 decode token 读取 prefill 后的 canonical state，之后把该层 `K_cache/V_cache` input 临时 alias 到上一次 `K_cache_out/V_cache_out`，生成结束后只做一次 output-to-canonical 同步。该路径保持 state 维度和 dtype 不变，避免每 token 约 18.6 MiB 的重复回写。如需固件 A/B 或精度回退：
+
+```shell
+export AXLLM_DISABLE_DECODE_INPLACE_STATE=1
+```
+
+
 `build_ax650.sh` 默认禁用 OpenCV，使用内置 SimpleCV，避免交叉编译时误链接主机架构的 OpenCV。若已准备好可用于目标架构的 OpenCV，可覆盖该默认值：
 
 ```shell

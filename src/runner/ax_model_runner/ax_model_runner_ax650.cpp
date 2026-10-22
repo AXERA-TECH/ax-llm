@@ -63,10 +63,10 @@ static bool axllm_env_flag_enabled(const char *name)
 
 static void mark_allow_inplace_io(AX_ENGINE_IO_T &io, int grpid)
 {
-    if (!axllm_env_flag_enabled("AXLLM_ALLOW_INPLACE_IO")) return;
+    if (axllm_env_flag_enabled("AXLLM_DISABLE_DECODE_INPLACE_STATE")) return;
     io.u64Reserved[0] |= AX_ENGINE_IO_FLAG_ALLOW_INPLACE;
     if (axllm_env_flag_enabled("AXLLM_DEBUG_LAYER0_IO"))
-        ALOGI("AXLLM_ALLOW_INPLACE_IO enabled for group %d", grpid);
+        ALOGI("decode in-place IO enabled for group %d", grpid);
 }
 
 static bool axllm_ax650_blanket_auto_sync()

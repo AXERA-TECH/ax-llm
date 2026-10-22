@@ -198,6 +198,13 @@ static inline std::string getenv_string(const char *name)
     return v ? std::string(v) : std::string();
 }
 
+static inline bool getenv_flag_enabled(const char *name)
+{
+    const std::string value = getenv_string(name);
+    return !value.empty() && value != "0" && value != "false" &&
+           value != "off" && value != "no";
+}
+
 static inline bool is_history_prefix(const std::vector<Content> &prefix, const std::vector<Content> &full)
 {
     if (prefix.size() > full.size())
@@ -254,6 +261,7 @@ struct LLM::Impl : public IKvSlotHost {
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     axllm::qwen3_5::LinearStateStore linear_state_snapshots_;
     int precompute_len = 0;
+    bool kv_buffers_known_zero_ = true;
     std::vector<int> prefill_history_kv_cache_num_grp;
     std::vector<int> prefill_symbolic_kv_cache_num_grp;
 
@@ -521,6 +529,47 @@ struct LLM::Impl : public IKvSlotHost {
     {
         (void)val;
         return postprocess.apply_bf16(p, n, history);
+    }
+
+    // New post AXModels can expose an int32 `token_id` from an on-device
+    // AxArgMax. Preserve the logits ABI for sampling/debugging and older model
+    // packages, but avoid a full-vocabulary D2H on the unmodified greedy path.
+    static int post_process_runner_output(LLMPostprocess &postprocess,
+                                          ax_runner_t &runner,
+                                          int devid,
+                                          int vocab_size,
+                                          std::vector<int> &history,
+                                          bool output_on_device,
+                                          unsigned short **logits_out = nullptr,
+                                          bool force_logits = false)
+    {
+        if (logits_out) *logits_out = nullptr;
+        const bool capture_logits = force_logits ||
+                                    std::getenv("AXLLM_DEBUG_DECODE_TRACE") != nullptr ||
+                                    std::getenv("AXLLM_DEBUG_DECODE_DUMP") != nullptr ||
+                                    std::getenv("AXLLM_DEBUG_PREFILL_DUMP") != nullptr;
+        const ax_runner_tensor_t *token_tensor = try_get_output_tensor(runner, "token_id");
+        if (!capture_logits && token_tensor && token_tensor->nSize >= sizeof(int32_t) &&
+            postprocess.can_use_device_argmax())
+        {
+            int32_t token_id = -1;
+            if (output_on_device)
+                llm_d2h(&token_id, LLM_RADDR(*token_tensor), sizeof(token_id), devid);
+            else if (token_tensor->pVirAddr)
+                std::memcpy(&token_id, token_tensor->pVirAddr, sizeof(token_id));
+            if (postprocess.accepts_device_argmax(token_id, vocab_size))
+                return token_id;
+            // If the raw argmax is the configured pad token, read logits and
+            // rerun the host argmax with the same pad-token exclusion rule.
+        }
+
+        const ax_runner_tensor_t *logits_tensor = try_get_output_tensor(runner, "output");
+        if (!logits_tensor || !logits_tensor->pVirAddr) return 0;
+        auto *logits = reinterpret_cast<unsigned short *>(logits_tensor->pVirAddr);
+        if (output_on_device)
+            llm_d2h(logits, LLM_RADDR(*logits_tensor), logits_tensor->nSize, devid);
+        if (logits_out) *logits_out = logits;
+        return post_process(postprocess, logits, vocab_size, history, nullptr);
     }
 
     static inline void fill_indices(unsigned int *dst, int start, int count)
@@ -2321,7 +2370,24 @@ struct LLM::Impl : public IKvSlotHost {
             ALOGE("input_num_token(%d) > prefill_max_token_num(%d)", input_num_token, remaining);
             return -1;
         }
-        if (_precompute_len == 0) { clear_all_group_kv_cache_tensors(); reset_full_cache_slot_state(); ALOGI("first run"); return 0; }
+        if (_precompute_len == 0)
+        {
+            // AXModel IO allocation zeroes every input buffer during init.  For
+            // the first request after model load, repeating that here clears
+            // hundreds of MiB of max-capacity KV and dominates short-prompt
+            // TTFT.  Keep an explicit force path for A/B/recovery diagnostics.
+            static const bool force_initial_kv_clear =
+                getenv_flag_enabled("AXLLM_FORCE_INITIAL_KV_CLEAR");
+            // Extra multi-slot KV buffers are allocated later and are not
+            // guaranteed to be zero-filled by AX_SYS_MemAllocCached().
+            const bool skip_clear =
+                kv_buffers_known_zero_ && _attr.kv_cache_slots <= 1 && !force_initial_kv_clear;
+            if (!skip_clear) clear_all_group_kv_cache_tensors();
+            kv_buffers_known_zero_ = false;
+            reset_full_cache_slot_state();
+            ALOGI("first run skip_kv_clear=%d", skip_clear ? 1 : 0);
+            return 0;
+        }
         if (full_cache_valid_slots_.empty()) mark_full_cache_slots(0, _precompute_len);
         // KV always lives on the device (single context, or the active prefix-cache
         // slot's own device buffer). Just sync the cached prefix across shape groups.
@@ -2342,6 +2408,7 @@ struct LLM::Impl : public IKvSlotHost {
     void ResetKVCache()
     {
         last_tokens_ids.clear(); last_history_snapshot.clear(); run_input_token_ids.clear(); last_run_generated_token_ids.clear(); k_caches.clear(); v_caches.clear(); linear_state_snapshots_.clear(); precompute_len = 0; cached_mrope_next_pos = -1; active_prefill_pos_start = -1; active_token_pos_start = -1; reset_full_cache_slot_state();
+        kv_buffers_known_zero_ = false;
         decode_grpid = decode_grpids_.empty() ? 0 : decode_grpids_.back();
         _attr.prefill_grpid = prefill_grpids_.empty() ? 1 : prefill_grpids_.back();
         if (!_attr.prefill_max_kv_cache_num_grp.empty())
