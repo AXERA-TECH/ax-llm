@@ -201,7 +201,10 @@ bool LLM::Impl::EmbedTokens(const std::vector<int> &token_ids, std::vector<float
 
             // Full-attention AX8860 DSL graphs use this optional scalar to
             // stop their runtime KV-history loop at the live prefix.
-            set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len, devid);
+            if (!is_linear_layer(m)) {
+                set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len,
+                                              _attr.kv_block_size, devid);
+            }
 
             // inference
             if (!ensure_layer_loaded(m)) return false;

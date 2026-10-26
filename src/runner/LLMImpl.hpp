@@ -576,21 +576,25 @@ struct LLM::Impl : public IKvSlotHost {
     { for (int i = 0; i < count; ++i) dst[i] = (unsigned int)(start + i); }
 
     // New AX8860 DSL full-attention graphs expose a small runtime scalar that
-    // controls the number of live 256-token KV history tiles.  Keep this
-    // helper optional so older axmodels (and GDN/other layer types) continue
+    // controls the number of live KV history tiles. The tile size is exported
+    // alongside the graph.  Keep this helper optional so older axmodels (and
+    // GDN/other layer types) continue
     // to use their original ABI unchanged.
     static inline void set_kv_block_count_if_present(ax_runner_t &runner,
                                                      int grpid,
                                                      int history_tokens,
+                                                     int block_size,
                                                      int devid)
     {
         const ax_runner_tensor_t *t = try_get_group_input_tensor(runner, grpid, "kv_block_count");
         if (!t || t->nSize < sizeof(int32_t)) return;
-        int32_t blocks = (int32_t)((std::max(0, history_tokens) + 255) / 256);
+        const int32_t tile_size = std::max(1, block_size);
+        int32_t blocks = (int32_t)((std::max(0, history_tokens) + tile_size - 1) / tile_size);
         if (blocks == 0 && std::getenv("AXLLM_MIN_KV_BLOCK_COUNT"))
             blocks = 1;
         if (std::getenv("AXLLM_DEBUG_LAYER0_IO"))
-            ALOGI("set kv_block_count: gid=%d history_tokens=%d blocks=%d", grpid, history_tokens, blocks);
+            ALOGI("set kv_block_count: gid=%d history_tokens=%d block_size=%d blocks=%d",
+                  grpid, history_tokens, tile_size, blocks);
         llm_h2d(LLM_WADDR(*t), &blocks, sizeof(blocks), devid);
     }
 
@@ -866,6 +870,67 @@ struct LLM::Impl : public IKvSlotHost {
                 }
             }
         }
+    }
+
+    bool hybrid_prefill_only_state_clear_enabled() const
+    {
+        static const bool disabled =
+            getenv_flag_enabled("AXLLM_DISABLE_HYBRID_PREFILL_ONLY_STATE_CLEAR") ||
+            getenv_flag_enabled("AXLLM_QWEN38_27B_DISABLE_PREFILL_ONLY_STATE_CLEAR");
+        return !disabled;
+    }
+
+    bool hybrid_prefill_only_state_clear_supported() const
+    {
+        bool has_linear = false;
+        bool has_full = false;
+        for (int i = 0; i < _attr.axmodel_num; ++i)
+        {
+            const std::string &graph_class = layer_graph_class_for(i);
+            has_linear = has_linear || graph_class == "linear_attention";
+            has_full = has_full || graph_class == "full_attention";
+        }
+        return has_linear && has_full && _attr.kv_cache_slots <= 1;
+    }
+
+    size_t clear_cold_prefill_linear_state_tensors(int requested_gid)
+    {
+        size_t cleared_bytes = 0;
+        int cleared_layers = 0;
+        for (int i = 0; i < _attr.axmodel_num; ++i)
+        {
+            if (!is_linear_layer(i)) continue;
+
+            auto &lyr = llama_layers[(size_t)i];
+            const int devid = LLM_DEVID(lyr);
+            const int gid = prefill_gid_for_layer(i, requested_gid);
+            const auto *k = try_get_group_input_tensor(lyr.layer, gid, "K_cache");
+            const auto *v = try_get_group_input_tensor(lyr.layer, gid, "V_cache");
+            if (k)
+            {
+                void *kaddr = LLM_WADDR(*k);
+                if (kaddr && k->nSize)
+                {
+                    llm_memset(kaddr, 0, k->nSize, devid);
+                    cleared_bytes += k->nSize;
+                }
+            }
+            if (v)
+            {
+                void *vaddr = LLM_WADDR(*v);
+                if (vaddr && v->nSize)
+                {
+                    llm_memset(vaddr, 0, v->nSize, devid);
+                    cleared_bytes += v->nSize;
+                }
+            }
+            ++cleared_layers;
+        }
+        ALOGI("cold prefill linear-state clear: requested_gid=%d layers=%d bytes=%zu",
+              requested_gid,
+              cleared_layers,
+              cleared_bytes);
+        return cleared_bytes;
     }
 
     void drop_linear_state_snapshots_after(int token_len)
@@ -2382,7 +2447,20 @@ struct LLM::Impl : public IKvSlotHost {
             // guaranteed to be zero-filled by AX_SYS_MemAllocCached().
             const bool skip_clear =
                 kv_buffers_known_zero_ && _attr.kv_cache_slots <= 1 && !force_initial_kv_clear;
-            if (!skip_clear) clear_all_group_kv_cache_tensors();
+            if (!skip_clear)
+            {
+                const bool hybrid_prefill_only_clear =
+                    hybrid_prefill_only_state_clear_enabled() &&
+                    hybrid_prefill_only_state_clear_supported();
+                if (hybrid_prefill_only_clear)
+                {
+                    clear_cold_prefill_linear_state_tensors(_attr.prefill_grpid);
+                }
+                else
+                {
+                    clear_all_group_kv_cache_tensors();
+                }
+            }
             kv_buffers_known_zero_ = false;
             reset_full_cache_slot_state();
             ALOGI("first run skip_kv_clear=%d", skip_clear ? 1 : 0);

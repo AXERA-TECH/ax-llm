@@ -588,6 +588,11 @@ struct ModelConfig
                 // layer-local maps.
                 attr.layer_graph_classes.assign((size_t)attr.axmodel_num, "full_attention");
             }
+            attr.kv_block_size = 256;
+            if (auto v = json_int_value(j, "kv_block_size"); v.has_value())
+            {
+                attr.kv_block_size = std::max(1, *v);
+            }
             attr.reuse_graph_metadata = true;
             json_bool_value(j, "reuse_graph_metadata", attr.reuse_graph_metadata);
 

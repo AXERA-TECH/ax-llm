@@ -1,5 +1,6 @@
 // Auto-split from LLM.cpp/LLMImpl.hpp: generation/decode engine (LLM::Impl::Run + prefill).
 #include "LLMImpl.hpp"
+#include <array>
 #include <filesystem>
 #include <fstream>
 
@@ -120,7 +121,10 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
                 llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
             }
             auto &t_in = lyr.layer.get_input(layer_prefill_grpid, "input"); llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)), devid);
-            set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len, devid);
+            if (!is_linear_layer(m)) {
+                set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len,
+                                              _attr.kv_block_size, devid);
+            }
             if (!ensure_layer_loaded(m)) return -1;
             const int kv_prefill_infer_ret = lyr.layer.inference(layer_prefill_grpid);
             if (kv_prefill_infer_ret != 0)
@@ -348,19 +352,23 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         if (linear_decode_mask.empty()) linear_decode_mask.push_back(bf16_one.data);
         return linear_decode_mask;
     };
-    std::map<std::string, std::pair<int, int>> decode_io_anchors;
+    std::map<std::array<int, 7>, std::pair<int, int>> decode_io_anchors;
     const auto reuse_decode_mask_and_indices = [&](int layer_idx,
                                                    int group_id,
                                                    int devid,
                                                    const ax_runner_tensor_t &indices,
                                                    const ax_runner_tensor_t &mask) -> bool {
-        const std::string signature =
-            layer_graph_class_for(layer_idx) + "|" +
-            (is_linear_layer(layer_idx) ? "linear" : "attention") + "|" +
-            (is_sliding_attention_layer(layer_idx) ? "sliding" : "regular") + "|" +
-            std::to_string(_attr.sliding_window) + "|" +
-            std::to_string(indices.nSize) + "|" + std::to_string(mask.nSize) + "|" +
-            std::to_string(devid);
+        const auto &graph_class = layer_graph_class_for(layer_idx);
+        const int graph_class_id = graph_class == "linear_attention" ? 0 : 1;
+        const std::array<int, 7> signature = {
+            graph_class_id,
+            is_linear_layer(layer_idx) ? 1 : 0,
+            is_sliding_attention_layer(layer_idx) ? 1 : 0,
+            _attr.sliding_window,
+            static_cast<int>(indices.nSize),
+            static_cast<int>(mask.nSize),
+            devid,
+        };
         const auto anchor_it = decode_io_anchors.find(signature);
         if (anchor_it == decode_io_anchors.end())
         {
@@ -855,7 +863,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                             : std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short)),
                         devid);
             }
-            set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len, devid);
+            if (!is_linear_layer(m)) {
+                set_kv_block_count_if_present(lyr.layer, layer_prefill_grpid, history_len,
+                                              _attr.kv_block_size, devid);
+            }
             const int shared_src = shared_kv_source_for_layer(m);
             if (shared_src >= 0)
             {
@@ -1296,7 +1307,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 }
             }
             auto &t_idx = lyr.layer.get_input(layer_decode_grpid, "indices");
-            set_kv_block_count_if_present(lyr.layer, layer_decode_grpid, (int)kv_slot, devid);
+            if (!is_linear_layer(m)) {
+                set_kv_block_count_if_present(lyr.layer, layer_decode_grpid, (int)kv_slot,
+                                              _attr.kv_block_size, devid);
+            }
             auto &t_mask= lyr.layer.get_input(layer_decode_grpid, "mask");
             const bool reused_decode_io = reuse_decode_mask_and_indices(m, layer_decode_grpid, devid, t_idx, t_mask);
             if (!reused_decode_io)
@@ -1420,6 +1434,13 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         {
             if (b_stop.load(std::memory_order_relaxed)) break; auto &lyr = llama_layers[m]; int devid = lyr.layer.get_devid();
             const auto layer_wall_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
+            if (m == 0)
+            {
+                auto &first_in = lyr.layer.get_input(decode_gid_for_layer(0, decode_grpid), "input");
+                memcpy(first_in.pVirAddr,
+                       embed.data(),
+                       std::min((size_t)first_in.nSize, embed.size() * sizeof(unsigned short)));
+            }
             const int layer_decode_grpid = decode_gid_for_layer(m, decode_grpid);
             auto &in_k = lyr.layer.get_input(layer_decode_grpid, "K_cache"); auto *in_k_ptr = (unsigned short *)in_k.pVirAddr;
             auto &in_v = lyr.layer.get_input(layer_decode_grpid, "V_cache"); auto *in_v_ptr = (unsigned short *)in_v.pVirAddr;
@@ -1457,7 +1478,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 decode_profile.shared_kv_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - shared_t0).count();
             const auto prep_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
             auto &t_idx = lyr.layer.get_input(layer_decode_grpid, "indices");
-            set_kv_block_count_if_present(lyr.layer, layer_decode_grpid, (int)kv_slot, devid);
+            if (!is_linear_layer(m)) {
+                set_kv_block_count_if_present(lyr.layer, layer_decode_grpid, (int)kv_slot,
+                                              _attr.kv_block_size, devid);
+            }
             auto &t_mask= lyr.layer.get_input(layer_decode_grpid, "mask");
             const bool reused_decode_io = reuse_decode_mask_and_indices(m, layer_decode_grpid, devid, t_idx, t_mask);
             if (!reused_decode_io)
@@ -1493,8 +1517,6 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                        decode_per_layer_input.data() + src_off,
                        std::min((size_t)t_per_layer->nSize, (size_t)per_layer_hidden * sizeof(unsigned short)));
             }
-            auto &t_in = lyr.layer.get_input(layer_decode_grpid, "input");
-            memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             bool linear_state_aliased = false;
             if (decode_linear_state_inplace_enabled && is_linear_layer(m))
             {
@@ -1682,12 +1704,25 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             );
             auto &t_out= lyr.layer.get_output(layer_decode_grpid, "output");
             const auto output_copy_t0 = decode_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
-            if (decode_explicit_output_d2h)
+            if (m + 1 < _attr.axmodel_num)
             {
+                auto &next_layer = llama_layers[(size_t)(m + 1)];
+                const int next_decode_grpid = decode_gid_for_layer(m + 1, decode_grpid);
+                auto &next_in = next_layer.layer.get_input(next_decode_grpid, "input");
+                const size_t copy_bytes = std::min((size_t)t_out.nSize,
+                                                    std::min(embed.size() * sizeof(unsigned short),
+                                                             (size_t)next_in.nSize));
+                memcpy(next_in.pVirAddr, t_out.pVirAddr, copy_bytes);
             }
             else
             {
+                if (decode_explicit_output_d2h)
+                {
+                }
+                else
+                {
                 memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
+                }
             }
             if (decode_profile_enabled)
                 decode_profile.output_copy_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - output_copy_t0).count();

@@ -42,6 +42,10 @@ struct LLMAttrType {
     // share dispatch/group metadata, but each layer still owns its weights
     // and AXModel handle.
     std::vector<std::string> layer_graph_classes;
+    // Number of KV-history tokens consumed by one dynamic-loop iteration in
+    // AX8860 DSL full-attention graphs. The package exporter keeps this in
+    // sync with the compiler tile size.
+    int kv_block_size = 256;
     // Reuse validated group/dispatch metadata between layers with identical
     // graph ABI.  Layer AXModels and their constant weights remain separate.
     bool reuse_graph_metadata = true;
