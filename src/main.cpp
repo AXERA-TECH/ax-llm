@@ -2403,6 +2403,8 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         else if (body.is_array())
         {
             bool first_text = true;
+            // [Qwen3.5-order-fix] remember whether any text part precedes the first media part
+            bool saw_text_part = false;
             for (size_t part_idx = 0; part_idx < body.size(); ++part_idx)
             {
                 const auto &c = body[part_idx];
@@ -2413,6 +2415,7 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                     if (!first_text) content.data += "\n";
                     content.data += c.value("text", "");
                     first_text = false;
+                    saw_text_part = true;
                     continue;
                 }
 
@@ -2482,6 +2485,8 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                     resolved += ":" + format_fps(video_fps);
                 }
                 media_uris.push_back(std::move(resolved));
+                // [Qwen3.5-order-fix] first media part already preceded by text -> text-first
+                if (saw_text_part) content.media_before_text = false;
             }
         }
         else if (!body.is_null())
