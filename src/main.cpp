@@ -1226,6 +1226,9 @@ int run_interactive_mode(ModelConfig &config)
         user.role = USER;
         user.data = prompt;
         user.type = (has_media ? media_type : TEXT);
+        // [Qwen3.5-order-fix] run mode: render text before media, matching the serve/HF
+        // convention (the interactive flow also asks for the prompt before media).
+        user.media_before_text = false;
 
         const size_t hist_before = history.size();
         const size_t media_before = media_inputs.size();
