@@ -4,6 +4,20 @@
 
 #include <map>
 
+#include "axcl_sys_type.h"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 static std::map<int, std::shared_ptr<AXCLWorker>> g_devices;
 
 static bool axcl_contains(int devid)
@@ -38,8 +52,70 @@ axclError axcl_Exit(int devid)
     return 0;
 }
 
+namespace
+{
+// AXCL SYS entry points, looked up at run time so the build does not need to link libaxcl_sys.
+struct AxclSysApi
+{
+    using VoidFn = AX_S32 (*)();
+    using QueryFn = AX_S32 (*)(AX_CMM_STATUS_T *);
+    VoidFn init = nullptr;
+    VoidFn deinit = nullptr;
+    QueryFn query = nullptr;
+
+    AxclSysApi()
+    {
+#ifdef _WIN32
+        HMODULE lib = LoadLibraryA("libaxcl_sys.dll");
+        auto sym = [lib](const char *name) { return lib ? (void *)GetProcAddress(lib, name) : nullptr; };
+#else
+        void *lib = dlopen("libaxcl_sys.so", RTLD_NOW | RTLD_LOCAL);
+        auto sym = [lib](const char *name) { return lib ? dlsym(lib, name) : nullptr; };
+#endif
+        init = reinterpret_cast<VoidFn>(sym("AXCL_SYS_Init"));
+        deinit = reinterpret_cast<VoidFn>(sym("AXCL_SYS_Deinit"));
+        query = reinterpret_cast<QueryFn>(sym("AXCL_SYS_MemQueryStatus"));
+    }
+};
+
+const AxclSysApi &axcl_sys_api()
+{
+    static const AxclSysApi api;
+    return api;
+}
+} // namespace
+
+int axcl_sys_cmm_remain_mb(bool *sys_inited)
+{
+    const AxclSysApi &api = axcl_sys_api();
+    if (!api.query) return -1;
+    AX_CMM_STATUS_T status{};
+    AX_S32 ret = api.query(&status);
+    if (ret != 0 && api.init && !*sys_inited && api.init() == 0)
+    {
+        *sys_inited = true;
+        status = AX_CMM_STATUS_T{};
+        ret = api.query(&status);
+    }
+    if (ret != 0) return -1;
+    return (int)(status.RemainSize / 1024); // KB
+}
+
+void axcl_sys_deinit()
+{
+    if (axcl_sys_api().deinit) axcl_sys_api().deinit();
+}
+
 int axcl_GetCMMRemain(int devid)
 {
+    // AXCL_SYS_MemQueryStatus on the device's worker thread. The fallback runs
+    // `axcl-smi sh cat /proc/ax_proc/mem_cmm_info`, ~0.5 s per call (the loader asks twice per
+    // layer), and that call has been seen to hang on the first use after a killed process.
+    if (axcl_contains(devid))
+    {
+        const int mb = g_devices[devid]->cmmRemainMB();
+        if (mb >= 0) return mb;
+    }
     return get_pcie_remaining_cmm_size(devid);
 }
 

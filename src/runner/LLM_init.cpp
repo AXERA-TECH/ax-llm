@@ -476,7 +476,6 @@ bool LLM::Impl::Init(LLMAttrType attr)
     ALOGI("LLM init start");
     this->_attr = attr;
     deinited_ = false;
-    mem_guard_.capture_sentry_baseline();
     dynamic_layer_load_enabled_ = _attr.dynamic_load_enable;
     dynamic_layer_pool_size_ = _attr.dynamic_load_pool_size;
     if (dynamic_layer_load_enabled_ && dynamic_layer_pool_size_ <= 0)
@@ -535,6 +534,8 @@ bool LLM::Impl::Init(LLMAttrType attr)
         }
     }
 #endif
+    // After axcl_Init, so the devices' AXCL workers answer the CMM query (see axcl_GetCMMRemain).
+    mem_guard_.capture_sentry_baseline();
 
     t_cqdm cqdm = create_cqdm(attr.axmodel_num + 3, 32);
     tokenizer = create_tokenizer(this->_attr.tokenizer_type);
@@ -952,6 +953,7 @@ void LLM::Impl::Deinit()
     deinited_ = true;
 #ifdef USE_AXCL
     decode_io_share_end(); // never let deinit() see a buffer shared across layers
+    prefill_io_share_end();
 #endif
     for (size_t i = 0; i < llama_layers.size(); i++) llama_layers[i].layer.deinit();
     llama_post.deinit();

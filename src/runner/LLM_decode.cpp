@@ -128,9 +128,11 @@ int LLM::Impl::GenerateKVCachePrefill(std::vector<int> &_token_ids,
                     auto &gv = lyr.layer.get_input(gid, "V_cache");
                     const int cap_tokens_k = (int)(gk.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
                     const int cap_tokens_v = (int)(gv.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
-                    if (history_len + input_num_token <= cap_tokens_k)
+                    // Groups that share the decode buffer (the AXCL runner aliases them) already
+                    // hold this chunk: the copy above wrote the same bytes to the same address.
+                    if (history_len + input_num_token <= cap_tokens_k && LLM_WADDR(gk) != LLM_WADDR(dec_k))
                         llm_d2d((unsigned short *)LLM_WADDR(gk) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
-                    if (history_len + input_num_token <= cap_tokens_v)
+                    if (history_len + input_num_token <= cap_tokens_v && LLM_WADDR(gv) != LLM_WADDR(dec_v))
                         llm_d2d((unsigned short *)LLM_WADDR(gv) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
                 }
             }
@@ -313,6 +315,19 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     const int per_layer_hidden = gemma4_per_layer_helper.hidden_size_per_layer_input();
     const bool decode_profile_enabled = std::getenv("AXLLM_PROFILE_DECODE") != nullptr;
     DecodeProfileStats decode_profile{};
+    // AXLLM_PROFILE_PREFILL: where the prefill time goes (host copies vs NPU), summed over the chunks of one run.
+    const bool prefill_profile_enabled = std::getenv("AXLLM_PROFILE_PREFILL") != nullptr;
+    struct PrefillProfileStats
+    {
+        uint64_t idx_ns = 0, mask_ns = 0, input_ns = 0, infer_ns = 0, kv_ns = 0, kv_future_ns = 0, out_ns = 0, post_ns = 0;
+        int kv_future_copies = 0, kv_future_same_buffer = 0, kv_direct_layers = 0;
+    } prefill_profile{};
+    const auto prefill_now = [prefill_profile_enabled]() {
+        return prefill_profile_enabled ? DecodeClock::now() : DecodeClock::time_point{};
+    };
+    const auto prefill_ns_since = [](DecodeClock::time_point t0) {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(DecodeClock::now() - t0).count();
+    };
     std::vector<unsigned short> prefill_per_layer_inputs;
     std::vector<unsigned short> decode_per_layer_input;
     std::vector<unsigned short> per_layer_tmp;
@@ -353,6 +368,18 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         }
     }
 
+#ifdef USE_AXCL
+    // The host copy of each layer's output is only read by the vision deepstack merge, the per-layer
+    // inputs and the debug traces; those keep the per-layer upload/download path.
+    const bool prefill_keep_host_hidden = debug_prefill || use_per_layer_input ||
+                                          (has_vision_state && !vision_state.deepstack_features.empty());
+    prefill_io_share_begin(prefill_grp_list, prefill_keep_host_hidden);
+    struct PrefillIoShareGuard
+    {
+        Impl *self;
+        ~PrefillIoShareGuard() { self->prefill_io_share_end(); }
+    } prefill_io_share_guard{this};
+#endif
     for (int p = 0; p < prefill_split_num; p++)
     {
         if (b_stop.load(std::memory_order_relaxed)) break;
@@ -411,6 +438,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                       layer_prefill_grpid,
                       layer_kv_cache_num);
             }
+            auto prof_t = prefill_now();
             auto &t_idx = lyr.layer.get_input(layer_prefill_grpid, "indices");
             unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
             {
@@ -450,7 +478,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     }
                 }
             }
-            llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
+            if (!prefill_io_uses_shared(m, layer_prefill_grpid, "indices"))
+                llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
+            if (prefill_profile_enabled) { prefill_profile.idx_ns += prefill_ns_since(prof_t); prof_t = prefill_now(); }
             auto &t_mask = lyr.layer.get_input(layer_prefill_grpid, "mask");
             if (is_linear_layer(m))
             {
@@ -458,7 +488,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 fill_linear_prefill_mask(linear_mask_tmp, elems, input_num_token);
                 llm_h2d(LLM_WADDR(t_mask), linear_mask_tmp.data(), std::min((size_t)t_mask.nSize, linear_mask_tmp.size() * sizeof(unsigned short)), devid);
             }
-            else
+            else if (!prefill_io_uses_shared(m, layer_prefill_grpid, "mask"))
             {
                 mask_tmp.assign((size_t)_attr.prefill_token_num * (size_t)(layer_kv_cache_num + _attr.prefill_token_num), bf16.data);
                 if (use_sparse_full_cache_mask())
@@ -467,16 +497,18 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     build_layer_prefill_mask(mask_tmp, layer_kv_cache_num, _attr.prefill_token_num, history_len, input_num_token, m);
                 llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short)), devid);
             }
+            if (prefill_profile_enabled) { prefill_profile.mask_ns += prefill_ns_since(prof_t); prof_t = prefill_now(); }
             auto &t_in = lyr.layer.get_input(layer_prefill_grpid, "input");
             if (std::getenv("AXLLM_ZERO_LAYER0_PREFILL_INPUT") && m == 0 && p == 0)
             {
                 std::vector<unsigned short> zero_embed(embed_tmp.size(), 0);
                 llm_h2d(LLM_WADDR(t_in), zero_embed.data(), zero_embed.size() * sizeof(unsigned short), devid);
             }
-            else
+            else if (!prefill_io_input_chained(m, layer_prefill_grpid))
             {
                 llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), embed_tmp.size() * sizeof(unsigned short), devid);
             }
+            if (prefill_profile_enabled) prefill_profile.input_ns += prefill_ns_since(prof_t);
             const int shared_src = shared_kv_source_for_layer(m);
             if (shared_src >= 0)
             {
@@ -541,7 +573,13 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 dump_selected_prefill_tensors(lyr.layer, layer_prefill_grpid, -1);
             const bool linear_prefill = is_linear_layer(m);
             const int layer_decode_grpid = decode_gid_for_layer(m, decode_grpid);
+            auto &dec_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
+            auto &dec_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
+            const bool kv_direct = !linear_prefill && shared_src < 0 &&
+                                   prefill_kv_bind_rows(m, layer_prefill_grpid, dec_k, dec_v, history_len);
+            prof_t = prefill_now();
             const int infer_ret = lyr.layer.inference(layer_prefill_grpid);
+            if (prefill_profile_enabled) { prefill_profile.infer_ns += prefill_ns_since(prof_t); prof_t = prefill_now(); }
             if (infer_ret != 0)
             {
                 ALOGW("prefill layer %d gid=%d inference failed: 0x%x", m, layer_prefill_grpid, infer_ret);
@@ -570,8 +608,6 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 {
                 }
             }
-            auto &dec_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
-            auto &dec_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
             if (linear_prefill)
             {
                 (void)dec_k;
@@ -590,8 +626,21 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 const int layer_kv = kv_cache_size_for_layer(m);
                 int kv_off = history_len * layer_kv;
                 size_t kv_sz = (size_t)input_num_token * (size_t)layer_kv * sizeof(unsigned short);
-                llm_d2d((unsigned short *)LLM_WADDR(dec_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
-                llm_d2d((unsigned short *)LLM_WADDR(dec_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
+                // With kv_direct the chunk's K/V are already in the decode cache, which is then the source
+                // for any group that does not share it.
+                const void *src_k = kv_direct ? (const void *)((const unsigned short *)LLM_RADDR(dec_k) + kv_off) : LLM_RADDR(out_k);
+                const void *src_v = kv_direct ? (const void *)((const unsigned short *)LLM_RADDR(dec_v) + kv_off) : LLM_RADDR(out_v);
+                if (!kv_direct)
+                {
+                    llm_d2d((unsigned short *)LLM_WADDR(dec_k) + kv_off, src_k, kv_sz, devid);
+                    llm_d2d((unsigned short *)LLM_WADDR(dec_v) + kv_off, src_v, kv_sz, devid);
+                }
+                if (prefill_profile_enabled)
+                {
+                    prefill_profile.kv_ns += prefill_ns_since(prof_t);
+                    prof_t = prefill_now();
+                    if (kv_direct) ++prefill_profile.kv_direct_layers;
+                }
                 std::vector<int> future_prefill_gids;
                 future_prefill_gids.reserve((size_t)std::max(0, prefill_split_num - p - 1));
                 for (int q = p + 1; q < prefill_split_num; ++q)
@@ -605,17 +654,37 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                     auto &gv = lyr.layer.get_input(gid, "V_cache");
                     const int cap_tokens_k = (int)(gk.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
                     const int cap_tokens_v = (int)(gv.nSize / (size_t)(layer_kv * (int)sizeof(unsigned short)));
-                    if (kv_off / layer_kv + input_num_token <= cap_tokens_k) {
-                        llm_d2d((unsigned short *)LLM_WADDR(gk) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
+                    if (prefill_profile_enabled)
+                    {
+                        prefill_profile.kv_future_copies += 2;
+                        if (LLM_WADDR(gk) == LLM_WADDR(dec_k)) ++prefill_profile.kv_future_same_buffer;
+                        if (LLM_WADDR(gv) == LLM_WADDR(dec_v)) ++prefill_profile.kv_future_same_buffer;
                     }
-                    if (kv_off / layer_kv + input_num_token <= cap_tokens_v) {
-                        llm_d2d((unsigned short *)LLM_WADDR(gv) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
+                    // Groups that share the decode buffer (the AXCL runner aliases them) already
+                    // hold this chunk: the copy above wrote the same bytes to the same address.
+                    if (kv_off / layer_kv + input_num_token <= cap_tokens_k && LLM_WADDR(gk) != LLM_WADDR(dec_k)) {
+                        llm_d2d((unsigned short *)LLM_WADDR(gk) + kv_off, src_k, kv_sz, devid);
+                    }
+                    if (kv_off / layer_kv + input_num_token <= cap_tokens_v && LLM_WADDR(gv) != LLM_WADDR(dec_v)) {
+                        llm_d2d((unsigned short *)LLM_WADDR(gv) + kv_off, src_v, kv_sz, devid);
                     }
                 }
             }
 
+            if (prefill_profile_enabled) { prefill_profile.kv_future_ns += prefill_ns_since(prof_t); prof_t = prefill_now(); }
             auto &t_out = lyr.layer.get_output(layer_prefill_grpid, "output");
-            llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
+            if (!prefill_io_output_chained(m, layer_prefill_grpid, prefill_grpid))
+            {
+                llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
+            }
+            else if (m == _attr.axmodel_num - 1 && p == prefill_split_num - 1)
+            {
+                // Only the chunk's last row feeds the post model.
+                const size_t row = (size_t)(input_num_token - 1) * (size_t)_attr.tokens_embed_size;
+                llm_d2h(embed_tmp.data() + row, (const unsigned short *)LLM_RADDR(t_out) + row,
+                        (size_t)_attr.tokens_embed_size * sizeof(unsigned short), devid);
+            }
+            if (prefill_profile_enabled) prefill_profile.out_ns += prefill_ns_since(prof_t);
             if (debug_prefill) ALOGI("prefill layer %d output d2h done", m);
             if (std::getenv("AXLLM_DEBUG_DECODE_TRACE") &&
                 p == prefill_split_num - 1 &&
@@ -665,6 +734,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             memcpy(embed.data(), embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
     }
 
+#ifdef USE_AXCL
+    prefill_io_share_end();
+#endif
     int next_token = -1; t_cqdm cqdm = create_cqdm(_attr.max_token_len, 32);
     bool b_hit_eos = false;
     if (use_per_layer_input)
@@ -682,6 +754,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     if (decode_start != dense_decode_start)
         ALOGI("VLM decode positions: rope_start=%u dense_kv_start=%u", decode_start, dense_decode_start);
     {
+        const auto post_prof_t = prefill_now();
         auto &t_in = llama_post.get_input("input");
         if (debug_prefill) ALOGI("post stage begin: input_bytes=%u device=%d", t_in.nSize, LLM_DEVID(llama_layers.back()));
         dump_hidden_trace("post_input_hidden", 0, embed.data(), _attr.tokens_embed_size);
@@ -696,6 +769,18 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
         dump_decode_trace(0, post_out, _attr.tokens_embed_num, next_token);
         const float ttft_text_ms = ttft_timer.cost();
+        if (prefill_profile_enabled)
+        {
+            prefill_profile.post_ns += prefill_ns_since(post_prof_t);
+            const auto ms = [](uint64_t ns) { return (double)ns / 1e6; };
+            ALOGN("prefill profile: tokens=%d chunks=%d text=%.1f ms | idx=%.1f mask=%.1f input=%.1f infer=%.1f kv=%.1f "
+                  "(%d layer-chunks written directly) kv_future=%.1f (%d copies, %d into the same buffer) out=%.1f post=%.1f ms\n",
+                  input_embed_num, prefill_split_num, ttft_text_ms, ms(prefill_profile.idx_ns), ms(prefill_profile.mask_ns),
+                  ms(prefill_profile.input_ns), ms(prefill_profile.infer_ns), ms(prefill_profile.kv_ns),
+                  prefill_profile.kv_direct_layers,
+                  ms(prefill_profile.kv_future_ns), prefill_profile.kv_future_copies,
+                  prefill_profile.kv_future_same_buffer, ms(prefill_profile.out_ns), ms(prefill_profile.post_ns));
+        }
         const float ttft_e2e_ms = CurrentRequestElapsedMs();
         if (ttft_e2e_ms >= 0.0f)
         {
@@ -854,8 +939,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             else if (is_linear_layer(m))
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
-                std::vector<unsigned short> linear_decode_mask(elems, bf16_one.data);
-                if (linear_decode_mask.empty()) linear_decode_mask.push_back(bf16_one.data);
+                // at least one element; sized up front (GCC 15 flags the push_back growth path with
+                // -Werror=free-nonheap-object once Run() inlines differently)
+                std::vector<unsigned short> linear_decode_mask(std::max<size_t>(elems, 1), bf16_one.data);
                 llm_h2d(LLM_WADDR(t_mask), linear_decode_mask.data(), linear_decode_mask.size() * sizeof(unsigned short), devid);
             }
             else
@@ -1018,8 +1104,9 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             if (is_linear_layer(m))
             {
                 const size_t elems = (size_t)t_mask.nSize / sizeof(unsigned short);
-                std::vector<unsigned short> linear_decode_mask(elems, bf16_one.data);
-                if (linear_decode_mask.empty()) linear_decode_mask.push_back(bf16_one.data);
+                // at least one element; sized up front (GCC 15 flags the push_back growth path with
+                // -Werror=free-nonheap-object once Run() inlines differently)
+                std::vector<unsigned short> linear_decode_mask(std::max<size_t>(elems, 1), bf16_one.data);
                 memcpy(t_mask.pVirAddr, linear_decode_mask.data(), std::min((size_t)t_mask.nSize, linear_decode_mask.size() * sizeof(unsigned short)));
             }
             else
